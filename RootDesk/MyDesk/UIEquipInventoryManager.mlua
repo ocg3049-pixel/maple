@@ -1,0 +1,1834 @@
+@Logic
+script UIEquipInventoryManager extends Logic
+
+	-- 장비 슬롯 7개 (7=모자): "이름|RUID" 형식
+	property string equip1 = ""
+	property string equip2 = ""
+	property string equip3 = ""
+	property string equip4 = ""
+	property string equip5 = ""
+	property string equip6 = ""
+	property string equip7 = ""
+
+	-- 메소
+	property integer meso = 0
+
+	-- 더블클릭 추적
+	property number lastEquipSlot = 0
+	property number lastEquipTime = 0.0
+	property number lastInvenSlot = 0
+	property number lastInvenTime = 0.0
+
+	-- 주문서 드래그 드랍
+	property boolean isDragging = false
+	property number dragScrollSlot = 0
+
+	-- 창 드래그
+	property boolean isDraggingWindow = false
+	property string dragWindowPath = ""
+	property number dragWinOffsetX = 0.0
+	property number dragWinOffsetY = 0.0
+
+	-- 툴팁 출처 추적: "equip" / "inven" / ""
+	property string tooltipSource = ""
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self._T.winStack = {}
+		self._T.tabData = { equip={}, consume={}, etc={}, install={}, cash={}, decorate={} }
+		self._T.activeTab = "equip"
+		self._T.scrollRow = 0
+		self._T.minimized = false
+		self._T.prevEnhanceOpen = false
+		self._T.prevSkillOpen   = false
+		self._T.isDraggingWindow = false
+		self._T.dragWindowPath = ""
+		self._T.dragWinOffsetX = 0.0
+		self._T.dragWinOffsetY = 0.0
+		self._T.pendingCancelDrag = false
+		self._T.isDraggingPotion = false
+		self._T.potionInvenSlot = 0
+		self._T.pendingCancelPotionDrag = false
+		self._T.pendingHideTooltip = false
+		self._T.isDraggingThumb = false
+		self._T.thumbDragOffsetY = 0.0
+		self._T.isHoldingScrollTrack = false
+		self._T.scrollTrackTimer = 0.0
+		self._T.scrollHandler = nil
+		self._T.wheelAccum = 0.0
+		self._T.hoverEquipSlot = 0
+		self._T.hoverInvenSlot = 0
+		self._T.pendingShowSlotType = ""
+		self._T.pendingShowSlotIdx = 0
+		local cE = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/CloseEquip")
+		local cI = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/CloseInven")
+		if isvalid(cE) then cE:ConnectEvent(ButtonClickEvent, self.OnCloseEquip) end
+		if isvalid(cI) then cI:ConnectEvent(ButtonClickEvent, self.OnCloseInven) end
+		_InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+
+		-- 장비 슬롯: UITouchReceiveComponent 추가 후 click + hover 연결
+		local eBase = "/ui/DefaultGroup/EquipWindow/"
+		local eNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon" }
+		local eHandlers = {
+			self.OnEquipBtn1, self.OnEquipBtn2, self.OnEquipBtn3,
+			self.OnEquipBtn4, self.OnEquipBtn5, self.OnEquipBtn6
+		}
+		local eEnterHandlers = {
+			self.OnEquipHoverEnter1, self.OnEquipHoverEnter2, self.OnEquipHoverEnter3,
+			self.OnEquipHoverEnter4, self.OnEquipHoverEnter5, self.OnEquipHoverEnter6
+		}
+		for i, sn in ipairs(eNames) do
+			local slot = _EntityService:GetEntityByPath(eBase .. sn)
+			if isvalid(slot) then
+				if not isvalid(slot:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					slot:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				slot:ConnectEvent(UITouchDownEvent, eHandlers[i])
+				-- 호버: Touch 자식 엔티티가 touch 이벤트를 가로채므로 그쪽에 연결
+				local eHoverTarget = slot
+				local eTouchChild = _EntityService:GetEntityByPath(eBase .. sn .. "/Touch")
+				if isvalid(eTouchChild) then eHoverTarget = eTouchChild end
+				eHoverTarget:ConnectEvent(UITouchEnterEvent, eEnterHandlers[i])
+				local equipSlotI = i
+				eHoverTarget:ConnectEvent(UITouchExitEvent, function(e)
+					if self._T.hoverEquipSlot == equipSlotI then
+						self._T.hoverEquipSlot = 0
+						self._T.hoverInvenSlot = 0
+						self._T.pendingHideTooltip = true
+					end
+				end)
+				log("[EquipInven] equip wired: " .. sn)
+			end
+		end
+
+		-- 모자 슬롯 (SlotCap)
+		local capSlot = _EntityService:GetEntityByPath(eBase .. "SlotCap")
+		if isvalid(capSlot) then
+			if not isvalid(capSlot:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+				capSlot:AddComponent("MOD.Core.UITouchReceiveComponent")
+			end
+			capSlot:ConnectEvent(UITouchDownEvent, self.OnEquipBtn7)
+			local capHoverTarget = capSlot
+			local capTouchChild = _EntityService:GetEntityByPath(eBase .. "SlotCap/Touch")
+			if isvalid(capTouchChild) then capHoverTarget = capTouchChild end
+			capHoverTarget:ConnectEvent(UITouchEnterEvent, self.OnEquipHoverEnter7)
+			capHoverTarget:ConnectEvent(UITouchExitEvent, function(e)
+				if self._T.hoverEquipSlot == 7 then
+					self._T.hoverEquipSlot = 0
+					self._T.hoverInvenSlot = 0
+					self._T.pendingHideTooltip = true
+				end
+			end)
+			log("[EquipInven] equip wired: SlotCap")
+		end
+
+		-- 인벤 슬롯: click + hover 연결 (128슬롯)
+		-- SlotBG와 Icon에 UITouchReceiveComponent가 있으므로 slot, SlotBG, Icon 모두에 연결
+		local iBase = "/ui/DefaultGroup/InvenWindow/InvenSlot"
+		for i = 1, 128 do
+			local capturedI = i
+			local slot = _EntityService:GetEntityByPath(iBase .. i)
+			if isvalid(slot) then
+				if not isvalid(slot:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					slot:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				local function slotClickHandler(e)
+					if e.TouchId ~= -1 then return end
+					log("[SLOT_CLICK] slot=" .. capturedI)
+					local limit = self._T.minimized and 32 or 128
+					if capturedI > limit then return end
+					local dataIdx = self._T.minimized and (self._T.scrollRow * 4 + capturedI) or capturedI
+					if dataIdx <= 128 then self:OnSlotClick("inven", dataIdx) end
+				end
+				local function slotEnterHandler(e)
+					local limit = self._T.minimized and 32 or 128
+					if capturedI <= limit then self:ShowInvenTooltip(capturedI) end
+				end
+				local function slotExitHandler(e)
+					if self._T.hoverInvenSlot == capturedI then
+						self._T.hoverEquipSlot = 0
+						self._T.hoverInvenSlot = 0
+						self._T.pendingHideTooltip = true
+					end
+				end
+				-- slot 자체
+				slot:ConnectEvent(UITouchDownEvent, slotClickHandler)
+				slot:ConnectEvent(UITouchEnterEvent, slotEnterHandler)
+				slot:ConnectEvent(UITouchExitEvent, slotExitHandler)
+				-- SlotBG (흰색 배경 자식)
+				local slotBG = _EntityService:GetEntityByPath(iBase .. capturedI .. "/SlotBG")
+				if isvalid(slotBG) then
+					slotBG:ConnectEvent(UITouchDownEvent, slotClickHandler)
+					slotBG:ConnectEvent(UITouchEnterEvent, slotEnterHandler)
+					slotBG:ConnectEvent(UITouchExitEvent, slotExitHandler)
+				end
+				-- Icon
+				local iconEnt = _EntityService:GetEntityByPath(iBase .. capturedI .. "/Icon")
+				if isvalid(iconEnt) then
+					iconEnt:ConnectEvent(UITouchDownEvent, slotClickHandler)
+					iconEnt:ConnectEvent(UITouchEnterEvent, slotEnterHandler)
+					iconEnt:ConnectEvent(UITouchExitEvent, slotExitHandler)
+				end
+				-- ItemName, StarLabel은 TextComponent만 있고 UITouchReceive 없음 → 클릭 통과
+			end
+		end
+		log("[EquipInven] inven wired (128 slots)")
+
+		-- 탭 버튼 와이어링: tabEnt, TabBG, TabLbl 모두에 연결 (displayOrder=10=front)
+		local tabKeys = {"equip","consume","etc","install","cash","decorate"}
+		for _, tk in ipairs(tabKeys) do
+			local capturedTk = tk
+			local tabBase = "/ui/DefaultGroup/InvenWindow/InvenTab_" .. tk
+			local tabEnt = _EntityService:GetEntityByPath(tabBase)
+			local tabBG = _EntityService:GetEntityByPath(tabBase .. "/TabBG")
+			local tabLbl = _EntityService:GetEntityByPath(tabBase .. "/TabLbl")
+			log("[TAB_WIRE] " .. tk .. " tabEnt=" .. tostring(isvalid(tabEnt)) .. " TabBG=" .. tostring(isvalid(tabBG)) .. " TabLbl=" .. tostring(isvalid(tabLbl)))
+			local function tabHandler(e)
+				if e.TouchId ~= -1 then return end
+				log("[TAB_CLICK] " .. capturedTk)
+				self:OnTabSwitch(capturedTk)
+			end
+			if isvalid(tabEnt) then
+				tabEnt:ConnectEvent(UITouchDownEvent, tabHandler)
+			end
+			if isvalid(tabBG) then
+				tabBG:ConnectEvent(UITouchDownEvent, tabHandler)
+			end
+			-- TabLbl은 TextComponent만 있음 → RaycastTarget=false → 클릭이 TabBG로 전달
+		end
+		-- 스크롤 버튼 와이어링 (Touch 자식에 직접 연결)
+		local scrollUpEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollUp")
+		local scrollUpTouch = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollUp/Touch")
+		local suTarget = isvalid(scrollUpTouch) and scrollUpTouch or scrollUpEnt
+		if isvalid(suTarget) then
+			suTarget:ConnectEvent(UITouchDownEvent, function(e)
+				if e.TouchId ~= -1 then return end
+				self:OnScrollUp()
+			end)
+		end
+		local scrollDownEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollDown")
+		local scrollDownTouch = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollDown/Touch")
+		local sdTarget = isvalid(scrollDownTouch) and scrollDownTouch or scrollDownEnt
+		if isvalid(sdTarget) then
+			sdTarget:ConnectEvent(UITouchDownEvent, function(e)
+				if e.TouchId ~= -1 then return end
+				self:OnScrollDown()
+			end)
+		end
+		-- 최소화 버튼 와이어링 (Touch 자식에 직접 연결)
+		local minBtnEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenMinBtn")
+		local minBtnTouch = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenMinBtn/Touch")
+		local mbTarget = isvalid(minBtnTouch) and minBtnTouch or minBtnEnt
+		if isvalid(mbTarget) then
+			mbTarget:ConnectEvent(UITouchDownEvent, function(e)
+				if e.TouchId ~= -1 then return end
+				self:OnMinimizeToggle()
+			end)
+		end
+		log("[EquipInven] tab/scroll/minimize wired")
+		-- 스크롤 썸 드래그 와이어링
+		local thumbEnt2 = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollThumb")
+		if isvalid(thumbEnt2) then
+			if not isvalid(thumbEnt2:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+				thumbEnt2:AddComponent("MOD.Core.UITouchReceiveComponent")
+			end
+			thumbEnt2:ConnectEvent(UITouchDownEvent, self.OnScrollThumbDown)
+		end
+		-- 스크롤 트랙 클릭/홀드 와이어링
+		local trackEnt2 = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollTrack")
+		if isvalid(trackEnt2) then
+			if not isvalid(trackEnt2:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+				trackEnt2:AddComponent("MOD.Core.UITouchReceiveComponent")
+			end
+			trackEnt2:ConnectEvent(UITouchDownEvent, self.OnScrollTrackDown)
+		end
+		-- 마우스 휠 스크롤 와이어링
+		self._T.scrollHandler = _InputService:ConnectEvent(MouseScrollEvent, self.OnMouseScroll)
+		log("[EquipInven] 스크롤 드래그/홀드/휠 와이어링 완료")
+
+		-- 장비 슬롯 UITouchUpEvent (주문서 드랍 감지)
+		local eUpHandlers = {
+			self.OnEquipSlotUp1, self.OnEquipSlotUp2, self.OnEquipSlotUp3,
+			self.OnEquipSlotUp4, self.OnEquipSlotUp5, self.OnEquipSlotUp6
+		}
+		for i, sn in ipairs(eNames) do
+			local slot = _EntityService:GetEntityByPath(eBase .. sn)
+			if isvalid(slot) then
+				slot:ConnectEvent(UITouchUpEvent, eUpHandlers[i])
+			end
+		end
+		local capSlotUp = _EntityService:GetEntityByPath(eBase .. "SlotCap")
+		if isvalid(capSlotUp) then
+			capSlotUp:ConnectEvent(UITouchUpEvent, self.OnEquipSlotUp7)
+		end
+		-- 인벤 슬롯 UITouchUpEvent (주문서 드랍 감지, 128 슬롯, Touch 자식에 직접 연결)
+		for i = 1, 128 do
+			local capturedUp = i
+			local iSlotUp = _EntityService:GetEntityByPath(iBase .. i)
+			if isvalid(iSlotUp) then
+				local iUpTouch = _EntityService:GetEntityByPath(iBase .. i .. "/Touch")
+				local upTarget = isvalid(iUpTouch) and iUpTouch or iSlotUp
+				upTarget:ConnectEvent(UITouchUpEvent, function(e)
+					if self.isDragging then
+						local dataIdx = self._T.minimized and (self._T.scrollRow * 4 + capturedUp) or capturedUp
+						if dataIdx <= 128 then self:ApplyScrollToInven(dataIdx) end
+					end
+				end)
+			end
+		end
+		_InputService:ConnectEvent(ScreenTouchReleaseEvent, self.OnScreenRelease)
+		local initGhost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(initGhost) then initGhost.Enable = false end
+		log("[EquipInven] drag-drop wired")
+
+		-- 창 타이틀바 드래그 와이어링
+		local titlePaths = {
+			"/ui/DefaultGroup/InvenWindow/TitleText",
+			"/ui/DefaultGroup/EquipWindow/TitleText",
+			"/ui/DefaultGroup/EnhanceWindow/TitleText"
+		}
+		local titleHandlers = {
+			self.OnInvenTitleDown,
+			self.OnEquipTitleDown,
+			self.OnEnhanceTitleDown
+		}
+		for i, tp in ipairs(titlePaths) do
+			local te = _EntityService:GetEntityByPath(tp)
+			if isvalid(te) then
+				if not isvalid(te:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					te:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				te:ConnectEvent(UITouchDownEvent, titleHandlers[i])
+				log("[WinDrag] 타이틀 와이어링: " .. tp)
+			end
+		end
+		-- 매 Play 시작 시 UI를 올바른 초기 상태로 리셋
+		-- Maker Play 모드에서 DefaultGroup이 항상 false로 시작하므로 먼저 활성화
+		local function setEnable(path, val)
+			local e = _EntityService:GetEntityByPath(path)
+			if isvalid(e) then e.Enable = val end
+		end
+		setEnable("/ui/DefaultGroup",                      true)   -- 부모 먼저!
+		setEnable("/ui/DefaultGroup/LoginGroup",          true)
+		setEnable("/ui/DefaultGroup/CharacterSelectGroup", false)
+		setEnable("/ui/DefaultGroup/CreateCharacter",      false)
+		setEnable("/ui/DefaultGroup/InvenWindow",          false)
+		setEnable("/ui/DefaultGroup/EquipWindow",          false)
+		setEnable("/ui/DefaultGroup/EnhanceWindow",        false)
+		-- Enable 애니메이션이 자식 위치를 오염시키므로 완료 후 복원
+		wait(0.5)
+		local function setPos(path, x, y)
+			local e = _EntityService:GetEntityByPath(path)
+			if isvalid(e) then
+				e.UITransformComponent.anchoredPosition = Vector2(x, y)
+			end
+		end
+		local lgBase = "/ui/DefaultGroup/LoginGroup/LoginBackground/"
+		setPos(lgBase .. "TitleText",    0,   250)
+		setPos(lgBase .. "AccountText",  0,  -200)
+		setPos(lgBase .. "PasswordText", 0,  -300)
+		setPos(lgBase .. "StartButton",  300, -250)
+		log("[EquipInven] UI 초기 상태 리셋 완료 - 로그인 화면 표시")
+		log("[EquipInven] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent event)
+		if event.key == KeyboardKey.E then
+			self:ToggleWin("/ui/DefaultGroup/EquipWindow")
+		elseif event.key == KeyboardKey.I then
+			self:ToggleWin("/ui/DefaultGroup/InvenWindow")
+		elseif event.key == KeyboardKey.Tab then
+			local invenWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+			if isvalid(invenWin) and invenWin.Enable and invenWin.Visible then
+				local tabOrder = {"equip","consume","etc","install","cash","decorate"}
+				local current = self._T.activeTab
+				local nextIdx = 1
+				for i, tk in ipairs(tabOrder) do
+					if tk == current then
+						nextIdx = (i % #tabOrder) + 1
+						break
+					end
+				end
+				self:OnTabSwitch(tabOrder[nextIdx])
+			end
+		elseif event.key == KeyboardKey.Escape then
+			self:CloseTopWindow()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleWin(string path)
+		local dg = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(dg) and not dg.Enable then dg.Enable = true end
+
+		local w = _EntityService:GetEntityByPath(path)
+		if not isvalid(w) then return end
+
+		local enable = not w.Enable
+		if enable then
+			self:PushWin(path)
+			self:BringWindowToFront(path)
+			local cur = w.UITransformComponent.anchoredPosition
+			if math.abs(cur.x) > 1000 or math.abs(cur.y) > 1000 then
+				w.UITransformComponent.anchoredPosition = self:GetWindowDefaultPos(path)
+			end
+			-- 위치를 먼저 설정한 뒤 창을 표시 (구 위치에서 점프하는 현상 방지)
+			self:ResetWindowChildren(path)
+			w.Enable = true
+		else
+			w.Enable = false
+			self:RemoveWin(path)
+			-- 창이 닫힐 때 해당 창 소속 툴팁이 열려있으면 같이 닫기
+			if path == "/ui/DefaultGroup/EquipWindow" and self.tooltipSource == "equip" then
+				self:HideTooltip()
+			elseif path == "/ui/DefaultGroup/InvenWindow" and self.tooltipSource == "inven" then
+				self:HideTooltip()
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetWindowChildren(string path)
+		local function sp(p, x, y)
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) then e.UITransformComponent.anchoredPosition = Vector2(x, y) end
+		end
+		if path == "/ui/DefaultGroup/EquipWindow" then
+			local b = path .. "/"
+			sp(b .. "BG",            0,    0)
+			sp(b .. "TitleText",     0,  -30)
+			sp(b .. "TitleText/TitleBG", 0, 0)
+			sp(b .. "TitleText/Label",   0, 0)
+			sp(b .. "CloseEquip",  -10,  -10)
+			sp(b .. "Divider",       0,  -58)
+			sp(b .. "HintText",      0,  -85)
+			sp(b .. "SlotCap",       0,  120)
+			sp(b .. "SlotFace",    -95,   10)
+			sp(b .. "SlotHair",     95,   10)
+			sp(b .. "SlotTop",     -95, -100)
+			sp(b .. "SlotBottom",   95, -100)
+			sp(b .. "SlotShoes",   -95, -210)
+			sp(b .. "SlotWeapon",   95, -210)
+			local slots = {"SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap"}
+			for _, sn in ipairs(slots) do
+				sp(b .. sn .. "/SlotBG",    0,   0)
+				sp(b .. sn .. "/Icon",      0,  -8)
+				sp(b .. sn .. "/ItemName",  0, -32)
+				sp(b .. sn .. "/Label",     0,  -8)
+				sp(b .. sn .. "/StarLabel", 0,  46)
+				sp(b .. sn .. "/Touch",     0,   0)
+			end
+		elseif path == "/ui/DefaultGroup/InvenWindow" then
+			local b = path .. "/"
+			local function sr(p, w, h)
+				local e = _EntityService:GetEntityByPath(p)
+				if isvalid(e) then e.UITransformComponent.RectSize = Vector2(w, h) end
+			end
+			local winEnt = _EntityService:GetEntityByPath(path)
+			local tabKeys2 = {"equip","consume","etc","install","cash","decorate"}
+			local tabX = {-350, -210, -70, 70, 210, 350}
+			if self._T.minimized then
+				-- 최소화 모드: 455×760, 4×8=32슬롯 가시, 스크롤 있음 (탭 70% 축소)
+				local minW = 455
+				local minTabW = 62
+				local minTabX = {-155, -93, -31, 31, 93, 155}
+				if isvalid(winEnt) then winEnt.UITransformComponent.RectSize = Vector2(minW, 760) end
+				sr(b .. "BG", minW, 760)
+				sr(b .. "TitleText", minW, 50)
+				sr(b .. "TitleText/TitleBG", minW, 50)
+				sr(b .. "MesoBar", minW - 20, 50)
+				sp(b .. "BG",                    0,    0)
+				sp(b .. "TitleText",             0,  355)
+				sp(b .. "TitleText/TitleBG",     0,    0)
+				sp(b .. "TitleText/Label",     -60,    0)
+				sp(b .. "CloseInven",          207,  355)
+				sp(b .. "InvenMinBtn",         165,  355)
+				sp(b .. "Divider",            3000, 3000)
+				sp(b .. "HintText",           3000, 3000)
+				sp(b .. "MesoBar",             -20, -350)
+				for i, tk in ipairs(tabKeys2) do
+					sp(b .. "InvenTab_" .. tk, minTabX[i], 228)
+					sr(b .. "InvenTab_" .. tk, minTabW, 36)
+					sr(b .. "InvenTab_" .. tk .. "/TabBG", minTabW, 36)
+				end
+				sp(b .. "InvenSlotCount", 190, 333)
+				sp(b .. "InvenScrollTrack", 209,  -75)
+				sr(b .. "InvenScrollTrack",  16,  500)
+				sp(b .. "InvenScrollUp",    209,  194)
+				sp(b .. "InvenScrollDown",  209, -342)
+				sp(b .. "InvenScrollThumb", 209,  158)
+				local colX = {-111, -37, 37, 111}
+				local rowY = {176, 106, 36, -34, -104, -174, -244, -314}
+				for i = 1, 32 do
+					local col = ((i - 1) % 4) + 1
+					local row = math.floor((i - 1) / 4) + 1
+					sp(b .. "InvenSlot" .. i, colX[col], rowY[row])
+				end
+				for i = 33, 128 do
+					sp(b .. "InvenSlot" .. i, 3000, 3000)
+				end
+			else
+				-- 확장 모드: 1200×760, 16×8=128슬롯 전체 가시, 스크롤 없음
+				if isvalid(winEnt) then winEnt.UITransformComponent.RectSize = Vector2(1200, 760) end
+				sr(b .. "BG", 1200, 760)
+				sr(b .. "TitleText", 1200, 50)
+				sr(b .. "TitleText/TitleBG", 1200, 50)
+				sr(b .. "MesoBar", 1180, 50)
+				sp(b .. "BG",                    0,    0)
+				sp(b .. "TitleText",             0,  355)
+				sp(b .. "TitleText/TitleBG",     0,    0)
+				sp(b .. "TitleText/Label",     -60,    0)
+				sp(b .. "CloseInven",          580,  355)
+				sp(b .. "InvenMinBtn",         538,  355)
+				sp(b .. "Divider",            3000, 3000)
+				sp(b .. "HintText",           3000, 3000)
+				sp(b .. "MesoBar",             -20, -350)
+				for i, tk in ipairs(tabKeys2) do
+					sp(b .. "InvenTab_" .. tk, tabX[i], 250)
+					sr(b .. "InvenTab_" .. tk, 132, 36)
+					sr(b .. "InvenTab_" .. tk .. "/TabBG", 132, 36)
+					sr(b .. "InvenTab_" .. tk .. "/TabActiveBG", 132, 36)
+				end
+				sp(b .. "InvenSlotCount", 555, 303)
+				sp(b .. "InvenScrollTrack", 3000, 3000)
+				sp(b .. "InvenScrollUp",    3000, 3000)
+				sp(b .. "InvenScrollDown",  3000, 3000)
+				sp(b .. "InvenScrollThumb", 3000, 3000)
+				local colX = {-525,-455,-385,-315,-245,-175,-105,-35,35,105,175,245,315,385,455,525}
+				local rowY = {176, 106, 36, -34, -104, -174, -244, -314}
+				for i = 1, 128 do
+					local col = ((i - 1) % 16) + 1
+					local row = math.floor((i - 1) / 16) + 1
+					sp(b .. "InvenSlot" .. i, colX[col], rowY[row])
+				end
+			end
+			-- 뷰포트 콘텐츠 갱신
+			self:UpdateInvenViewport()
+			self:UpdateTabColors()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetMesoBarVisible(boolean visible)
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/MesoBar")
+		if not isvalid(bar) then return end
+		bar.Enable = visible
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseEquip(ButtonClickEvent event)
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow")
+		if isvalid(w) then w.Enable = false end
+		self:RemoveWin("/ui/DefaultGroup/EquipWindow")
+		self:HideTooltip()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseInven(ButtonClickEvent event)
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+		if isvalid(w) then w.Enable = false end
+		self:RemoveWin("/ui/DefaultGroup/InvenWindow")
+		self:HideTooltip()
+	end
+
+	-- 장비 슬롯 핸들러 (UITouchDownEvent, 왼쪽 클릭만)
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn1(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 1)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn2(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 2)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn3(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 3)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn4(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 4)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn5(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 5)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn6(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 6)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipBtn7(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:OnSlotClick("equip", 7)
+	end
+
+	-- 장비 슬롯 호버 엔터 핸들러
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter1(UITouchEnterEvent e)
+		self:ShowEquipTooltip(1)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter2(UITouchEnterEvent e)
+		self:ShowEquipTooltip(2)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter3(UITouchEnterEvent e)
+		self:ShowEquipTooltip(3)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter4(UITouchEnterEvent e)
+		self:ShowEquipTooltip(4)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter5(UITouchEnterEvent e)
+		self:ShowEquipTooltip(5)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter6(UITouchEnterEvent e)
+		self:ShowEquipTooltip(6)
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipHoverEnter7(UITouchEnterEvent e)
+		self:ShowEquipTooltip(7)
+	end
+
+	-- 모든 슬롯 공유 호버 엑시트
+	@ExecSpace("ClientOnly")
+	method void OnHoverExit(UITouchExitEvent e)
+		self._T.hoverEquipSlot = 0
+		self._T.hoverInvenSlot = 0
+		self._T.pendingHideTooltip = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSlotClick(string winType, number slotIdx)
+		local t = _UtilLogic.ElapsedSeconds
+		log("[EquipInven] click: " .. winType .. " slot=" .. tostring(slotIdx) .. " t=" .. tostring(math.floor(t*10)/10))
+		if winType == "equip" then
+			if self.lastEquipSlot == slotIdx and t - self.lastEquipTime < 0.5 then
+				self:MoveEquipToInven(slotIdx)
+				self.lastEquipSlot = 0
+			else
+				self.lastEquipSlot = slotIdx
+				self.lastEquipTime = t
+			end
+		else
+			local dragS = self:GetInven(slotIdx)
+			local dragSI = dragS ~= "" and self:ParseSlotIdx(dragS) or -1
+			local dragName = dragS ~= "" and self:ParseName(dragS) or ""
+			if dragSI == 0 and string.find(dragName, "포션") then
+				-- 포션: 더블클릭이면 사용, 단일 클릭이면 드래그 시작
+				if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+					-- 더블클릭 → 포션 즉시 사용
+					self:CancelPotionDrag()
+					_PotionShopManager:RequestUsePotion()
+					self:SetInvenStr(slotIdx, "")
+					self:RefreshUI()
+					self.lastInvenSlot = 0
+				else
+					-- 단일 클릭 → SkillBar로 드래그 가능
+					self.lastInvenSlot = slotIdx
+					self.lastInvenTime = t
+					self:StartPotionDrag(slotIdx)
+				end
+				return
+			end
+			-- 주문서(slotIdx==0) → 단일 클릭으로 장비 슬롯 드래그
+			if dragSI == 0 then
+				self:StartDrag(slotIdx)
+				return
+			end
+			if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+				local s = self:GetInven(slotIdx)
+				if _EnhancementManager:IsWindowOpen() then
+					if s ~= "" then
+						local name = self:ParseName(s)
+						local ruid = self:ParseInvenRUID(s)
+						_EnhancementManager:SetEnhanceTarget(name, ruid, slotIdx)
+					end
+				else
+					self:MoveInvenToEquip(slotIdx)
+				end
+				self.lastInvenSlot = 0
+			else
+				self.lastInvenSlot = slotIdx
+				self.lastInvenTime = t
+			end
+		end
+	end
+
+	-- 장비 슬롯 string get/set helpers
+	@ExecSpace("ClientOnly")
+	method string GetEquip(number i)
+		if i == 1 then return self.equip1
+		elseif i == 2 then return self.equip2
+		elseif i == 3 then return self.equip3
+		elseif i == 4 then return self.equip4
+		elseif i == 5 then return self.equip5
+		elseif i == 6 then return self.equip6
+		elseif i == 7 then return self.equip7
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetEquipStr(number i, string v)
+		if i == 1 then self.equip1 = v
+		elseif i == 2 then self.equip2 = v
+		elseif i == 3 then self.equip3 = v
+		elseif i == 4 then self.equip4 = v
+		elseif i == 5 then self.equip5 = v
+		elseif i == 6 then self.equip6 = v
+		elseif i == 7 then self.equip7 = v
+		end
+	end
+
+	-- 인벤 슬롯 string get/set helpers (탭별 128슬롯 테이블 기반)
+	@ExecSpace("ClientOnly")
+	method string GetInven(number i)
+		return self._T.tabData[self._T.activeTab][i] or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetInvenStr(number i, string v)
+		self._T.tabData[self._T.activeTab][i] = v
+	end
+
+	-- 강화 단계 파싱: "+N" 접미사 → 정수
+	@ExecSpace("ClientOnly")
+	method number ParseEnhanceLevel(string name)
+		local s = string.match(name, "%+(%d+)$")
+		return tonumber(s) or 0
+	end
+
+	-- 강화 단계만큼 ★ 문자열 반환
+	@ExecSpace("ClientOnly")
+	method string GetStarText(number level)
+		if level <= 0 then return "" end
+		local stars = ""
+		for i = 1, level do
+			stars = stars .. "★"
+		end
+		return stars
+	end
+
+	-- 장비 슬롯 파싱: "이름|RUID"
+	@ExecSpace("ClientOnly")
+	method string ParseName(string s)
+		return string.match(s, "([^|]+)") or s
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ParseRUID(string s)
+		return string.match(s, "[^|]+|([^|]+)") or ""
+	end
+
+	-- 인벤 슬롯 파싱: "이름|RUID|slotIdx"
+	@ExecSpace("ClientOnly")
+	method string ParseInvenRUID(string s)
+		return string.match(s, "[^|]+|([^|]+)") or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method number ParseSlotIdx(string s)
+		local v = string.match(s, "[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 0
+	end
+
+	-- 6필드 파서: "baseName|RUID|slotIdx|stars|scrolls|upgrade"
+	@ExecSpace("ClientOnly")
+	method number ParseStars(string s)
+		local v = string.match(s, "[^|]+|[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method number ParseScrolls(string s)
+		local v = string.match(s, "[^|]+|[^|]+|[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method number ParseUpgrade(string s)
+		local v = string.match(s, "[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method string BuildItemStr(string baseName, string ruid, number slotIdx, number stars, number scrolls, number upgrade)
+		return baseName .. "|" .. ruid .. "|" .. tostring(slotIdx) .. "|" .. tostring(stars) .. "|" .. tostring(scrolls) .. "|" .. tostring(upgrade)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetDisplayName(string s)
+		local baseName = self:ParseName(s)
+		local scrolls = self:ParseScrolls(s)
+		if scrolls > 0 then
+			return baseName .. "+" .. tostring(scrolls)
+		end
+		return baseName
+	end
+
+	-- 캐릭터 입장 시 장비 초기화
+	@ExecSpace("ClientOnly")
+	method void InitEquip(string faceN, string faceR, string hairN, string hairR, string topN, string topR, string botN, string botR, string shoN, string shoR, string wpnN, string wpnR)
+		self.equip1 = faceN .. "|" .. faceR .. "|1|0|0|0"
+		self.equip2 = hairN .. "|" .. hairR .. "|2|0|0|0"
+		self.equip3 = topN  .. "|" .. topR  .. "|3|0|0|0"
+		self.equip4 = botN  .. "|" .. botR  .. "|4|0|0|0"
+		self.equip5 = shoN  .. "|" .. shoR  .. "|5|0|0|0"
+		self.equip6 = wpnN  .. "|" .. wpnR  .. "|6|0|0|0"
+		self.equip7 = ""
+		-- 모든 탭 초기화
+		for _, tab in ipairs({"equip","consume","etc","install","cash","decorate"}) do
+			self._T.tabData[tab] = {}
+		end
+		self._T.activeTab = "equip"
+		self._T.scrollRow = 0
+		-- 테스트: 초기 메소 1000원 + 아이템 지급
+		self.meso = 1000
+		-- 연두색 머리띠 → 장비 탭
+		self._T.tabData["equip"][1] = "연두색 머리띠|274b50c184c047d8abf1b520c958ce98|7|0|0|7"
+		-- 연두색주문서 10개 → 소비 탭
+		local scrollRUID = "314215aface349c48b81eee58065e1b7"
+		for i = 1, 10 do
+			self._T.tabData["consume"][i] = "연두색주문서|" .. scrollRUID .. "|0|0|0|0"
+		end
+		self:RefreshUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MoveEquipToInven(number slotIdx)
+		log("[EquipInven] MoveEquipToInven slot=" .. tostring(slotIdx))
+		local s = self:GetEquip(slotIdx)
+		if s == "" then return end
+		local ruid = self:ParseRUID(s)
+		if ruid == "" then return end
+
+		-- 장비 아이템은 장비 탭으로
+		local savedTab = self._T.activeTab
+		self._T.activeTab = "equip"
+		local emptySlot = nil
+		for i = 1, 128 do
+			if self:GetInven(i) == "" then emptySlot = i; break end
+		end
+		if emptySlot == nil then
+			self._T.activeTab = savedTab
+			log("[EquipInven] 인벤토리 가득 참"); return
+		end
+		self:SetInvenStr(emptySlot, s)
+		self:SetEquipStr(slotIdx, "")
+		self._T.activeTab = savedTab
+
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			local cm = player.CostumeManagerComponent
+			if isvalid(cm) then
+				local cats = {
+					MapleAvatarItemCategory.Face, MapleAvatarItemCategory.Hair,
+					MapleAvatarItemCategory.Coat, MapleAvatarItemCategory.Pants,
+					MapleAvatarItemCategory.Shoes, MapleAvatarItemCategory.TwoHandedWeapon,
+					MapleAvatarItemCategory.Cap,
+				}
+				cm:SetEquip(cats[slotIdx], "")
+			end
+		end
+		self:RefreshUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MoveInvenToEquip(number invenIdx)
+		local s = self:GetInven(invenIdx)
+		if s == "" then return end
+		local name    = self:ParseName(s)
+		local ruid    = self:ParseInvenRUID(s)
+		local slotIdx = self:ParseSlotIdx(s)
+		if slotIdx < 1 or slotIdx > 7 then return end
+
+		-- 6필드 포맷 그대로 swap
+		local cur = self:GetEquip(slotIdx)
+		if cur ~= "" and self:ParseRUID(cur) ~= "" then
+			self:SetInvenStr(invenIdx, cur)
+		else
+			self:SetInvenStr(invenIdx, "")
+		end
+
+		self:SetEquipStr(slotIdx, s)
+
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			local cm = player.CostumeManagerComponent
+			if isvalid(cm) then
+				local cats = {
+					MapleAvatarItemCategory.Face, MapleAvatarItemCategory.Hair,
+					MapleAvatarItemCategory.Coat, MapleAvatarItemCategory.Pants,
+					MapleAvatarItemCategory.Shoes, MapleAvatarItemCategory.TwoHandedWeapon,
+					MapleAvatarItemCategory.Cap,
+				}
+				cm:SetEquip(cats[slotIdx], ruid)
+			end
+		end
+		self:RefreshUI()
+	end
+
+	-- 드랍 아이템 습득 시 호출 (서버→클라이언트 RPC 경유)
+	@ExecSpace("ClientOnly")
+	method void AddItemToInventory(string name, string ruid, string itemType)
+		-- avataritem → 장비 탭, 나머지 → 소비 탭
+		local targetTab = (itemType == "avataritem") and "equip" or "consume"
+		local slotMark = (itemType == "avataritem") and "7" or "0"
+		local td = self._T.tabData[targetTab]
+		for i = 1, 128 do
+			if (td[i] or "") == "" then
+				td[i] = name .. "|" .. ruid .. "|" .. slotMark
+				self:RefreshUI()
+				log("[Inven] 추가: " .. name .. " 탭=" .. targetTab .. " 슬롯=" .. tostring(i))
+				return
+			end
+		end
+		log("[Inven] 인벤토리 가득 참, 추가 불가: " .. name)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshUI()
+		self:UpdateEquipUI()
+		self:UpdateInvenUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AddMeso(integer amount)
+		self.meso = self.meso + amount
+		self:UpdateMesoUI()
+		log("[Meso] +" .. tostring(amount) .. "원  합계: " .. tostring(self.meso) .. "원")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateMesoUI()
+		local textEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/MesoBar/MesoText")
+		if isvalid(textEnt) then
+			textEnt.TextComponent.Text = "메소: " .. tostring(self.meso)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateEquipUI()
+		local slotNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap" }
+		for i, sn in ipairs(slotNames) do
+			local d    = self:GetEquip(i)
+			local ruid = self:ParseRUID(d)
+			local name = self:ParseName(d)
+			local has  = ruid ~= ""
+			local base = "/ui/DefaultGroup/EquipWindow/" .. sn
+			local icon = _EntityService:GetEntityByPath(base .. "/Icon")
+			local nEnt = _EntityService:GetEntityByPath(base .. "/ItemName")
+			if isvalid(icon) then
+				local spr = icon.SpriteGUIRendererComponent
+				if has then
+					spr.ImageRUID = "thumbnail://" .. ruid
+					spr.Color = Color(1, 1, 1, 1)
+				else
+					spr.ImageRUID = ""
+					spr.Color = Color(1, 1, 1, 0)
+				end
+			end
+			if isvalid(nEnt) then
+				nEnt.TextComponent.Text = ""
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateInvenUI()
+		self:UpdateInvenViewport()
+	end
+
+	-- 툴팁: 장비창 슬롯 호버 (1프레임 지연으로 스쳐지나감 필터링)
+	@ExecSpace("ClientOnly")
+	method void ShowEquipTooltip(number slotIdx)
+		self._T.hoverEquipSlot = slotIdx
+		self._T.hoverInvenSlot = 0
+		self._T.pendingHideTooltip = false
+		self._T.pendingShowSlotType = "equip"
+		self._T.pendingShowSlotIdx = slotIdx
+	end
+
+	-- 툴팁: 인벤 슬롯 호버 (1프레임 지연으로 스쳐지나감 필터링)
+	@ExecSpace("ClientOnly")
+	method void ShowInvenTooltip(number invenIdx)
+		self._T.hoverInvenSlot = invenIdx
+		self._T.hoverEquipSlot = 0
+		self._T.pendingHideTooltip = false
+		self._T.pendingShowSlotType = "inven"
+		self._T.pendingShowSlotIdx = invenIdx
+	end
+
+	-- 툴팁 표시 (6필드 아이템 스트링 기반, 슬롯 우측에 동적 배치)
+	@ExecSpace("ClientOnly")
+	method void ShowTooltipFromStr(string s, boolean isEquip, string slotPath, string winPath)
+		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
+		if not isvalid(tp) then return end
+
+		local baseName   = self:ParseName(s)
+		local ruid       = self:ParseInvenRUID(s)
+		local stars      = self:ParseStars(s)
+		local scrolls    = self:ParseScrolls(s)
+		local upgrade    = self:ParseUpgrade(s)
+		local slotIdx    = self:ParseSlotIdx(s)
+		local displayName = scrolls > 0 and (baseName .. "+" .. tostring(scrolls)) or baseName
+
+		local titleEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipTitle")
+		local iconEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipIcon")
+		local infoEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipInfo")
+		local starEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/StarText")
+
+		if isvalid(titleEnt) then
+			titleEnt.TextComponent.Text = displayName
+		end
+		if isvalid(iconEnt) then
+			local spr = iconEnt.SpriteGUIRendererComponent
+			if ruid ~= "" then
+				spr.ImageRUID = isEquip and ("thumbnail://" .. ruid) or ruid
+				spr.Color = Color(1, 1, 1, 1)
+			else
+				spr.ImageRUID = ""
+				spr.Color = Color(1, 1, 1, 0)
+			end
+		end
+		if isvalid(infoEnt) then
+			local desc = self:GetItemBaseDescription(baseName)
+			if slotIdx >= 1 then
+				infoEnt.TextComponent.Text = desc .. "\n업그레이드 가능: " .. tostring(upgrade)
+			else
+				infoEnt.TextComponent.Text = desc
+			end
+		end
+		if isvalid(starEnt) then
+			starEnt.TextComponent.Text = self:GetStarText(stars)
+		end
+
+		-- 슬롯 우측에 툴팁 배치 (슬롯 반폭44 + 여백8 + 툴팁 반폭130 = 182px)
+		local slotEnt = _EntityService:GetEntityByPath(slotPath)
+		local winEnt  = _EntityService:GetEntityByPath(winPath)
+		if isvalid(slotEnt) and isvalid(winEnt) then
+			local sp = slotEnt.UITransformComponent.anchoredPosition
+			local wp = winEnt.UITransformComponent.anchoredPosition
+			local cx = wp.x + sp.x
+			local cy = wp.y + sp.y
+			local offset = 182
+			local tx = cx + offset
+			if tx + 130 > 900 then tx = cx - offset end  -- 우측 넘으면 좌측으로
+			tp.UITransformComponent.anchoredPosition = Vector2(tx, cy)
+		end
+
+		tp.Enable = true
+	end
+
+	-- 툴팁 숨김
+	@ExecSpace("ClientOnly")
+	method void HideTooltip()
+		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
+		if isvalid(tp) then tp.Enable = false end
+		self.tooltipSource = ""
+	end
+
+	-- 아이템 기본 설명 (업그레이드 횟수 제외 - 동적으로 표시됨)
+	@ExecSpace("ClientOnly")
+	method string GetItemBaseDescription(string name)
+		if name == "껍질" then
+			return "[LV.1] 달팽이의 껍질을\n벗긴 것이다."
+		elseif name == "연두색 머리띠" then
+			return "REQ LEV: 5\nSTR: 0  DEX: 0\nINT: 0  LUK: 0\nPOP: 0\n초보자/전사\n마법사/궁수/도적\n[모자] 방어력+5"
+		elseif name == "연두색주문서" then
+			return "[연두색 머리띠용]\n성공률: 60%\n강화 1회 소모"
+		end
+		return ""
+	end
+
+	-- 하위 호환용 alias
+	@ExecSpace("ClientOnly")
+	method string GetItemTooltipText(string name)
+		return self:GetItemBaseDescription(name)
+	end
+
+	-- ── 주문서 드래그 드랍 ──────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void StartDrag(number scrollSlot)
+		local s = self:GetInven(scrollSlot)
+		if s == "" then return end
+		local ruid = self:ParseInvenRUID(s)
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) then
+			ghost.SpriteGUIRendererComponent.ImageRUID = ruid
+			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+			ghost.Enable = true
+		end
+		self.isDragging = true
+		self.dragScrollSlot = scrollSlot
+		log("[Drag] 드래그 시작: 인벤 슬롯 " .. tostring(scrollSlot))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelDrag()
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) then
+			ghost.Enable = false
+		end
+		self.isDragging = false
+		self.dragScrollSlot = 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartPotionDrag(number invenSlot)
+		local s = self:GetInven(invenSlot)
+		if s == "" then return end
+		local ruid = self:ParseInvenRUID(s)
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) then
+			ghost.SpriteGUIRendererComponent.ImageRUID = ruid
+			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+			ghost.Enable = true
+		end
+		self._T.isDraggingPotion = true
+		self._T.potionInvenSlot = invenSlot
+		log("[Drag] 포션 드래그 시작: 인벤 슬롯 " .. tostring(invenSlot))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelPotionDrag()
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) then ghost.Enable = false end
+		self._T.isDraggingPotion = false
+		self._T.potionInvenSlot = 0
+		self._T.pendingCancelPotionDrag = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyScrollToEquip(number equipSlot)
+		if not self.isDragging then return end
+		local scrollSlot = self.dragScrollSlot
+		local scrollStr = self:GetInven(scrollSlot)
+		if scrollStr == "" then self:CancelDrag() return end
+		local itemStr = self:GetEquip(equipSlot)
+		if itemStr == "" then self:CancelDrag() return end
+		local upgrade = self:ParseUpgrade(itemStr)
+		if upgrade <= 0 then
+			log("[Scroll] 업그레이드 횟수 부족. 강화 불가")
+			self:CancelDrag()
+			return
+		end
+		-- 주문서 소모
+		self:SetInvenStr(scrollSlot, "")
+		-- 60% 성공 판정
+		local success = _UtilLogic:RandomDouble() < 0.6
+		local baseName  = self:ParseName(itemStr)
+		local ruid      = self:ParseInvenRUID(itemStr)
+		local slotIdx   = self:ParseSlotIdx(itemStr)
+		local stars     = self:ParseStars(itemStr)
+		local scrolls   = self:ParseScrolls(itemStr)
+		local newUpgrade = upgrade - 1
+		if success then
+			scrolls = scrolls + 1
+			log("[Scroll] 성공! +" .. tostring(scrolls) .. "  남은 업그레이드: " .. tostring(newUpgrade))
+		else
+			log("[Scroll] 실패.  남은 업그레이드: " .. tostring(newUpgrade))
+		end
+		local newStr = self:BuildItemStr(baseName, ruid, slotIdx, stars, scrolls, newUpgrade)
+		self:SetEquipStr(equipSlot, newStr)
+		self:RefreshUI()
+		self:CancelDrag()
+		-- 드랍 완료 후 툴팁 즉시 갱신
+		self:ShowEquipTooltip(equipSlot)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		local cursor = _InputService:GetCursorPosition()
+		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		-- 툴팁 1프레임 지연 표시: Enter 후 같은 프레임에 Exit가 오면 취소됨
+		if self._T.pendingShowSlotType ~= "" then
+			local t = self._T.pendingShowSlotType
+			local idx = self._T.pendingShowSlotIdx
+			self._T.pendingShowSlotType = ""
+			self._T.pendingShowSlotIdx = 0
+			if t == "equip" and self._T.hoverEquipSlot == idx then
+				local s = self:GetEquip(idx)
+				if s == "" then
+					self:HideTooltip()
+				else
+					self.tooltipSource = "equip"
+					local slotNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap" }
+					self:ShowTooltipFromStr(s, true, "/ui/DefaultGroup/EquipWindow/" .. slotNames[idx], "/ui/DefaultGroup/EquipWindow")
+				end
+			elseif t == "inven" and self._T.hoverInvenSlot == idx then
+				local dataIdx = self._T.minimized and (self._T.scrollRow * 4 + idx) or idx
+				local s = (dataIdx <= 128) and self:GetInven(dataIdx) or ""
+				if s == "" then
+					self:HideTooltip()
+				else
+					local si = self:ParseSlotIdx(s)
+					self.tooltipSource = "inven"
+					self:ShowTooltipFromStr(s, si >= 1, "/ui/DefaultGroup/InvenWindow/InvenSlot" .. idx, "/ui/DefaultGroup/InvenWindow")
+				end
+			end
+		end
+		-- 툴팁 지연 숨김: Exit 후 Enter가 없으면 1프레임 뒤에 HideTooltip
+		if self._T.pendingHideTooltip then
+			self._T.pendingHideTooltip = false
+			if self._T.hoverEquipSlot == 0 and self._T.hoverInvenSlot == 0 then
+				self:HideTooltip()
+			end
+		end
+		-- 주문서 드래그: 고스트 위치 갱신
+		if self.isDragging then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				-- UITouchUpEvent보다 OnUpdate가 먼저 실행될 수 있으므로 1프레임 지연
+				if self._T.pendingCancelDrag then
+					self:CancelDrag()
+					self._T.pendingCancelDrag = false
+				else
+					self._T.pendingCancelDrag = true
+				end
+			else
+				self._T.pendingCancelDrag = false
+				local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+				if isvalid(ghost) then
+					ghost.UITransformComponent.anchoredPosition = cursorUI
+				end
+			end
+		end
+		-- 포션 드래그: 고스트 위치 갱신
+		if self._T.isDraggingPotion then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				if self._T.pendingCancelPotionDrag then
+					self:CancelPotionDrag()
+				else
+					self._T.pendingCancelPotionDrag = true
+				end
+			else
+				self._T.pendingCancelPotionDrag = false
+				local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+				if isvalid(ghost) then
+					ghost.UITransformComponent.anchoredPosition = cursorUI
+				end
+			end
+		end
+		-- 창 드래그: 마우스 버튼 떼면 강제 종료 (윈도우 밖 릴리즈 대응)
+		if self._T.isDraggingWindow then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				self:StopWindowDrag()
+			elseif self._T.dragWindowPath ~= "" then
+				local w = _EntityService:GetEntityByPath(self._T.dragWindowPath)
+				if isvalid(w) then
+					local newX = cursorUI.x - self._T.dragWinOffsetX
+					local newY = cursorUI.y - self._T.dragWinOffsetY
+					-- 화면 경계 제한 (±900 x, ±500 y)
+					if newX < -900 then newX = -900 elseif newX > 900 then newX = 900 end
+					if newY < -500 then newY = -500 elseif newY > 500 then newY = 500 end
+					w.UITransformComponent.anchoredPosition = Vector2(newX, newY)
+				end
+			end
+		end
+		-- 스크롤 썸 드래그 처리
+		if self._T.isDraggingThumb then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				self._T.isDraggingThumb = false
+			elseif self._T.minimized then
+				local win = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+				if isvalid(win) then
+					local winPos = win.UITransformComponent.anchoredPosition
+					local newThumbY = cursorUI.y - winPos.y - self._T.thumbDragOffsetY
+					-- 썸 이동 범위: ThumbBG halfH=24 기준 (topLimit=158, botLimit=-306)
+					local _tTop = 158  -- ThumbBG 상단이 UP버튼 하단(182)에 맞춤
+					local _tBot = -306 -- ThumbBG 하단이 DN버튼 상단(-330)에 맞춤
+					newThumbY = math.max(_tBot, math.min(_tTop, newThumbY))
+					local progress = (_tTop - newThumbY) / (_tTop - _tBot)
+					local newRow = math.floor(progress * 24 + 0.5)
+					newRow = math.max(0, math.min(24, newRow))
+					local rowChanged = newRow ~= self._T.scrollRow
+					self._T.scrollRow = newRow
+					local th = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollThumb")
+					if isvalid(th) then
+						th.UITransformComponent.anchoredPosition = Vector2(209, newThumbY)
+					end
+					if rowChanged then self:UpdateInvenViewport() end
+				end
+			end
+		end
+		-- 스크롤 트랙 홀드 처리
+		if self._T.isHoldingScrollTrack and not self._T.isDraggingThumb then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				self._T.isHoldingScrollTrack = false
+			else
+				self._T.scrollTrackTimer = self._T.scrollTrackTimer + delta
+				if self._T.scrollTrackTimer >= 0.12 then
+					self._T.scrollTrackTimer = 0.0
+					self:ScrollTrackStep()
+				end
+			end
+		end
+		-- EnhanceWindow 열림 상태 변화 감지 → 스택 동기화
+		local eWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+		if isvalid(eWin) then
+			local nowOpen = eWin.Enable
+			if nowOpen ~= self._T.prevEnhanceOpen then
+				self._T.prevEnhanceOpen = nowOpen
+				if nowOpen then
+					self:PushWin("/ui/DefaultGroup/EnhanceWindow")
+					self:BringWindowToFront("/ui/DefaultGroup/EnhanceWindow")
+				else
+					self:RemoveWin("/ui/DefaultGroup/EnhanceWindow")
+				end
+			end
+		end
+		-- SkillWindow 열림 상태 변화 감지 → 스택 동기화
+		local sWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+		if isvalid(sWin) then
+			local nowOpen = sWin.Enable
+			if nowOpen ~= self._T.prevSkillOpen then
+				self._T.prevSkillOpen = nowOpen
+				if nowOpen then
+					self:PushWin("/ui/DefaultGroup/SkillWindow")
+					self:BringWindowToFront("/ui/DefaultGroup/SkillWindow")
+				else
+					self:RemoveWin("/ui/DefaultGroup/SkillWindow")
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnScreenRelease(ScreenTouchReleaseEvent e)
+		if self.isDragging then
+			-- hover 중인 슬롯에 드랍 처리
+			local eq = self._T.hoverEquipSlot
+			local iv = self._T.hoverInvenSlot
+			self._T.hoverEquipSlot = 0
+			self._T.hoverInvenSlot = 0
+			if eq > 0 then
+				self:ApplyScrollToEquip(eq)
+			elseif iv > 0 then
+				self:ApplyScrollToInven(iv)
+			else
+				self:CancelDrag()
+			end
+		end
+		if self._T.isDraggingPotion then
+			local cursor = _InputService:GetCursorPosition()
+			local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+			local key = _SkillManager:FindSkillBarSlot(cursorUI.x, cursorUI.y)
+			if key ~= "" then
+				local s = self:GetInven(self._T.potionInvenSlot)
+				local ruid = self:ParseInvenRUID(s)
+				_SkillManager:AssignSkillToSlot(key, ruid, "HP포션")
+				self:SetInvenStr(self._T.potionInvenSlot, "")
+				self:RefreshUI()
+				log("[Drag] 포션을 단축키 [" .. key .. "]에 배정")
+			end
+			self:CancelPotionDrag()
+		end
+		if self._T.isDraggingWindow then self:StopWindowDrag() end
+	end
+
+	-- ── 창 드래그 ───────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method Vector2 GetWindowDefaultPos(string path)
+		if path == "/ui/DefaultGroup/InvenWindow" then
+			return Vector2(200, 0)
+		elseif path == "/ui/DefaultGroup/EquipWindow" then
+			return Vector2(-230, 0)
+		elseif path == "/ui/DefaultGroup/EnhanceWindow" then
+			return Vector2(600, 0)
+		end
+		return Vector2(0, 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartWindowDrag(string winPath)
+		local w = _EntityService:GetEntityByPath(winPath)
+		if not isvalid(w) then return end
+		if self.isDragging then self:CancelDrag() end
+		self._T.isDraggingWindow = true
+		self._T.dragWindowPath = winPath
+		local cursor = _InputService:GetCursorPosition()
+		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local winPos = w.UITransformComponent.anchoredPosition
+		self._T.dragWinOffsetX = cursorUI.x - winPos.x
+		self._T.dragWinOffsetY = cursorUI.y - winPos.y
+		self:BringWindowToFront(winPath)
+		log("[WinDrag] 드래그 시작: " .. winPath)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BringWindowToFront(string winPath)
+		local paths = {
+			"/ui/DefaultGroup/InvenWindow",
+			"/ui/DefaultGroup/EquipWindow",
+			"/ui/DefaultGroup/EnhanceWindow",
+			"/ui/DefaultGroup/SkillWindow"
+		}
+		local maxIdx = 0
+		for _, p in ipairs(paths) do
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) then
+				local idx = _UILogic:GetSiblingIndex(e.UITransformComponent)
+				if idx > maxIdx then maxIdx = idx end
+			end
+		end
+		local target = _EntityService:GetEntityByPath(winPath)
+		if isvalid(target) then
+			_UILogic:SetSiblingIndex(target.UITransformComponent, maxIdx)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopWindowDrag()
+		self._T.isDraggingWindow = false
+		self._T.dragWindowPath = ""
+		log("[WinDrag] 드래그 종료")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnInvenTitleDown(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:StartWindowDrag("/ui/DefaultGroup/InvenWindow")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEquipTitleDown(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:StartWindowDrag("/ui/DefaultGroup/EquipWindow")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEnhanceTitleDown(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:StartWindowDrag("/ui/DefaultGroup/EnhanceWindow")
+	end
+
+	-- 장비 슬롯 드랍 핸들러 (UITouchUpEvent)
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp1(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(1) end
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp2(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(2) end
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp3(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(3) end
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp4(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(4) end
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp5(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(5) end
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp6(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(6) end
+	end
+	@ExecSpace("ClientOnly")
+	method void OnEquipSlotUp7(UITouchUpEvent e)
+		if self.isDragging then self:ApplyScrollToEquip(7) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyScrollToInven(number invenSlot)
+		if not self.isDragging then return end
+		local scrollSlot = self.dragScrollSlot
+		if scrollSlot == invenSlot then self:CancelDrag() return end
+		local scrollStr = self:GetInven(scrollSlot)
+		if scrollStr == "" then self:CancelDrag() return end
+		local itemStr = self:GetInven(invenSlot)
+		if itemStr == "" then self:CancelDrag() return end
+		local slotIdx = self:ParseSlotIdx(itemStr)
+		if slotIdx < 1 or slotIdx > 7 then
+			log("[Scroll] 장비 아이템이 아님 (slotIdx=" .. tostring(slotIdx) .. ") — 주문서 사용 불가")
+			self:CancelDrag()
+			return
+		end
+		local upgrade = self:ParseUpgrade(itemStr)
+		if upgrade <= 0 then
+			log("[Scroll] 업그레이드 횟수 부족. 강화 불가")
+			self:CancelDrag()
+			return
+		end
+		-- 주문서 소모
+		self:SetInvenStr(scrollSlot, "")
+		-- 60% 성공 판정
+		local success = _UtilLogic:RandomDouble() < 0.6
+		local baseName  = self:ParseName(itemStr)
+		local ruid      = self:ParseInvenRUID(itemStr)
+		local stars     = self:ParseStars(itemStr)
+		local scrolls   = self:ParseScrolls(itemStr)
+		local newUpgrade = upgrade - 1
+		if success then
+			scrolls = scrolls + 1
+			log("[Scroll] 성공! +" .. tostring(scrolls) .. "  남은 업그레이드: " .. tostring(newUpgrade))
+		else
+			log("[Scroll] 실패.  남은 업그레이드: " .. tostring(newUpgrade))
+		end
+		local newStr = self:BuildItemStr(baseName, ruid, slotIdx, stars, scrolls, newUpgrade)
+		self:SetInvenStr(invenSlot, newStr)
+		self:RefreshUI()
+		self:CancelDrag()
+		-- 드랍 완료 후 툴팁 즉시 갱신
+		self:ShowInvenTooltip(invenSlot)
+	end
+
+	-- ── 탭 / 스크롤 / 최소화 ────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTabColors()
+		local tabKeys = {"equip","consume","etc","install","cash","decorate"}
+		local base = "/ui/DefaultGroup/InvenWindow/InvenTab_"
+		for _, tk in ipairs(tabKeys) do
+			local isActive = (tk == self._T.activeTab)
+			local activeColor = Color(0.27, 0.75, 1.0, 1.0)
+			local inactiveColor = Color(0.22, 0.22, 0.28, 1.0)
+			local tabBG = _EntityService:GetEntityByPath(base .. tk .. "/TabBG")
+			if isvalid(tabBG) then
+				local spr = tabBG.SpriteGUIRendererComponent
+				if isvalid(spr) then
+					spr.Color = isActive and activeColor or inactiveColor
+				end
+			end
+			local tabLbl = _EntityService:GetEntityByPath(base .. tk .. "/TabLbl")
+			if isvalid(tabLbl) then
+				local spr = tabLbl.SpriteGUIRendererComponent
+				if isvalid(spr) then
+					spr.Color = isActive and activeColor or inactiveColor
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnTabSwitch(string tabKey)
+		self._T.activeTab = tabKey
+		self._T.scrollRow = 0
+		self:UpdateInvenViewport()
+		self:UpdateTabColors()
+		log("[Inven] 탭 전환: " .. tabKey)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnScrollUp()
+		if self._T.scrollRow > 0 then
+			self._T.scrollRow = self._T.scrollRow - 1
+			self:UpdateInvenViewport()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnScrollDown()
+		if not self._T.minimized then return end
+		local maxRow = 24  -- ceil(128/4) - 8 = 32 - 8
+		if self._T.scrollRow < maxRow then
+			self._T.scrollRow = self._T.scrollRow + 1
+			self:UpdateInvenViewport()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnMinimizeToggle()
+		self._T.minimized = not self._T.minimized
+		self._T.scrollRow = 0
+		local b = "/ui/DefaultGroup/InvenWindow/"
+		local function sp(p, x, y)
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) then e.UITransformComponent.anchoredPosition = Vector2(x, y) end
+		end
+		local function sr(p, w, h)
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) then e.UITransformComponent.RectSize = Vector2(w, h) end
+		end
+		local winEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+		local tabKeys2 = {"equip","consume","etc","install","cash","decorate"}
+		local tabX = {-350, -210, -70, 70, 210, 350}
+		if self._T.minimized then
+			-- 최소화: 455×760, 4×8=32슬롯 가시, 스크롤 있음 (탭 70% 축소)
+			local minW = 455
+			local minTabW = 62
+			local minTabX = {-155, -93, -31, 31, 93, 155}
+			if isvalid(winEnt) then winEnt.UITransformComponent.RectSize = Vector2(minW, 760) end
+			sr(b .. "BG", minW, 760)
+			sr(b .. "TitleText", minW, 50)
+			sr(b .. "TitleText/TitleBG", minW, 50)
+			sr(b .. "MesoBar", minW - 20, 50)
+			sp(b .. "CloseInven",          207,  355)
+			sp(b .. "InvenMinBtn",         165,  355)
+			sp(b .. "InvenScrollTrack",    209,  -75)
+			sr(b .. "InvenScrollTrack",     16,  500)
+			sp(b .. "InvenScrollUp",       209,  194)
+			sp(b .. "InvenScrollDown",     209, -342)
+			sp(b .. "InvenScrollThumb",    209,  158)
+			for i, tk in ipairs(tabKeys2) do
+				sp(b .. "InvenTab_" .. tk, minTabX[i], 228)
+				sr(b .. "InvenTab_" .. tk, minTabW, 36)
+				sr(b .. "InvenTab_" .. tk .. "/TabBG", minTabW, 36)
+				sr(b .. "InvenTab_" .. tk .. "/TabLbl", minTabW, 36)
+			end
+			local colX = {-111, -37, 37, 111}
+			local rowY = {176, 106, 36, -34, -104, -174, -244, -314}
+			for i = 1, 32 do
+				local col = ((i - 1) % 4) + 1
+				local row = math.floor((i - 1) / 4) + 1
+				sp(b .. "InvenSlot" .. i, colX[col], rowY[row])
+			end
+			sp(b .. "InvenSlotCount", 190, 333)
+			for i = 33, 128 do sp(b .. "InvenSlot" .. i, 3000, 3000) end
+			log("[Inven] 최소화 (4×8, 스크롤)")
+		else
+			-- 확장: 1200×760, 16×8=128슬롯 전체 가시, 스크롤 없음
+			if isvalid(winEnt) then winEnt.UITransformComponent.RectSize = Vector2(1200, 760) end
+			sr(b .. "BG", 1200, 760)
+			sr(b .. "TitleText", 1200, 50)
+			sr(b .. "TitleText/TitleBG", 1200, 50)
+			sr(b .. "MesoBar", 1180, 50)
+			sp(b .. "CloseInven",          580,  355)
+			sp(b .. "InvenMinBtn",         538,  355)
+			sp(b .. "InvenScrollTrack", 3000, 3000)
+			sp(b .. "InvenScrollUp",    3000, 3000)
+			sp(b .. "InvenScrollDown",  3000, 3000)
+			sp(b .. "InvenScrollThumb", 3000, 3000)
+			for i, tk in ipairs(tabKeys2) do
+				sp(b .. "InvenTab_" .. tk, tabX[i], 250)
+				sr(b .. "InvenTab_" .. tk, 132, 36)
+				sr(b .. "InvenTab_" .. tk .. "/TabBG", 132, 36)
+				sr(b .. "InvenTab_" .. tk .. "/TabLbl", 132, 36)
+			end
+			local colX = {-525,-455,-385,-315,-245,-175,-105,-35,35,105,175,245,315,385,455,525}
+			local rowY = {176, 106, 36, -34, -104, -174, -244, -314}
+			for i = 1, 128 do
+				local col = ((i - 1) % 16) + 1
+				local row = math.floor((i - 1) / 16) + 1
+				sp(b .. "InvenSlot" .. i, colX[col], rowY[row])
+			end
+			sp(b .. "InvenSlotCount", 555, 303)
+			log("[Inven] 확장 (16×8, 스크롤 없음)")
+		end
+		self:UpdateInvenViewport()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateInvenViewport()
+		local tab = self._T.activeTab
+		local scrollRow = self._T.scrollRow
+		local td = self._T.tabData[tab]
+		local base = "/ui/DefaultGroup/InvenWindow/InvenSlot"
+		-- 확장: 128슬롯 전체 표시(1:1 매핑), 최소화: 32슬롯(스크롤 4열 기준)
+		local visSlots = self._T.minimized and 32 or 128
+		for v = 1, visSlots do
+			local dataIdx = self._T.minimized and (scrollRow * 4 + v) or v
+			local s = (dataIdx <= 128) and (td[dataIdx] or "") or ""
+			local icon = _EntityService:GetEntityByPath(base .. v .. "/Icon")
+			local nEnt = _EntityService:GetEntityByPath(base .. v .. "/ItemName")
+			if isvalid(icon) then
+				local spr = icon:GetComponent("MOD.Core.SpriteGUIRendererComponent")
+				if isvalid(spr) then
+					if s ~= "" then
+						local ruid = self:ParseInvenRUID(s)
+						local si = self:ParseSlotIdx(s)
+						spr.ImageRUID = (si >= 1) and ("thumbnail://" .. ruid) or ruid
+						spr.Color = Color(1, 1, 1, 1)
+					else
+						spr.ImageRUID = ""
+						spr.Color = Color(1, 1, 1, 0)
+					end
+				end
+			end
+			if isvalid(nEnt) then
+				local tc = nEnt:GetComponent("MOD.Core.TextComponent")
+				if isvalid(tc) then tc.Text = s ~= "" and self:GetDisplayName(s) or "" end
+			end
+			local sEnt = _EntityService:GetEntityByPath(base .. v .. "/StarLabel")
+			if isvalid(sEnt) then
+				local stc = sEnt:GetComponent("MOD.Core.TextComponent")
+				if isvalid(stc) then
+					stc.Text = (s ~= "") and self:GetStarText(self:ParseStars(s)) or ""
+				end
+			end
+		end
+		log("[Inven] viewport 갱신: tab=" .. tab .. " scrollRow=" .. tostring(scrollRow) .. " visSlots=" .. tostring(visSlots))
+		-- 슬롯 카운트 갱신
+		local countEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenSlotCount")
+		if isvalid(countEnt) then
+			local used = 0
+			for i = 1, 128 do if (td[i] or "") ~= "" then used = used + 1 end end
+			countEnt.TextComponent.Text = tostring(used) .. "/128"
+		end
+		-- 스크롤 썸 위치 갱신 (최소화 모드에서만)
+		if self._T.minimized then
+			-- ThumbBG(자식) 높이=48, halfH=24. 부모(InvenScrollThumb)를 UP하단-halfH ~ DN상단+halfH 범위에서 이동
+			local thumbBGHalfH = 24  -- ThumbBG 48/2
+			local maxRow = 24
+			local topLimit = 182 - thumbBGHalfH  -- 158: ThumbBG 상단이 UP버튼 하단(182)에 맞춤
+			local botLimit = -330 + thumbBGHalfH -- -306: ThumbBG 하단이 DN버튼 상단(-330)에 맞춤
+			local thumbY = topLimit
+			if maxRow > 0 then
+				local progress = scrollRow / maxRow
+				thumbY = topLimit - progress * (topLimit - botLimit)
+			end
+			local thumb = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollThumb")
+			if isvalid(thumb) then
+				thumb.UITransformComponent.anchoredPosition = Vector2(209, thumbY)
+			end
+		end
+	end
+
+	-- ── ESC 창 스택 관리 ────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void PushWin(string path)
+		self:RemoveWin(path)
+		local stack = self._T.winStack
+		stack[#stack + 1] = path
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RemoveWin(string path)
+		local stack = self._T.winStack
+		local newStack = {}
+		for _, p in ipairs(stack) do
+			if p ~= path then
+				newStack[#newStack + 1] = p
+			end
+		end
+		self._T.winStack = newStack
+	end
+
+	-- ── 스크롤 방식 3종: 썸 드래그 / 마우스 휠 / 트랙 홀드 ────────────
+
+	@ExecSpace("ClientOnly")
+	method void OnScrollThumbDown(UITouchDownEvent e)
+		-- 스크롤 썸 드래그 시작
+		if e.TouchId ~= -1 then return end
+		if not self._T.minimized then return end
+		self._T.isDraggingThumb = true
+		self._T.isHoldingScrollTrack = false
+		local win = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+		if not isvalid(win) then return end
+		local winPos = win.UITransformComponent.anchoredPosition
+		local cursor = _InputService:GetCursorPosition()
+		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local localY = cursorUI.y - winPos.y
+		local thumb = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollThumb")
+		if isvalid(thumb) then
+			self._T.thumbDragOffsetY = localY - thumb.UITransformComponent.anchoredPosition.y
+		else
+			self._T.thumbDragOffsetY = 0.0
+		end
+		log("[Scroll] 썸 드래그 시작")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnScrollTrackDown(UITouchDownEvent e)
+		-- 트랙 클릭 홀드: 썸이 커서 위치로 한 단계씩 이동
+		if e.TouchId ~= -1 then return end
+		if not self._T.minimized then return end
+		if self._T.isDraggingThumb then return end
+		self._T.isHoldingScrollTrack = true
+		self._T.scrollTrackTimer = 0.0
+		self:ScrollTrackStep()
+		log("[Scroll] 트랙 홀드 시작")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnMouseScroll(MouseScrollEvent e)
+		-- 마우스 휠: 인벤 창 영역 위에 있을 때만 동작
+		if not self._T.minimized then return end
+		local win = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+		if not isvalid(win) or not win.Enable then return end
+		local winPos = win.UITransformComponent.anchoredPosition
+		local cursor = _InputService:GetCursorPosition()
+		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local localX = cursorUI.x - winPos.x
+		local localY = cursorUI.y - winPos.y
+		if localX < -227.5 or localX > 227.5 or localY < -380.0 or localY > 380.0 then return end
+		-- 휠 속도 1/5: 5회 누를 때마다 1행 이동
+		if e.ScrollDelta > 0 then
+			self._T.wheelAccum = self._T.wheelAccum + 0.2
+			if self._T.wheelAccum >= 1.0 then
+				self._T.wheelAccum = self._T.wheelAccum - 1.0
+				self:OnScrollUp()
+			end
+		elseif e.ScrollDelta < 0 then
+			self._T.wheelAccum = self._T.wheelAccum - 0.2
+			if self._T.wheelAccum <= -1.0 then
+				self._T.wheelAccum = self._T.wheelAccum + 1.0
+				self:OnScrollDown()
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ScrollTrackStep()
+		-- 트랙 클릭 위치 기준으로 scrollRow 한 단계 이동
+		if not self._T.minimized then return end
+		local win = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+		if not isvalid(win) then return end
+		local winPos = win.UITransformComponent.anchoredPosition
+		local cursor = _InputService:GetCursorPosition()
+		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local localY = cursorUI.y - winPos.y
+		-- 썸 이동 범위: topLimit=158, botLimit=-306, range=464
+		local progress = (158 - localY) / 464
+		progress = math.max(0.0, math.min(1.0, progress))
+		local targetRow = math.floor(progress * 24 + 0.5)
+		if self._T.scrollRow < targetRow then
+			self._T.scrollRow = self._T.scrollRow + 1
+			self:UpdateInvenViewport()
+		elseif self._T.scrollRow > targetRow then
+			self._T.scrollRow = self._T.scrollRow - 1
+			self:UpdateInvenViewport()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 마우스 휠 이벤트 핸들러 해제
+		if self._T.scrollHandler then
+			_InputService:DisconnectEvent(MouseScrollEvent, self._T.scrollHandler)
+			self._T.scrollHandler = nil
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseTopWindow()
+		local stack = self._T.winStack
+		if #stack == 0 then return end
+		local path = stack[#stack]
+		self:RemoveWin(path)
+		if path == "/ui/DefaultGroup/EnhanceWindow" then
+			_EnhancementManager:CloseWindow()
+		elseif path == "/ui/DefaultGroup/SkillWindow" then
+			local w = _EntityService:GetEntityByPath(path)
+			if isvalid(w) then w.Enable = false end
+			local stp = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillTooltipPanel")
+			if isvalid(stp) then stp.Enable = false end
+		else
+			local w = _EntityService:GetEntityByPath(path)
+			if isvalid(w) then w.Enable = false end
+			if path == "/ui/DefaultGroup/InvenWindow" then
+				if self.tooltipSource == "inven" then self:HideTooltip() end
+			elseif path == "/ui/DefaultGroup/EquipWindow" then
+				if self.tooltipSource == "equip" then self:HideTooltip() end
+			end
+		end
+		log("[ESC] 창 닫힘: " .. path)
+	end
+
+end

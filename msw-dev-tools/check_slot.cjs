@@ -1,0 +1,10 @@
+const { UIBuilder } = require('./.claude/skills/msw-ui-system/scripts/msw_ui_builder.cjs');
+const b = UIBuilder.read('ui/DefaultGroup.ui');
+const all = b.listEntities();
+const slot1 = all.filter(e => e.path && e.path.startsWith('/ui/DefaultGroup/InvenWindow/InvenSlot1'));
+console.log('InvenSlot1 관련 (' + slot1.length + '):');
+slot1.forEach((e,i) => console.log('  ['+i+']', e.path));
+const slot2 = all.filter(e => e.path && e.path.startsWith('/ui/DefaultGroup/InvenWindow/InvenSlot2/'));
+console.log('InvenSlot2 자식 (' + slot2.length + '):');
+slot2.forEach((e,i) => console.log('  ['+i+']', e.path));
+console.log('총 엔티티:', all.length);

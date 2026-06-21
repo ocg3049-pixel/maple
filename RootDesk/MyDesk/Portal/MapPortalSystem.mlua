@@ -1,0 +1,190 @@
+@Logic
+script MapPortalSystem extends Logic
+
+    property any triggerHandlers = nil
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        self._T.mapRegion = {}
+        self._T.mapIdx    = {}
+        self._T.cooldown  = {}
+        self.triggerHandlers = {}
+
+        -- Custom forward overrides: right portal of these maps goes to a specific destination
+        self._T.customForward = {
+            ["100010001"] = "001000003"
+        }
+
+        local regions = {
+            {
+                lobby = "hunting01",
+                maps  = {
+                    "000010000","000040000","000050000",
+                    "001000000","001000001","001000002","001000003",
+                    "001010000","001010100","001010200","001010300","001010400",
+                    "001020000","002000000","002000100"
+                }
+            },
+            {
+                lobby = "hunting02",
+                maps  = {
+                    "100000000","100010001","100010100",
+                    "100020000","100020100","100020200","100020300","100020400","100020500",
+                    "100040000","100040100","100040200","100040300","100040400","100040500",
+                    "101000000","101010000","101010100",
+                    "101020100","101020200","101020300",
+                    "101030000","101030100","101030300","101030400","101030500",
+                    "102000000","102010000",
+                    "102020000","102020100","102020200","102020300","102020400","102020500",
+                    "102030000","102030100","102030200",
+                    "103000000","103010000","103010100",
+                    "103030000","103030100","103030200","103030300","103030400",
+                    "104000000","104010000","104010100","104010200","104020000"
+                }
+            },
+            {
+                lobby = "hunting03",
+                maps  = {
+                    "105000000","105000010","105000011","105000012",
+                    "105010000","105010200","105010300","105010301",
+                    "105020000","105020100","105020200","105020300","105020400","105020500",
+                    "105030000","105030200","105030300","105030400","105030500",
+                    "105100000","105100100","105100101","105100300","105100301"
+                }
+            }
+        }
+
+        self._T.regions = regions
+
+        for ri, region in ipairs(regions) do
+            for mi, mapId in ipairs(region.maps) do
+                self._T.mapRegion[mapId] = ri
+                self._T.mapIdx[mapId]    = mi
+            end
+        end
+
+        local totalWired = 0
+        for _, region in ipairs(regions) do
+            for _, mapId in ipairs(region.maps) do
+                local mapEntity = _EntityService:GetEntityByPath("/maps/" .. mapId)
+                if isvalid(mapEntity) then
+                    totalWired += self:WirePortals(mapId, mapEntity)
+                end
+            end
+        end
+
+        -- portal wiring complete
+    end
+
+    @ExecSpace("ServerOnly")
+    method integer WirePortals(string mapId, Entity mapEntity)
+        local portals = {}
+        for _, child in ipairs(mapEntity.Children:ToTable()) do
+            if isvalid(child.PortalComponent) and isvalid(child.TriggerComponent) then
+                local wx = child.TransformComponent.WorldPosition.x
+                table.insert(portals, {entity = child, x = wx})
+            end
+        end
+
+        if #portals == 0 then return 0 end
+
+        table.sort(portals, function(a, b) return a.x < b.x end)
+
+        local half = math.floor(#portals / 2)
+
+        for i, p in ipairs(portals) do
+            local capturedMapId  = mapId
+            local capturedGoBack = (i <= half)
+
+            local h = p.entity:ConnectEvent(TriggerEnterEvent, function(ev)
+                self:OnPortalEnter(ev.TriggerBodyEntity, capturedMapId, capturedGoBack)
+            end)
+            table.insert(self.triggerHandlers, {entity = p.entity, eventHandler = h})
+        end
+
+        return #portals
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnPortalEnter(Entity triggerBody, string fromMapId, boolean goBack)
+        if not isvalid(triggerBody) then return end
+        local pc = triggerBody.PlayerComponent
+        if not isvalid(pc) then return end
+
+        local userId = pc.UserId
+        local now  = _UtilLogic.ServerElapsedSeconds
+        local last = self._T.cooldown[userId] or 0
+        if now - last < 1.5 then return end
+        self._T.cooldown[userId] = now
+
+        local destMapId = self:GetDestination(fromMapId, goBack)
+        if destMapId == "" then return end
+
+        local spawnPos = self:GetDestPortalPos(destMapId, goBack)
+        pc:MoveToMapPosition(destMapId, spawnPos)
+    end
+
+    method string GetDestination(string mapId, boolean goBack)
+        -- Check custom forward override for right portal
+        if not goBack then
+            local custom = self._T.customForward[mapId]
+            if custom then return custom end
+        end
+
+        local ri = self._T.mapRegion[mapId]
+        local mi = self._T.mapIdx[mapId]
+        if not ri or not mi then return "" end
+
+        local region = self._T.regions[ri]
+
+        if goBack then
+            if mi <= 1 then
+                return region.lobby
+            else
+                return region.maps[mi - 1]
+            end
+        else
+            if mi >= #region.maps then
+                return region.lobby
+            else
+                return region.maps[mi + 1]
+            end
+        end
+    end
+
+    method Vector2 GetDestPortalPos(string destMapId, boolean goBack)
+        local mapEntity = _EntityService:GetEntityByPath("/maps/" .. destMapId)
+        if not isvalid(mapEntity) then return Vector2(0, 0) end
+
+        local portals = {}
+        for _, child in ipairs(mapEntity.Children:ToTable()) do
+            if isvalid(child.PortalComponent) and isvalid(child.TriggerComponent) then
+                local pos = child.TransformComponent.WorldPosition
+                table.insert(portals, {x = pos.x, y = pos.y})
+            end
+        end
+
+        if #portals == 0 then return Vector2(0, 0) end
+
+        table.sort(portals, function(a, b) return a.x < b.x end)
+
+        if goBack then
+            return Vector2(portals[#portals].x, portals[#portals].y)
+        else
+            return Vector2(portals[1].x, portals[1].y)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        if self.triggerHandlers then
+            for _, pair in ipairs(self.triggerHandlers) do
+                if isvalid(pair.entity) then
+                    pair.entity:DisconnectEvent(TriggerEnterEvent, pair.eventHandler)
+                end
+            end
+        end
+        self.triggerHandlers = nil
+    end
+
+end

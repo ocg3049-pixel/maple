@@ -1,0 +1,458 @@
+@Logic
+script SkillManager extends Logic
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- 창 드래그 상태
+		self._T.isDragging    = false
+		self._T.dragOffsetX   = 0
+		self._T.dragOffsetY   = 0
+		-- 툴팁 상태
+		self._T.hovering      = false
+		self._T.pendingShow   = false
+		-- 스킬 쿨다운
+		self._T.skillOnCooldown = false
+
+		-- 스킬 드래그 상태
+		self._T.isDraggingSkill = false
+		self._T.dragSkillRUID   = ""
+		self._T.dragSkillName   = ""
+		self._T.dragSource      = ""  -- "window" | "bar"
+		self._T.dragFromKey     = ""
+
+		-- 슬롯 데이터 초기화
+		self._T.slotData = {}
+		local allKeys = {"Q","W","E","R","1","2","3","4","A","S","D","F","5","6","7","8"}
+		for _, k in ipairs(allKeys) do
+			self._T.slotData[k] = { ruid = "", name = "" }
+		end
+
+		-- SkillBar 아이콘 전부 투명화
+		self:InitBarIcons()
+
+		-- 스킬창 아이콘 RUID 설정
+		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow/SkillSlot1/SkillIcon")
+		if isvalid(iconEnt) then
+			local spr = iconEnt.SpriteGUIRendererComponent
+			spr.ImageRUID = "0e3a7c540e494b41b34c853eadab0d7e"
+			spr.Color = Color(1, 1, 1, 1)
+		end
+
+		-- 스킬 툴팁 내용 초기화
+		local tipIcon = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillTooltipPanel/Icon")
+		if isvalid(tipIcon) then
+			local spr = tipIcon.SpriteGUIRendererComponent
+			spr.ImageRUID = "0e3a7c540e494b41b34c853eadab0d7e"
+			spr.Color = Color(1, 1, 1, 1)
+		end
+		local tipTitle = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillTooltipPanel/Title")
+		if isvalid(tipTitle) then
+			tipTitle.TextComponent.Text = "달팽이 세마리"
+		end
+		local tipInfo = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillTooltipPanel/Info")
+		if isvalid(tipInfo) then
+			tipInfo.TextComponent.Text = "달팽이 3마리를 소환한다.\n일정 시간 후 사라진다."
+		end
+
+		-- 키 이벤트 연결
+		_InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+
+		-- 닫기 버튼
+		local closeBtn = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow/CloseSkill")
+		if isvalid(closeBtn) then
+			closeBtn:ConnectEvent(UITouchDownEvent, self.OnCloseClick)
+		end
+
+		-- 타이틀바 드래그
+		local titleBar = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow/TitleBar")
+		if isvalid(titleBar) then
+			titleBar:ConnectEvent(UITouchDownEvent, self.OnTitleBarDown)
+		end
+
+		-- 스킬 슬롯 1: 호버 + 스킬창에서 드래그 시작
+		local touch = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow/SkillSlot1/Touch")
+		if isvalid(touch) then
+			touch:ConnectEvent(UITouchEnterEvent, self.OnSkillHoverEnter)
+			touch:ConnectEvent(UITouchExitEvent, self.OnSkillHoverExit)
+			touch:ConnectEvent(UITouchDownEvent, self.OnSkillDragStart)
+		end
+
+		-- SkillBar 슬롯 드래그: 각 슬롯에 UITouchDownEvent 연결
+		for _, k in ipairs(allKeys) do
+			local slotTouch = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. k .. "/Touch")
+			local slotKey = k
+			if isvalid(slotTouch) then
+				slotTouch:ConnectEvent(UITouchDownEvent, function(e)
+					if e.TouchId == -1 then
+						self:OnBarSlotDragStart(slotKey)
+					end
+				end)
+			end
+		end
+
+		log("[SkillManager] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void InitBarIcons()
+		local keys = {"Q","W","E","R","1","2","3","4","A","S","D","F","5","6","7","8"}
+		for _, k in ipairs(keys) do
+			local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. k .. "/Icon")
+			if isvalid(iconEnt) then
+				iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent e)
+		local k = e.key
+		if k == KeyboardKey.K then
+			self:ToggleWindow()
+		elseif k == KeyboardKey.Q     then self:UseSkillInSlot("Q")
+		elseif k == KeyboardKey.W     then self:UseSkillInSlot("W")
+		elseif k == KeyboardKey.E     then self:UseSkillInSlot("E")
+		elseif k == KeyboardKey.R     then self:UseSkillInSlot("R")
+		elseif k == KeyboardKey.Alpha1 then self:UseSkillInSlot("1")
+		elseif k == KeyboardKey.Alpha2 then self:UseSkillInSlot("2")
+		elseif k == KeyboardKey.Alpha3 then self:UseSkillInSlot("3")
+		elseif k == KeyboardKey.Alpha4 then self:UseSkillInSlot("4")
+		elseif k == KeyboardKey.A     then self:UseSkillInSlot("A")
+		elseif k == KeyboardKey.S     then self:UseSkillInSlot("S")
+		elseif k == KeyboardKey.D     then self:UseSkillInSlot("D")
+		elseif k == KeyboardKey.F     then self:UseSkillInSlot("F")
+		elseif k == KeyboardKey.Alpha5 then self:UseSkillInSlot("5")
+		elseif k == KeyboardKey.Alpha6 then self:UseSkillInSlot("6")
+		elseif k == KeyboardKey.Alpha7 then self:UseSkillInSlot("7")
+		elseif k == KeyboardKey.Alpha8 then self:UseSkillInSlot("8")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UseSkillInSlot(string key)
+		local slot = self._T.slotData[key]
+		if slot == nil or slot.ruid == "" then return end
+		-- 포션은 스킬 쿨다운과 무관하게 사용
+		if slot.name == "HP포션" then
+			_PotionShopManager:RequestUsePotion()
+			self._T.slotData[key] = { ruid = "", name = "" }
+			local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
+			if isvalid(iconEnt) then
+				iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
+			end
+			log("[SkillManager] HP포션 사용 키=" .. key)
+			return
+		end
+		if self._T.skillOnCooldown then return end
+		log("[SkillManager] 스킬 사용: " .. slot.name .. " (단축키: " .. key .. ")")
+		if slot.name == "달팽이 세마리" then
+			self._T.skillOnCooldown = true
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.75)
+			_SoundService:PlaySound("06f080c8c42e431785a46e20ec9be5bb", 1.0)
+			self:RequestFireSnailSkill()
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireSnailSkill()
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireSnailSkill: player not found")
+			return
+		end
+
+		local dirX = 1
+		local ctrl = player.PlayerControllerComponent
+		if isvalid(ctrl) then
+			dirX = ctrl.LookDirectionX
+		end
+
+		local parent = player.CurrentMap
+		if not isvalid(parent) then return end
+
+		if self._T.projCount == nil then self._T.projCount = 0 end
+		self._T.projCount = self._T.projCount + 1
+		local projName = "snail_proj_" .. tostring(self._T.projCount)
+
+		local pos = player.TransformComponent.Position
+		local spawnPos = Vector3(pos.x + dirX * 0.3, pos.y + 0.3, pos.z)
+
+		local proj = _SpawnService:SpawnByModelId(
+			"snailprojectile",
+			projName,
+			spawnPos,
+			parent
+		)
+		if not isvalid(proj) then
+			log_warning("[SkillManager] SnailProjectile 스폰 실패 — 모델 미등록 또는 refresh 필요")
+			return
+		end
+
+		local pc = proj.SnailSkillProjectile
+		if pc ~= nil then
+			pc:Fire(dirX, player)
+		end
+		log("[SkillManager] 달팽이 세마리 발사! dir=" .. tostring(dirX))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleWindow()
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+		if not isvalid(w) then return end
+		w.Enable = not w.Enable
+		if not w.Enable then
+			self:HideSkillTooltip()
+		end
+		log("[SkillManager] 스킬창 " .. (w.Enable and "열림" or "닫힘"))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseClick(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+		if isvalid(w) then w.Enable = false end
+		self:HideSkillTooltip()
+		log("[SkillManager] 닫기")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnTitleBarDown(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self:StartDrag()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartDrag()
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+		if not isvalid(w) then return end
+		self._T.isDragging = true
+		local cursor = _InputService:GetCursorPosition()
+		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local winPos = w.UITransformComponent.anchoredPosition
+		self._T.dragOffsetX = cursorUI.x - winPos.x
+		self._T.dragOffsetY = cursorUI.y - winPos.y
+		self:BringWindowToFront()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BringWindowToFront()
+		local paths = {
+			"/ui/DefaultGroup/InvenWindow",
+			"/ui/DefaultGroup/EquipWindow",
+			"/ui/DefaultGroup/EnhanceWindow",
+			"/ui/DefaultGroup/SkillWindow"
+		}
+		local maxIdx = 0
+		for _, p in ipairs(paths) do
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) then
+				local idx = _UILogic:GetSiblingIndex(e.UITransformComponent)
+				if idx > maxIdx then maxIdx = idx end
+			end
+		end
+		local target = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+		if isvalid(target) then
+			_UILogic:SetSiblingIndex(target.UITransformComponent, maxIdx)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillHoverEnter(UITouchEnterEvent e)
+		self._T.hovering    = true
+		self._T.pendingShow = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillHoverExit(UITouchExitEvent e)
+		if self._T.hovering then
+			self._T.hovering    = false
+			self._T.pendingShow = false
+			self:HideSkillTooltip()
+		end
+	end
+
+	-- 스킬창 슬롯에서 드래그 시작
+	@ExecSpace("ClientOnly")
+	method void OnSkillDragStart(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		self._T.isDraggingSkill = true
+		self._T.dragSkillRUID   = "0e3a7c540e494b41b34c853eadab0d7e"
+		self._T.dragSkillName   = "달팽이 세마리"
+		self._T.dragSource      = "window"
+		self._T.dragFromKey     = ""
+		self._T.hovering    = false
+		self._T.pendingShow = false
+		self:HideSkillTooltip()
+		self:ShowDragGhost(self._T.dragSkillRUID)
+		log("[SkillManager] 스킬 드래그 시작: " .. self._T.dragSkillName)
+	end
+
+	-- SkillBar 슬롯에서 드래그 시작 (슬롯을 즉시 비움)
+	@ExecSpace("ClientOnly")
+	method void OnBarSlotDragStart(string key)
+		local slot = self._T.slotData[key]
+		if slot == nil or slot.ruid == "" then return end
+
+		self._T.isDraggingSkill = true
+		self._T.dragSkillRUID   = slot.ruid
+		self._T.dragSkillName   = slot.name
+		self._T.dragSource      = "bar"
+		self._T.dragFromKey     = key
+
+		-- 슬롯 즉시 비우기
+		self._T.slotData[key] = { ruid = "", name = "" }
+		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
+		if isvalid(iconEnt) then
+			iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
+		end
+
+		self:ShowDragGhost(self._T.dragSkillRUID)
+		log("[SkillManager] SkillBar 드래그 시작: [" .. key .. "] " .. slot.name)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowDragGhost(string ruid)
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+		if not isvalid(ghost) then return end
+		local spr = ghost.SpriteGUIRendererComponent
+		spr.ImageRUID = ruid
+		spr.Color = Color(1, 1, 1, 1)
+		local cursor = _InputService:GetCursorPosition()
+		ghost.UITransformComponent.anchoredPosition = Vector2(cursor.x - 960, cursor.y - 540)
+		ghost.Enable = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideSkillTooltip()
+		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillTooltipPanel")
+		if isvalid(tp) then tp.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowSkillTooltip()
+		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillTooltipPanel")
+		if not isvalid(tp) then return end
+		local w    = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+		local slot = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow/SkillSlot1")
+		if isvalid(w) and isvalid(slot) then
+			local winPos  = w.UITransformComponent.anchoredPosition
+			local slotPos = slot.UITransformComponent.anchoredPosition
+			local tx = winPos.x + slotPos.x + 162
+			local ty = winPos.y + slotPos.y
+			if tx + 110 > 940 then
+				tx = winPos.x + slotPos.x - 162
+			end
+			tp.UITransformComponent.anchoredPosition = Vector2(tx, ty)
+		end
+		tp.Enable = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FindSkillBarSlot(number cx, number cy)
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar")
+		if not isvalid(bar) then return "" end
+		local barPos = bar.UITransformComponent.anchoredPosition
+
+		local row1 = {"Q","W","E","R","1","2","3","4"}
+		local row2 = {"A","S","D","F","5","6","7","8"}
+		local xOff = {-224, -160, -96, -32, 32, 96, 160, 224}
+
+		for i, k in ipairs(row1) do
+			local sx = barPos.x + xOff[i]
+			local sy = barPos.y + 36
+			if math.abs(cx - sx) <= 30 and math.abs(cy - sy) <= 30 then
+				return k
+			end
+		end
+		for i, k in ipairs(row2) do
+			local sx = barPos.x + xOff[i]
+			local sy = barPos.y - 36
+			if math.abs(cx - sx) <= 30 and math.abs(cy - sy) <= 30 then
+				return k
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AssignSkillToSlot(string key, string ruid, string name)
+		self._T.slotData[key] = { ruid = ruid, name = name }
+		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
+		if isvalid(iconEnt) then
+			local spr = iconEnt.SpriteGUIRendererComponent
+			spr.ImageRUID = ruid
+			spr.Color = Color(1, 1, 1, 1)
+		end
+		log("[SkillManager] 슬롯 배정: [" .. key .. "] = " .. name)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 1-frame 지연 툴팁 표시
+		if self._T.pendingShow then
+			self._T.pendingShow = false
+			if self._T.hovering then
+				self:ShowSkillTooltip()
+			end
+		end
+
+		-- 창 드래그
+		if self._T.isDragging then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				self._T.isDragging = false
+			else
+				local cursor = _InputService:GetCursorPosition()
+				local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+				local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+				if isvalid(w) then
+					local newX = cursorUI.x - self._T.dragOffsetX
+					local newY = cursorUI.y - self._T.dragOffsetY
+					if newX < -900 then newX = -900 elseif newX > 900 then newX = 900 end
+					if newY < -500 then newY = -500 elseif newY > 500 then newY = 500 end
+					w.UITransformComponent.anchoredPosition = Vector2(newX, newY)
+				end
+			end
+		end
+
+		-- 스킬 드래그
+		if self._T.isDraggingSkill then
+			local cursor = _InputService:GetCursorPosition()
+			local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+
+			-- 고스트 이동
+			local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+			if isvalid(ghost) then
+				ghost.UITransformComponent.anchoredPosition = cursorUI
+			end
+
+			-- 마우스 버튼 해제 → 드랍 처리
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				self._T.isDraggingSkill = false
+				if isvalid(ghost) then ghost.Enable = false end
+
+				local key = self:FindSkillBarSlot(cursorUI.x, cursorUI.y)
+				if key ~= "" then
+					-- 슬롯에 드랍 → 배정
+					self:AssignSkillToSlot(key, self._T.dragSkillRUID, self._T.dragSkillName)
+				else
+					-- 허공에 드랍
+					if self._T.dragSource == "bar" then
+						-- SkillBar 슬롯에서 드래그 → 허공 → 슬롯은 이미 비워진 상태 유지
+						log("[SkillManager] 허공에 드랍 — [" .. self._T.dragFromKey .. "] 슬롯 비워짐")
+					else
+						-- 스킬창에서 드래그 → 허공 → 아무것도 안 함
+						log("[SkillManager] 빈 공간에 드랍 — 배정 취소")
+					end
+				end
+
+				self._T.dragSkillRUID = ""
+				self._T.dragSkillName = ""
+				self._T.dragSource    = ""
+				self._T.dragFromKey   = ""
+			end
+		end
+	end
+
+end

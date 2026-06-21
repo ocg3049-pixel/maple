@@ -1,0 +1,378 @@
+@Logic
+script PotionShopManager extends Logic
+
+    property Entity shopNpcEntity = "f490f78f-9145-4ddf-86f2-f663fa9c28f2"
+
+    property integer DEFAULT_MESO = 1000
+    property integer POTION_PRICE = 50
+
+    @Sync property integer PlayerMeso = 0
+
+    property integer healTimerId = 0
+    property integer healTickCount = 0
+    property string healUserId = ""
+
+    property any touchHandler = nil
+    property any buyBtnHandler = nil
+    property any closeBtnHandler = nil
+    property Entity buyBtnEntity = ""
+    property Entity closeBtnEntity = ""
+
+    property integer mesoSyncTimerId = 0
+    property boolean wasInvenOpen = false
+
+    method void OnBeginPlay()
+        if self:IsServer() then
+            self:ConnectEvent(UserEnterEvent, self.OnUserEnter)
+            _TimerService:SetTimerOnce(self.CheckExistingPlayers, 0.5)
+        end
+        if self:IsClient() then
+            self:ClientInit()
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CheckExistingPlayers()
+        local mapsEnt = _EntityService:GetEntityByPath("/maps")
+        if not isvalid(mapsEnt) then return end
+        for _, map in ipairs(mapsEnt.Children:ToTable()) do
+            if not isvalid(map) then continue end
+            for _, child in ipairs(map.Children:ToTable()) do
+                if isvalid(child) and isvalid(child.PlayerComponent) then
+                    local userId = tostring(child.PlayerComponent.UserId)
+                    if userId ~= "" then
+                        self:InitMesoForUser(userId)
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    method void OnEndPlay()
+        if self:IsServer() then
+            if self.healTimerId ~= 0 then
+                _TimerService:ClearTimer(self.healTimerId)
+                self.healTimerId = 0
+            end
+        end
+        if self:IsClient() then
+            if self.mesoSyncTimerId ~= 0 then
+                _TimerService:ClearTimer(self.mesoSyncTimerId)
+                self.mesoSyncTimerId = 0
+            end
+            if self.touchHandler ~= nil then
+                local npc = _EntityService:GetEntityByPath("/maps/map01/ShopNPC")
+                if isvalid(npc) then
+                    npc:DisconnectEvent(TouchEvent, self.touchHandler)
+                end
+                self.touchHandler = nil
+            end
+            if self.buyBtnHandler ~= nil then
+                if isvalid(self.buyBtnEntity) then
+                    self.buyBtnEntity:DisconnectEvent(ButtonClickEvent, self.buyBtnHandler)
+                end
+                self.buyBtnHandler = nil
+            end
+            if self.closeBtnHandler ~= nil then
+                if isvalid(self.closeBtnEntity) then
+                    self.closeBtnEntity:DisconnectEvent(ButtonClickEvent, self.closeBtnHandler)
+                end
+                self.closeBtnHandler = nil
+            end
+        end
+    end
+
+    -- ===== 서버 =====
+
+    @ExecSpace("ServerOnly")
+    method void OnUserEnter(UserEnterEvent event)
+        local userId = event.UserId
+        if userId == nil or userId == "" then return end
+        self:InitMesoForUser(userId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void InitMesoForUser(string userId)
+        if self._T.mesoInitialized then return end
+        self._T.mesoInitialized = true
+        local store = _DataStorageService:GetDataStorage("PotionShopMeso")
+        store:SetAndWait("meso_" .. userId, tostring(self.DEFAULT_MESO))
+        self.PlayerMeso = self.DEFAULT_MESO
+        log("[Shop] 초기화: " .. userId .. " 메소=" .. tostring(self.PlayerMeso))
+    end
+
+    @ExecSpace("Server")
+    method void RequestBuyPotion()
+        local userId = senderUserId
+        if userId == nil or userId == "" then return end
+        self:ProcessBuyPotionServer(userId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ProcessBuyPotionServer(string userId)
+        local playerEntity = self:FindPlayerByUserId(userId)
+        if not isvalid(playerEntity) then
+            log("[Shop] 플레이어 없음: " .. userId)
+            return
+        end
+        local inv = playerEntity.InventoryComponent
+        if not isvalid(inv) or not inv.IsInitialized then
+            log("[Shop] 인벤토리 없음: " .. userId)
+            return
+        end
+
+        local store = _DataStorageService:GetDataStorage("PotionShopMeso")
+        local saved = store:GetAndWait("meso_" .. userId)
+        local meso = tonumber(saved)
+        if meso == nil then
+            meso = self.DEFAULT_MESO
+            store:SetAndWait("meso_" .. userId, tostring(meso))
+            self.PlayerMeso = meso
+        end
+
+        if meso < self.POTION_PRICE then
+            self:NotifyMessage("메소가 부족합니다! (현재: " .. meso .. ")", userId)
+            return
+        end
+
+        meso = meso - self.POTION_PRICE
+        store:SetAndWait("meso_" .. userId, tostring(meso))
+        self.PlayerMeso = meso
+
+        _ItemService:CreateItem(PotionItem, "PotionItem", inv)
+        log("[Shop] 포션 구매: " .. userId .. " 메소=" .. meso)
+        self:NotifyPurchaseDone(meso, userId)
+        self:NotifyPotionAdded(userId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestUsePotion()
+        local userId = senderUserId
+        if userId == nil or userId == "" then return end
+        self:ProcessUsePotionServer(userId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ProcessUsePotionServer(string userId)
+        if self.healTimerId ~= 0 then
+            self:NotifyMessage("이미 포션 효과가 진행 중입니다!", userId)
+            return
+        end
+        self.healUserId = userId
+        self.healTickCount = 0
+        self.healTimerId = _TimerService:SetTimerRepeat(self.DoHealTick, 2.0)
+        log("[Shop] 포션 사용: " .. userId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity FindPlayerByUserId(string userId)
+        local mapsEnt = _EntityService:GetEntityByPath("/maps")
+        if not isvalid(mapsEnt) then return nil end
+        for _, map in ipairs(mapsEnt.Children:ToTable()) do
+            if not isvalid(map) then continue end
+            for _, child in ipairs(map.Children:ToTable()) do
+                if isvalid(child) and isvalid(child.PlayerComponent) then
+                    if tostring(child.PlayerComponent.UserId) == userId then
+                        return child
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void DoHealTick()
+        self.healTickCount = self.healTickCount + 1
+        local userId = self.healUserId
+
+        local playerEntity = self:FindPlayerByUserId(userId)
+        if isvalid(playerEntity) then
+            local pc = playerEntity.PlayerComponent
+            local newHp = math.min((pc.Hp or 0) + 10, (pc.MaxHp or 50))
+            pc.Hp = newHp
+            log("[Shop] 힐 " .. self.healTickCount .. "/5: HP=" .. newHp)
+            self:NotifyHealEffect(userId)
+        end
+
+        if self.healTickCount >= 5 then
+            _TimerService:ClearTimer(self.healTimerId)
+            self.healTimerId = 0
+            self.healTickCount = 0
+            self.healUserId = ""
+            log("[Shop] 힐 완료")
+        end
+    end
+
+    @ExecSpace("Client")
+    method void NotifyPurchaseDone(integer meso)
+        local mesoText = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/text_meso")
+        if isvalid(mesoText) and isvalid(mesoText.TextComponent) then
+            mesoText.TextComponent.Text = "소지 메소: " .. tostring(meso)
+        end
+        _UIEquipInventoryManager.meso = meso
+        _UIEquipInventoryManager:UpdateMesoUI()
+    end
+
+    @ExecSpace("Client")
+    method void NotifyPotionAdded()
+        _UIEquipInventoryManager:AddItemToInventory("HP포션", "323920d2805d4ec1aa85eca9e3e1cab2", "sprite")
+        log("[Shop] 포션이 인벤토리에 추가됨")
+    end
+
+    @ExecSpace("Client")
+    method void NotifyMessage(string msg)
+        log("[Shop] " .. msg)
+    end
+
+    @ExecSpace("Client")
+    method void NotifyHealEffect()
+        local mapsEnt = _EntityService:GetEntityByPath("/maps")
+        if not isvalid(mapsEnt) then return end
+        local playerEntity = nil
+        for _, map in ipairs(mapsEnt.Children:ToTable()) do
+            if not isvalid(map) then continue end
+            for _, child in ipairs(map.Children:ToTable()) do
+                if isvalid(child) and isvalid(child.PlayerComponent) then
+                    playerEntity = child
+                    break
+                end
+            end
+            if isvalid(playerEntity) then break end
+        end
+        if not isvalid(playerEntity) then return end
+
+        _DamageSkinService:Play(
+            playerEntity,
+            "6ba67548f43f48f29eb23dafd0766383",
+            0,
+            {10},
+            DamageSkinTweenType.Default,
+            false,
+            Vector2(0, 0.5)
+        )
+    end
+
+    -- ===== 클라이언트 =====
+
+    @ExecSpace("ClientOnly")
+    method void ClientInit()
+        local npc = _EntityService:GetEntityByPath("/maps/map01/ShopNPC")
+        if isvalid(npc) then
+            self.touchHandler = npc:ConnectEvent(TouchEvent, self.OnNpcTouched)
+            log("[Shop] NPC 터치 연결 완료")
+        else
+            log("[Shop] NPC 터치 연결 실패")
+        end
+
+        local shopGroup = _EntityService:GetEntityByPath("/ui/ShopGroup")
+        if isvalid(shopGroup) then
+            shopGroup.Enable = false
+        end
+
+        local invGroup = _EntityService:GetEntityByPath("/ui/InventoryGroup")
+        if isvalid(invGroup) then
+            invGroup.Enable = false
+        end
+
+        self.mesoSyncTimerId = _TimerService:SetTimerRepeat(self.SyncInvenMeso, 0.3)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SyncInvenMeso()
+        local inven = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+        if not isvalid(inven) then return end
+        local isOpen = inven.Enable
+        if isOpen and not self.wasInvenOpen then
+            self:RequestMesoRefresh()
+        end
+        self.wasInvenOpen = isOpen
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnNpcTouched(TouchEvent event)
+        self:OpenShopUI()
+    end
+
+    @ExecSpace("Server")
+    method void RequestMesoRefresh()
+        local userId = senderUserId
+        if userId == nil or userId == "" then return end
+        self:ProcessMesoRefreshServer(userId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ProcessMesoRefreshServer(string userId)
+        local store = _DataStorageService:GetDataStorage("PotionShopMeso")
+        local saved = store:GetAndWait("meso_" .. userId)
+        local meso = tonumber(saved)
+        if meso == nil then
+            meso = self.DEFAULT_MESO
+            store:SetAndWait("meso_" .. userId, tostring(meso))
+        end
+        self.PlayerMeso = meso
+        self:NotifyPurchaseDone(meso, userId)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenShopUI()
+        local shopGroup = _EntityService:GetEntityByPath("/ui/ShopGroup")
+        if not isvalid(shopGroup) then
+            log("[Shop] ShopGroup 없음")
+            return
+        end
+
+        shopGroup.Enable = true
+        _UIEquipInventoryManager:PushWin("/ui/ShopGroup")
+
+        local mesoText = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/text_meso")
+        if isvalid(mesoText) and isvalid(mesoText.TextComponent) then
+            mesoText.TextComponent.Text = "소지 메소: " .. tostring(self.PlayerMeso)
+        end
+        self:RequestMesoRefresh()
+
+        if self.buyBtnHandler == nil then
+            local buyBtn = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/btn_buy")
+            if isvalid(buyBtn) then
+                self.buyBtnEntity = buyBtn
+                self.buyBtnHandler = buyBtn:ConnectEvent(ButtonClickEvent, self.OnBuyClicked)
+            end
+        end
+        if self.closeBtnHandler == nil then
+            local closeBtn = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/btn_close")
+            if isvalid(closeBtn) then
+                self.closeBtnEntity = closeBtn
+                self.closeBtnHandler = closeBtn:ConnectEvent(ButtonClickEvent, self.OnCloseClicked)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseShopUI()
+        local shopGroup = _EntityService:GetEntityByPath("/ui/ShopGroup")
+        if isvalid(shopGroup) then
+            shopGroup.Enable = false
+        end
+        local stack = _UIEquipInventoryManager._T.winStack
+        if stack ~= nil then
+            for i = #stack, 1, -1 do
+                if stack[i] == "/ui/ShopGroup" then
+                    table.remove(stack, i)
+                    break
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBuyClicked()
+        self:RequestBuyPotion()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnCloseClicked()
+        self:CloseShopUI()
+    end
+
+end

@@ -1,0 +1,150 @@
+@Component
+script SnailSkillProjectile extends Component
+
+    property number Speed = 6
+    property number MaxRange = 4
+    property string HitEffectRUID = "bb996be9b40e45559d12981c6be603b0"
+    property number YTolerance = 1.0
+
+    -- Default 0 so Fire(1) or Fire(-1) always triggers OnSyncProperty
+    @Sync property number SyncDirX = 0
+
+    method void OnBeginPlay()
+        if self:IsServer() then
+            self._T.moved = 0
+            self._T.hit = false
+            self._T.targetEntity = nil
+            self._T.ownerEntity = nil
+            self._T.hitTargetPos = nil
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnSyncProperty(string name, any value)
+        if name == "SyncDirX" then
+            local opts = {}
+            if self.SyncDirX < 0 then opts["FlipX"] = true end
+            self._T.effectSerial = _EffectService:PlayEffectAttached(
+                "656a620d18744c9bbcb7b4073ba5eb7b", self.Entity,
+                Vector3(0, 0, 0), 0, Vector3(1, 1, 1), true, opts
+            )
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Fire(number dirX, Entity ownerEntity)
+        self._T.moved = 0
+        self._T.hit = false
+        self._T.ownerEntity = ownerEntity
+        self.SyncDirX = dirX
+        self:FindNearestTarget(dirX)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void FindNearestTarget(number dirX)
+        local myPos = self.Entity.TransformComponent.Position
+        local currentMap = self.Entity.CurrentMap
+        if not isvalid(currentMap) then return end
+
+        local nearest = nil
+        local nearestDist = self.MaxRange + 1
+
+        for _, child in ipairs(currentMap.Children:ToTable()) do
+            if isvalid(child) then
+                local hc = child.HitComponent
+                local tc = child.TransformComponent
+                if isvalid(hc) and isvalid(tc) then
+                    local tPos = tc.Position
+                    local dx = tPos.x - myPos.x
+                    local dy = tPos.y - myPos.y
+                    -- Only consider targets in the firing direction
+                    if (dirX > 0 and dx > 0) or (dirX < 0 and dx < 0) then
+                        local dist = math.sqrt(dx * dx + dy * dy)
+                        if dist < nearestDist and math.abs(dy) <= self.YTolerance * 2 then
+                            nearestDist = dist
+                            nearest = child
+                        end
+                    end
+                end
+            end
+        end
+        self._T.targetEntity = nearest
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        if self._T.hit then return end
+
+        local moveX = self.SyncDirX
+        local moveY = 0
+
+        if self._T.targetEntity ~= nil and isvalid(self._T.targetEntity) then
+            local myPos = self.Entity.TransformComponent.Position
+            local tPos = self._T.targetEntity.TransformComponent.Position
+            local dx = tPos.x - myPos.x
+            local dy = tPos.y - myPos.y
+            local d = math.sqrt(dx * dx + dy * dy)
+            if d > 0.01 then
+                moveX = dx / d
+                moveY = dy / d
+            end
+        end
+
+        local dist = self.Speed * delta
+        self.Entity.TransformComponent:Translate(moveX * dist, moveY * dist)
+        self._T.moved = self._T.moved + dist
+
+        if self._T.moved >= self.MaxRange then
+            _EntityService:Destroy(self.Entity)
+            return
+        end
+
+        -- Start hit detection only after moving 0.5 units to prevent self-damage
+        if self._T.moved >= 0.5 then
+            local ac = self.Entity.SnailSkillProjectileAttack
+            if ac ~= nil then
+                local pos = self.Entity.TransformComponent.Position
+                local hits = ac:AttackFrom(
+                    Vector2(0.6, self.YTolerance * 2),
+                    pos:ToVector2(),
+                    "snailSkill",
+                    CollisionGroups.HitBox
+                )
+                if hits ~= nil and #hits > 0 then
+                    self._T.hit = true
+                    local hc = hits[1]
+                    if isvalid(hc) and isvalid(hc.Entity) then
+                        local tc = hc.Entity.TransformComponent
+                        if isvalid(tc) then
+                            local tp = tc.Position
+                            self._T.hitTargetPos = Vector3(tp.x, tp.y + 0.1, tp.z)
+                        end
+                    end
+                    self:OnHit()
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnHit()
+        local p = self._T.hitTargetPos
+        if p == nil then
+            p = self.Entity.TransformComponent.Position
+        end
+        self:ShowHitEffect(p.x, p.y, p.z)
+        _EntityService:Destroy(self.Entity)
+    end
+
+    @ExecSpace("Client")
+    method void ShowHitEffect(number px, number py, number pz)
+        local mapEnt = self.Entity.CurrentMap
+        if not isvalid(mapEnt) then return end
+        _EffectService:PlayEffect(
+            self.HitEffectRUID, mapEnt,
+            Vector3(px, py, pz), 0, Vector3(1, 1, 1), false
+        )
+        _SoundService:PlaySound("04edcf3c77b049bc9bfa1fa0f541b063", 1.0)
+    end
+
+end

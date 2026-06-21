@@ -1,0 +1,368 @@
+@Component
+script MyInventory extends Component
+
+	property number Meso = 1000
+	property table Tab01 = {}
+	property table Tab02 = {}
+	property table Tab03 = {}
+	property number Capacity = 10
+
+	handler OnBeginPlay()
+		local userId = self.Entity.PlayerComponent.UserId
+		local userDataStorage = _DataStorageService:GetUserDataStorage(userId)
+		local errorcode, loadData = userDataStorage:GetAndWait("MyInventoryData")
+
+		if errorcode ~= 0 then
+			log_error("MyInventory 데이터 로딩 실패" .. tostring(errorcode))
+			return
+		end
+
+		if loadData ~= nil then
+			self:Deserialized(loadData)
+		end
+
+		self:SendInitializedEvent()
+
+		self:AddItem("potion_red", 5)
+		self:AddItem("woodstick", 1001)
+		self:AddItem("santa_hat", 5)
+
+		local saveInventory = function()
+			local saveData = self:Serialize()
+			userDataStorage:SetAsync("MyInventoryData", saveData, function() log("[MyInventoryData] 저장 완료") end)
+			log("[MyInventoryData] 저장중")
+		end
+
+		local saveInterval = 600
+		_TimerService:SetTimerRepeat(saveInventory, saveInterval, saveInterval)
+	end
+
+	method void Deserialized(string dataString)
+		if dataString == nil or dataString == "" then
+			return
+		end
+
+		local dataTale = _HttpService:JSONDecode(dataString)
+		local meso = dataTale.Meso
+		local tab01 = dataTale.Tab01
+		local tab02 = dataTale.Tab02
+		local tab03 = dataTale.Tab03
+
+		self.Meso = math.tointeger(meso)
+
+		if tab01 ~= nil then
+			for _, stackData in pairs(tab01) do
+				local stack = ItemStack()
+				stack:FromTable(stackData)
+				self.Tab01[stack.SlotIndex] = stack
+			end
+		end
+		if tab02 ~= nil then
+			for _, stackData in pairs(tab02) do
+				local stack = ItemStack()
+				stack:FromTable(stackData)
+				self.Tab02[stack.SlotIndex] = stack
+			end
+		end
+		if tab03 ~= nil then
+			for _, stackData in pairs(tab03) do
+				local stack = ItemStack()
+				stack:FromTable(stackData)
+				self.Tab03[stack.SlotIndex] = stack
+			end
+		end
+	end
+
+	method void SendInitializedEvent()
+		local event = MyInventoryInitializedEvent()
+		event.Meso = self.Meso
+		event.Tab01 = self.Tab01
+		event.Tab02 = self.Tab02
+		event.Tab03 = self.Tab03
+		self.Entity:SendEvent(event)
+		self:SendInitializedEventToClient(event, self.Entity.PlayerComponent.UserId)
+	end
+
+	method void SendInitializedEventToClient(any event, string userId)
+		self.Meso = event.Meso
+		self.Tab01 = event.Tab01
+		self.Tab02 = event.Tab02
+		self.Tab03 = event.Tab03
+		self.Entity:SendEvent(event)
+	end
+
+	method string Serialize()
+		local dataTable = {}
+		local tab01 = {}
+		local tab02 = {}
+		local tab03 = {}
+
+		dataTable.Meso = self.Meso
+
+		for _, stack in pairs(self.Tab01) do
+			table.insert(tab01, stack:ToTable())
+		end
+		if #tab01 > 0 then dataTable.Tab01 = tab01 end
+
+		for _, stack in pairs(self.Tab02) do
+			table.insert(tab02, stack:ToTable())
+		end
+		if #tab02 > 0 then dataTable.Tab02 = tab02 end
+
+		for _, stack in pairs(self.Tab03) do
+			table.insert(tab03, stack:ToTable())
+		end
+		if #tab03 > 0 then dataTable.Tab03 = tab03 end
+
+		return _HttpService:JSONEncode(dataTable)
+	end
+
+	method number AddItem(string itemId, number ItemCount)
+		local itemInfo = _Data.ItemTable[itemId]
+		if itemInfo == nil then
+			log_error("[MyInventory] (AddItem) 아이템 Id 오류 :" .. itemId)
+			return
+		end
+		if ItemCount <= 0 then
+			log_error("[MyInventory] (AddItem) 아이템 Count 오류 :" .. itemId)
+			return
+		end
+
+		local maxStackCount = itemInfo.MaxStackCount
+		local remain = ItemCount
+		local itemCategory = itemInfo.Category
+		local tab = self:GetTab(itemCategory)
+
+		for i = 1, self.Capacity do
+			if remain <= 0 then break end
+			local stack = tab[i]
+			if stack ~= nil and stack.ItemId == itemId then
+				local addCount = math.min(maxStackCount - stack.Count, remain)
+				stack.Count = stack.Count + addCount
+				remain = remain - addCount
+				self:SendItemModifiedEvent(stack, itemCategory)
+			end
+		end
+
+		for i = 1, self.Capacity do
+			if remain <= 0 then break end
+			if tab[i] ~= nil then continue end
+			local addCount = math.min(maxStackCount, remain)
+			local newStack = ItemStack()
+			newStack.SlotIndex = i
+			newStack.ItemId = itemId
+			newStack.Count = addCount
+			tab[i] = newStack
+			remain = remain - addCount
+			self:SendItemAddedEvent(newStack, itemCategory)
+		end
+
+		return remain
+	end
+
+	method void SendItemAddedEvent(any stack, string category)
+		local event = MyInventoryItemAddedEvent()
+		event.Category = category
+		event.SlotIndex = stack.SlotIndex
+		event.ItemId = stack.ItemId
+		event.ItemCount = stack.Count
+		self.Entity:SendEvent(event)
+		self:SendItemAddedEventToClient(event, self.Entity.PlayerComponent.UserId)
+	end
+
+	method void SendItemAddedEventToClient(any event, string userId)
+		local tab = self:GetTab(event.Category)
+		if tab == nil then return end
+		local stack = ItemStack()
+		stack.SlotIndex = event.SlotIndex
+		stack.ItemId = event.ItemId
+		stack.Count = event.ItemCount
+		tab[event.SlotIndex] = stack
+		self.Entity:SendEvent(event)
+	end
+
+	method void SendItemModifiedEvent(any stack, string category)
+		local event = MyInventoryItemModifiedEvent()
+		event.Category = category
+		event.SlotIndex = stack.SlotIndex
+		event.ItemId = stack.ItemId
+		event.ItemCount = stack.Count
+		self.Entity:SendEvent(event)
+		self:SendItemModifiedEventToClient(event, self.Entity.PlayerComponent.UserId)
+	end
+
+	method void SendItemModifiedEventToClient(any event, string userId)
+		local tab = self:GetTab(event.Category)
+		local stack = tab[event.SlotIndex]
+		stack.SlotIndex = event.SlotIndex
+		stack.ItemId = event.ItemId
+		stack.Count = event.ItemCount
+		self.Entity:SendEvent(event)
+	end
+
+	method void SendItemRemovedEvent(any stack, string category)
+		local event = MyInventoryItemRemovedEvent()
+		event.Category = category
+		event.SlotIndex = stack.SlotIndex
+		event.ItemId = stack.ItemId
+		self.Entity:SendEvent(event)
+		self:SendItemRemovedEventToClient(event, self.Entity.PlayerComponent.UserId)
+	end
+
+	method void SendItemRemovedEventToClient(any event, string userId)
+		local category = event.Category
+		if category == "Tab01" then self.Tab01[event.SlotIndex] = nil
+		elseif category == "Tab02" then self.Tab02[event.SlotIndex] = nil
+		elseif category == "Tab03" then self.Tab03[event.SlotIndex] = nil
+		end
+		self.Entity:SendEvent(event)
+	end
+
+	method boolean RemoveItemAt(number slotIndex, number itemCount, string category)
+		if slotIndex < 1 or slotIndex > self.Capacity then
+			log_error("[MyInventory] (RemoveItemAt) slotIndex 오류 :" .. slotIndex)
+			return false
+		end
+		local tab = self:GetTab(category)
+		local stack = tab[slotIndex]
+		if stack == nil then
+			log_error("[MyInventory] (RemoveItemAt) 슬롯에 아이템이 없습니다.")
+			return false
+		end
+		if stack.Count < itemCount then
+			log_error("[MyInventory] (RemoveItemAt) 아이템 수가 부족합니다.")
+			return false
+		end
+		stack.Count -= itemCount
+		if stack.Count > 0 then
+			self:SendItemModifiedEvent(stack, category)
+		else
+			tab[slotIndex] = nil
+			self:SendItemRemovedEvent(stack, category)
+		end
+		return true
+	end
+
+	method void SendMesoModifiedEvent(number meso)
+		local event = MyInventoryMesoModifiedEvent()
+		event.Meso = meso
+		self.Entity:SendEvent(event)
+		self:SendMesoModifiedEventToClient(event, self.Entity.PlayerComponent.UserId)
+	end
+
+	method void SendMesoModifiedEventToClient(any event, string userId)
+		self.Meso = event.Meso
+		self.Entity:SendEvent(event)
+	end
+
+	method void SetMeso(number meso)
+		self.Meso = meso
+		self:SendMesoModifiedEvent(meso)
+	end
+
+	method table GetTab(string category)
+		if category == "Tab01" then return self.Tab01
+		elseif category == "Tab02" then return self.Tab02
+		elseif category == "Tab03" then return self.Tab03
+		end
+	end
+
+	method void RequestMoveItem(number from, number to, string category, string senderUserId)
+		local owner = self.Entity.PlayerComponent.UserId
+		if owner ~= senderUserId then return end
+		self:MoveItem(from, to, category)
+	end
+
+	method void MoveItem(number from, number to, string category)
+		local tab = self:GetTab(category)
+		if tab == nil then return end
+
+		local itemFrom = tab[from]
+		local itemTo = tab[to]
+
+		if itemTo ~= nil then
+			local category1 = _Data:GetCategory(itemFrom.ItemId)
+			local category2 = _Data:GetCategory(itemTo.ItemId)
+			if category1 ~= category or category2 ~= category then
+				log_error("[MyInventory] (MoveItem) 아이템 카테고리가 서로 다릅니다.")
+				return
+			end
+			tab[to] = itemFrom
+			tab[from] = itemTo
+			itemFrom.SlotIndex = to
+			itemTo.SlotIndex = from
+		else
+			tab[from] = nil
+			tab[to] = itemFrom
+			itemFrom.SlotIndex = to
+		end
+		self:SendItemMovedEvent(itemFrom, itemTo, category, from)
+	end
+
+	method void SendItemMovedEvent(any itemFrom, any itemTo, string category, number from)
+		local event = MyInventoryMovedEvent()
+		event.SlotIndex2 = itemFrom.SlotIndex
+		event.ItemId2 = itemFrom.ItemId
+		event.ItemCount2 = itemFrom.Count
+		if itemTo ~= nil then
+			event.SlotIndex1 = itemTo.SlotIndex
+			event.ItemId1 = itemTo.ItemId
+			event.ItemCount1 = itemTo.Count
+		else
+			event.SlotIndex1 = from
+			event.ItemId1 = ""
+			event.ItemCount1 = 0
+		end
+		event.Category = category
+		self.Entity:SendEvent(event)
+		self:SendItemMovedEventToClient(event, category, self.Entity.PlayerComponent.UserId)
+	end
+
+	method void SendItemMovedEventToClient(any event, string category, string userId)
+		local tab = self:GetTab(category)
+		if event.ItemId1 == "" then
+			tab[event.SlotIndex1] = nil
+		else
+			local stack1 = ItemStack()
+			stack1.SlotIndex = event.SlotIndex1
+			stack1.ItemId = event.ItemId1
+			stack1.Count = event.ItemCount1
+			tab[event.SlotIndex1] = stack1
+		end
+		local stack2 = ItemStack()
+		stack2.SlotIndex = event.SlotIndex2
+		stack2.ItemId = event.ItemId2
+		stack2.Count = event.ItemCount2
+		tab[event.SlotIndex2] = stack2
+		self.Entity:SendEvent(event)
+	end
+
+	method void RequestThrowItem(number slotIndex, number itemCount, string category, string senderUserId)
+		local owner = self.Entity.PlayerComponent.UserId
+		if owner ~= senderUserId then return end
+		self:RemoveItemAt(slotIndex, itemCount, category)
+	end
+
+	@EventSender("service:UserService")
+	handler HandleUserLeaveEvent(UserLeaveEvent event)
+		local thisUserId = event.UserId
+		if thisUserId ~= self.Entity.PlayerComponent.UserId then return end
+		local userDataStorage = _DataStorageService:GetUserDataStorage(thisUserId)
+		if userDataStorage ~= nil then
+			local saveData = self:Serialize()
+			userDataStorage:SetAndWait("MyInventoryData", saveData)
+		end
+	end
+
+	@EventSender("service:InputService")
+	handler HandleKeyDownEvent(KeyDownEvent event)
+		local key = event.Key
+		local inventory = _EntityService:GetEntityByPath("/ui/DefaultGroup/Inventory")
+		if key == KeyboardKey.I and inventory.Enable == false then
+			inventory.Enable = true
+		elseif key == KeyboardKey.I and inventory.Enable == true then
+			inventory.Enable = false
+		end
+	end
+
+end

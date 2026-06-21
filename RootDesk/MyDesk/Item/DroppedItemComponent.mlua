@@ -1,0 +1,93 @@
+@Component
+script DroppedItemComponent extends Component
+
+    @Sync property string ItemName = "껍질"
+    @Sync property string ItemRUID = "927d463a046b48869cffa1eeaf8e3f5a"
+    @Sync property string ItemType = "sprite"   -- "sprite" or "avataritem"
+
+    -- 사인파+quartic ease-in: 처음엔 거의 정지, 끝에 급격히 왼쪽으로 날아감
+    property number arcElapsed = 0.0
+    property boolean arcDone = false
+    property number arcStartX = 0.0
+    property number arcStartY = 0.0
+    property number arcTotalX = -14.0   -- total x displacement (world units, left)
+    property number arcPeakHeight = 5.0 -- arc peak height (world units)
+    property number arcDuration = 2.5
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        local pos = self.Entity.TransformComponent.WorldPosition
+        self.arcStartX = pos.x
+        self.arcStartY = pos.y
+        log("[DroppedItem] 드랍: " .. self.ItemName)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        -- Dramatic ease-in: rises almost vertically, then suddenly whips left
+        if self.arcDone then return end
+        self.arcElapsed = self.arcElapsed + delta
+        local t = self.arcElapsed
+        if t >= self.arcDuration then
+            self.arcDone = true
+            self:AutoPickup()
+            return
+        end
+        local n = t / self.arcDuration
+        local ne_x = n * n * n * n               -- quartic ease-in for X (극적: 처음에 거의 안 움직임)
+        local ne_y = n * n                        -- quadratic ease-in for Y (더 빨리 올라감)
+        -- X: stays near origin for most of flight, then suddenly whips left
+        local x = self.arcStartX + self.arcTotalX * ne_x
+        -- Y: rises fast to peak (sin arc), creating clear curved trajectory
+        local y = self.arcStartY + self.arcPeakHeight * math.sin(ne_y * math.pi)
+        self.Entity.TransformComponent.Position = Vector3(x, y, 0)
+        -- Rotation: quartic ease-in spin (stays slow then spins fast at end)
+        self.Entity.TransformComponent:Rotate(-(80 + 640 * ne_x) * delta)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void AutoPickup()
+        local map = self.Entity.CurrentMap
+        if not isvalid(map) then
+            self.Entity:Destroy()
+            return
+        end
+
+        -- Find nearest player on this map
+        local players = _UserService:GetUsersByMapComponent(map.MapComponent)
+        local targetUserId = nil
+
+        if players ~= nil then
+            local myPos = self.Entity.TransformComponent.WorldPosition
+            local nearestDistSq = math.huge
+            for _, player in ipairs(players) do
+                if isvalid(player) then
+                    local pc = player.PlayerComponent
+                    if isvalid(pc) then
+                        local pPos = player.TransformComponent.WorldPosition
+                        local dx = pPos.x - myPos.x
+                        local dy = pPos.y - myPos.y
+                        local distSq = dx * dx + dy * dy
+                        if distSq < nearestDistSq then
+                            nearestDistSq = distSq
+                            targetUserId = pc.UserId
+                        end
+                    end
+                end
+            end
+        end
+
+        local itemName = self.ItemName
+        local itemRUID = self.ItemRUID
+        local itemType = self.ItemType
+        self.Entity:Destroy()
+
+        if targetUserId ~= nil then
+            _ItemPickupLogic:DeliverItem(itemName, itemRUID, itemType, targetUserId)
+            log("[DroppedItem] 자동 습득 완료: " .. itemName)
+        else
+            log("[DroppedItem] 주변 플레이어 없어 소멸: " .. itemName)
+        end
+    end
+
+end
