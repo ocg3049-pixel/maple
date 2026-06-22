@@ -49,6 +49,10 @@ script UIEquipInventoryManager extends Logic
 		self._T.isDraggingPotion = false
 		self._T.potionInvenSlot = 0
 		self._T.pendingCancelPotionDrag = false
+		self._T.isDraggingEquipToEnhance = false
+		self._T.dragEquipToEnhanceSlot = 0
+		self._T.hoverEnhanceSlot = false
+		self._T.pendingCancelEquipDrag = false
 		self._T.pendingHideTooltip = false
 		self._T.isDraggingThumb = false
 		self._T.thumbDragOffsetY = 0.0
@@ -62,8 +66,10 @@ script UIEquipInventoryManager extends Logic
 		self._T.pendingShowSlotIdx = 0
 		local cE = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/CloseEquip")
 		local cI = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/CloseInven")
+		local cEnh = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/CloseEnhance")
 		if isvalid(cE) then cE:ConnectEvent(ButtonClickEvent, self.OnCloseEquip) end
 		if isvalid(cI) then cI:ConnectEvent(ButtonClickEvent, self.OnCloseInven) end
+		if isvalid(cEnh) then cEnh:ConnectEvent(ButtonClickEvent, self.OnCloseEnhance) end
 		_InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
 
 		-- 장비 슬롯: UITouchReceiveComponent 추가 후 click + hover 연결
@@ -280,6 +286,13 @@ script UIEquipInventoryManager extends Logic
 		local initGhost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
 		if isvalid(initGhost) then initGhost.Enable = false end
 		log("[EquipInven] drag-drop wired")
+		-- 강화 드롭존 hover 감지
+		local dropZone = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/SlotArea/TargetSlotBG/DropZone")
+		if isvalid(dropZone) then
+			dropZone:ConnectEvent(UITouchEnterEvent, self.OnEnhanceDropEnter)
+			dropZone:ConnectEvent(UITouchExitEvent, self.OnEnhanceDropExit)
+			log("[EquipInven] 강화 드롭존 wired")
+		end
 
 		-- 창 타이틀바 드래그 와이어링
 		local titlePaths = {
@@ -532,6 +545,11 @@ script UIEquipInventoryManager extends Logic
 		self:HideTooltip()
 	end
 
+	@ExecSpace("ClientOnly")
+	method void OnCloseEnhance(ButtonClickEvent event)
+		_EnhancementManager:CloseWindow()
+	end
+
 	-- 장비 슬롯 핸들러 (UITouchDownEvent, 왼쪽 클릭만)
 	@ExecSpace("ClientOnly")
 	method void OnEquipBtn1(UITouchDownEvent e)
@@ -646,6 +664,8 @@ script UIEquipInventoryManager extends Logic
 				return
 			end
 			if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+				-- 더블클릭: 드래그 취소 후 즉시 대상 설정
+				if self._T.isDraggingEquipToEnhance then self:CancelEquipDrag() end
 				local s = self:GetInven(slotIdx)
 				if _EnhancementManager:IsWindowOpen() then
 					if s ~= "" then
@@ -660,6 +680,11 @@ script UIEquipInventoryManager extends Logic
 			else
 				self.lastInvenSlot = slotIdx
 				self.lastInvenTime = t
+				-- 단일 클릭: 강화창 열려있으면 드래그 시작
+				if _EnhancementManager:IsWindowOpen() then
+					local s = self:GetInven(slotIdx)
+					if s ~= "" then self:StartEquipDrag(slotIdx) end
+				end
 			end
 		end
 	end
@@ -1111,6 +1136,47 @@ script UIEquipInventoryManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void StartEquipDrag(number invenSlot)
+		self._T.isDraggingEquipToEnhance = true
+		self._T.dragEquipToEnhanceSlot = invenSlot
+		self._T.pendingCancelEquipDrag = false
+		local s = self:GetInven(invenSlot)
+		local ruid = s ~= "" and self:ParseInvenRUID(s) or ""
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) then
+			if ruid ~= "" then
+				ghost.SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. ruid
+			end
+			ghost.Enable = true
+		end
+		log("[EquipDrag] 시작 slot=" .. tostring(invenSlot))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelEquipDrag()
+		self._T.isDraggingEquipToEnhance = false
+		self._T.dragEquipToEnhanceSlot = 0
+		self._T.hoverEnhanceSlot = false
+		self._T.pendingCancelEquipDrag = false
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) then
+			ghost.Enable = false
+			ghost.SpriteGUIRendererComponent.ImageRUID = ""
+		end
+		log("[EquipDrag] 취소")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEnhanceDropEnter(UITouchEnterEvent e)
+		self._T.hoverEnhanceSlot = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEnhanceDropExit(UITouchExitEvent e)
+		self._T.hoverEnhanceSlot = false
+	end
+
+	@ExecSpace("ClientOnly")
 	method void ApplyScrollToEquip(number equipSlot)
 		if not self.isDragging then return end
 		local scrollSlot = self.dragScrollSlot
@@ -1214,6 +1280,23 @@ script UIEquipInventoryManager extends Logic
 				end
 			else
 				self._T.pendingCancelPotionDrag = false
+				local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+				if isvalid(ghost) then
+					ghost.UITransformComponent.anchoredPosition = cursorUI
+				end
+			end
+		end
+		-- 강화 드래그: 고스트 위치 갱신
+		if self._T.isDraggingEquipToEnhance then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				if self._T.pendingCancelEquipDrag then
+					self:CancelEquipDrag()
+					self._T.pendingCancelEquipDrag = false
+				else
+					self._T.pendingCancelEquipDrag = true
+				end
+			else
+				self._T.pendingCancelEquipDrag = false
 				local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
 				if isvalid(ghost) then
 					ghost.UITransformComponent.anchoredPosition = cursorUI
@@ -1334,6 +1417,19 @@ script UIEquipInventoryManager extends Logic
 			end
 			self:CancelPotionDrag()
 		end
+		if self._T.isDraggingEquipToEnhance then
+			if self._T.hoverEnhanceSlot then
+				local slot = self._T.dragEquipToEnhanceSlot
+				local s = self:GetInven(slot)
+				if s ~= "" then
+					local name = self:ParseName(s)
+					local ruid = self:ParseInvenRUID(s)
+					_EnhancementManager:SetEnhanceTarget(name, ruid, slot)
+					log("[Drag] 강화 드롭 성공: " .. name)
+				end
+			end
+			self:CancelEquipDrag()
+		end
 		if self._T.isDraggingWindow then self:StopWindowDrag() end
 	end
 
@@ -1346,7 +1442,7 @@ script UIEquipInventoryManager extends Logic
 		elseif path == "/ui/DefaultGroup/EquipWindow" then
 			return Vector2(-230, 0)
 		elseif path == "/ui/DefaultGroup/EnhanceWindow" then
-			return Vector2(600, 0)
+			return Vector2(550, 0)
 		end
 		return Vector2(0, 0)
 	end
