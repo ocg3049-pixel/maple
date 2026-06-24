@@ -15,8 +15,20 @@ script EnhancementManager extends Logic
 	property integer enhanceLevel = 0
 	property integer currentTab = 0   -- 0=없음 1=스타포스 2=주문서 3=추가옵션 4=잠재능력 5=에디셔널
 
+	-- 큐브 리셋 UI 상태
+	property integer potSelectedSlot = 0   -- 잠재능력 탭 선택 큐브 슬롯 (1-18, 0=미선택)
+	property integer addSelectedSlot = 0   -- 에디셔널 탭 선택 큐브 슬롯
+	property integer potCurrencyTab  = 0   -- 0=큐브, 1=메소
+	property integer addCurrencyTab  = 0
+	property string enhanceTargetItemStr = ""  -- 대상 아이템 전체 문자열
+	property string enhanceTargetSrcTab  = ""  -- 대상 아이템이 위치한 인벤 탭 키
+
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		self._T.potCubeSlots = {}
+		self._T.addCubeSlots = {}
+		self._T.tabPotDisabled = true   -- 아이템 없으면 기본 비활성화
+		self._T.tabAddDisabled = true
 		-- 강화 열기 버튼 (인벤창 하단)
 		local openBtn = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/MesoBar/EnhanceOpenBtn")
 		log("[Enhance] openBtn isvalid=" .. tostring(isvalid(openBtn)))
@@ -67,6 +79,8 @@ script EnhancementManager extends Logic
 			local tabPath = self.pathLeft .. "/" .. tabName
 			local function tabHandler(e)
 				log("[Enhance] 탭 클릭 idx=" .. tostring(capturedIdx))
+				if capturedIdx == 4 and self._T.tabPotDisabled then return end
+				if capturedIdx == 5 and self._T.tabAddDisabled then return end
 				self:SelectTab(capturedIdx)
 			end
 			-- TabBG 스프라이트에 RaycastTarget=true + UITouchReceiveComponent 연결
@@ -82,15 +96,115 @@ script EnhancementManager extends Logic
 			end
 		end
 		log("[Enhance] 탭 와이어링 완료")
+
+		-- 큐브 리셋 UI 버튼 와이어링 (잠재능력 탭=4, 에디셔널 탭=5)
+		local cubeTabInfos = {
+			{ tabIdx=4, contentName="PotentialContent" },
+			{ tabIdx=5, contentName="AdditionalContent" },
+		}
+		for _, info in ipairs(cubeTabInfos) do
+			local tIdx = info.tabIdx
+			local cPath = self.pathContent .. "/" .. info.contentName
+
+			-- 메소 탭 버튼 (BG sprite에 연결 - SPR 엔티티에서만 UITouchReceive 동작)
+			local mesoBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBG")
+			if isvalid(mesoBG) then
+				mesoBG.SpriteGUIRendererComponent.RaycastTarget = true
+				if not isvalid(mesoBG:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					mesoBG:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				local captTab = tIdx
+				mesoBG:ConnectEvent(UITouchDownEvent, function(e)
+					if e.TouchId ~= -1 then return end
+					self:OnMesoTabTouch(captTab)
+				end)
+				log("[Enhance] MesoTabBG 연결 tab=" .. tostring(tIdx))
+			end
+
+			-- 큐브 탭 버튼 (BG sprite에 연결)
+			local cubeBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBG")
+			if isvalid(cubeBG) then
+				cubeBG.SpriteGUIRendererComponent.RaycastTarget = true
+				if not isvalid(cubeBG:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					cubeBG:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				local captTab = tIdx
+				cubeBG:ConnectEvent(UITouchDownEvent, function(e)
+					if e.TouchId ~= -1 then return end
+					self:OnCubeTabTouch(captTab)
+				end)
+				log("[Enhance] CubeTabBG 연결 tab=" .. tostring(tIdx))
+			end
+
+			-- 18개 큐브 슬롯 (SlotBG sprite에 연결)
+			for i = 1, 18 do
+				local slotBG = _EntityService:GetEntityByPath(cPath .. "/CubePanel/CubeGrid/CubeSlot" .. tostring(i) .. "/SlotBG")
+				if isvalid(slotBG) then
+					slotBG.SpriteGUIRendererComponent.RaycastTarget = true
+					if not isvalid(slotBG:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+						slotBG:AddComponent("MOD.Core.UITouchReceiveComponent")
+					end
+					local captTab  = tIdx
+					local captSlot = i
+					slotBG:ConnectEvent(UITouchDownEvent, function(e)
+						if e.TouchId ~= -1 then return end
+						self:OnCubeSlotTouch(captTab, captSlot)
+					end)
+				end
+			end
+
+			-- 재설정하기 버튼 (BG sprite에 연결)
+			local resetBG = _EntityService:GetEntityByPath(cPath .. "/ResetBtnBG")
+			if isvalid(resetBG) then
+				resetBG.SpriteGUIRendererComponent.RaycastTarget = true
+				if not isvalid(resetBG:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					resetBG:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				local captTab = tIdx
+				resetBG:ConnectEvent(UITouchDownEvent, function(e)
+					if e.TouchId ~= -1 then return end
+					self:OnResetBtnTouch(captTab)
+				end)
+				log("[Enhance] ResetBtnBG 연결 tab=" .. tostring(tIdx))
+			end
+		end
+		log("[Enhance] 큐브 UI 와이어링 완료")
+
+		-- 강화 슬롯 hover → 아이템 설명창 / 더블클릭 → ClearTarget
+		local targetBG = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG")
+		if isvalid(targetBG) then
+			self._T.lastTargetClickTime = 0
+			targetBG:ConnectEvent(UITouchEnterEvent, function(e)
+				if self.enhanceTargetInvenIdx > 0 then
+					_UIEquipInventoryManager:ShowInvenTooltip(self.enhanceTargetInvenIdx)
+				end
+			end)
+			targetBG:ConnectEvent(UITouchExitEvent, function(e)
+				_UIEquipInventoryManager:HideTooltip()
+			end)
+			targetBG:ConnectEvent(UITouchDownEvent, function(e)
+				if e.TouchId ~= -1 then return end
+				local t = _UtilLogic.ElapsedSeconds
+				if t - self._T.lastTargetClickTime < 0.5 then
+					self:ClearTarget()
+					self._T.lastTargetClickTime = 0
+				else
+					self._T.lastTargetClickTime = t
+				end
+			end)
+			log("[Enhance] TargetSlotBG hover/더블클릭 연결")
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void SelectTab(integer idx)
 		self.currentTab = idx
-		local TAB_ACTIVE = Color(0.27, 0.75, 1.0, 1.0)
-		local TAB_NORMAL = Color(0.22, 0.22, 0.28, 1.0)
-		local TAB_TEXT_ON  = Color(1.0, 1.0, 0.6, 1.0)
-		local TAB_TEXT_OFF = Color(1.0, 1.0, 1.0, 1.0)
+		local TAB_ACTIVE    = Color(0.27, 0.75, 1.0, 1.0)
+		local TAB_NORMAL    = Color(0.22, 0.22, 0.28, 1.0)
+		local TAB_DISABLED  = Color(0.15, 0.15, 0.17, 0.7)
+		local TAB_TEXT_ON   = Color(1.0, 1.0, 0.6, 1.0)
+		local TAB_TEXT_OFF  = Color(1.0, 1.0, 1.0, 1.0)
+		local TAB_TEXT_DIS  = Color(0.4, 0.4, 0.4, 1.0)
 
 		local tabNames = {
 			"EnhanceTab_Starforce",
@@ -110,24 +224,37 @@ script EnhancementManager extends Logic
 		-- 탭 색상 / 컨텐츠 패널 표시
 		for i, tabName in ipairs(tabNames) do
 			local tabPath = self.pathLeft .. "/" .. tabName
+			local isDisabled = (i == 4 and self._T.tabPotDisabled) or (i == 5 and self._T.tabAddDisabled)
+			local bgColor
+			local textColor
+			if i == idx then
+				bgColor = TAB_ACTIVE; textColor = TAB_TEXT_ON
+			elseif isDisabled then
+				bgColor = TAB_DISABLED; textColor = TAB_TEXT_DIS
+			else
+				bgColor = TAB_NORMAL; textColor = TAB_TEXT_OFF
+			end
 			local bg = _EntityService:GetEntityByPath(tabPath .. "/TabBG")
 			if isvalid(bg) then
-				bg.SpriteGUIRendererComponent.Color = (i == idx) and TAB_ACTIVE or TAB_NORMAL
+				bg.SpriteGUIRendererComponent.Color = bgColor
 			end
 			local lbl = _EntityService:GetEntityByPath(tabPath .. "/TabLbl")
 			if isvalid(lbl) then
-				lbl.TextComponent.FontColor = (i == idx) and TAB_TEXT_ON or TAB_TEXT_OFF
+				lbl.TextComponent.FontColor = textColor
 			end
 			local ct = _EntityService:GetEntityByPath(self.pathContent .. "/" .. contentNames[i])
 			if isvalid(ct) then ct.Enable = (i == idx) end
 		end
 
-		-- DefaultContent는 탭 선택 시 숨김
+		-- idx=0(대기): DefaultContent 표시 / 나머지: 숨김
 		local defContent = _EntityService:GetEntityByPath(self.pathContent .. "/DefaultContent")
-		if isvalid(defContent) then defContent.Enable = false end
+		if isvalid(defContent) then defContent.Enable = (idx == 0) end
 
 		-- 스타포스 탭 선택 시 현재 레벨로 UI 갱신
 		if idx == 1 then self:UpdateStarforceUI(self.enhanceLevel) end
+
+		-- 잠재능력 / 에디셔널 탭 선택 시 큐브 UI 갱신
+		if idx == 4 or idx == 5 then self:RefreshCubeContent(idx) end
 
 		log("[Enhance] SelectTab=" .. tostring(idx))
 	end
@@ -178,6 +305,27 @@ script EnhancementManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OpenWindowWithTab(integer tabIdx)
+		-- 강화창을 열고 지정 탭을 선택한다 (큐브 더블클릭 진입점)
+		local dg = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(dg) and not dg.Enable then dg.Enable = true end
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+		if not isvalid(w) then log("[Enhance] OpenWindowWithTab: EnhanceWindow 없음") return end
+		if not w.Enable then
+			w.Enable = true
+			local cur = w.UITransformComponent.anchoredPosition
+			local isUnset = math.abs(cur.x) < 5 and math.abs(cur.y) < 5
+			local isOffScreen = math.abs(cur.x) > 1000 or math.abs(cur.y) > 1000
+			if isUnset or isOffScreen then
+				w.UITransformComponent.anchoredPosition = Vector2(550, 0)
+			end
+		end
+		self:SelectTab(tabIdx)
+		if self.enhanceTargetRUID == "" then self:ClearTarget() end
+		log("[Enhance] OpenWindowWithTab tab=" .. tostring(tabIdx))
+	end
+
+	@ExecSpace("ClientOnly")
 	method void ToggleWindow()
 		local dg = _EntityService:GetEntityByPath("/ui/DefaultGroup")
 		if isvalid(dg) and not dg.Enable then dg.Enable = true end
@@ -218,7 +366,11 @@ script EnhancementManager extends Logic
 		self.enhanceTargetRUID = ruid
 		self.enhanceTargetInvenIdx = invenIdx
 
-		local s = _UIEquipInventoryManager:GetInven(invenIdx)
+		-- 아이템 문자열 및 탭 저장 (탭 전환 후에도 정확한 데이터 유지)
+		self.enhanceTargetItemStr = _UIEquipInventoryManager:GetInven(invenIdx)
+		self.enhanceTargetSrcTab  = _UIEquipInventoryManager._T.activeTab
+
+		local s = self.enhanceTargetItemStr
 		if s ~= "" then
 			self.enhanceLevel = _UIEquipInventoryManager:ParseStars(s)
 		else
@@ -254,6 +406,9 @@ script EnhancementManager extends Logic
 		if self.currentTab == 1 then
 			self:UpdateStarforceUI(self.enhanceLevel)
 		end
+
+		-- 탭 비활성화 갱신 및 큐브 UI 갱신
+		self:UpdateTabDisabledState()
 
 		self:AppendLog("대상: " .. name)
 		log("[Enhance] 대상 설정: " .. name .. " 인벤=" .. tostring(invenIdx))
@@ -453,6 +608,10 @@ script EnhancementManager extends Logic
 		self.enhanceTargetRUID = ""
 		self.enhanceTargetInvenIdx = 0
 		self.enhanceLevel = 0
+		self.enhanceTargetItemStr = ""
+		self.enhanceTargetSrcTab  = ""
+		self.potSelectedSlot = 0
+		self.addSelectedSlot = 0
 		if self.currentTab == 1 then self:UpdateStarforceUI(0) end
 
 		local icon = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/TargetIcon")
@@ -478,6 +637,617 @@ script EnhancementManager extends Logic
 
 		local levelText = _EntityService:GetEntityByPath(self.pathContent .. "/StarforceContent/EnhanceLevelText")
 		if isvalid(levelText) then levelText.TextComponent.Text = "+0강" end
+
+		-- 탭 비활성화 갱신 (아이템 없음)
+		self:UpdateTabDisabledState()
+	end
+
+	-- ─── 탭 비활성화 상태 갱신 ──────────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void UpdateTabDisabledState()
+		local hasPot = false
+		local hasAdd = false
+		local s = self.enhanceTargetItemStr
+		if s ~= "" then
+			local fields = {}
+			local pos = 1
+			while true do
+				local j, _ = string.find(s, "|", pos, true)
+				if j then fields[#fields+1] = string.sub(s, pos, j-1); pos = j+1
+				else fields[#fields+1] = string.sub(s, pos); break end
+			end
+			if #fields >= 8 then
+				hasPot = (tonumber(fields[7]) or 0) >= 1
+				hasAdd = (tonumber(fields[8]) or 0) >= 1
+			end
+		end
+		self._T.tabPotDisabled = not hasPot
+		self._T.tabAddDisabled = not hasAdd
+
+		-- 현재 탭이 비활성화된 경우 대기 상태(0)로 전환
+		if (self.currentTab == 4 and self._T.tabPotDisabled) or
+		   (self.currentTab == 5 and self._T.tabAddDisabled) then
+			self:SelectTab(0)
+		elseif self.currentTab == 4 or self.currentTab == 5 then
+			self:RefreshCubeContent(self.currentTab)
+		else
+			-- 다른 탭 유지 — 탭 색상만 SelectTab 재호출로 갱신
+			self:SelectTab(self.currentTab)
+		end
+		log("[Enhance] TabDisabled pot=" .. tostring(self._T.tabPotDisabled) .. " add=" .. tostring(self._T.tabAddDisabled))
+	end
+
+	-- ─── 큐브 리셋: 상태 표시 갱신 ─────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void RefreshCubeContent(integer tabIdx)
+		-- 잠재능력(4) 또는 에디셔널(5) 탭의 우측 패널 상태 결정 후 UI 갱신
+		local contentName = tabIdx == 4 and "PotentialContent" or "AdditionalContent"
+		local cPath = self.pathContent .. "/" .. contentName
+
+		local function setStatePanel(noItem, incompat, itemInfo)
+			local pNone = _EntityService:GetEntityByPath(cPath .. "/NoItemPanel")
+			local pInco = _EntityService:GetEntityByPath(cPath .. "/IncompatiblePanel")
+			local pItem = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel")
+			if isvalid(pNone) then pNone.Enable = noItem   end
+			if isvalid(pInco) then pInco.Enable = incompat  end
+			if isvalid(pItem) then pItem.Enable = itemInfo  end
+		end
+
+		local s = self.enhanceTargetItemStr
+		if s == "" then
+			setStatePanel(true, false, false)
+			return
+		end
+
+		-- 파이프 구분 필드 파싱
+		local fields = {}
+		local pos = 1
+		while true do
+			local j = (string.find(s, "|", pos, true))
+			if j then fields[#fields+1] = string.sub(s, pos, j-1); pos = j+1
+			else fields[#fields+1] = string.sub(s, pos); break end
+		end
+
+		if #fields < 8 then
+			-- 잠재능력 필드가 없는 오래된 아이템 형식
+			setStatePanel(false, true, false)
+			return
+		end
+
+		local relevantField = (tabIdx == 4) and (tonumber(fields[7]) or 0) or (tonumber(fields[8]) or 0)
+		if relevantField == 0 then
+			setStatePanel(false, true, false)
+			return
+		end
+
+		-- 등급 및 옵션 표시
+		local gradeIdx = tabIdx == 4 and 9 or 13
+		local opt1Idx  = tabIdx == 4 and 10 or 14
+		local opt2Idx  = tabIdx == 4 and 11 or 15
+		local opt3Idx  = tabIdx == 4 and 12 or 16
+
+		local grade = tonumber(fields[gradeIdx]) or 1
+		if grade < 1 then grade = 1 end
+		if grade > 4 then grade = 4 end
+
+		local opt1 = (#fields >= opt1Idx) and fields[opt1Idx] or ""
+		local opt2 = (#fields >= opt2Idx) and fields[opt2Idx] or ""
+		local opt3 = (#fields >= opt3Idx) and fields[opt3Idx] or ""
+
+		local gradeNames  = {"레어", "에픽", "유니크", "레전드리"}
+		local gradeColors = {
+			Color(0.55, 0.55, 0.65, 1.0),
+			Color(0.55, 0.20, 0.80, 1.0),
+			Color(0.90, 0.55, 0.00, 1.0),
+			Color(0.20, 0.80, 0.20, 1.0),
+		}
+
+		local barEnt = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel/GradeBarBG")
+		if isvalid(barEnt) then barEnt.SpriteGUIRendererComponent.Color = gradeColors[grade] end
+
+		local titleEnt = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel/GradeTitleText")
+		if isvalid(titleEnt) then titleEnt.TextComponent.Text = gradeNames[grade] end
+
+		local o1 = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel/Opt1Text")
+		local o2 = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel/Opt2Text")
+		local o3 = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel/Opt3Text")
+		if isvalid(o1) then o1.TextComponent.Text = opt1 end
+		if isvalid(o2) then o2.TextComponent.Text = opt2 end
+		if isvalid(o3) then o3.TextComponent.Text = opt3 end
+
+		setStatePanel(false, false, true)
+		self:UpdateCubeGrid(tabIdx)
+
+		-- 초기 탭 상태 색상 적용 (큐브 탭 기본 선택)
+		local currTab = (tabIdx == 4) and self.potCurrencyTab or self.addCurrencyTab
+		if currTab == 1 then self:OnMesoTabTouch(tabIdx) else self:OnCubeTabTouch(tabIdx) end
+
+		log("[Cube] RefreshCubeContent tab=" .. tostring(tabIdx) .. " grade=" .. tostring(grade))
+	end
+
+	-- ─── 큐브 리셋: 그리드 채우기 ────────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void UpdateCubeGrid(integer tabIdx)
+		-- 소비 인벤에서 해당 탭 큐브를 탐색해 그리드 슬롯에 배치
+		local contentName = tabIdx == 4 and "PotentialContent" or "AdditionalContent"
+		local gridPath = self.pathContent .. "/" .. contentName .. "/CubePanel/CubeGrid"
+
+		local validRUIDs = {}
+		if tabIdx == 4 then
+			validRUIDs["b2300eda46f3445e9b1c6e774a2ee95a"] = true
+			validRUIDs["b8f0af90c30b462f859f45bdc1878d8b"] = true
+		else
+			validRUIDs["af5404f4c8fc4ec78ccc1a57446f69db"] = true
+			validRUIDs["9c2a12b9a92f44d4b6dd95c7fb182ac9"] = true
+		end
+
+		local consumeData = _UIEquipInventoryManager._T.tabData["consume"] or {}
+		local slotFill = {}
+		local gridIdx  = 0
+
+		for consumeSlot = 1, 128 do
+			local cs = consumeData[consumeSlot] or ""
+			if cs ~= "" then
+				local ruid  = _UIEquipInventoryManager:ParseInvenRUID(cs)
+				local count = _UIEquipInventoryManager:ParseCount(cs)
+				if validRUIDs[ruid] and count > 0 then
+					gridIdx = gridIdx + 1
+					if gridIdx <= 18 then
+						slotFill[gridIdx] = { consumeSlot=consumeSlot, ruid=ruid, count=count }
+					end
+				end
+			end
+		end
+
+		if tabIdx == 4 then self._T.potCubeSlots = slotFill
+		else self._T.addCubeSlots = slotFill end
+
+		-- 기존 선택 유지: 선택된 큐브가 소진된 경우에만 해제
+		local prevSel = tabIdx == 4 and self.potSelectedSlot or self.addSelectedSlot
+		local newSel  = (prevSel > 0 and slotFill[prevSel]) and prevSel or 0
+		if tabIdx == 4 then self.potSelectedSlot = newSel
+		else self.addSelectedSlot = newSel end
+
+		local SEL = Color(0.20, 0.50, 0.90, 1.0)
+		local DEF = Color(0.15, 0.15, 0.18, 1.0)
+		for i = 1, 18 do
+			local slotPath = gridPath .. "/CubeSlot" .. tostring(i)
+			local iconEnt  = _EntityService:GetEntityByPath(slotPath .. "/SlotIcon")
+			local bgEnt    = _EntityService:GetEntityByPath(slotPath .. "/SlotBG")
+			local countEnt = _EntityService:GetEntityByPath(slotPath .. "/CountText")
+			if isvalid(bgEnt) then
+				if i == newSel then
+					bgEnt.SpriteGUIRendererComponent.Color = SEL
+				else
+					bgEnt.SpriteGUIRendererComponent.Color = DEF
+				end
+			end
+			if slotFill[i] then
+				if isvalid(iconEnt) then
+					iconEnt.SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. slotFill[i].ruid
+					iconEnt.SpriteGUIRendererComponent.Color = Color(1,1,1,1)
+				end
+				if isvalid(countEnt) then
+					countEnt.TextComponent.Text = tostring(slotFill[i].count)
+				end
+			else
+				if isvalid(iconEnt) then
+					iconEnt.SpriteGUIRendererComponent.ImageRUID = ""
+					iconEnt.SpriteGUIRendererComponent.Color = Color(1,1,1,0)
+				end
+				if isvalid(countEnt) then countEnt.TextComponent.Text = "" end
+			end
+		end
+		log("[Cube] UpdateCubeGrid tab=" .. tostring(tabIdx) .. " found=" .. tostring(gridIdx))
+	end
+
+	-- ─── 큐브 리셋: 슬롯 클릭 ────────────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void OnCubeSlotTouch(integer tabIdx, integer slotIdx)
+		local cubeSlots = (tabIdx == 4) and self._T.potCubeSlots or self._T.addCubeSlots
+		if not cubeSlots or not cubeSlots[slotIdx] then
+			log("[Cube] 빈 슬롯: " .. tostring(slotIdx))
+			return
+		end
+
+		if tabIdx == 4 then self.potSelectedSlot = slotIdx
+		else self.addSelectedSlot = slotIdx end
+
+		local contentName = tabIdx == 4 and "PotentialContent" or "AdditionalContent"
+		local gridPath = self.pathContent .. "/" .. contentName .. "/CubePanel/CubeGrid"
+
+		local SEL = Color(0.20, 0.50, 0.90, 1.0)
+		local DEF = Color(0.15, 0.15, 0.18, 1.0)
+		for i = 1, 18 do
+			local bgEnt = _EntityService:GetEntityByPath(gridPath .. "/CubeSlot" .. tostring(i) .. "/SlotBG")
+			if isvalid(bgEnt) then
+				if i == slotIdx then
+					bgEnt.SpriteGUIRendererComponent.Color = SEL
+				else
+					bgEnt.SpriteGUIRendererComponent.Color = DEF
+				end
+			end
+		end
+		log("[Cube] 슬롯 선택 tab=" .. tostring(tabIdx) .. " slot=" .. tostring(slotIdx))
+	end
+
+	-- ─── 큐브 리셋: 메소/큐브 탭 전환 ───────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void OnMesoTabTouch(integer tabIdx)
+		local cPath = self.pathContent .. "/" .. (tabIdx == 4 and "PotentialContent" or "AdditionalContent")
+		local mesoPanel = _EntityService:GetEntityByPath(cPath .. "/MesoPanel")
+		local cubePanel = _EntityService:GetEntityByPath(cPath .. "/CubePanel")
+		if isvalid(mesoPanel) then mesoPanel.Enable = true  end
+		if isvalid(cubePanel) then cubePanel.Enable = false end
+
+		local mesoBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBG")
+		local cubeBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBG")
+		if isvalid(mesoBG) then mesoBG.SpriteGUIRendererComponent.Color = Color(0.22, 0.22, 0.28, 1.0) end
+		if isvalid(cubeBG) then cubeBG.SpriteGUIRendererComponent.Color = Color(0.12, 0.12, 0.15, 1.0) end
+
+		local mesoTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBtn/MesoTabText")
+		local cubeTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBtn/CubeTabText")
+		if isvalid(mesoTxt) then mesoTxt.TextComponent.FontColor = Color(1,1,1,1) end
+		if isvalid(cubeTxt) then cubeTxt.TextComponent.FontColor = Color(0.5,0.5,0.5,1) end
+
+		if tabIdx == 4 then self.potCurrencyTab = 1 else self.addCurrencyTab = 1 end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCubeTabTouch(integer tabIdx)
+		local cPath = self.pathContent .. "/" .. (tabIdx == 4 and "PotentialContent" or "AdditionalContent")
+		local mesoPanel = _EntityService:GetEntityByPath(cPath .. "/MesoPanel")
+		local cubePanel = _EntityService:GetEntityByPath(cPath .. "/CubePanel")
+		if isvalid(mesoPanel) then mesoPanel.Enable = false end
+		if isvalid(cubePanel) then cubePanel.Enable = true  end
+
+		local mesoBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBG")
+		local cubeBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBG")
+		if isvalid(mesoBG) then mesoBG.SpriteGUIRendererComponent.Color = Color(0.12, 0.12, 0.15, 1.0) end
+		if isvalid(cubeBG) then cubeBG.SpriteGUIRendererComponent.Color = Color(0.22, 0.22, 0.28, 1.0) end
+
+		local mesoTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBtn/MesoTabText")
+		local cubeTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBtn/CubeTabText")
+		if isvalid(mesoTxt) then mesoTxt.TextComponent.FontColor = Color(0.5,0.5,0.5,1) end
+		if isvalid(cubeTxt) then cubeTxt.TextComponent.FontColor = Color(1,1,1,1) end
+
+		if tabIdx == 4 then self.potCurrencyTab = 0 else self.addCurrencyTab = 0 end
+	end
+
+	-- ─── 큐브 리셋: 재설정 실행 ─────────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void OnResetBtnTouch(integer tabIdx)
+		local selectedSlot = (tabIdx == 4) and self.potSelectedSlot or self.addSelectedSlot
+		if selectedSlot == 0 then
+			log("[Cube] 큐브 미선택")
+			return
+		end
+
+		local cubeSlots = (tabIdx == 4) and self._T.potCubeSlots or self._T.addCubeSlots
+		if not cubeSlots or not cubeSlots[selectedSlot] then
+			log("[Cube] 슬롯 데이터 없음")
+			return
+		end
+
+		local cubeInfo   = cubeSlots[selectedSlot]
+		local cubeRUID   = cubeInfo.ruid
+		local consumeIdx = cubeInfo.consumeSlot
+
+		local s = self.enhanceTargetItemStr
+		if s == "" then return end
+
+		-- 파이프 필드 파싱
+		local fields = {}
+		local pos = 1
+		while true do
+			local j = (string.find(s, "|", pos, true))
+			if j then fields[#fields+1] = string.sub(s, pos, j-1); pos = j+1
+			else fields[#fields+1] = string.sub(s, pos); break end
+		end
+		while #fields < 16 do fields[#fields+1] = "" end
+
+		local gradeIdx = tabIdx == 4 and 9  or 13
+		local opt1Idx  = tabIdx == 4 and 10 or 14
+		local opt2Idx  = tabIdx == 4 and 11 or 15
+		local opt3Idx  = tabIdx == 4 and 12 or 16
+
+		local curGrade = tonumber(fields[gradeIdx]) or 1
+		if curGrade < 1 then curGrade = 1 end
+		if curGrade > 4 then curGrade = 4 end
+
+		-- 등급 업그레이드 판정 (레전드리는 업그레이드 불가)
+		local newGrade = curGrade
+		if curGrade < 4 then
+			if _UtilLogic:RandomDouble() < self:GetGradeUpgradeProb(cubeRUID, curGrade) then
+				newGrade = curGrade + 1
+				log("[Cube] 등급 업: " .. tostring(curGrade) .. "→" .. tostring(newGrade))
+			end
+		end
+
+		-- 무기 여부 판별 (slotIdx 3번째 필드: 6=무기)
+		local slotIdx = tonumber(fields[3]) or 0
+		local isWeapon = (slotIdx == 6)
+
+		-- 슬롯별 옵션 티어 및 텍스트 결정
+		local isPot = (tabIdx == 4)
+		local opt1 = self:GetRandomOption(self:RollOptionTier(cubeRUID, newGrade, 1), isPot, isWeapon)
+		local opt2 = self:GetRandomOption(self:RollOptionTier(cubeRUID, newGrade, 2), isPot, isWeapon)
+		local opt3 = self:GetRandomOption(self:RollOptionTier(cubeRUID, newGrade, 3), isPot, isWeapon)
+
+		fields[gradeIdx] = tostring(newGrade)
+		fields[opt1Idx]  = opt1
+		fields[opt2Idx]  = opt2
+		fields[opt3Idx]  = opt3
+
+		local newItemStr = table.concat(fields, "|")
+		self.enhanceTargetItemStr = newItemStr
+
+		-- 인벤 탭에 반영
+		local srcTab = self.enhanceTargetSrcTab
+		if srcTab == "" then srcTab = "equip" end
+		_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newItemStr
+		_UIEquipInventoryManager:RefreshUI()
+
+		-- 큐브 1개 소비
+		local cd = _UIEquipInventoryManager._T.tabData["consume"][consumeIdx] or ""
+		if cd ~= "" then
+			local cf = {}
+			local cp = 1
+			while true do
+				local cj = (string.find(cd, "|", cp, true))
+				if cj then cf[#cf+1] = string.sub(cd, cp, cj-1); cp = cj+1
+				else cf[#cf+1] = string.sub(cd, cp); break end
+			end
+			while #cf < 7 do cf[#cf+1] = "0" end
+			local cnt = (tonumber(cf[7]) or 0) - 1
+			if cnt <= 0 then
+				_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = ""
+			else
+				cf[7] = tostring(cnt)
+				_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = table.concat(cf, "|")
+			end
+		end
+
+		self:RefreshCubeContent(tabIdx)
+		log("[Cube] 리셋 완료 grade=" .. tostring(newGrade) .. " " .. opt1 .. " / " .. opt2 .. " / " .. opt3)
+	end
+
+	-- ─── 큐브 리셋: 확률 테이블 ─────────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method number GetGradeUpgradeProb(string cubeRUID, integer fromGrade)
+		-- fromGrade: 1=레어, 2=에픽, 3=유니크 → 업그레이드 확률 반환
+		if cubeRUID == "b2300eda46f3445e9b1c6e774a2ee95a" then
+			if fromGrade == 1 then return 0.060
+			elseif fromGrade == 2 then return 0.018
+			else return 0.003 end
+		elseif cubeRUID == "b8f0af90c30b462f859f45bdc1878d8b" then
+			if fromGrade == 1 then return 0.150
+			elseif fromGrade == 2 then return 0.035
+			else return 0.014 end
+		elseif cubeRUID == "af5404f4c8fc4ec78ccc1a57446f69db" then
+			if fromGrade == 1 then return 0.023810
+			elseif fromGrade == 2 then return 0.009804
+			else return 0.007 end
+		elseif cubeRUID == "9c2a12b9a92f44d4b6dd95c7fb182ac9" then
+			if fromGrade == 1 then return 0.047619
+			elseif fromGrade == 2 then return 0.019608
+			else return 0.007 end
+		end
+		return 0.0
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer RollOptionTier(string cubeRUID, integer currentGrade, integer slotPos)
+		-- 슬롯 위치와 큐브 종류에 따른 옵션 등급 결정
+		if currentGrade <= 1 then return 1 end
+
+		local roll = _UtilLogic:RandomDouble()
+		local isEdi = (cubeRUID == "af5404f4c8fc4ec78ccc1a57446f69db" or cubeRUID == "9c2a12b9a92f44d4b6dd95c7fb182ac9")
+		local isBlack = (cubeRUID == "b8f0af90c30b462f859f45bdc1878d8b")
+
+		if slotPos == 1 then
+			-- 1번 슬롯은 항상 현재 등급
+			return currentGrade
+		end
+
+		if isEdi then
+			-- 에디셔널 계열: slot2/3 같은 확률
+			if currentGrade == 2 then return (roll < 0.047619)  and 2 or 1 end
+			if currentGrade == 3 then return (roll < 0.019608)  and 3 or 2 end
+			if currentGrade == 4 then return (roll < 0.019608)  and 4 or 3 end
+		else
+			-- 레드/블랙큐브
+			local prob = 0.0
+			if slotPos == 2 then
+				if currentGrade == 2 then prob = isBlack and 0.20 or 0.10
+				elseif currentGrade == 3 then prob = isBlack and 0.20 or 0.10
+				else prob = isBlack and 0.20 or 0.10 end
+			else
+				if currentGrade == 2 then prob = isBlack and 0.05 or 0.01
+				elseif currentGrade == 3 then prob = isBlack and 0.05 or 0.01
+				else prob = isBlack and 0.05 or 0.01 end
+			end
+			return (roll < prob) and currentGrade or (currentGrade - 1)
+		end
+		return currentGrade - 1
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetRandomOption(integer grade, boolean isPotential, boolean isWeapon)
+		local opts
+
+		if isPotential then
+			-- ── 잠재능력 ──────────────────────────────────────────────────────
+			if isWeapon then
+				-- 무기 잠재능력 (무기 잠재능력확률.txt 기준)
+				if grade <= 1 then
+					opts = {
+						"STR +12","DEX +12","INT +12","LUK +12",
+						"최대 HP +120","최대 MP +120","공격력 +12","마력 +12",
+						"STR +3%","DEX +3%","INT +3%","LUK +3%",
+						"공격력 +3%","마력 +3%","크리티컬 확률 +4%","데미지 +3%",
+						"올스탯 +5",
+						"공격 시 20% 확률로 240의 HP 회복",
+						"공격 시 20% 확률로 120의 MP 회복",
+						"공격 시 20% 확률로 6레벨 중독효과 적용",
+						"공격 시 10% 확률로 2레벨 기절효과 적용",
+						"공격 시 20% 확률로 2레벨 슬로우효과 적용",
+						"공격 시 20% 확률로 3레벨 암흑효과 적용",
+						"공격 시 10% 확률로 2레벨 빙결효과 적용",
+						"공격 시 10% 확률로 2레벨 봉인효과 적용",
+						"몬스터 방어율 무시 +15%",
+					}
+				elseif grade == 2 then
+					opts = {
+						"STR +6%","DEX +6%","INT +6%","LUK +6%",
+						"최대 HP +6%","최대 MP +6%","공격력 +6%","마력 +6%",
+						"크리티컬 확률 +8%","데미지 +6%","올스탯 +3%",
+						"공격 시 20% 확률로 360의 HP 회복",
+						"공격 시 20% 확률로 180의 MP 회복",
+						"몬스터 방어율 무시 +15%",
+					}
+				elseif grade == 3 then
+					opts = {
+						"STR +9%","DEX +9%","INT +9%","LUK +9%",
+						"공격력 +9%","마력 +9%","크리티컬 확률 +9%","데미지 +9%",
+						"올스탯 +6%","몬스터 방어율 무시 +30%","보스 몬스터 데미지 +30%",
+					}
+				else
+					opts = {
+						"STR +12%","DEX +12%","INT +12%","LUK +12%",
+						"공격력 +12%","마력 +12%","크리티컬 확률 +12%","데미지 +12%",
+						"올스탯 +9%","공격력 +32","마력 +32",
+						"몬스터 방어율 무시 +35%","몬스터 방어율 무시 +40%",
+						"보스 몬스터 데미지 +35%","보스 몬스터 데미지 +40%",
+					}
+				end
+			else
+				-- 비무기 잠재능력 (모자 잠재능력확률.txt 기준)
+				if grade <= 1 then
+					opts = {
+						"STR +12","DEX +12","INT +12","LUK +12",
+						"최대 HP +120","최대 MP +120","방어력 +120",
+						"STR +3%","DEX +3%","INT +3%","LUK +3%",
+						"최대 HP +3%","최대 MP +3%","방어력 +3%","올스탯 +5",
+					}
+				elseif grade == 2 then
+					opts = {
+						"STR +6%","DEX +6%","INT +6%","LUK +6%",
+						"최대 HP +6%","최대 MP +6%","방어력 +6%","올스탯 +3%",
+					}
+				elseif grade == 3 then
+					opts = {
+						"STR +9%","DEX +9%","INT +9%","LUK +9%",
+						"최대 HP +9%","최대 MP +9%","올스탯 +6%",
+						"피격 시 5% 확률로 데미지의 20% 무시",
+						"피격 시 5% 확률로 데미지의 40% 무시",
+						"HP 회복 아이템 및 회복 스킬 효율 +30%",
+						"<쓸만한 미스틱 도어> 스킬 사용 가능",
+					}
+				else
+					opts = {
+						"STR +12%","DEX +12%","INT +12%","LUK +12%",
+						"최대 HP +12%","최대 MP +12%","올스탯 +9%",
+						"피격 시 10% 확률로 데미지의 20% 무시",
+						"피격 시 10% 확률로 데미지의 40% 무시",
+						"스킬 재사용 대기시간 -1초","스킬 재사용 대기시간 -2초",
+						"<쓸만한 어드밴스드 블레스> 스킬 사용 가능",
+					}
+				end
+			end
+		else
+			-- ── 에디셔널 잠재능력 ─────────────────────────────────────────────
+			if isWeapon then
+				-- 무기 에디셔널 (무기 에디셔널확률표.txt 기준)
+				if grade <= 1 then
+					opts = {
+						"최대 HP +100","최대 MP +100","이동속도 +6","점프력 +6","방어력 +100",
+						"STR +12","DEX +12","INT +12","LUK +12","공격력 +12","마력 +12",
+						"최대 HP +2%","최대 MP +2%",
+						"STR +3%","DEX +3%","INT +3%","LUK +3%",
+						"공격력 +3%","마력 +3%","크리티컬 확률 +4%","데미지 +3%","올스탯 +5",
+					}
+				elseif grade == 2 then
+					opts = {
+						"최대 HP +5%","최대 MP +5%","공격력 +6%","마력 +6%",
+						"크리티컬 확률 +6%",
+						"STR +6%","DEX +6%","INT +6%","LUK +6%",
+						"데미지 +6%","올스탯 +3%",
+						"공격 시 3% 확률로 53의 HP 회복",
+						"공격 시 3% 확률로 53의 MP 회복",
+						"몬스터 방어율 무시 +3%",
+					}
+				elseif grade == 3 then
+					opts = {
+						"최대 HP +8%","최대 MP +8%","공격력 +9%","마력 +9%",
+						"크리티컬 확률 +9%",
+						"STR +9%","DEX +9%","INT +9%","LUK +9%",
+						"데미지 +9%","올스탯 +6%",
+						"캐릭터 기준 9레벨 당 STR +1","캐릭터 기준 9레벨 당 DEX +1",
+						"캐릭터 기준 9레벨 당 INT +1","캐릭터 기준 9레벨 당 LUK +1",
+						"공격 시 15% 확률로 95의 HP 회복",
+						"공격 시 15% 확률로 95의 MP 회복",
+						"몬스터 방어율 무시 +4%","보스 몬스터 데미지 +12%",
+					}
+				else
+					opts = {
+						"최대 HP +11%","최대 MP +11%","공격력 +12%","마력 +12%",
+						"크리티컬 확률 +12%",
+						"STR +12%","DEX +12%","INT +12%","LUK +12%",
+						"데미지 +12%","올스탯 +9%",
+						"캐릭터 기준 9레벨 당 STR +2","캐릭터 기준 9레벨 당 DEX +2",
+						"캐릭터 기준 9레벨 당 INT +2","캐릭터 기준 9레벨 당 LUK +2",
+						"공격력 +32","마력 +32",
+						"몬스터 방어율 무시 +5%","보스 몬스터 데미지 +18%",
+					}
+				end
+			else
+				-- 비무기 에디셔널 (모자 에디셔널확률표.txt 기준)
+				if grade <= 1 then
+					opts = {
+						"STR +10","DEX +10","INT +10","LUK +10",
+						"최대 HP +100","최대 MP +100","이동속도 +6","점프력 +6",
+						"공격력 +10","마력 +10","방어력 +100",
+						"STR +2%","DEX +2%","INT +2%","LUK +2%",
+						"최대 HP +2%","최대 MP +2%","방어력 +2%","올스탯 +3",
+					}
+				elseif grade == 2 then
+					opts = {
+						"STR +14","DEX +14","INT +14","LUK +14",
+						"최대 HP +180","최대 MP +180","이동속도 +8","점프력 +8",
+						"공격력 +11","마력 +11","방어력 +120",
+						"STR +4%","DEX +4%","INT +4%","LUK +4%",
+						"최대 HP +5%","최대 MP +5%","방어력 +4%","올스탯 +2%",
+					}
+				elseif grade == 3 then
+					opts = {
+						"STR +18","DEX +18","INT +18","LUK +18",
+						"최대 HP +300","최대 MP +300","공격력 +14","마력 +14",
+						"STR +6%","DEX +6%","INT +6%","LUK +6%",
+						"최대 HP +8%","최대 MP +8%","올스탯 +5%",
+						"캐릭터 기준 9레벨 당 STR +1","캐릭터 기준 9레벨 당 DEX +1",
+						"캐릭터 기준 9레벨 당 INT +1","캐릭터 기준 9레벨 당 LUK +1",
+						"HP 회복 아이템 및 회복 스킬 효율 +20%",
+					}
+				else
+					opts = {
+						"STR +20","DEX +20","INT +20","LUK +20",
+						"최대 HP +360","최대 MP +360","공격력 +16","마력 +16",
+						"STR +8%","DEX +8%","INT +8%","LUK +8%",
+						"최대 HP +11%","최대 MP +11%","크리티컬 데미지 +1%","올스탯 +6%",
+						"캐릭터 기준 9레벨 당 STR +2","캐릭터 기준 9레벨 당 DEX +2",
+						"캐릭터 기준 9레벨 당 INT +2","캐릭터 기준 9레벨 당 LUK +2",
+						"HP 회복 아이템 및 회복 스킬 효율 +30%",
+						"스킬 재사용 대기시간 -1초","메소 획득량 +5%","아이템 드롭률 +5%",
+					}
+				end
+			end
+		end
+
+		local idx = math.floor(_UtilLogic:RandomDouble() * #opts) + 1
+		if idx < 1 then idx = 1 end
+		if idx > #opts then idx = #opts end
+		return opts[idx]
 	end
 
 	-- ─── 로그 ─────────────────────────────────────────────────────────────
