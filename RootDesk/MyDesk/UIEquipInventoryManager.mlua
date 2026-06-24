@@ -53,6 +53,10 @@ script UIEquipInventoryManager extends Logic
 		self._T.dragEquipToEnhanceSlot = 0
 		self._T.hoverEnhanceSlot = false
 		self._T.pendingCancelEquipDrag = false
+		self._T.isDraggingInvenItem = false
+		self._T.dragInvenSourceSlot = 0
+		self._T.pendingCancelInvenDrag = false
+		self._T.invenDragHoverSlot = 0
 		self._T.pendingHideTooltip = false
 		self._T.isDraggingThumb = false
 		self._T.thumbDragOffsetY = 0.0
@@ -64,6 +68,9 @@ script UIEquipInventoryManager extends Logic
 		self._T.hoverInvenSlot = 0
 		self._T.pendingShowSlotType = ""
 		self._T.pendingShowSlotIdx = 0
+		self._T.boxSourceSlot = 0
+		self._T.boxSelectedType = 0
+		self._T.boxMaxQty = 0
 		local cE = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/CloseEquip")
 		local cI = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/CloseInven")
 		local cEnh = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/CloseEnhance")
@@ -267,25 +274,75 @@ script UIEquipInventoryManager extends Logic
 		if isvalid(capSlotUp) then
 			capSlotUp:ConnectEvent(UITouchUpEvent, self.OnEquipSlotUp7)
 		end
-		-- 인벤 슬롯 UITouchUpEvent (주문서 드랍 감지, 128 슬롯, Touch 자식에 직접 연결)
+		-- 인벤 슬롯 UITouchUpEvent (드랍 감지, 128 슬롯, slot+SlotBG+Icon+Touch 모두에 연결)
 		for i = 1, 128 do
 			local capturedUp = i
 			local iSlotUp = _EntityService:GetEntityByPath(iBase .. i)
 			if isvalid(iSlotUp) then
-				local iUpTouch = _EntityService:GetEntityByPath(iBase .. i .. "/Touch")
-				local upTarget = isvalid(iUpTouch) and iUpTouch or iSlotUp
-				upTarget:ConnectEvent(UITouchUpEvent, function(e)
-					if self.isDragging then
-						local dataIdx = self._T.minimized and (self._T.scrollRow * 4 + capturedUp) or capturedUp
-						if dataIdx <= 128 then self:ApplyScrollToInven(dataIdx) end
+				local function upHandler(e)
+					local dataIdx = self._T.minimized and (self._T.scrollRow * 4 + capturedUp) or capturedUp
+					if dataIdx > 128 then return end
+					if self._T.isDraggingInvenItem then
+						self:ApplyInvenDrop(dataIdx)
+					elseif self.isDragging then
+						self:ApplyScrollToInven(dataIdx)
 					end
-				end)
+				end
+				iSlotUp:ConnectEvent(UITouchUpEvent, upHandler)
+				local slotBGUp = _EntityService:GetEntityByPath(iBase .. capturedUp .. "/SlotBG")
+				if isvalid(slotBGUp) then slotBGUp:ConnectEvent(UITouchUpEvent, upHandler) end
+				local iconUp = _EntityService:GetEntityByPath(iBase .. capturedUp .. "/Icon")
+				if isvalid(iconUp) then iconUp:ConnectEvent(UITouchUpEvent, upHandler) end
+				local iUpTouch = _EntityService:GetEntityByPath(iBase .. capturedUp .. "/Touch")
+				if isvalid(iUpTouch) then iUpTouch:ConnectEvent(UITouchUpEvent, upHandler) end
 			end
 		end
 		_InputService:ConnectEvent(ScreenTouchReleaseEvent, self.OnScreenRelease)
 		local initGhost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
 		if isvalid(initGhost) then initGhost.Enable = false end
 		log("[EquipInven] drag-drop wired")
+
+		-- 박스 타입 선택 팝업 버튼 와이어링
+		local typePopupBase = "/ui/DefaultGroup/ItemTypeSelectPopup/Dialog/"
+		local typeSlotMap = {7, 0, 3, 0, 4, 5, 6, 0, 0, 0, 0, 1, 2, 0}
+		for bi = 0, 13 do
+			local capturedTypeSlot = typeSlotMap[bi + 1]
+			local typeBtnEnt = _EntityService:GetEntityByPath(typePopupBase .. "TypeBtn_" .. tostring(bi))
+			if isvalid(typeBtnEnt) then
+				local capturedSelf = self
+				typeBtnEnt:ConnectEvent(ButtonClickEvent, function(e)
+					capturedSelf:OnBoxTypeSelect(capturedTypeSlot)
+				end)
+			end
+		end
+		local typeCloseBtnEnt = _EntityService:GetEntityByPath(typePopupBase .. "CloseBtn")
+		if isvalid(typeCloseBtnEnt) then
+			typeCloseBtnEnt:ConnectEvent(ButtonClickEvent, function(e)
+				self:HideBoxTypeSelectPopup()
+			end)
+		end
+		-- 박스 수량 팝업 버튼 와이어링
+		local qtyPopupBase = "/ui/DefaultGroup/BoxQuantityPopup/Dialog/"
+		local confirmBtnEnt = _EntityService:GetEntityByPath(qtyPopupBase .. "ConfirmBtn")
+		if isvalid(confirmBtnEnt) then
+			confirmBtnEnt:ConnectEvent(ButtonClickEvent, function(e)
+				self:OnBoxQuantityConfirm()
+			end)
+		end
+		local cancelBtnEnt = _EntityService:GetEntityByPath(qtyPopupBase .. "CancelBtn")
+		if isvalid(cancelBtnEnt) then
+			cancelBtnEnt:ConnectEvent(ButtonClickEvent, function(e)
+				self:OnBoxQuantityCancel()
+			end)
+		end
+		local qtyCloseBtnEnt = _EntityService:GetEntityByPath(qtyPopupBase .. "CloseBtn")
+		if isvalid(qtyCloseBtnEnt) then
+			qtyCloseBtnEnt:ConnectEvent(ButtonClickEvent, function(e)
+				self:OnBoxQuantityCancel()
+			end)
+		end
+		log("[EquipInven] 박스 팝업 버튼 와이어링 완료")
+
 		-- 강화 드롭존 hover 감지
 		local dropZone = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/SlotArea/TargetSlotBG/DropZone")
 		if isvalid(dropZone) then
@@ -328,6 +385,8 @@ script UIEquipInventoryManager extends Logic
 		setEnable("/ui/DefaultGroup/InvenWindow",          false)
 		setEnable("/ui/DefaultGroup/EquipWindow",          false)
 		setEnable("/ui/DefaultGroup/EnhanceWindow",        false)
+		setEnable("/ui/DefaultGroup/ItemTypeSelectPopup", false)
+		setEnable("/ui/DefaultGroup/BoxQuantityPopup",    false)
 		-- Enable 애니메이션이 자식 위치를 오염시키므로 완료 후 복원
 		wait(0.5)
 		local function setPos(path, x, y)
@@ -658,9 +717,22 @@ script UIEquipInventoryManager extends Logic
 				end
 				return
 			end
-			-- 주문서(slotIdx==0) → 단일 클릭으로 장비 슬롯 드래그
+			-- 드롭 아이템(slotIdx==0, name="드롭 아이템"): 더블클릭 → 박스 사용 팝업
+			if dragSI == 0 and dragName == "드롭 아이템" then
+				if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+					self:ShowBoxTypeSelectPopup(slotIdx)
+					self.lastInvenSlot = 0
+				else
+					self.lastInvenSlot = slotIdx
+					self.lastInvenTime = t
+					self:StartInvenDrag(slotIdx)
+				end
+				return
+			end
+			-- 주문서(slotIdx==0) → 단일 클릭으로 장비 슬롯 드래그 + 인벤 슬롯 이동
 			if dragSI == 0 then
 				self:StartDrag(slotIdx)
+				self:StartInvenDrag(slotIdx)
 				return
 			end
 			if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
@@ -685,6 +757,9 @@ script UIEquipInventoryManager extends Logic
 					local s = self:GetInven(slotIdx)
 					if s ~= "" then self:StartEquipDrag(slotIdx) end
 				end
+				-- 인벤 슬롯 이동 드래그 (장비 아이템)
+				local sInven = self:GetInven(slotIdx)
+				if sInven ~= "" then self:StartInvenDrag(slotIdx) end
 			end
 		end
 	end
@@ -787,6 +862,358 @@ script UIEquipInventoryManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method number ParseCount(string s)
+		-- 7번째 필드: 아이템 수량 (없으면 기본값 1)
+		local v = string.match(s, "[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 1
+	end
+
+	-- 슬롯당 최대 보유 수량 (RUID 기준)
+	-- 7번째 필드: 장비 아이템의 잠재능력 부여 여부 (0=미부여, 1=부여됨)
+	@ExecSpace("ClientOnly")
+	method number ParseHasPotential(string s)
+		local v = string.match(s, "[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 0
+	end
+
+	-- 8번째 필드: 장비 아이템의 에디셔널 잠재능력 부여 여부 (0=미부여, 1=부여됨)
+	@ExecSpace("ClientOnly")
+	method number ParseHasAdditionalPotential(string s)
+		local v = string.match(s, "[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|[^|]+|([^|]+)")
+		return tonumber(v) or 0
+	end
+
+	-- n번째 파이프 구분 필드 반환 (1-indexed, 빈 필드는 ""로 반환)
+	@ExecSpace("ClientOnly")
+	method string GetField(string s, integer n)
+		local count = 0
+		local last = 1
+		local slen = string.len(s)
+		local i = 1
+		while i <= slen do
+			if string.sub(s, i, i) == "|" then
+				count = count + 1
+				if count == n then return string.sub(s, last, i - 1) end
+				last = i + 1
+			end
+			i = i + 1
+		end
+		count = count + 1
+		if count == n then return string.sub(s, last) end
+		return ""
+	end
+
+	-- pool={{opt,weight},...} 에서 가중치 기반 랜덤 선택
+	@ExecSpace("ClientOnly")
+	method string RollOneOption(table pool)
+		local total = 0
+		for i = 1, #pool do total = total + pool[i][2] end
+		local r = _UtilLogic:RandomDouble() * total
+		local cum = 0
+		for i = 1, #pool do
+			cum = cum + pool[i][2]
+			if r <= cum then return pool[i][1] end
+		end
+		return pool[#pool][1]
+	end
+
+	-- 슬롯 인덱스로 장비 분류 이름 반환
+	@ExecSpace("ClientOnly")
+	method string GetEquipTypeBySlot(number slotIdx)
+		if slotIdx == 7 then return "모자" end
+		if slotIdx == 3 then return "상의" end
+		if slotIdx == 4 then return "하의" end
+		if slotIdx == 5 then return "신발" end
+		if slotIdx == 6 then return "무기" end
+		return "모자"
+	end
+
+	-- 장비 분류·등급·옵션 슬롯(1/2/3)에 따른 잠재능력 옵션 롤링
+	@ExecSpace("ClientOnly")
+	method string RollPotOption(string equipType, string grade, integer optSlot)
+		local pool = {}
+		if grade == "레어" then
+			if equipType == "무기" then
+				if optSlot == 1 then
+					pool = {
+						{"STR +12",6.1224},{"DEX +12",6.1224},{"INT +12",6.1224},{"LUK +12",6.1224},
+						{"최대 HP +120",6.1224},{"최대 MP +120",6.1224},
+						{"공격력 +12",4.08163},{"마력 +12",4.08163},
+						{"STR +3%",6.1224},{"DEX +3%",6.1224},{"INT +3%",6.1224},{"LUK +3%",6.1224},
+						{"공격력 +3%",2.04082},{"마력 +3%",2.04082},
+						{"크리티컬 확률 +4%",2.04082},{"데미지 +3%",2.04082},
+						{"올스탯 +5",4.08163},
+						{"공격 시 HP 회복",2.04082},{"공격 시 MP 회복",2.04082},
+						{"몬스터 방어율 무시 +15%",2.04082}
+					}
+				elseif optSlot == 2 then
+					pool = {
+						{"STR +6",12.2727},{"DEX +6",12.2727},{"INT +6",12.2727},{"LUK +6",12.2727},
+						{"최대 HP +60",12.2727},{"최대 MP +60",12.2727},
+						{"공격력 +6",8.1818},{"마력 +6",8.1818},
+						{"STR +12",0.6122},{"DEX +12",0.6122},{"INT +12",0.6122},{"LUK +12",0.6122},
+						{"최대 HP +120",0.6122},{"최대 MP +120",0.6122},
+						{"공격력 +12",0.4082},{"마력 +12",0.4082},
+						{"STR +3%",0.6122},{"DEX +3%",0.6122},{"INT +3%",0.6122},{"LUK +3%",0.6122},
+						{"공격력 +3%",0.2041},{"마력 +3%",0.2041},
+						{"크리티컬 확률 +4%",0.2041},{"데미지 +3%",0.2041},
+						{"올스탯 +5",0.4082},
+						{"공격 시 HP 회복",0.2041},{"공격 시 MP 회복",0.2041},
+						{"몬스터 방어율 무시 +15%",0.2041}
+					}
+				else
+					pool = {
+						{"STR +6",13.5},{"DEX +6",13.5},{"INT +6",13.5},{"LUK +6",13.5},
+						{"최대 HP +60",13.5},{"최대 MP +60",13.5},
+						{"공격력 +6",9},{"마력 +6",9},
+						{"STR +12",0.06122},{"DEX +12",0.06122},{"INT +12",0.06122},{"LUK +12",0.06122},
+						{"최대 HP +120",0.06122},{"최대 MP +120",0.06122},
+						{"공격력 +12",0.04082},{"마력 +12",0.04082},
+						{"STR +3%",0.06122},{"DEX +3%",0.06122},{"INT +3%",0.06122},{"LUK +3%",0.06122},
+						{"공격력 +3%",0.02041},{"마력 +3%",0.02041},
+						{"크리티컬 확률 +4%",0.02041},{"데미지 +3%",0.02041},
+						{"올스탯 +5",0.04082},
+						{"공격 시 HP 회복",0.02041},{"공격 시 MP 회복",0.02041},
+						{"몬스터 방어율 무시 +15%",0.02041}
+					}
+				end
+			elseif equipType == "신발" then
+				if optSlot == 1 then
+					pool = {
+						{"STR +12",6.8182},{"DEX +12",6.8182},{"INT +12",6.8182},{"LUK +12",6.8182},
+						{"최대 HP +120",6.8182},{"최대 MP +120",6.8182},
+						{"이동속도 +8",4.5455},{"점프력 +8",4.5455},{"방어력 +120",4.5455},
+						{"STR +3%",6.8182},{"DEX +3%",6.8182},{"INT +3%",6.8182},{"LUK +3%",6.8182},
+						{"최대 HP +3%",4.5455},{"최대 MP +3%",4.5455},{"방어력 +3%",4.5455},{"올스탯 +5",4.5455}
+					}
+				elseif optSlot == 2 then
+					pool = {
+						{"STR +6",10.8},{"DEX +6",10.8},{"INT +6",10.8},{"LUK +6",10.8},
+						{"최대 HP +60",10.8},{"최대 MP +60",10.8},
+						{"이동속도 +4",7.2},{"점프력 +4",7.2},{"방어력 +60",10.8},
+						{"STR +12",0.6818},{"DEX +12",0.6818},{"INT +12",0.6818},{"LUK +12",0.6818},
+						{"최대 HP +120",0.6818},{"최대 MP +120",0.6818},
+						{"이동속도 +8",0.4545},{"점프력 +8",0.4545},{"방어력 +120",0.4545},
+						{"STR +3%",0.6818},{"DEX +3%",0.6818},{"INT +3%",0.6818},{"LUK +3%",0.6818},
+						{"최대 HP +3%",0.4545},{"최대 MP +3%",0.4545},{"방어력 +3%",0.4545},{"올스탯 +5",0.4545}
+					}
+				else
+					pool = {
+						{"STR +6",11.88},{"DEX +6",11.88},{"INT +6",11.88},{"LUK +6",11.88},
+						{"최대 HP +60",11.88},{"최대 MP +60",11.88},
+						{"이동속도 +4",7.92},{"점프력 +4",7.92},{"방어력 +60",11.88},
+						{"STR +12",0.06818},{"DEX +12",0.06818},{"INT +12",0.06818},{"LUK +12",0.06818},
+						{"최대 HP +120",0.06818},{"최대 MP +120",0.06818},
+						{"이동속도 +8",0.04545},{"점프력 +8",0.04545},{"방어력 +120",0.04545},
+						{"STR +3%",0.06818},{"DEX +3%",0.06818},{"INT +3%",0.06818},{"LUK +3%",0.06818},
+						{"최대 HP +3%",0.04545},{"최대 MP +3%",0.04545},{"방어력 +3%",0.04545},{"올스탯 +5",0.04545}
+					}
+				end
+			else
+				-- 모자/상의/하의/얼굴/눈장식 공통 레어 풀
+				if optSlot == 1 then
+					pool = {
+						{"STR +12",7.5},{"DEX +12",7.5},{"INT +12",7.5},{"LUK +12",7.5},
+						{"최대 HP +120",7.5},{"최대 MP +120",7.5},{"방어력 +120",5},
+						{"STR +3%",7.5},{"DEX +3%",7.5},{"INT +3%",7.5},{"LUK +3%",7.5},
+						{"최대 HP +3%",5},{"최대 MP +3%",5},{"방어력 +3%",5},{"올스탯 +5",5}
+					}
+				elseif optSlot == 2 then
+					pool = {
+						{"STR +6",12.8571},{"DEX +6",12.8571},{"INT +6",12.8571},{"LUK +6",12.8571},
+						{"최대 HP +60",12.8571},{"최대 MP +60",12.8571},{"방어력 +60",12.8571},
+						{"STR +12",0.75},{"DEX +12",0.75},{"INT +12",0.75},{"LUK +12",0.75},
+						{"최대 HP +120",0.75},{"최대 MP +120",0.75},{"방어력 +120",0.5},
+						{"STR +3%",0.75},{"DEX +3%",0.75},{"INT +3%",0.75},{"LUK +3%",0.75},
+						{"최대 HP +3%",0.5},{"최대 MP +3%",0.5},{"방어력 +3%",0.5},{"올스탯 +5",0.5}
+					}
+				else
+					pool = {
+						{"STR +6",14.1429},{"DEX +6",14.1429},{"INT +6",14.1429},{"LUK +6",14.1429},
+						{"최대 HP +60",14.1429},{"최대 MP +60",14.1429},{"방어력 +60",14.1429},
+						{"STR +12",0.075},{"DEX +12",0.075},{"INT +12",0.075},{"LUK +12",0.075},
+						{"최대 HP +120",0.075},{"최대 MP +120",0.075},{"방어력 +120",0.05},
+						{"STR +3%",0.075},{"DEX +3%",0.075},{"INT +3%",0.075},{"LUK +3%",0.075},
+						{"최대 HP +3%",0.05},{"최대 MP +3%",0.05},{"방어력 +3%",0.05},{"올스탯 +5",0.05}
+					}
+				end
+			end
+		end
+		if #pool == 0 then return "" end
+		return self:RollOneOption(pool)
+	end
+
+	-- 에디셔널 잠재능력 전용 확률 풀
+	@ExecSpace("ClientOnly")
+	method string RollAddPotOption(string equipType, string grade, integer optSlot)
+		local pool = {}
+		if grade == "레어" then
+			if equipType == "무기" then
+				if optSlot == 1 then
+					pool = {
+						{"최대 HP +100",5.8824},{"최대 MP +100",5.8824},
+						{"이동속도 +6",5.8824},{"점프력 +6",5.8824},{"방어력 +100",5.8824},
+						{"STR +12",5.8824},{"DEX +12",5.8824},{"INT +12",5.8824},{"LUK +12",5.8824},
+						{"공격력 +12",3.9216},{"마력 +12",3.9216},
+						{"최대 HP +2%",3.9216},{"최대 MP +2%",3.9216},
+						{"STR +3%",3.9216},{"DEX +3%",3.9216},{"INT +3%",3.9216},{"LUK +3%",3.9216},
+						{"공격력 +3%",1.9608},{"마력 +3%",1.9608},
+						{"크리티컬 확률 +4%",3.9216},{"데미지 +3%",1.9608},{"올스탯 +5",5.8824}
+					}
+				elseif optSlot == 2 then
+					pool = {
+						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
+						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
+						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},{"방어력 +60",10.8932},
+						{"공격력 +6",7.2622},{"마력 +6",7.2622},
+						{"최대 HP +100",0.1153},{"최대 MP +100",0.1153},
+						{"이동속도 +6",0.1153},{"점프력 +6",0.1153},{"방어력 +100",0.1153},
+						{"STR +12",0.1153},{"DEX +12",0.1153},{"INT +12",0.1153},{"LUK +12",0.1153},
+						{"공격력 +12",0.07689},{"마력 +12",0.07689},
+						{"최대 HP +2%",0.07689},{"최대 MP +2%",0.07689},
+						{"STR +3%",0.07689},{"DEX +3%",0.07689},{"INT +3%",0.07689},{"LUK +3%",0.07689},
+						{"공격력 +3%",0.03845},{"마력 +3%",0.03845},
+						{"크리티컬 확률 +4%",0.07689},{"데미지 +3%",0.03845},{"올스탯 +5",0.1153}
+					}
+				else
+					pool = {
+						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
+						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
+						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},{"방어력 +60",10.8932},
+						{"공격력 +6",7.2622},{"마력 +6",7.2622},
+						{"최대 HP +100",0.1153},{"최대 MP +100",0.1153},
+						{"이동속도 +6",0.1153},{"점프력 +6",0.1153},{"방어력 +100",0.1153},
+						{"STR +12",0.1153},{"DEX +12",0.1153},{"INT +12",0.1153},{"LUK +12",0.1153},
+						{"공격력 +12",0.07689},{"마력 +12",0.07689},
+						{"최대 HP +2%",0.07689},{"최대 MP +2%",0.07689},
+						{"STR +3%",0.07689},{"DEX +3%",0.07689},{"INT +3%",0.07689},{"LUK +3%",0.07689},
+						{"공격력 +3%",0.03845},{"마력 +3%",0.03845},
+						{"크리티컬 확률 +4%",0.07689},{"데미지 +3%",0.03845},{"올스탯 +5",0.1153}
+					}
+				end
+			else
+				-- 모자/상의/하의/신발/기타 방어구 공통 에디셔널 레어
+				if optSlot == 1 then
+					pool = {
+						{"STR +10",6.3830},{"DEX +10",6.3830},{"INT +10",6.3830},{"LUK +10",6.3830},
+						{"최대 HP +100",6.3830},{"최대 MP +100",6.3830},
+						{"이동속도 +6",6.3830},{"점프력 +6",6.3830},
+						{"공격력 +10",4.2553},{"마력 +10",4.2553},{"방어력 +100",6.3830},
+						{"STR +2%",4.2553},{"DEX +2%",4.2553},{"INT +2%",4.2553},{"LUK +2%",4.2553},
+						{"최대 HP +2%",4.2553},{"최대 MP +2%",4.2553},{"방어력 +2%",4.2553},{"올스탯 +3",4.2553}
+					}
+				elseif optSlot == 2 then
+					pool = {
+						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
+						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
+						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},
+						{"공격력 +3",7.2622},{"마력 +3",7.2622},{"방어력 +60",10.8932},
+						{"STR +10",0.1252},{"DEX +10",0.1252},{"INT +10",0.1252},{"LUK +10",0.1252},
+						{"최대 HP +100",0.1252},{"최대 MP +100",0.1252},
+						{"이동속도 +6",0.1252},{"점프력 +6",0.1252},
+						{"공격력 +10",0.08344},{"마력 +10",0.08344},{"방어력 +100",0.1252},
+						{"STR +2%",0.08344},{"DEX +2%",0.08344},{"INT +2%",0.08344},{"LUK +2%",0.08344},
+						{"최대 HP +2%",0.08344},{"최대 MP +2%",0.08344},{"방어력 +2%",0.08344},{"올스탯 +3",0.08344}
+					}
+				else
+					pool = {
+						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
+						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
+						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},
+						{"공격력 +3",7.2622},{"마력 +3",7.2622},{"방어력 +60",10.8932},
+						{"STR +10",0.1252},{"DEX +10",0.1252},{"INT +10",0.1252},{"LUK +10",0.1252},
+						{"최대 HP +100",0.1252},{"최대 MP +100",0.1252},
+						{"이동속도 +6",0.1252},{"점프력 +6",0.1252},
+						{"공격력 +10",0.08344},{"마력 +10",0.08344},{"방어력 +100",0.1252},
+						{"STR +2%",0.08344},{"DEX +2%",0.08344},{"INT +2%",0.08344},{"LUK +2%",0.08344},
+						{"최대 HP +2%",0.08344},{"최대 MP +2%",0.08344},{"방어력 +2%",0.08344},{"올스탯 +3",0.08344}
+					}
+				end
+			end
+		end
+		if #pool == 0 then return "" end
+		return self:RollOneOption(pool)
+	end
+
+	-- 등급 색상 반환 (Rich Text용 hex)
+	@ExecSpace("ClientOnly")
+	method string GetGradeColor(string grade)
+		if grade == "레어" then return "#5B9BD5" end
+		if grade == "에픽" then return "#AA59C9" end
+		if grade == "유니크" then return "#DAA520" end
+		if grade == "레전드리" then return "#27AE60" end
+		return "#FFFFFF"
+	end
+
+	-- 등급 약자 반환
+	@ExecSpace("ClientOnly")
+	method string GetGradeLabel(string grade)
+		if grade == "레어" then return "R" end
+		if grade == "에픽" then return "E" end
+		if grade == "유니크" then return "U" end
+		if grade == "레전드리" then return "L" end
+		return "?"
+	end
+
+	-- 아이템 문자열에서 잠재능력/에디셔널 잠재능력 섹션 텍스트 생성
+	@ExecSpace("ClientOnly")
+	method string BuildPotentialText(string s)
+		local result = ""
+		local validGrades = {["레어"]=true,["에픽"]=true,["유니크"]=true,["레전드리"]=true}
+		local potGrade = self:GetField(s, 9)
+		if validGrades[potGrade] then
+			local color = self:GetGradeColor(potGrade)
+			local label = self:GetGradeLabel(potGrade)
+			result = result .. "\n<color=" .. color .. ">[" .. label .. "] 잠재옵션</color>"
+			local p1 = self:GetField(s, 10)
+			local p2 = self:GetField(s, 11)
+			local p3 = self:GetField(s, 12)
+			if p1 ~= "" and p1 ~= "0" then result = result .. "\n" .. p1 end
+			if p2 ~= "" and p2 ~= "0" then result = result .. "\n" .. p2 end
+			if p3 ~= "" and p3 ~= "0" then result = result .. "\n" .. p3 end
+		end
+		local addPotGrade = self:GetField(s, 13)
+		if validGrades[addPotGrade] then
+			local color = self:GetGradeColor(addPotGrade)
+			local label = self:GetGradeLabel(addPotGrade)
+			result = result .. "\n<color=" .. color .. ">[" .. label .. "] 에디셔널 잠재옵션</color>"
+			local a1 = self:GetField(s, 14)
+			local a2 = self:GetField(s, 15)
+			local a3 = self:GetField(s, 16)
+			if a1 ~= "" and a1 ~= "0" then result = result .. "\n" .. a1 end
+			if a2 ~= "" and a2 ~= "0" then result = result .. "\n" .. a2 end
+			if a3 ~= "" and a3 ~= "0" then result = result .. "\n" .. a3 end
+		end
+		return result
+	end
+
+	-- 스택형 주문서 1개 소모 (count>1이면 감소, count==1이면 슬롯 삭제)
+	@ExecSpace("ClientOnly")
+	method void ConsumeScrollFromSlot(number scrollSlot)
+		local scrollStr = self:GetInven(scrollSlot)
+		if scrollStr == "" then return end
+		local cnt = self:ParseCount(scrollStr)
+		if cnt <= 1 then
+			self:SetInvenStr(scrollSlot, "")
+		else
+			local fields = {}
+			for part in string.gmatch(scrollStr, "[^|]+") do fields[#fields+1] = part end
+			while #fields < 7 do fields[#fields+1] = "0" end
+			fields[7] = tostring(cnt - 1)
+			self:SetInvenStr(scrollSlot, table.concat(fields, "|"))
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetItemMaxStack(string ruid)
+		if ruid == "47841bc4d3554cf0a68bd05f19de1f18" then return 10 end
+		if ruid == "14267ae8e168458480697c148ddfdcab" then return 99 end
+		if ruid == "314215aface349c48b81eee58065e1b7" then return 99 end
+		if ruid == "0f134eebddee4b368062790b46afc26a" then return 99 end
+		return 1
+	end
+
+	@ExecSpace("ClientOnly")
 	method string BuildItemStr(string baseName, string ruid, number slotIdx, number stars, number scrolls, number upgrade)
 		return baseName .. "|" .. ruid .. "|" .. tostring(slotIdx) .. "|" .. tostring(stars) .. "|" .. tostring(scrolls) .. "|" .. tostring(upgrade)
 	end
@@ -821,11 +1248,19 @@ script UIEquipInventoryManager extends Logic
 		self.meso = 1000
 		-- 연두색 머리띠 → 장비 탭
 		self._T.tabData["equip"][1] = "연두색 머리띠|274b50c184c047d8abf1b520c958ce98|7|0|0|7"
-		-- 연두색주문서 10개 → 소비 탭
+		-- 연두색주문서 10개 → 소비 탭 슬롯 1 (스택, 최대 99)
 		local scrollRUID = "314215aface349c48b81eee58065e1b7"
-		for i = 1, 10 do
-			self._T.tabData["consume"][i] = "연두색주문서|" .. scrollRUID .. "|0|0|0|0"
-		end
+		self._T.tabData["consume"][1] = "연두색주문서|" .. scrollRUID .. "|0|0|0|0|10"
+		-- 드롭 아이템 20개 → 소비 탭 슬롯 11~12 (슬롯당 10개)
+		local dropRUID = "47841bc4d3554cf0a68bd05f19de1f18"
+		self._T.tabData["consume"][11] = "드롭 아이템|" .. dropRUID .. "|0|0|0|0|10"
+		self._T.tabData["consume"][12] = "드롭 아이템|" .. dropRUID .. "|0|0|0|0|10"
+		-- 잠재능력 부여주문서 20개 → 소비 탭 슬롯 13 (슬롯당 최대 99개)
+		local potionScrollRUID = "14267ae8e168458480697c148ddfdcab"
+		self._T.tabData["consume"][13] = "잠재능력 부여주문서|" .. potionScrollRUID .. "|0|0|0|0|20"
+		-- 에디셔널 잠재능력 부여주문서 20개 → 소비 탭 슬롯 14
+		local addPotScrollRUID = "0f134eebddee4b368062790b46afc26a"
+		self._T.tabData["consume"][14] = "에디셔널 잠재능력 부여주문서|" .. addPotScrollRUID .. "|0|0|0|0|20"
 		self:RefreshUI()
 	end
 
@@ -910,12 +1345,56 @@ script UIEquipInventoryManager extends Logic
 		local targetTab = (itemType == "avataritem") and "equip" or "consume"
 		local slotMark = (itemType == "avataritem") and "7" or "0"
 		local td = self._T.tabData[targetTab]
-		for i = 1, 128 do
-			if (td[i] or "") == "" then
-				td[i] = name .. "|" .. ruid .. "|" .. slotMark
-				self:RefreshUI()
-				log("[Inven] 추가: " .. name .. " 탭=" .. targetTab .. " 슬롯=" .. tostring(i))
-				return
+
+		if itemType ~= "avataritem" then
+			local maxStack = self:GetItemMaxStack(ruid)
+			if maxStack > 1 then
+				-- 같은 RUID이며 아직 여유 있는 슬롯에 먼저 쌓기
+				for i = 1, 128 do
+					local s = td[i] or ""
+					if s ~= "" and self:ParseInvenRUID(s) == ruid then
+						local cnt = self:ParseCount(s)
+						if cnt < maxStack then
+							local fields = {}
+							for part in string.gmatch(s, "[^|]+") do fields[#fields + 1] = part end
+							while #fields < 7 do fields[#fields + 1] = "0" end
+							fields[7] = tostring(cnt + 1)
+							td[i] = table.concat(fields, "|")
+							self:RefreshUI()
+							log("[Inven] 스택 추가: " .. name .. " 슬롯=" .. tostring(i) .. " 수량=" .. tostring(cnt + 1))
+							return
+						end
+					end
+				end
+				-- 여유 슬롯 없으면 새 슬롯 생성 (7필드 포맷, count=1)
+				for i = 1, 128 do
+					if (td[i] or "") == "" then
+						td[i] = name .. "|" .. ruid .. "|0|0|0|0|1"
+						self:RefreshUI()
+						log("[Inven] 추가(새 슬롯): " .. name .. " 탭=" .. targetTab .. " 슬롯=" .. tostring(i))
+						return
+					end
+				end
+			else
+				-- 비스택 소비 아이템 (기존 방식)
+				for i = 1, 128 do
+					if (td[i] or "") == "" then
+						td[i] = name .. "|" .. ruid .. "|" .. slotMark
+						self:RefreshUI()
+						log("[Inven] 추가: " .. name .. " 탭=" .. targetTab .. " 슬롯=" .. tostring(i))
+						return
+					end
+				end
+			end
+		else
+			-- 장비 아이템 (기존 방식)
+			for i = 1, 128 do
+				if (td[i] or "") == "" then
+					td[i] = name .. "|" .. ruid .. "|" .. slotMark
+					self:RefreshUI()
+					log("[Inven] 추가: " .. name .. " 탭=" .. targetTab .. " 슬롯=" .. tostring(i))
+					return
+				end
 			end
 		end
 		log("[Inven] 인벤토리 가득 참, 추가 불가: " .. name)
@@ -994,28 +1473,56 @@ script UIEquipInventoryManager extends Logic
 		self._T.pendingShowSlotIdx = invenIdx
 	end
 
-	-- 툴팁 표시 (6필드 아이템 스트링 기반, 슬롯 우측에 동적 배치)
+	-- 툴팁 표시 (7필드 아이템 스트링 기반, 메이플스타일 재설계)
 	@ExecSpace("ClientOnly")
 	method void ShowTooltipFromStr(string s, boolean isEquip, string slotPath, string winPath)
 		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
 		if not isvalid(tp) then return end
 
-		local baseName   = self:ParseName(s)
-		local ruid       = self:ParseInvenRUID(s)
-		local stars      = self:ParseStars(s)
-		local scrolls    = self:ParseScrolls(s)
-		local upgrade    = self:ParseUpgrade(s)
-		local slotIdx    = self:ParseSlotIdx(s)
-		local displayName = scrolls > 0 and (baseName .. "+" .. tostring(scrolls)) or baseName
+		local baseName = self:ParseName(s)
+		local ruid     = self:ParseInvenRUID(s)
+		local stars    = self:ParseStars(s)
+		local scrolls  = self:ParseScrolls(s)
+		local upgrade  = self:ParseUpgrade(s)
 
+		-- 1. 이름 (+주문서강화수)
+		local displayName = scrolls > 0 and (baseName .. " (+" .. tostring(scrolls) .. ")") or baseName
 		local titleEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipTitle")
-		local iconEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipIcon")
-		local infoEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipInfo")
-		local starEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/StarText")
-
 		if isvalid(titleEnt) then
 			titleEnt.TextComponent.Text = displayName
 		end
+
+		-- 2. 별 표시: TpStarFull (★/☆, 5+공백+5+공백+5 × 7행 = 최대 100개, 상단 중앙)
+		local STAR_MAX       = 100
+		local STARS_PER_GROUP = 5
+		local PER_ROW        = 15  -- 5+space+5+space+5
+		local fullStarEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TpStarFull")
+		local emptyStarEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/StarText")
+		if isvalid(fullStarEnt) then
+			local rows = {}
+			local rowStr  = ""
+			local colInRow = 0
+			for i = 1, STAR_MAX do
+				if colInRow > 0 and colInRow % STARS_PER_GROUP == 0 then
+					rowStr = rowStr .. " "
+				end
+				rowStr = rowStr .. (i <= stars and "<color=#FFD700>★</color>" or "<color=#888888>☆</color>")
+				colInRow = colInRow + 1
+				if colInRow == PER_ROW then
+					rows[#rows + 1] = rowStr
+					rowStr   = ""
+					colInRow = 0
+				end
+			end
+			if colInRow > 0 then rows[#rows + 1] = rowStr end
+			fullStarEnt.TextComponent.Text = table.concat(rows, "\n")
+		end
+		if isvalid(emptyStarEnt) then
+			emptyStarEnt.TextComponent.Text = ""
+		end
+
+		-- 3. 아이콘
+		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipIcon")
 		if isvalid(iconEnt) then
 			local spr = iconEnt.SpriteGUIRendererComponent
 			if ruid ~= "" then
@@ -1026,19 +1533,48 @@ script UIEquipInventoryManager extends Logic
 				spr.Color = Color(1, 1, 1, 0)
 			end
 		end
-		if isvalid(infoEnt) then
-			local desc = self:GetItemBaseDescription(baseName)
-			if slotIdx >= 1 then
-				infoEnt.TextComponent.Text = desc .. "\n업그레이드 가능: " .. tostring(upgrade)
-			else
-				infoEnt.TextComponent.Text = desc
-			end
-		end
-		if isvalid(starEnt) then
-			starEnt.TextComponent.Text = self:GetStarText(stars)
+
+		-- 4. REQ 조건 텍스트
+		local reqEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/ReqText")
+		if isvalid(reqEnt) then
+			reqEnt.TextComponent.Text = self:GetItemReqText(baseName)
 		end
 
-		-- 슬롯 우측에 툴팁 배치 (슬롯 반폭44 + 여백8 + 툴팁 반폭130 = 182px)
+		-- 5. 직업 텍스트 색상 (연두색 머리띠: 모두 착용 가능 → 흰색)
+		local WHITE = Color(1, 1, 1, 1)
+		local GRAY  = Color(0.5, 0.5, 0.5, 1)
+		local jobCanUse = {true, true, true, true}
+		for i = 1, 4 do
+			local je = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/Job" .. tostring(i))
+			if isvalid(je) then
+				je.TextComponent.FontColor = jobCanUse[i] and WHITE or GRAY
+			end
+		end
+
+		-- 6. 능력치 텍스트 + 잠재능력 섹션 + TooltipInfo·패널·BG 높이 동적 조정
+		local infoEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipInfo")
+		if isvalid(infoEnt) then
+			local statsText = self:BuildTooltipStatsText(baseName, stars, upgrade)
+			local potText = self:BuildPotentialText(s)
+			infoEnt.TextComponent.Text = statsText .. potText
+			-- 줄 수 계산
+			local txt = infoEnt.TextComponent.Text
+			local lineCount = 1
+			for _ in string.gmatch(txt, "\n") do lineCount = lineCount + 1 end
+			local infoH = math.max(lineCount * 22, 44)
+			-- TooltipInfo 높이를 내용에 맞게 축소 (MiddleCenter 정렬이 패널 밖으로 밀리는 현상 방지)
+			infoEnt.UITransformComponent.RectSize = Vector2(379, infoH)
+			-- 패널·BG도 동일하게 조정 (너비 403)
+			local newH = 348 + infoH + 15
+			tp.UITransformComponent.RectSize = Vector2(403, newH)
+			local bgEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipBG")
+			if isvalid(bgEnt) then
+				bgEnt.UITransformComponent.RectSize = Vector2(403, newH)
+				bgEnt.UITransformComponent.anchoredPosition = Vector2(0, 0)
+			end
+		end
+
+		-- 7. 툴팁 위치 (슬롯 우측에 배치, 190px 오프셋)
 		local slotEnt = _EntityService:GetEntityByPath(slotPath)
 		local winEnt  = _EntityService:GetEntityByPath(winPath)
 		if isvalid(slotEnt) and isvalid(winEnt) then
@@ -1046,13 +1582,94 @@ script UIEquipInventoryManager extends Logic
 			local wp = winEnt.UITransformComponent.anchoredPosition
 			local cx = wp.x + sp.x
 			local cy = wp.y + sp.y
-			local offset = 182
+			local offset = 230
 			local tx = cx + offset
-			if tx + 130 > 900 then tx = cx - offset end  -- 우측 넘으면 좌측으로
+			if tx + 202 > 960 then tx = cx - offset end
 			tp.UITransformComponent.anchoredPosition = Vector2(tx, cy)
 		end
 
 		tp.Enable = true
+	end
+
+	-- 스타포스 누적 수치 포함 능력치 텍스트 생성
+	@ExecSpace("ClientOnly")
+	method string BuildTooltipStatsText(string name, integer stars, integer upgrade)
+		local str_b, dex_b, int_b, luk_b, hp_b, atk_b, matk_b, def_b = 0, 0, 0, 0, 0, 0, 0, 0
+		local equipType = "기타"
+
+		if name == "연두색 머리띠" then
+			def_b = 5
+			equipType = "모자"
+		end
+
+		-- 스타포스 누적 수치 계산 (각 레벨별 증가량 합산)
+		local str_sf, dex_sf, int_sf, luk_sf, hp_sf, atk_sf, matk_sf = 0, 0, 0, 0, 0, 0, 0
+		for i = 0, stars - 1 do
+			if i < 5 then
+				str_sf = str_sf + 3; dex_sf = dex_sf + 3
+				int_sf = int_sf + 3; luk_sf = luk_sf + 3
+				hp_sf  = hp_sf  + 25
+			elseif i < 10 then
+				str_sf = str_sf + 4; dex_sf = dex_sf + 4
+				int_sf = int_sf + 4; luk_sf = luk_sf + 4
+				hp_sf  = hp_sf  + 50
+			elseif i < 15 then
+				str_sf = str_sf + 5; dex_sf = dex_sf + 5
+				int_sf = int_sf + 5; luk_sf = luk_sf + 5
+			elseif i < 20 then
+				str_sf = str_sf + 7; dex_sf = dex_sf + 7
+				int_sf = int_sf + 7; luk_sf = luk_sf + 7
+				atk_sf = atk_sf + 7; matk_sf = matk_sf + 7
+			elseif i < 22 then
+				str_sf  = str_sf  + 22; dex_sf  = dex_sf  + 22
+				int_sf  = int_sf  + 22; luk_sf  = luk_sf  + 22
+				atk_sf  = atk_sf  + 21; matk_sf = matk_sf + 21
+			else
+				atk_sf  = atk_sf  + (i + 1)
+				matk_sf = matk_sf + (i + 1)
+			end
+		end
+
+		local text = "장비분류 : " .. equipType .. "\n"
+
+		-- 스타포스로 오른 수치 표시: 전체합 (기존 +강화)
+		if str_sf > 0 then
+			text = text .. "STR : +" .. tostring(str_b + str_sf) .. " (" .. tostring(str_b) .. " +" .. tostring(str_sf) .. ")\n"
+		end
+		if dex_sf > 0 then
+			text = text .. "DEX : +" .. tostring(dex_b + dex_sf) .. " (" .. tostring(dex_b) .. " +" .. tostring(dex_sf) .. ")\n"
+		end
+		if int_sf > 0 then
+			text = text .. "INT : +" .. tostring(int_b + int_sf) .. " (" .. tostring(int_b) .. " +" .. tostring(int_sf) .. ")\n"
+		end
+		if luk_sf > 0 then
+			text = text .. "LUK : +" .. tostring(luk_b + luk_sf) .. " (" .. tostring(luk_b) .. " +" .. tostring(luk_sf) .. ")\n"
+		end
+		if hp_sf > 0 then
+			text = text .. "최대 HP : +" .. tostring(hp_b + hp_sf) .. " (" .. tostring(hp_b) .. " +" .. tostring(hp_sf) .. ")\n"
+		end
+		if atk_sf > 0 then
+			text = text .. "공격력 : +" .. tostring(atk_b + atk_sf) .. " (" .. tostring(atk_b) .. " +" .. tostring(atk_sf) .. ")\n"
+		end
+		if matk_sf > 0 then
+			text = text .. "마력 : +" .. tostring(matk_b + matk_sf) .. " (" .. tostring(matk_b) .. " +" .. tostring(matk_sf) .. ")\n"
+		end
+
+		if def_b > 0 then
+			text = text .. "물리방어력 : +" .. tostring(def_b) .. "\n"
+		end
+
+		text = text .. "업그레이드 가능 횟수 : " .. tostring(upgrade)
+		return text
+	end
+
+	-- 아이템별 REQ 조건 텍스트
+	@ExecSpace("ClientOnly")
+	method string GetItemReqText(string name)
+		if name == "연두색 머리띠" then
+			return "REQ LEV : 5\nREQ STR : 0   REQ LUK : 0\nREQ DEX : 0   REQ INT : 0"
+		end
+		return ""
 	end
 
 	-- 툴팁 숨김
@@ -1072,6 +1689,10 @@ script UIEquipInventoryManager extends Logic
 			return "REQ LEV: 5\nSTR: 0  DEX: 0\nINT: 0  LUK: 0\nPOP: 0\n초보자/전사\n마법사/궁수/도적\n[모자] 방어력+5"
 		elseif name == "연두색주문서" then
 			return "[연두색 머리띠용]\n성공률: 60%\n강화 1회 소모"
+		elseif name == "잠재능력 부여주문서" then
+			return "장비에 잠재능력을 부여합니다.\n성공률: 70%\n실패 시 아이템 파괴\n이미 부여된 아이템에 사용 불가"
+		elseif name == "에디셔널 잠재능력 부여주문서" then
+			return "장비에 에디셔널 잠재능력을 부여합니다.\n성공률: 70%\n실패 시 아이템 파괴\n1번 성공하면 재사용 불가"
 		end
 		return ""
 	end
@@ -1108,6 +1729,7 @@ script UIEquipInventoryManager extends Logic
 		end
 		self.isDragging = false
 		self.dragScrollSlot = 0
+		if self._T.isDraggingInvenItem then self:CancelInvenDrag() end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1163,6 +1785,7 @@ script UIEquipInventoryManager extends Logic
 			ghost.Enable = false
 			ghost.SpriteGUIRendererComponent.ImageRUID = ""
 		end
+		if self._T.isDraggingInvenItem then self:CancelInvenDrag() end
 		log("[EquipDrag] 취소")
 	end
 
@@ -1176,6 +1799,69 @@ script UIEquipInventoryManager extends Logic
 		self._T.hoverEnhanceSlot = false
 	end
 
+	-- ── 인벤 슬롯 간 이동 드래그 ─────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void StartInvenDrag(number invenSlot)
+		if self._T.isDraggingInvenItem then return end
+		local s = self:GetInven(invenSlot)
+		if s == "" then return end
+		self._T.isDraggingInvenItem = true
+		self._T.dragInvenSourceSlot = invenSlot
+		self._T.pendingCancelInvenDrag = false
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		if isvalid(ghost) and not ghost.Enable then
+			local ruid = self:ParseInvenRUID(s)
+			local si = self:ParseSlotIdx(s)
+			ghost.SpriteGUIRendererComponent.ImageRUID = (si >= 1) and ("thumbnail://" .. ruid) or ruid
+			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+			ghost.Enable = true
+		end
+		log("[InvenDrag] 시작 slot=" .. tostring(invenSlot))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelInvenDrag()
+		self._T.isDraggingInvenItem = false
+		self._T.dragInvenSourceSlot = 0
+		self._T.pendingCancelInvenDrag = false
+		self._T.invenDragHoverSlot = 0
+		if not self.isDragging and not self._T.isDraggingPotion and not self._T.isDraggingEquipToEnhance then
+			local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+			if isvalid(ghost) then ghost.Enable = false end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyInvenDrop(number targetSlot)
+		if not self._T.isDraggingInvenItem then return end
+		local srcSlot = self._T.dragInvenSourceSlot
+		if srcSlot == targetSlot then
+			self:CancelInvenDrag()
+			if self.isDragging then self:CancelDrag() end
+			return
+		end
+		-- 스크롤 드래그 중이고 대상이 장비 아이템이면 → 주문서 적용 우선
+		if self.isDragging then
+			local targetStr = self:GetInven(targetSlot)
+			local targetSI = self:ParseSlotIdx(targetStr)
+			if targetSI >= 1 and targetSI <= 7 then
+				self:CancelInvenDrag()
+				self:ApplyScrollToInven(targetSlot)
+				return
+			end
+		end
+		-- 인벤 슬롯 간 swap
+		local srcStr = self:GetInven(srcSlot)
+		local dstStr = self:GetInven(targetSlot)
+		self:SetInvenStr(srcSlot, dstStr)
+		self:SetInvenStr(targetSlot, srcStr)
+		self:RefreshUI()
+		log("[InvenDrag] 이동: 슬롯" .. tostring(srcSlot) .. " ↔ 슬롯" .. tostring(targetSlot))
+		self:CancelInvenDrag()
+		if self.isDragging then self:CancelDrag() end
+	end
+
 	@ExecSpace("ClientOnly")
 	method void ApplyScrollToEquip(number equipSlot)
 		if not self.isDragging then return end
@@ -1184,15 +1870,84 @@ script UIEquipInventoryManager extends Logic
 		if scrollStr == "" then self:CancelDrag() return end
 		local itemStr = self:GetEquip(equipSlot)
 		if itemStr == "" then self:CancelDrag() return end
+
+		local scrollRUID = self:ParseInvenRUID(scrollStr)
+
+		-- 잠재능력 부여주문서: 미부여 아이템에만 사용, 70% 성공, 실패 시 아이템 파괴
+		if scrollRUID == "14267ae8e168458480697c148ddfdcab" then
+			if self:ParseHasPotential(itemStr) >= 1 then
+				log("[PotScroll] 이미 잠재능력이 부여된 아이템입니다.")
+				self:CancelDrag()
+				return
+			end
+			self:ConsumeScrollFromSlot(scrollSlot)
+			local success = _UtilLogic:RandomDouble() < 0.7
+			if success then
+				local fields = {}
+				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				while #fields < 12 do fields[#fields+1] = "0" end
+				fields[7] = "1"
+				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
+				fields[9] = "레어"
+				fields[10] = self:RollPotOption(et, "레어", 1)
+				fields[11] = self:RollPotOption(et, "레어", 2)
+				fields[12] = self:RollPotOption(et, "레어", 3)
+				self:SetEquipStr(equipSlot, table.concat(fields, "|"))
+				log("[PotScroll] 성공! " .. fields[10] .. " / " .. fields[11] .. " / " .. fields[12])
+			else
+				self:SetEquipStr(equipSlot, "")
+				log("[PotScroll] 실패! 아이템 파괴됨")
+			end
+			self:RefreshUI()
+			self:CancelDrag()
+			if success then self:ShowEquipTooltip(equipSlot) else self:HideTooltip() end
+			return
+		end
+
+		-- 에디셔널 잠재능력 부여주문서: 잠재능력 부여 선행 필수, 에디셔널 미부여 아이템에만 사용, 70% 성공, 실패 시 파괴
+		if scrollRUID == "0f134eebddee4b368062790b46afc26a" then
+			if self:ParseHasPotential(itemStr) < 1 then
+				log("[AddPotScroll] 잠재능력이 부여되지 않은 아이템입니다. 먼저 잠재능력을 부여하세요.")
+				self:CancelDrag()
+				return
+			end
+			if self:ParseHasAdditionalPotential(itemStr) >= 1 then
+				log("[AddPotScroll] 이미 에디셔널 잠재능력이 부여된 아이템입니다.")
+				self:CancelDrag()
+				return
+			end
+			self:ConsumeScrollFromSlot(scrollSlot)
+			local success = _UtilLogic:RandomDouble() < 0.7
+			if success then
+				local fields = {}
+				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				while #fields < 16 do fields[#fields+1] = "0" end
+				fields[8] = "1"
+				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
+				fields[13] = "레어"
+				fields[14] = self:RollAddPotOption(et, "레어", 1)
+				fields[15] = self:RollAddPotOption(et, "레어", 2)
+				fields[16] = self:RollAddPotOption(et, "레어", 3)
+				self:SetEquipStr(equipSlot, table.concat(fields, "|"))
+				log("[AddPotScroll] 성공! " .. fields[14] .. " / " .. fields[15] .. " / " .. fields[16])
+			else
+				self:SetEquipStr(equipSlot, "")
+				log("[AddPotScroll] 실패! 아이템 파괴됨")
+			end
+			self:RefreshUI()
+			self:CancelDrag()
+			if success then self:ShowEquipTooltip(equipSlot) else self:HideTooltip() end
+			return
+		end
+
+		-- 기존 주문서 (연두색주문서 등) 처리
 		local upgrade = self:ParseUpgrade(itemStr)
 		if upgrade <= 0 then
 			log("[Scroll] 업그레이드 횟수 부족. 강화 불가")
 			self:CancelDrag()
 			return
 		end
-		-- 주문서 소모
-		self:SetInvenStr(scrollSlot, "")
-		-- 60% 성공 판정
+		self:ConsumeScrollFromSlot(scrollSlot)
 		local success = _UtilLogic:RandomDouble() < 0.6
 		local baseName  = self:ParseName(itemStr)
 		local ruid      = self:ParseInvenRUID(itemStr)
@@ -1210,7 +1965,6 @@ script UIEquipInventoryManager extends Logic
 		self:SetEquipStr(equipSlot, newStr)
 		self:RefreshUI()
 		self:CancelDrag()
-		-- 드랍 완료 후 툴팁 즉시 갱신
 		self:ShowEquipTooltip(equipSlot)
 	end
 
@@ -1300,6 +2054,76 @@ script UIEquipInventoryManager extends Logic
 				local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
 				if isvalid(ghost) then
 					ghost.UITransformComponent.anchoredPosition = cursorUI
+				end
+			end
+		end
+		-- 인벤 슬롯 간 드래그: 고스트 위치 갱신 + 대상 슬롯 추적
+		if self._T.isDraggingInvenItem then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				if self._T.pendingCancelInvenDrag then
+					self:CancelInvenDrag()
+					self._T.pendingCancelInvenDrag = false
+				else
+					self._T.pendingCancelInvenDrag = true
+				end
+			else
+				self._T.pendingCancelInvenDrag = false
+				-- 커서 위치로 드롭 대상 슬롯 직접 계산
+				local invenWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+				if isvalid(invenWin) then
+					local wp = invenWin.UITransformComponent.anchoredPosition
+					local rx = cursorUI.x - wp.x
+					local ry = cursorUI.y - wp.y
+					local hovSlot = 0
+					if not self._T.minimized then
+						local colXs = {-525,-455,-385,-315,-245,-175,-105,-35,35,105,175,245,315,385,455,525}
+						local rowYs = {176,106,36,-34,-104,-174,-244,-314}
+						-- 그리드 경계 근처(±55px)에서 가장 가까운 행/열로 스냅
+						local snapRy = ry
+						if ry > rowYs[1] and ry <= rowYs[1] + 55 then snapRy = rowYs[1]
+						elseif ry < rowYs[8] and ry >= rowYs[8] - 55 then snapRy = rowYs[8] end
+						local snapRx = rx
+						if rx < colXs[1] and rx >= colXs[1] - 55 then snapRx = colXs[1]
+						elseif rx > colXs[16] and rx <= colXs[16] + 55 then snapRx = colXs[16] end
+						for row = 1, 8 do
+							if math.abs(snapRy - rowYs[row]) <= 35 then
+								for col = 1, 16 do
+									if math.abs(snapRx - colXs[col]) <= 35 then
+										hovSlot = (row - 1) * 16 + col
+										break
+									end
+								end
+								break
+							end
+						end
+					else
+						local colXs = {-111,-37,37,111}
+						local rowYs = {176,106,36,-34,-104,-174,-244,-314}
+						local snapRy = ry
+						if ry > rowYs[1] and ry <= rowYs[1] + 55 then snapRy = rowYs[1]
+						elseif ry < rowYs[8] and ry >= rowYs[8] - 55 then snapRy = rowYs[8] end
+						local snapRx = rx
+						if rx < colXs[1] and rx >= colXs[1] - 55 then snapRx = colXs[1]
+						elseif rx > colXs[4] and rx <= colXs[4] + 55 then snapRx = colXs[4] end
+						for row = 1, 8 do
+							if math.abs(snapRy - rowYs[row]) <= 35 then
+								for col = 1, 4 do
+									if math.abs(snapRx - colXs[col]) <= 37 then
+										hovSlot = (row - 1) * 4 + col
+										break
+									end
+								end
+								break
+							end
+						end
+					end
+					self._T.invenDragHoverSlot = hovSlot
+				end
+				if not self.isDragging and not self._T.isDraggingEquipToEnhance then
+					local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+					if isvalid(ghost) then
+						ghost.UITransformComponent.anchoredPosition = cursorUI
+					end
 				end
 			end
 		end
@@ -1396,12 +2220,17 @@ script UIEquipInventoryManager extends Logic
 			self._T.hoverEquipSlot = 0
 			self._T.hoverInvenSlot = 0
 			if eq > 0 then
+				-- 장비창 슬롯 드랍: 주문서 적용 (인벤 이동과 무관)
 				self:ApplyScrollToEquip(eq)
-			elseif iv > 0 then
-				self:ApplyScrollToInven(iv)
-			else
-				self:CancelDrag()
+			elseif not self._T.isDraggingInvenItem then
+				-- 인벤 이동 드래그 중이 아닐 때만 스크롤→인벤 처리
+				if iv > 0 then
+					self:ApplyScrollToInven(iv)
+				else
+					self:CancelDrag()
+				end
 			end
+			-- isDraggingInvenItem=true이고 장비슬롯이 아닌 경우: 아래 블록에서 처리
 		end
 		if self._T.isDraggingPotion then
 			local cursor = _InputService:GetCursorPosition()
@@ -1431,6 +2260,19 @@ script UIEquipInventoryManager extends Logic
 			self:CancelEquipDrag()
 		end
 		if self._T.isDraggingWindow then self:StopWindowDrag() end
+		if self._T.isDraggingInvenItem then
+			local iv = self._T.invenDragHoverSlot or 0
+			if iv > 0 then
+				local dataIdx = self._T.minimized and (self._T.scrollRow * 4 + iv) or iv
+				if dataIdx <= 128 then
+					self:ApplyInvenDrop(dataIdx)
+				else
+					self:CancelInvenDrag()
+				end
+			else
+				self:CancelInvenDrag()
+			end
+		end
 	end
 
 	-- ── 창 드래그 ───────────────────────────────────────────────────
@@ -1555,15 +2397,84 @@ script UIEquipInventoryManager extends Logic
 			self:CancelDrag()
 			return
 		end
+
+		local scrollRUID = self:ParseInvenRUID(scrollStr)
+
+		-- 잠재능력 부여주문서: 미부여 아이템에만 사용, 70% 성공, 실패 시 아이템 파괴
+		if scrollRUID == "14267ae8e168458480697c148ddfdcab" then
+			if self:ParseHasPotential(itemStr) >= 1 then
+				log("[PotScroll] 이미 잠재능력이 부여된 아이템입니다.")
+				self:CancelDrag()
+				return
+			end
+			self:ConsumeScrollFromSlot(scrollSlot)
+			local success = _UtilLogic:RandomDouble() < 0.7
+			if success then
+				local fields = {}
+				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				while #fields < 12 do fields[#fields+1] = "0" end
+				fields[7] = "1"
+				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
+				fields[9] = "레어"
+				fields[10] = self:RollPotOption(et, "레어", 1)
+				fields[11] = self:RollPotOption(et, "레어", 2)
+				fields[12] = self:RollPotOption(et, "레어", 3)
+				self:SetInvenStr(invenSlot, table.concat(fields, "|"))
+				log("[PotScroll] 성공! " .. fields[10] .. " / " .. fields[11] .. " / " .. fields[12])
+			else
+				self:SetInvenStr(invenSlot, "")
+				log("[PotScroll] 실패! 아이템 파괴됨")
+			end
+			self:RefreshUI()
+			self:CancelDrag()
+			if success then self:ShowInvenTooltip(invenSlot) else self:HideTooltip() end
+			return
+		end
+
+		-- 에디셔널 잠재능력 부여주문서: 잠재능력 부여 선행 필수, 에디셔널 미부여 아이템에만 사용, 70% 성공, 실패 시 파괴
+		if scrollRUID == "0f134eebddee4b368062790b46afc26a" then
+			if self:ParseHasPotential(itemStr) < 1 then
+				log("[AddPotScroll] 잠재능력이 부여되지 않은 아이템입니다. 먼저 잠재능력을 부여하세요.")
+				self:CancelDrag()
+				return
+			end
+			if self:ParseHasAdditionalPotential(itemStr) >= 1 then
+				log("[AddPotScroll] 이미 에디셔널 잠재능력이 부여된 아이템입니다.")
+				self:CancelDrag()
+				return
+			end
+			self:ConsumeScrollFromSlot(scrollSlot)
+			local success = _UtilLogic:RandomDouble() < 0.7
+			if success then
+				local fields = {}
+				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				while #fields < 16 do fields[#fields+1] = "0" end
+				fields[8] = "1"
+				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
+				fields[13] = "레어"
+				fields[14] = self:RollAddPotOption(et, "레어", 1)
+				fields[15] = self:RollAddPotOption(et, "레어", 2)
+				fields[16] = self:RollAddPotOption(et, "레어", 3)
+				self:SetInvenStr(invenSlot, table.concat(fields, "|"))
+				log("[AddPotScroll] 성공! " .. fields[14] .. " / " .. fields[15] .. " / " .. fields[16])
+			else
+				self:SetInvenStr(invenSlot, "")
+				log("[AddPotScroll] 실패! 아이템 파괴됨")
+			end
+			self:RefreshUI()
+			self:CancelDrag()
+			if success then self:ShowInvenTooltip(invenSlot) else self:HideTooltip() end
+			return
+		end
+
+		-- 기존 주문서 (연두색주문서 등) 처리
 		local upgrade = self:ParseUpgrade(itemStr)
 		if upgrade <= 0 then
 			log("[Scroll] 업그레이드 횟수 부족. 강화 불가")
 			self:CancelDrag()
 			return
 		end
-		-- 주문서 소모
-		self:SetInvenStr(scrollSlot, "")
-		-- 60% 성공 판정
+		self:ConsumeScrollFromSlot(scrollSlot)
 		local success = _UtilLogic:RandomDouble() < 0.6
 		local baseName  = self:ParseName(itemStr)
 		local ruid      = self:ParseInvenRUID(itemStr)
@@ -1580,7 +2491,6 @@ script UIEquipInventoryManager extends Logic
 		self:SetInvenStr(invenSlot, newStr)
 		self:RefreshUI()
 		self:CancelDrag()
-		-- 드랍 완료 후 툴팁 즉시 갱신
 		self:ShowInvenTooltip(invenSlot)
 	end
 
@@ -1748,7 +2658,18 @@ script UIEquipInventoryManager extends Logic
 			end
 			if isvalid(nEnt) then
 				local tc = nEnt:GetComponent("MOD.Core.TextComponent")
-				if isvalid(tc) then tc.Text = s ~= "" and self:GetDisplayName(s) or "" end
+				if isvalid(tc) then
+					if s ~= "" then
+						local si = self:ParseSlotIdx(s)
+						if si == 0 then
+							tc.Text = tostring(self:ParseCount(s))
+						else
+							tc.Text = ""
+						end
+					else
+						tc.Text = ""
+					end
+				end
 			end
 			local sEnt = _EntityService:GetEntityByPath(base .. v .. "/StarLabel")
 			if isvalid(sEnt) then
@@ -1891,6 +2812,150 @@ script UIEquipInventoryManager extends Logic
 			self._T.scrollRow = self._T.scrollRow - 1
 			self:UpdateInvenViewport()
 		end
+	end
+
+	-- ── 박스 아이템 사용 ─────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void ShowBoxTypeSelectPopup(number sourceSlot)
+		self._T.boxSourceSlot = sourceSlot
+		local s = self:GetInven(sourceSlot)
+		local ruid = self:ParseInvenRUID(s)
+		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/ItemTypeSelectPopup/Dialog/ItemIcon")
+		if isvalid(iconEnt) then
+			local spr = iconEnt.SpriteGUIRendererComponent
+			if isvalid(spr) then
+				spr.ImageRUID = ruid
+				spr.Color = Color(1, 1, 1, 1)
+			end
+		end
+		local popup = _EntityService:GetEntityByPath("/ui/DefaultGroup/ItemTypeSelectPopup")
+		if isvalid(popup) then popup.Enable = true end
+		log("[Box] 타입 선택 팝업 표시 sourceSlot=" .. tostring(sourceSlot))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideBoxTypeSelectPopup()
+		local popup = _EntityService:GetEntityByPath("/ui/DefaultGroup/ItemTypeSelectPopup")
+		if isvalid(popup) then popup.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBoxTypeSelect(number typeSlotIdx)
+		if typeSlotIdx == 0 then
+			log("[Box] 해당 종류는 아직 준비 중입니다.")
+			return
+		end
+		self._T.boxSelectedType = typeSlotIdx
+		self:HideBoxTypeSelectPopup()
+		self:ShowBoxQuantityPopup(typeSlotIdx)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowBoxQuantityPopup(number typeSlotIdx)
+		local sourceSlot = self._T.boxSourceSlot
+		local s = self:GetInven(sourceSlot)
+		local boxCount = self:ParseCount(s)
+		local ruid = self:ParseInvenRUID(s)
+		local name = self:ParseName(s)
+		-- 장비 탭 여유 슬롯 계산
+		local savedTab = self._T.activeTab
+		self._T.activeTab = "equip"
+		local freeSlots = 0
+		for i = 1, 128 do
+			if self:GetInven(i) == "" then freeSlots = freeSlots + 1 end
+		end
+		self._T.activeTab = savedTab
+		local maxQty = math.min(boxCount, freeSlots)
+		self._T.boxMaxQty = maxQty
+		-- 아이템 이미지
+		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/ItemIcon")
+		if isvalid(iconEnt) then
+			local spr = iconEnt.SpriteGUIRendererComponent
+			if isvalid(spr) then
+				spr.ImageRUID = ruid
+				spr.Color = Color(1, 1, 1, 1)
+			end
+		end
+		-- 아이템 이름
+		local nameEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/ItemNameText")
+		if isvalid(nameEnt) then nameEnt.TextComponent.Text = name end
+		-- 최대 수량 안내
+		local maxQtyEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/MaxQtyText")
+		if isvalid(maxQtyEnt) then
+			maxQtyEnt.TextComponent.Text = "최대 " .. tostring(maxQty) .. "개 사용 가능"
+		end
+		-- 입력창 초기값
+		local inputEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/QuantityInput")
+		if isvalid(inputEnt) then inputEnt.TextInputComponent.Text = "1" end
+		-- 팝업 표시
+		local popup = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup")
+		if isvalid(popup) then popup.Enable = true end
+		log("[Box] 수량 팝업 표시 maxQty=" .. tostring(maxQty))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideBoxQuantityPopup()
+		local popup = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup")
+		if isvalid(popup) then popup.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBoxQuantityConfirm()
+		local inputEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/QuantityInput")
+		if not isvalid(inputEnt) then return end
+		local inputText = inputEnt.TextInputComponent.Text
+		local qty = tonumber(inputText) or 0
+		local maxQty = self._T.boxMaxQty or 0
+		if qty <= 0 then
+			log("[Box] 수량 0 이하, 취소")
+			self:HideBoxQuantityPopup()
+			return
+		end
+		if qty > maxQty then qty = maxQty end
+		if qty <= 0 then
+			log("[Box] 여유 슬롯 없음")
+			self:HideBoxQuantityPopup()
+			return
+		end
+		local sourceSlot = self._T.boxSourceSlot
+		-- 장비 탭에 qty개 추가 (모자: 연두색 머리띠)
+		local hatItem = "연두색 머리띠|274b50c184c047d8abf1b520c958ce98|7|0|0|7"
+		local savedTab = self._T.activeTab
+		self._T.activeTab = "equip"
+		local added = 0
+		for i = 1, 128 do
+			if added >= qty then break end
+			if self:GetInven(i) == "" then
+				self:SetInvenStr(i, hatItem)
+				added = added + 1
+			end
+		end
+		-- 소비 탭에서 상자 수량 감소
+		self._T.activeTab = "consume"
+		local s = self:GetInven(sourceSlot)
+		local boxCount = self:ParseCount(s)
+		local newCount = boxCount - added
+		if newCount <= 0 then
+			self:SetInvenStr(sourceSlot, "")
+		else
+			-- 7번째 필드(count)만 교체
+			local fields = {}
+			for part in string.gmatch(s, "[^|]+") do
+				fields[#fields + 1] = part
+			end
+			fields[7] = tostring(newCount)
+			self:SetInvenStr(sourceSlot, table.concat(fields, "|"))
+		end
+		self._T.activeTab = savedTab
+		self:HideBoxQuantityPopup()
+		self:RefreshUI()
+		log("[Box] 상자 " .. tostring(added) .. "개 사용 → 연두색 머리띠 획득. 남은 상자: " .. tostring(math.max(0, boxCount - added)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBoxQuantityCancel()
+		self:HideBoxQuantityPopup()
 	end
 
 	@ExecSpace("ClientOnly")
