@@ -3,6 +3,15 @@ script CharInfoManager extends Logic
 
 	property boolean detailOpen = true
 
+	-- 공격속도 단계 (기본 5단계 = 파워스트라이크 현재 속도). "공격 속도의 비약" 사용 시 1단계씩 증가한다.
+	-- 인벤토리와 마찬가지로 클라이언트 전용 상태 - 서버에는 대응 데이터가 없어(코스튬/인벤과 동일한 이유) 사용 시
+	-- 스킬 발동 RPC 인자로 배율을 계산해 넘겨준다 (SkillManager:UseSkillInSlot 참고).
+	property integer atkSpeedStage = 5
+
+	-- "레벨 70 물약" 사용 시 누적되는 보너스. 이 스탯 시스템은 공격력/마력을 하나의 flatATK로 합쳐서 계산하므로
+	-- (CalcCombatPower/UpdateStats의 "공격력" 또는 "마력" 옵션 분기 참고), 공격력 +1000·마력 +1000을 합쳐 2000으로 반영한다.
+	property integer potionAttackBonus = 0
+
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		local detailBtn = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow/DetailToggleBtn")
@@ -119,9 +128,14 @@ script CharInfoManager extends Logic
 		ac:SetEquip(MapleAvatarItemCategory.Coat,  pc:GetEquip(MapleAvatarItemCategory.Coat))
 		ac:SetEquip(MapleAvatarItemCategory.Pants, pc:GetEquip(MapleAvatarItemCategory.Pants))
 		ac:SetEquip(MapleAvatarItemCategory.Shoes, pc:GetEquip(MapleAvatarItemCategory.Shoes))
-		local weapon = pc:GetEquip(MapleAvatarItemCategory.TwoHandedWeapon)
-		if weapon ~= "" then
-			ac:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, weapon)
+		-- 두손무기/한손무기(후르츠 대거·나무 스태프·우드완드는 실제 리소스가 한손무기 카테고리)를 모두 확인
+		local twoHandWeapon = pc:GetEquip(MapleAvatarItemCategory.TwoHandedWeapon)
+		if twoHandWeapon ~= "" then
+			ac:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, twoHandWeapon)
+		end
+		local oneHandWeapon = pc:GetEquip(MapleAvatarItemCategory.OneHandedWeapon)
+		if oneHandWeapon ~= "" then
+			ac:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, oneHandWeapon)
 		end
 	end
 
@@ -151,6 +165,14 @@ script CharInfoManager extends Logic
 		for slot = 1, 7 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
+
+			-- 무기 슬롯 기본옵션: 직업별 드롭박스 지급 무기는 공격력/마력 +30 고정 (잠재능력과 별개)
+			if slot == 6 then
+				local baseName = _UIEquipInventoryManager:ParseName(s)
+				if _UIEquipInventoryManager:IsJobDropWeapon(baseName) then
+					flatATK += 30
+				end
+			end
 
 			-- Starforce bonus (field 4)
 			local stars = self:ParseFieldNum(s, 4)
@@ -197,6 +219,7 @@ script CharInfoManager extends Logic
 		end
 
 		-- Final stat values
+		flatATK += self.potionAttackBonus
 		local baseVal  = 4 + level * 5
 		local strFinal = math.floor((baseVal + flatSTR) * (1 + pctSTR / 100))
 		local dexFinal = math.floor((baseVal + flatDEX) * (1 + pctDEX / 100))
@@ -237,9 +260,45 @@ script CharInfoManager extends Logic
 		sv("CritRate",  tostring(critRate) .. "%")
 		sv("CDReduce",  "0%")
 		sv("CDImmune",  "0%")
+		sv("AtkSpeed",  tostring(self.atkSpeedStage) .. "단계")
 		sv("Meso",      "0%")
 		sv("Drop",      "0%")
 		sv("ExpBonus",  "0%")
+	end
+
+	-- 공격속도 단계 반환 (기본 5단계)
+	@ExecSpace("ClientOnly")
+	method integer GetAttackSpeedStage()
+		return self.atkSpeedStage
+	end
+
+	-- 공격속도 단계 → 시간 배율. 5단계=1.0(현재 파워스트라이크 기준), 1단계 오를 때마다 이전 단계 대비 10%씩 줄어든다(복리).
+	-- 모션 재생시간/공격 딜레이/타이밍 등 "시간" 값에 그대로 곱해서 사용한다 (배율이 작을수록 더 빠름).
+	@ExecSpace("ClientOnly")
+	method number GetAttackSpeedMultiplier()
+		return 0.9 ^ (self.atkSpeedStage - 5)
+	end
+
+	-- "공격 속도의 비약" 사용 시 호출 - 공격속도 1단계 증가
+	@ExecSpace("ClientOnly")
+	method void IncreaseAttackSpeedStage()
+		self.atkSpeedStage = self.atkSpeedStage + 1
+		log("[CharInfo] 공격속도 증가: " .. tostring(self.atkSpeedStage) .. "단계")
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then
+			self:UpdateStats()
+		end
+	end
+
+	-- "레벨 70 물약" 사용 시 호출 - 공격력 +1000, 마력 +1000 (이 스탯 시스템은 둘을 flatATK 하나로 합쳐 계산하므로 2000 반영)
+	@ExecSpace("ClientOnly")
+	method void UseLevel70Potion()
+		self.potionAttackBonus = self.potionAttackBonus + 2000
+		log("[CharInfo] 레벨 70 물약 사용: 공격력/마력 각 +1000 (누적 potionAttackBonus=" .. tostring(self.potionAttackBonus) .. ")")
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then
+			self:UpdateStats()
+		end
 	end
 
 	-- Standalone combat-power number (same formula as UpdateStats' "Combat" stat), for callers that only need the number (e.g. UIMyInfoManager's world HUD level).
@@ -255,6 +314,14 @@ script CharInfoManager extends Logic
 		for slot = 1, 7 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
+
+			-- 무기 슬롯 기본옵션: 직업별 드롭박스 지급 무기는 공격력/마력 +30 고정 (잠재능력과 별개)
+			if slot == 6 then
+				local baseName = _UIEquipInventoryManager:ParseName(s)
+				if _UIEquipInventoryManager:IsJobDropWeapon(baseName) then
+					flatATK += 30
+				end
+			end
 
 			local stars = self:ParseFieldNum(s, 4)
 			if stars > 0 then
@@ -294,6 +361,7 @@ script CharInfoManager extends Logic
 			end
 		end
 
+		flatATK += self.potionAttackBonus
 		local baseVal  = 4 + level * 5
 		local strFinal = math.floor((baseVal + flatSTR) * (1 + pctSTR / 100))
 		local dexFinal = math.floor((baseVal + flatDEX) * (1 + pctDEX / 100))

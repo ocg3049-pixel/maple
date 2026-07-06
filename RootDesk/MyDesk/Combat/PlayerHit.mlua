@@ -2,42 +2,59 @@
 script PlayerHit extends HitComponent
 
     property number ImmuneCooldown = 1.0
-    property number LastHitTime = 0.0
+
+    -- MonsterAttack.IsAttackTarget이 공격자 쪽에서 참조하는 무적 플래그.
+    -- IsHitTarget(방어자 쪽 훅)은 이 프로젝트의 몬스터 근접공격 경로에서 전혀 호출되지 않고,
+    -- 겹친 여러 공격자의 피해가 OnHit 호출 횟수와 무관하게 한 번에 합산 적용되는 것으로 실측되어
+    -- (Enable=false로 즉시 꺼도 같은 틱에 겹친 공격자들의 피해는 그대로 들어옴), 실제로 동작하는
+    -- IsAttackTarget 쪽에서 걸러내야 한다.
+    property boolean IsInvincible = false
 
     @ExecSpace("ServerOnly")
     method void OnBeginPlay()
-        -- i-frame timer initialized
-        self.LastHitTime = 0.0
-        log("PlayerHit: OnBeginPlay")
+        -- BoxSize/ColliderOffset가 (0,0)으로 비어있으면 아바타 크기에 맞춘 자동 판정 박스가
+        -- TransformComponent 원점(발밑)을 중심으로 계산되어 절반이 땅 밑으로 파고들었다 - 몬스터가
+        -- 멀리 있거나 아래쪽에 있어도 맞는 것처럼 보인 원인. 발밑(0)부터 머리(0.7)까지를 덮도록 명시적으로 설정.
+        self.BoxSize = Vector2(0.45, 0.7)
+        self.ColliderOffset = Vector2(0, 0.35)
     end
 
     method boolean IsHitTarget(string attackInfo)
-        -- Allow hit only if immune cooldown has passed
-        local now = _UtilLogic.ElapsedSeconds
-        if now - self.LastHitTime > self.ImmuneCooldown then
-            self.LastHitTime = now
-            log("PlayerHit: Hit allowed, damage incoming")
-            return true
-        end
-        log("PlayerHit: Immune, hit blocked")
-        return false
+        -- 무적 상태면 판정을 거부한다 - 실측 결과 이 프로젝트의 몬스터 근접공격(MonsterAttack)에는 이 훅이
+        -- 전혀 호출되지 않는 것으로 확인됐지만, 다른 공격 경로가 이 훅을 실제로 참조할 경우를 대비한
+        -- 보조 방어선으로 남겨둔다 - 주 방어선은 MonsterAttack.IsAttackTarget의 IsInvincible 체크.
+        if self._T.invincible then return false end
+        return true
     end
 
     method void OnHit(Entity attacker, integer damage, boolean isCritical, string attackInfo, int32 hitCount)
-        -- Apply base hit behavior (damage, HIT animation state, etc.)
+        -- 서버가 유일한 권위 - OnHit의 부모 ExecSpace가 미지정(=All)이라 클라이언트에서도 호출될 수 있어
+        -- 클라이언트 쪽 실행은 맨 앞에서 걸러낸다.
+        if not self:IsServer() then return end
+        if self._T.invincible then return end
+        self._T.invincible = true
+        self.IsInvincible = true
+        self.Enable = false
+
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
         -- Reduce stagger (경직) to 1/4 of default: force IDLE after ~0.1s
-        if self:IsServer() then
-            local entity = self.Entity
-            _TimerService:SetTimerOnce(function()
-                if isvalid(entity) then
-                    local sc = entity.StateComponent
-                    if isvalid(sc) and sc.CurrentStateName == "HIT" then
-                        sc:ChangeState("IDLE")
-                    end
+        local entity = self.Entity
+        _TimerService:SetTimerOnce(function()
+            if isvalid(entity) then
+                local sc = entity.StateComponent
+                if isvalid(sc) and sc.CurrentStateName == "HIT" then
+                    sc:ChangeState("IDLE")
                 end
-            end, 0.1)
-        end
+            end
+        end, 0.1)
+
+        _TimerService:SetTimerOnce(function()
+            if isvalid(self.Entity) then
+                self.Enable = true
+                self._T.invincible = false
+                self.IsInvincible = false
+            end
+        end, self.ImmuneCooldown)
     end
 
 end
