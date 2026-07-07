@@ -1,0 +1,221 @@
+@Component
+script PoisonMistZone extends Component
+
+	@HideFromInspector property number CombatPower   = 0
+	@HideFromInspector property number Radius        = 1.8
+	@HideFromInspector property integer TickTimerId  = 0
+	@HideFromInspector property integer LifeTimerId  = 0
+	@HideFromInspector property boolean IsPopped     = false
+
+	method void OnBeginPlay()
+		-- 실제 초기화(전투력 설정/타이머 시작/타일 선택)는 스폰 직후 Init()에서 명시적으로 호출한다 -
+		-- 스폰 시점에는 아직 전투력 값을 알 수 없기 때문(달팽이 세마리/럭키세븐 표창 투사체와 동일한 패턴).
+		self._T.poisoned = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Init(number combatPower)
+		self.CombatPower = combatPower
+		self:PickRandomTile()
+		self.TickTimerId = _TimerService:SetTimerRepeat(function() self:Tick() end, 1.0)
+		self.LifeTimerId = _TimerService:SetTimerOnce(function() self:Expire() end, 40.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PickRandomTile()
+		-- skill/211.img/skill/2111003 리소스팩의 독안개 타일 9종(tile/0~tile/8) 중 하나를 무작위로 표시한다.
+		-- 실제 그림은 10배로 확대된 자식 엔티티(Visual)에 그린다 - 루트 엔티티를 직접 확대하면
+		-- PoisonMistAttack의 AttackFrom 판정 박스도 함께 10배로 커져 버려서(실측 확인됨) 안 된다.
+		local tiles = {
+			"eaed7d6a19f0483aa51dc5ff151f7acf",
+			"7f743e56d7cd43c7a3baf9f7061abd3d",
+			"302b1c7f241b400b8544f3b7378eacce",
+			"550d34dd449242c9b3df7daebac8f259",
+			"8bfddf0644494979ba02ef5a59b5a336",
+			"53f3500a48814dd0b97b2825d781583c",
+			"ce9db043ed324af5865e8fa21ce41dc1",
+			"92f82ee141f24246b462856f3ecd1493",
+			"3a6509634ee24b789f5446afb10fe357",
+		}
+		local index = _UtilLogic:RandomIntegerRange(1, #tiles)
+		local visual = self.Entity:GetChildByName("Visual")
+		local spr = isvalid(visual) and visual.SpriteRendererComponent or nil
+		if isvalid(spr) then
+			spr.SpriteRUID = tiles[index]
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Tick()
+		if not isvalid(self.Entity) then return end
+		if self._T.poisoned == nil then self._T.poisoned = {} end
+
+		-- 1) 범위 스캔: 안개 안에 있는 살아있는 몬스터는 새로 등록하거나(중첩 없이) 지속시간을 3초로 갱신한다.
+		local map = self.Entity.CurrentMap
+		if isvalid(map) then
+			local myPos = self.Entity.TransformComponent.WorldPosition
+			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			for _, comp in ipairs(monsterComps) do
+				---@type Monster
+				local mc = comp
+				if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+					local pos = mc.Entity.TransformComponent.WorldPosition
+					local dx = pos.x - myPos.x
+					local dy = pos.y - myPos.y
+					if math.abs(dx) <= self.Radius and math.abs(dy) <= 1.5 then
+						local key = mc.Entity.Path
+						local entry = self._T.poisoned[key]
+						if entry == nil then
+							self._T.poisoned[key] = { entity = mc.Entity, remaining = 3.0 }
+							self:ShowOverheadEffect(mc.Entity)
+						else
+							entry.remaining = 3.0
+						end
+					end
+				end
+			end
+		end
+
+		-- 2) 등록된 모든 대상(안개를 벗어나 남은 지속시간만 소진 중인 대상 포함)에게 1초 간격으로 독 데미지를 준다.
+		local mistAttack = self.Entity:GetComponent("script.PoisonMistAttack")
+		for key, entry in pairs(self._T.poisoned) do
+			if not isvalid(entry.entity) then
+				self._T.poisoned[key] = nil
+			else
+				local monster = entry.entity:GetComponent("script.Monster")
+				if monster ~= nil and monster.IsDead then
+					self:HideOverheadEffect(entry.entity)
+					self._T.poisoned[key] = nil
+				else
+					if mistAttack ~= nil then
+						mistAttack:DealDamage(entry.entity, self.CombatPower)
+					end
+					self:PlayPoisonSound()
+					entry.remaining = entry.remaining - 1.0
+					if entry.remaining <= 0 then
+						self:HideOverheadEffect(entry.entity)
+						self._T.poisoned[key] = nil
+					end
+				end
+			end
+		end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayPoisonSound()
+		if not self:IsClient() then return end
+		_SoundService:PlaySound("fbc82c9f2524497c81aea0a647043ab9", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowOverheadEffect(Entity target)
+		-- 독 디버프 아이콘을 몬스터 머리 위에 반복 재생한다. HitComponent 콜라이더 정보로 머리 높이를 계산한다
+		-- (PlayerAttack.mlua의 PlayFinalAttackHitEffect와 동일한 방식). 이펙트 serial은 클라이언트별로만
+		-- 의미가 있으므로 클라이언트 로컬 _T에 몬스터 경로를 키로 저장해둔다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		if self._T.overheadSerials == nil then self._T.overheadSerials = {} end
+		local key = target.Path
+		if self._T.overheadSerials[key] ~= nil then return end
+
+		local headY = 0.9
+		local hit = target.HitComponent
+		if isvalid(hit) then
+			headY = hit.ColliderOffset.y + hit.BoxSize.y / 2 + 0.2
+		end
+		self._T.overheadSerials[key] = _EffectService:PlayEffectAttached(
+			"7d78d41b9d6b4da986eccee3ba18700f", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), true, {}
+		)
+	end
+
+	@ExecSpace("Multicast")
+	method void HideOverheadEffect(Entity target)
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		if self._T.overheadSerials == nil then return end
+		local key = target.Path
+		local serial = self._T.overheadSerials[key]
+		if serial ~= nil then
+			_EffectService:RemoveEffect(serial)
+			self._T.overheadSerials[key] = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Expire()
+		if self.TickTimerId ~= 0 then
+			_TimerService:ClearTimer(self.TickTimerId)
+			self.TickTimerId = 0
+		end
+		-- 안개가 사라질 때 아직 남아있는 독 디버프 아이콘도 함께 정리한다.
+		if self._T.poisoned ~= nil then
+			for _, entry in pairs(self._T.poisoned) do
+				self:HideOverheadEffect(entry.entity)
+			end
+		end
+		if isvalid(self.Entity) then
+			self.Entity:Destroy()
+		end
+	end
+
+	method void OnEndPlay()
+		if self.TickTimerId ~= 0 then _TimerService:ClearTimer(self.TickTimerId) end
+		if self.LifeTimerId ~= 0 then _TimerService:ClearTimer(self.LifeTimerId) end
+	end
+
+	-- 익스플로젼에 의해 강제로 터질 때 호출된다(PlayerAttack.PopOnePoisonMist). 더 이상 스캔/틱하지 않고,
+	-- 화면에서는 투명도를 서서히 낮추며 사라진 뒤(0.1~0.5초 랜덤) 파괴한다.
+	@ExecSpace("ServerOnly")
+	method void Pop()
+		if self.IsPopped then return end
+		self.IsPopped = true
+		if self.TickTimerId ~= 0 then
+			_TimerService:ClearTimer(self.TickTimerId)
+			self.TickTimerId = 0
+		end
+		if self.LifeTimerId ~= 0 then
+			_TimerService:ClearTimer(self.LifeTimerId)
+			self.LifeTimerId = 0
+		end
+		if self._T.poisoned ~= nil then
+			for _, entry in pairs(self._T.poisoned) do
+				self:HideOverheadEffect(entry.entity)
+			end
+		end
+		local fadeDuration = 0.1 + _UtilLogic:RandomDouble() * (0.5 - 0.1)
+		self:PlayFadeOut(fadeDuration)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then self.Entity:Destroy() end
+		end, fadeDuration)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayFadeOut(number duration)
+		-- Visual 자식의 알파값을 duration에 걸쳐 서서히 0으로 낮춘다. 별도의 알파/컬러 트윈 API가 없어
+		-- 일정 간격 타이머로 계단식으로 낮춘다(슬래쉬블래스트의 DealNextSlashBlastHit과 동일한 재귀 타이머 패턴).
+		if not self:IsClient() then return end
+		local visual = self.Entity:GetChildByName("Visual")
+		if not isvalid(visual) then return end
+		local spr = visual.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		local startAlpha = spr.Color.a
+		local steps = 5
+		local stepTime = duration / steps
+		local stepIndex = 0
+		local fadeStep
+		fadeStep = function()
+			stepIndex = stepIndex + 1
+			if not isvalid(spr) then return end
+			local t = stepIndex / steps
+			local newAlpha = startAlpha * (1 - t)
+			if newAlpha < 0 then newAlpha = 0 end
+			local c = spr.Color
+			spr.Color = Color(c.r, c.g, c.b, newAlpha)
+			if stepIndex < steps then
+				_TimerService:SetTimerOnce(fadeStep, stepTime)
+			end
+		end
+		fadeStep()
+	end
+
+end
