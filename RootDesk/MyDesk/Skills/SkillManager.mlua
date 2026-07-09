@@ -789,6 +789,42 @@ script SkillManager extends Logic
 			end, 0.75 * atkMult)
 			local combatPower = _CharInfoManager:CalcCombatPower()
 			self:RequestFireExplosion(combatPower, atkMult)
+		elseif slot.name == "드래곤 로어" then
+			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+			self._T.skillOnCooldown = true
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.75 * atkMult)
+			local combatPower = _CharInfoManager:CalcCombatPower()
+			self:RequestFireDragonRoar(combatPower, atkMult)
+		elseif slot.name == "스피어 버스터" then
+			-- (실측 확인) 클라이언트 쿨다운을 다른 스킬과 동일하게 0.75*atkMult로 두면, 서버 쪽
+			-- isSpearBursting 잠금이 풀리는 시점(RestoreSpearBurstControl)보다 클라이언트가
+			-- 먼저 재시전을 시도하게 돼, 홀드 지속 시전 시 요청의 절반 가까이가 "이미 진행 중"으로
+			-- 차단되는 문제가 있었다(로그로 확인: 116번 시도 중 58번 차단). 서버 잠금 해제 시점과
+			-- 동일하게 맞춰 홀드 시 매번 성공하도록 한다.
+			-- (버그 수정) RestoreSpearBurstControl 자체가 PlayerAttack.mlua에서 반대 방향 모션 재생
+			-- 버그를 막기 위해 0.95*atkMult에서 1.55*atkMult로 늦춰졌으므로, 여기 쿨다운도 동일하게
+			-- 맞춘다 - 둘이 어긋나면 이 "이미 진행 중" 차단 문제가 다시 재현된다.
+			-- (기능 추가) PlayerAttack.AttackSpearBurst에서 이펙트/데미지 공용이었던 hitStartDelay가
+			-- "히트 속도는 0.7초 뒤, 찌르기 3종 이펙트 시점은 그보다 0.5초 앞당겨서" 요청으로
+			-- damageStartDelay(0.7)/effectStartDelay(0.2)로 다시 분리됐다.
+			-- (기능 추가) "스킬이 끝났는데도 못 움직이는 시간이 길게 느껴진다"는 피드백으로
+			-- RestoreSpearBurstControl 호출 시점이 damageStartDelay + 1.0*atkMult(여유 과다)에서
+			-- damageStartDelay + 0.2*atkMult + 0.05(3번째 실제 데미지 판정 직후 최소 여유)로 줄었다 -
+			-- 이 쿨다운도 그와 반드시 동일해야 하므로 맞춘다.
+			-- (기능 추가) 스피어 버스터는 플레이어의 실제 공격속도 단계(장비/버프로 변하는 값)와
+			-- 무관하게 "공격속도 3단계를 올린 속도"를 이 스킬 전용 기본 속도로 고정한다 - 기본 단계(5)
+			-- 대비 3단계 빠른 8단계에 해당하는 배율(CharInfoManager.GetAttackSpeedMultiplier와 동일한
+			-- 공식 0.9^(단계-5)을 8단계에 적용 = 0.9^3)을 그대로 하드코딩한다. 다른 스킬은 여전히
+			-- _CharInfoManager:GetAttackSpeedMultiplier()(플레이어의 실제 현재 단계)를 그대로 쓴다.
+			local atkMult = 0.9 ^ 3
+			self._T.skillOnCooldown = true
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.7 + 0.2 * atkMult + 0.05)
+			local combatPower = _CharInfoManager:CalcCombatPower()
+			self:RequestFireSpearBurst(combatPower, atkMult)
 		end
 	end
 
@@ -1067,6 +1103,40 @@ script SkillManager extends Logic
 		end
 		pa:AttackExplosion(combatPower, atkMultiplier)
 		log("[SkillManager] 익스플로젼 발동! combatPower=" .. tostring(combatPower))
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireDragonRoar(number combatPower, number atkMultiplier)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireDragonRoar: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireDragonRoar: PlayerAttack component not found")
+			return
+		end
+		pa:AttackDragonRoar(combatPower, atkMultiplier)
+		log("[SkillManager] 드래곤 로어 발동! combatPower=" .. tostring(combatPower))
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireSpearBurst(number combatPower, number atkMultiplier)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireSpearBurst: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireSpearBurst: PlayerAttack component not found")
+			return
+		end
+		pa:AttackSpearBurst(combatPower, atkMultiplier)
+		log("[SkillManager] 스피어 버스터 발동! combatPower=" .. tostring(combatPower))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1407,7 +1477,7 @@ script SkillManager extends Logic
 			for key, held in pairs(self._T.heldSkillKeys) do
 				if held and not self._T.skillOnCooldown then
 					local slot = self._T.slotData[key]
-					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트") then
+					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터") then
 						self:UseSkillInSlot(key)
 					end
 				end
