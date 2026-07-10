@@ -1,6 +1,22 @@
 @Component
 script PlayerAttack extends AttackComponent
 
+	-- 콤보 어택 버프로 쌓인 콤보 구슬 수(0~5). 서버가 갱신하고 모든 클라이언트에 동기화돼
+	-- ComboOrb(구슬 엔티티)가 균등 간격 공전 계산에 읽어 쓴다. 구슬 1개당 데미지 +20%.
+	@Sync property integer ComboOrbCount = 0
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- (버그 수정) "스탯창의 데미지가 오르지 않는다 - 스탯창이 열려있어도 즉시 반영돼야 한다"는
+		-- 피드백. 콤보 구슬 개수(ComboOrbCount)가 바뀔 때마다, 스탯창이 열려 있으면 즉시 다시 계산해
+		-- 표시한다(창이 닫혀 있으면 다음에 열 때 어차피 새로 계산되므로 건너뛴다).
+		if name ~= "ComboOrbCount" then return end
+		local window = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(window) and window.Enable then
+			_CharInfoManager:UpdateStats()
+		end
+	end
+
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
 		        -- Ready: player attack component initialized
@@ -109,6 +125,22 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 실제 공식은 CalcDamageBase에 있고, 여기서는 콤보 어택 버프 보너스(구슬 1개당 +20%)만
+		-- 모든 스킬/기본공격에 일괄 적용한다. 수동 데미지 표시용 캐시(lastDoubleStabDamage 등)는
+		-- Base 안에서 보너스 미반영 값으로 먼저 채워지므로, 여기서 보너스 반영값으로 재갱신해
+		-- 화면 표시와 실제 적용량을 일치시킨다.
+		local dmg = self:ApplyComboAttackBonus(self:CalcDamageBase(attacker, defender, attackInfo))
+		if attackInfo == "skill.doublestab" then
+			self._T.lastDoubleStabDamage = dmg
+		elseif attackInfo == "skill.magicclaw" then
+			self._T.lastMagicClawDamage = dmg
+		elseif attackInfo == "skill.spearburst" then
+			self._T.lastSpearBurstDamage = dmg
+		end
+		return dmg
+	end
+
+	method integer CalcDamageBase(Entity attacker, Entity defender, string attackInfo)
 		        if attackInfo == "skill.powerstrike" then
 		            local combatPower = self._T.pendingCombatPower or 0
 		            local mult = 0.5 + math.random() * (3.0 - 1.0)
@@ -1203,11 +1235,16 @@ script PlayerAttack extends AttackComponent
 		                playerCtrl.LookDirectionX = self._T.lockedDragonRoarDirX
 		            end
 		        end
-		        -- 스피어 버스터 모션 재생 중에도 동일하게 방향을 고정한다 (다른 스킬과 별도 플래그)
+		        -- 스피어 버스터 모션 재생 중에도 동일하게 방향을 고정한다 (다른 스킬과 별도 플래그).
+		        -- (버그 수정) playerCtrl.Enable=false만으로는 "반대 방향키를 누르고 있으면 뒤로 돈다"는
+		        -- 현상이 남아있어, 매 프레임 MovementComponent:Stop()도 함께 호출해 이동 자체를 확실히 막는다.
 		        if self._T.isSpearBurstDirectionLocked then
 		            local playerCtrl = self.Entity.PlayerControllerComponent
 		            if isvalid(playerCtrl) then
 		                playerCtrl.LookDirectionX = self._T.lockedSpearBurstDirX
+		            end
+		            if isvalid(self.Entity.MovementComponent) then
+		                self.Entity.MovementComponent:Stop()
 		            end
 		        end
 		        -- 헤이스트 모션 재생 중에도 동일하게 방향을 고정한다 (다른 스킬과 별도 플래그)
@@ -1678,6 +1715,15 @@ script PlayerAttack extends AttackComponent
 		                log("[SpearBurst] HandleStateChangeEvent forced back to IDLE from " .. tostring(event.CurrentStateName))
 		            end
 		        end
+		        -- (기능 추가) 숨고르기(alert) 재생 중 실제 이동/다른 행동으로 상태가 바뀌면 즉시 중단한다. 위의
+		        -- 잠금 블록들과 달리 여기서는 상태를 강제로 되돌리지 않고 그대로 통과시켜(움직임을 막지 않고)
+		        -- 우리 쪽 오버레이 플래그만 내려, 다음 프레임부터 엔진의 정상 애니메이션이 자연스럽게 이어지게 한다.
+		        if self._T.isSpearBurstBreatherPlaying then
+		            self._T.isSpearBurstBreatherPlaying = false
+		            self._T.spearBurstBreatherToken = (self._T.spearBurstBreatherToken or 0) + 1
+		            log("[SpearBurst] 숨고르기 중단(다른 행동 감지): " .. tostring(event.CurrentStateName))
+		        end
+
 
 		        -- 헤이스트 전용 처리 (힐과 동일한 패턴이지만 별도의 플래그를 사용 - 서로 간섭하지 않는다)
 		        if self._T.isHasteMotionPlaying then
@@ -3049,6 +3095,227 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
+	method void AttackComboAttack(number atkMultiplier)
+		-- 콤보 어택(3차 버프, 30분): 시전 이펙트(skill/1111.img/skill/11111001의 effect 클립) +
+		-- 사용 사운드(_audio/Use)를 1회 재생하고, 버프 지속 중 적을 hit할 때마다(OnAttack) 콤보
+		-- 구슬이 1개씩(최대 5개) 몸 주위를 공전하며 쌓인다. 구슬 1개당 데미지 +20%(5개 = +100%,
+		-- CalcDamage의 ApplyComboAttackBonus에서 일괄 적용). 헤이스트와 동일하게 시전 중에는
+		-- 컨트롤을 잠그고(딜레이), 지속 중 재사용하면 중첩 없이 지속시간만 갱신된다(토큰 비교).
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" then
+			return
+		end
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local dirX = isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1
+		self._T.pendingComboWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+
+		-- 시전 모션: 정확한 전용 자세를 아직 실측 확정하지 못해 사용할 때마다 후보를 순서대로
+		-- 하나씩 바꿔가며 재생하고 로그로 남긴다 - 화면과 로그를 대조해 마음에 드는 이름을
+		-- 알려주면 그걸로 고정한다(스피어 버스터의 stabT2 확정 때와 동일한 절차).
+		local motionName = self:GetComboAttackMotionName()
+		self:PlayComboAttackMotion(self.Entity, dirX, mult, motionName)
+		_TimerService:SetTimerOnce(function()
+			self:RestoreComboAttackControl()
+		end, 0.6 * mult)
+
+		self:PlayComboAttackCastEffect(self.Entity, dirX)
+
+		self._T.comboAttackToken = (self._T.comboAttackToken or 0) + 1
+		local myToken = self._T.comboAttackToken
+		local duration = 1800 -- 30분
+		self._T.comboAttackActive = true
+
+		local userId = self.Entity.PlayerComponent.UserId
+		self:NotifyComboAttackStart(duration, userId)
+
+		_TimerService:SetTimerOnce(function()
+			if self._T.comboAttackToken ~= myToken then return end
+			self._T.comboAttackActive = false
+			self:ClearComboOrbs()
+			log("[ComboAttack] 버프 종료(30분 경과)")
+		end, duration)
+		log("[ComboAttack] 버프 시작 duration=" .. tostring(duration))
+	end
+
+	method string GetComboAttackMotionName()
+		-- 시전 자세 모션. 후보 순환 테스트 결과 첫 번째 후보(alert)로 확정했다 - 고정 재생.
+		return "alert"
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComboAttackMotion(Entity attacker, number dirX, number atkMultiplier, string motionName)
+		-- 시전 모션을 1회 재생한다(헤이스트의 PlayHasteMotion과 동일한 방식 - 별도 플래그 없이
+		-- 컨트롤 잠금(0.6*mult) 구간 동안만 재생되는 짧은 자세라 상태 재적용 훅은 두지 않는다).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		local body = avatarRenderer:GetBodyEntity()
+		if not isvalid(body) then return end
+
+		local playerCtrl = attacker.PlayerControllerComponent
+		if isvalid(attacker.MovementComponent) then
+			attacker.MovementComponent:Stop()
+		end
+		if isvalid(playerCtrl) then
+			playerCtrl.LookDirectionX = dirX
+		end
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local playRate = 1.0 / mult
+		local motionEvent = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
+		body:SendEvent(motionEvent)
+		log("[ComboAttack] PlayComboAttackMotion sent " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
+
+		_TimerService:SetTimerOnce(function()
+			local sc = attacker.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+				sc:ChangeState("MOVE")
+				sc:ChangeState("IDLE")
+			end
+		end, 0.80 * mult)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComboAttackCastEffect(Entity attacker, number dirX)
+		-- 시전 이펙트(마법진 버스트, 참고 영상 '콤보어택 사용시') 1회 + 사용 사운드.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local flipX = dirX > 0
+		_EffectService:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX })
+		_SoundService:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
+		log("[ComboAttack] 시전 이펙트/사운드 재생")
+	end
+
+	@ExecSpace("Client")
+	method void NotifyComboAttackStart(number duration)
+		-- 콤보 어택 버프 타이머 UI 표시(본인 클라이언트에게만 - 호출부에서 UserId를 마지막 인자로 타겟팅).
+		_ComboBuffUI:ShowBuff(duration)
+	end
+
+	@ExecSpace("Server")
+	method void RestoreComboAttackControl()
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) and self._T.pendingComboWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
+	end
+
+	method void OnAttack(Entity defender)
+		-- 콤보 어택 버프 지속 중 적을 실제로 적중시킬 때마다 콤보 구슬 +1(최대 5).
+		-- 부모 AttackComponent.OnAttack은 ExecSpace 미지정(All)이라 어노테이션 없이 오버라이드해야
+		-- 한다(LEA-3014 방지). 실제 히트 파이프라인은 서버에서만 돌지만 안전하게 한 번 더 거른다.
+		-- 스피어 버스터(3연타)/더블스탭(2연타)/썬더볼트(최대 6대상 동시)처럼 스킬 1회 사용이 여러 번
+		-- OnAttack을 호출하는 경우에도 스택은 1회만 쌓여야 한다 - 같은 사용(cast) 안의 모든 히트는
+		-- 0.4초 이내에 몰려서 들어오고(가장 느린 스피어버스터도 히트 간격 최대 ~0.3초), 다음 재사용은
+		-- 쿨다운(0.7초 이상)이 지난 뒤라 서로 겹치지 않는다는 실측 타이밍에 기반한 시간창 방식.
+		if not self:IsServer() then return end
+		if not self._T.comboAttackActive then return end
+		if not isvalid(defender) then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if self._T.lastComboStackTime and (now - self._T.lastComboStackTime) < 0.4 then
+			return
+		end
+		self._T.lastComboStackTime = now
+		-- (기능 추가) "히트 시 50% 확률로 구슬이 생기게 해달라"는 요청 - 매 히트마다 확정 지급하던 것을
+		-- 절반 확률로 바꾼다. math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 이 파일에서 이미
+		-- 실측 확인된 버그(스피어 버스터 등 여러 히트가 0.1~0.2초 간격으로 잇따라 호출되면 math.random()이
+		-- 같은 값을 두 번 반환)를 피하기 위해서다.
+		if _UtilLogic:RandomDouble() >= 0.5 then return end
+		self:AddComboOrb()
+	end
+
+	method string GetComboOrbSpriteRuid(integer idx)
+		-- state 클립(8c563f54...)의 프레임 1~5가 룬 문양 구슬 스프라이트다(msw-search 실측).
+		local ruids = {
+			"594f34c4103145a28951780047e71e42",
+			"eefe86c8b370407aa16c9fe34f12c98d",
+			"dfb6702ddc994b8b8b24acf3c695020b",
+			"18b94fa75cc54db0a806f522564ba449",
+			"1c603235dffd468f8b28b36aa8cb3df2",
+		}
+		return ruids[math.max(1, math.min(idx, #ruids))]
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AddComboOrb()
+		-- 콤보 구슬 1개를 추가한다: 카운트(@Sync) 증가 + 플레이어의 자식으로 구슬 엔티티 스폰.
+		-- 공전/크기 연출은 ComboOrb 컴포넌트가 클라이언트에서 담당한다. 첫 구슬이 생길 때 캐릭터
+		-- 중심에 고정되는 큰 원(8c563f54... 클립 프레임0)도 함께 스폰한다.
+		if self.ComboOrbCount >= 5 then return end
+		local idx = self.ComboOrbCount + 1
+		self.ComboOrbCount = idx
+
+		if idx == 1 then
+			self:SpawnComboOrbCenter()
+		end
+
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", "ComboOrb" .. idx, Vector3(0, 0.35, 0), self.Entity)
+		if isvalid(fx) then
+			fx:AddComponent("script.ComboOrb")
+			local comp = fx:GetComponent("script.ComboOrb")
+			if isvalid(comp) then
+				comp.OrbIndex = idx
+				comp.OrbSpriteRUID = self:GetComboOrbSpriteRuid(idx)
+			end
+			self._T.comboOrbEntities = self._T.comboOrbEntities or {}
+			table.insert(self._T.comboOrbEntities, fx)
+		end
+		log("[ComboAttack] 콤보 구슬 +1 → " .. tostring(idx) .. "/5 (데미지 +" .. tostring(idx * 20) .. "%)")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnComboOrbCenter()
+		-- 구슬들 한가운데(캐릭터 중심)에 고정되는 큰 원. state 클립 프레임0 스프라이트(72x76,
+		-- 작은 구슬보다 큼)를 사용하고 IsCenterOrb=true라 공전하지 않는다.
+		local center = _SpawnService:SpawnByModelId("spearburstfadingeffect", "ComboOrbCenter", Vector3(0, 0.35, 0), self.Entity)
+		if isvalid(center) then
+			center:AddComponent("script.ComboOrb")
+			local comp = center:GetComponent("script.ComboOrb")
+			if isvalid(comp) then
+				comp.IsCenterOrb = true
+				comp.OrbSpriteRUID = "9cfc22d7db1842608b648d9d7b5d216e"
+			end
+			self._T.comboOrbCenterEntity = center
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearComboOrbs()
+		-- 버프 종료 시 구슬 전부 + 중앙 큰 원 제거, 카운트 초기화.
+		self.ComboOrbCount = 0
+		local orbs = self._T.comboOrbEntities or {}
+		for _, e in ipairs(orbs) do
+			if isvalid(e) then
+				e:Destroy()
+			end
+		end
+		self._T.comboOrbEntities = {}
+		if isvalid(self._T.comboOrbCenterEntity) then
+			self._T.comboOrbCenterEntity:Destroy()
+		end
+		self._T.comboOrbCenterEntity = nil
+	end
+
+	method integer ApplyComboAttackBonus(integer damage)
+		-- 콤보 어택 버프 보너스: 구슬 1개당 +20%(최대 5개 = +100%). CalcDamage의 모든 분기 반환값에
+		-- 일괄 적용된다. 부모 훅(CalcDamage)에서 호출되므로 ExecSpace 어노테이션 없이 선언한다.
+		if not self._T.comboAttackActive then return damage end
+		local count = self.ComboOrbCount or 0
+		if count <= 0 then return damage end
+		return math.floor(damage * (1 + 0.2 * count))
+	end
+
+	@ExecSpace("ServerOnly")
 	method void AttackBooster(boolean isMage, number atkMultiplier)
 		-- 부스터: 실제 공격속도 상승 효과는 CharInfoManager가 클라이언트에서 이미 즉시 적용했다(서버에
 		-- 대응 데이터가 없는 클라이언트 전용 스탯이라). 여기서는 다른 플레이어에게 보이는 시전
@@ -4207,7 +4474,7 @@ script PlayerAttack extends AttackComponent
 		-- 기존 0.3+0.3(총 0.6초)에서 1.5배인 0.45+0.45(총 0.9초)로 늘렸다.
 		self:SpawnSpearBurstFadingEffect(
 			"c7051cc242c54208a7c22df2b4bcc28e", Vector2(-0.2 * dirX, 0.05), dirX > 0,
-			1.0, 1.0, 1.0, 0.0, 0.45, 0.45, -1
+			1.0, 1.0, 1.0, 0.0, 0.45, 0.45, -1, false, "", 0, 0, 0, 0
 		)
 		-- 몸쪽 마법진 이펙트(176da561...)도 전용 엔티티(SpawnSpearBurstFadingEffect)로 재생해 투명도 50%→0%로
 		-- 서서히 사라지면서 살짝 커지는 라이브 트윈을 재현한다 - PlayEffectAttached로 한 번 바꿨었지만
@@ -4217,10 +4484,40 @@ script PlayerAttack extends AttackComponent
 		-- 기준으로는 딱히 뒤도 아니지만 항상 보이는 안전값)으로 고정했었다. 이번 피드백은 "다른 이펙트(날개,
 		-- 찌르는 이펙트 3종)와 겹칠 때 마법진이 앞에 보여야 한다"는 것으로, 그 이펙트들은 PlayEffectAttached
 		-- 기본값(OrderInLayer 0 근방)을 쓰므로 마법진을 그보다 높은 양수로 올려 확실히 앞에 오도록 한다.
-		self:SpawnSpearBurstFadingEffect(
-			"176da561b7f946bcbb45bbfbabbaf605", Vector2(0, 0), dirX > 0,
-			1.0, 1.3, 0.5, 0.0, 0.5, 0.35, 10
-		)
+		-- (버그 수정) "마법진이 2번 재생된다"는 진짜 원인을 찾았다 - 애니메이션클립(176da561...)의
+		-- RUID를 SpriteRUID에 그대로 넣으면 world용 SpriteRendererComponent엔 재생 방식(Loop/Onetime)을
+		-- 제어하는 프로퍼티 자체가 없어(UI용과 달리) 엔진이 프레임을 계속 반복 재생했다. 대신 그 클립의
+		-- 개별 프레임 스프라이트(마법진=d757a7ca..., 용머리=7d52e3968f...)를 직접 교체하는 방식으로
+		-- 바꿔 반복 없이 정확히 한 번만 전환되게 한다.
+		-- (기능 추가) 투명도 85%, 크기 75%→160%, 전체 속도 1.5배(0.6초, 각 구간 0.3초)로 조정.
+		-- (버그 수정) "확대될 때 중앙에서 퍼지지 않고 한쪽에서 잡아당기듯 커진다" - 두 스프라이트의
+		-- Pivot이 이미지 중앙이 아니라 좌하단 쪽으로 치우쳐 있어서였다(msw-search 실측: 마법진 pivot
+		-- nx=0.6724,ny=0.1638, 116x116 → 중심오프셋(-0.20,0.39); 용머리 pivot nx=0.625,ny=0.1917,
+		-- 168x120 → 중심오프셋(-0.21,0.37)). SpawnSpearBurstFadingEffect의 pivotOffset 인자로 넘겨
+		-- 매 프레임 그만큼 반대로 위치를 보정해 이미지 중심이 고정된 채 커지도록 한다.
+		-- (기능 추가) "좀 더 몸쪽 캐릭터 쪽으로 이동" - localOffset을 (0,0)에서 (0,0.25)로 올려 몸통
+		-- 높이 쪽으로 옮겼다(추가 피드백으로 0.15→0.25로 한 번 더 올림). 투명도는 85%→60%로 낮췄고,
+		-- 2번째 구간(용머리)이 95%만큼 커진 시점부터 투명도를 0%로 서서히 낮추는 처리는
+		-- SpearBurstFadingEffect.mlua의 UpdateSplitGrowth에서 담당한다(StartAlpha=0.6 기준으로 페이드).
+		-- (기능 추가) "버튼을 누르고 0.15초 뒤에 재생돼야 한다"는 피드백으로 스폰 자체를 0.15초 지연시켰다
+		-- (날개 이펙트(c7051cc2)는 그대로 즉시 재생 - 이 마법진 이펙트만 지연).
+		-- (되돌림) "캐릭터보다 앞은 Z-order(OrderInLayer)가 아니라 X축 이동으로 해야 한다"는 피드백으로
+		-- OrderInLayer는 10으로 되돌리고(찌르기 3종의 OrderInLayer도 11로 함께 되돌림), 대신 localOffset.x를
+		-- 캐릭터가 바라보는 방향(dirX)으로 0.2만큼 옮겨 앞쪽으로 이동시켰다.
+		-- (기능 추가) "이펙트 속도를 50% 더 늘려달라(더 빠르게 커지고 더 빠르게 사라지도록)"는 피드백으로
+		-- 전체 길이를 0.8→0.8/1.5초(≈0.533초)로 줄였다(1.5배 빠름).
+		-- (기능 추가) "최대치를 10% 더 늘려달라"는 피드백으로 EndScale을 1.6→1.76(1.6*1.1)로 올렸다.
+		-- (기능 추가) "Y축을 더 올려달라"는 피드백으로 localOffset.y를 0.25→0.35로 올렸다.
+		-- (기능 추가) "커지는 속도를 5% 늦춰달라"는 피드백으로 전체 길이를 0.533→0.533*1.05(≈0.56초)로
+		-- 늘렸다(5% 느리게).
+		-- (기능 추가) "발동 시작 시간을 0.2초 더 미뤄달라"는 피드백으로 스폰 지연을 0.15→0.35초로 늘렸다.
+		_TimerService:SetTimerOnce(function()
+			self:SpawnSpearBurstFadingEffect(
+				"d757a7ca9e3b417fb2d0d5b725baa12c", Vector2(0.2 * dirX, 0.35), dirX > 0,
+				0.75, 1.76, 0.6, 0.6, 0.0, 0.8 / 1.5 * 1.05, 10, true, "7d52e3968f954e2dabc8f5a050adcd40",
+				-0.20, 0.39, -0.21, 0.37
+			)
+		end, 0.35)
 		-- 찌르는 이펙트 3종은 852883a5 → 3c2ee6e6 → 521bf9f6 순서대로 재생돼야 한다는 피드백으로,
 		-- 동시 재생이 아니라 짧은 간격을 두고 순서대로 트리거한다. 타격감을 위해 "3번 찌르는 스킬"답게
 		-- 데미지 판정과 무관하게 이 3번의 찌르기 각각에 공격 사운드를 재생한다(기존에는 시전 시점에
@@ -4257,8 +4554,22 @@ script PlayerAttack extends AttackComponent
 		-- (기능 추가) StartFrameIndex 수정으로 "852883a5 시작 시점이 스킬 사용 즉시로 바뀌었다"고
 		-- 확인받은 뒤, "이 시작 시점에서 0.5초 후에 뜨는 것으로 바꿔달라"는 피드백으로
 		-- effectStartDelay를 0 → 0.5로 조정한다.
-		local damageStartDelay = 0.7
-		local effectStartDelay = 0.5
+		-- (기능 추가) "데미지가 들어가는 시점을 0.2초 앞당겨달라"는 피드백으로 damageStartDelay를
+		-- 0.7→0.5로 줄였다(effectStartDelay는 그대로 0.5 유지 - 이제 데미지와 이펙트 시작이 같은
+		-- 시점이 된다). SkillManager.mlua의 재사용 대기시간도 damageStartDelay와 반드시 동일해야
+		-- 하므로 0.7→0.5로 함께 맞췄다.
+		-- (버그 수정) "공격속도를 올려도 실제 공격 횟수(DPS)가 거의 안 오른다 - 파워스트라이크는
+		-- 공속을 올리면 확실히 공격 횟수가 늘어난다"는 피드백. 원인은 damageStartDelay/effectStartDelay가
+		-- atkMult와 무관한 고정값(0.5초)이었던 것 - 공속을 올려 mult가 작아져도 이 0.5초 고정 구간은
+		-- 줄지 않아 스킬 전체 주기(SkillManager 쿨다운의 하한선)가 거의 안 줄었다. 다른 스킬들처럼
+		-- 전체 주기가 mult에 비례하도록 두 값 모두 mult를 곱해 스케일링한다(공속을 올렸을 때 파워스트라이크와
+		-- 동일한 비율로 스킬 전체 주기가 짧아지도록).
+		local damageStartDelay = 0.5 * mult
+		local effectStartDelay = 0.5 * mult
+		-- (기능 추가) "3종 찌르기 이펙트 간 시간 간격을 1.5배 늘려달라"는 피드백으로 간격 상수를
+		-- 0.1/0.2*mult → 0.15/0.3*mult로 1.5배 늘렸다. 데미지 판정(DealSpearBurstStabWave) 타이밍도
+		-- 화면 이펙트와 항상 함께 맞아야 하므로("3줄 데미지가 실제 3연타 이펙트와 같은 순간에 뜬다")
+		-- 동일하게 1.5배로 같이 늘렸다.
 		_TimerService:SetTimerOnce(function()
 			self:PlaySpearBurstCircleEffect(self.Entity, dirX)
 		end, effectStartDelay)
@@ -4267,16 +4578,16 @@ script PlayerAttack extends AttackComponent
 		end, damageStartDelay)
 		_TimerService:SetTimerOnce(function()
 			self:PlaySpearBurstBuildupEffect1(self.Entity, dirX)
-		end, effectStartDelay + 0.1 * mult)
+		end, effectStartDelay + 0.15 * mult)
 		_TimerService:SetTimerOnce(function()
 			self:DealSpearBurstStabWave(2, dirX)
-		end, damageStartDelay + 0.1 * mult)
+		end, damageStartDelay + 0.15 * mult)
 		_TimerService:SetTimerOnce(function()
 			self:PlaySpearBurstBuildupEffect2(self.Entity, dirX)
-		end, effectStartDelay + 0.2 * mult)
+		end, effectStartDelay + 0.3 * mult)
 		_TimerService:SetTimerOnce(function()
 			self:DealSpearBurstStabWave(3, dirX)
-		end, damageStartDelay + 0.2 * mult)
+		end, damageStartDelay + 0.3 * mult)
 
 		-- 찌르기 모션 이름이 아직 실측 확인되지 않아 사용할 때마다 순서대로(무작위 아님) 후보를 하나씩
 		-- 넘겨가며 로그에 남긴다. 화면과 로그(PlaySpearBurstStabMotion sent <이름>)를 대조해 실제로
@@ -4286,18 +4597,23 @@ script PlayerAttack extends AttackComponent
 		local motionName = self:GetSpearBurstMotionName()
 		self:PlaySpearBurstStabMotion(self.Entity, dirX, mult, motionName)
 
-		-- (버그 수정) 컨트롤 복구가 방향/모션 잠금 해제보다 먼저 일어나거나, 3번째 실제 데미지 판정
-		-- (damageStartDelay+0.2*mult)보다 먼저 일어나면 안 된다. 모션은 여전히 0초(시전 즉시)에
-		-- 시작해 1.0*mult 뒤 자체 잠금이 풀린다.
-		-- (기능 추가) "스킬이 끝났는데도 못 움직이는 시간이 길게 느껴진다"는 피드백으로 컨트롤 복구를
-		-- damageStartDelay + 1.0*mult(여유가 과했다)에서 damageStartDelay + 0.2*mult + 0.05(3번째
-		-- 실제 데미지 판정 직후 최소한의 여유만 두는 값)로 줄인다. 여전히 두 조건(모션 자체 잠금
-		-- 해제 1.0*mult=약 0.73s, 3타 판정 damageStartDelay+0.2*mult=약 0.85s) 모두보다 뒤에 오는
-		-- 값이라 안전하다(damageStartDelay 값이 바뀌어도 항상 안전하도록 변수로 계산). (SkillManager.mlua의
-		-- 재사용 대기시간도 이 시점과 반드시 동일해야 하므로 함께 맞췄다.)
+		-- (버그 수정) "반대 방향키를 누르고 있으면 찌르는 모션인 채로 뒤로 돌게 된다"는 피드백의 원인 -
+		-- 컨트롤 복구(playerCtrl.Enable=true) 시점이 damageStartDelay+0.3*mult 공식만으로 계산돼,
+		-- PlaySpearBurstStabMotion의 3단계 콤보(beat1Hold=0.12*mult+beat2Hold=0.25*mult+beat3Hold=0.2*mult)가
+		-- 아직 안 끝났는데도 먼저 풀려버리는 경우가 있었다. 두 시점 중 항상 더 늦은 쪽을 기준으로 삼도록
+		-- math.max로 묶어, 모션이 실제로 다 끝난 뒤에만 컨트롤이 풀리게 한다(모션 콤보 상수는
+		-- PlaySpearBurstStabMotion의 beat1Hold/beat2Hold/beat3Hold와 반드시 일치해야 한다 - DPS 스케일링을
+		-- 위해 이제 세 값 모두 mult가 곱해진다).
+		-- (버그 수정) "공속을 올려도 DPS가 파워스트라이크만큼 안 오른다"는 추가 피드백 - 안전 여유였던
+		-- "+0.05"가 mult와 무관한 고정값이라 공속이 빨라질수록 전체 주기에서 차지하는 비중이 커져 DPS
+		-- 스케일링을 계속 깎아먹고 있었다. 두 안전 여유 모두 mult에 비례하도록(0.05*mult) 바꿔, 최종
+		-- 주기가 damageStartDelay/motionComboEnd와 마찬가지로 순수하게 0.85*mult 형태(파워스트라이크의
+		-- 0.75*atkMult와 동일한 단일 비례식)가 되도록 한다.
+		local motionComboEnd = (0.12 + 0.25 + 0.2) * mult
+		local restoreDelay = math.max(damageStartDelay + 0.3 * mult + 0.05 * mult, motionComboEnd + 0.05 * mult)
 		_TimerService:SetTimerOnce(function()
 			self:RestoreSpearBurstControl()
-		end, damageStartDelay + 0.2 * mult + 0.05)
+		end, restoreDelay)
 	end
 
 	-- PlayEffectAttached 재생-재생 반복으로 알파/스케일 페이드를 흉내내면 깜빡임을 완전히 없앨 수
@@ -4314,7 +4630,7 @@ script PlayerAttack extends AttackComponent
 	-- 이전에는 맵의 자식으로 스폰 시점 월드좌표에 고정돼, 캐릭터가 움직이면 이펙트만 그 자리에 남는(따라오지
 	-- 않는) 문제가 있었다. 자식으로 붙이면 부모(캐릭터) Transform을 따라 매 프레임 자동으로 같이 움직인다.
 	@ExecSpace("ServerOnly")
-	method void SpawnSpearBurstFadingEffect(string ruid, Vector2 localOffset, boolean flipX, number startScale, number endScale, number startAlpha, number endAlpha, number holdDuration, number tweenDuration, integer orderInLayer)
+	method void SpawnSpearBurstFadingEffect(string ruid, Vector2 localOffset, boolean flipX, number startScale, number endScale, number startAlpha, number endAlpha, number holdDuration, number tweenDuration, integer orderInLayer, boolean useSplitGrowth, string secondRuid, number pivotOffsetX, number pivotOffsetY, number secondPivotOffsetX, number secondPivotOffsetY)
 		local fxEntity = _SpawnService:SpawnByModelId("spearburstfadingeffect", "SpearBurstFX", Vector3(localOffset.x, localOffset.y, 0), self.Entity)
 		if not isvalid(fxEntity) then return end
 		fxEntity:AddComponent("script.SpearBurstFadingEffect")
@@ -4329,6 +4645,12 @@ script PlayerAttack extends AttackComponent
 			comp.HoldDuration = holdDuration
 			comp.TweenDuration = tweenDuration
 			comp.OrderInLayerValue = orderInLayer
+			comp.UseSplitGrowth = useSplitGrowth
+			comp.SecondClipRUID = secondRuid
+			comp.PivotOffsetX = pivotOffsetX
+			comp.PivotOffsetY = pivotOffsetY
+			comp.SecondPivotOffsetX = secondPivotOffsetX
+			comp.SecondPivotOffsetY = secondPivotOffsetY
 		end
 		_TimerService:SetTimerOnce(function()
 			if isvalid(fxEntity) then
@@ -4357,6 +4679,9 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local flipX = dirX > 0
+		-- (기능 추가) 마법진 이펙트의 OrderInLayer를 10→15로 올리면서, 이 찌르기 이펙트가 다시 가려지지
+		-- (되돌림) 마법진이 X축 이동으로 앞에 오도록 바뀌어 OrderInLayer 경쟁이 더 이상 없으므로
+		-- 원래 값(11)으로 되돌린다.
 		_EffectService:PlayEffectAttached("852883a5b27442e88ac5a23f5a218a58", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
 		self:PlaySpearBurstAttackSound(attacker)
 	end
@@ -4371,7 +4696,12 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlaySpearBurstStabMotion(Entity attacker, number dirX, number atkMultiplier, string motionName)
-		-- 찌르기 자세 모션을 한 번만 재생한다(3번 반복 아님 - 참고 영상은 단일 동작).
+		-- (되돌림) "stabO1이 도중에 창이 사라지는 버그를 유발한다"는 피드백 + 참고 영상(123.mp4) 224프레임
+		-- 전수 분석 결과, 실제 원본도 몸 자세는 창을 든 채 거의 고정돼 있고 "3연타 찌르기" 느낌은 몸동작이
+		-- 아니라 용머리가 창을 타고 뻗어나가는 이펙트가 반복되는 데서 나온다는 것을 확인했다(이미 구현된
+		-- 852883a5/3c2ee6e6/521bf9f6 3종 이펙트 + 마법진/용머리 이펙트가 그 역할). 위-아래-위 합성 모션
+		-- 실험은 안전하지 않은 액션 이름(stabO1)이 무기 렌더링을 깨뜨리는 부작용만 낳았으므로, 실측으로
+		-- 안전 확인된 단일 모션(stabT2) 재생으로 되돌린다.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local avatarRenderer = attacker.AvatarRendererComponent
@@ -4392,26 +4722,50 @@ script PlayerAttack extends AttackComponent
 		self._T.lockedSpearBurstDirX = dirX
 		self._T.lockedSpearBurstMotionName = motionName
 		self._T.isSpearBurstMotionPlaying = true
+		-- 재시전 시 이전 숨고르기가 남아있으면 새 콤보를 방해하지 않도록 즉시 정리한다.
+		self._T.isSpearBurstBreatherPlaying = false
 
 		local mult = math.max(atkMultiplier or 1.0, 0.001)
 		local playRate = 1.0 / mult
 		self._T.lockedSpearBurstPlayRate = playRate
 
+		-- (사용자 정확 지정, 3단계) "마지막 모션 → 0.12초 뒤 마지막 전 모션(역방향, 0.25초 유지) →
+		-- 마지막 모션 다시". ZigzagLoop는 끊는 시점까지 영원히 왕복하므로(직전 버그: ChangeState("IDLE")는
+		-- 상태가 실제로 안 바뀌면 no-op라 못 끊음), 3단계에서 Onetime으로 덮어써 왕복을 확실히 멈춘다.
 		local motionEvent = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
 		body:SendEvent(motionEvent)
-		log("[SpearBurst] PlaySpearBurstStabMotion sent " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
+		log("[SpearBurst] 1단계(마지막 모션) sent " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
 
-		-- (버그 수정) 기존에는 이 잠금이 0.5*mult(=모션 시작 후 1.05*mult 시점)에 풀렸는데, 실제 stabT2
-		-- 클립 재생 길이가 그보다 길어 모션이 화면에서 끝나기 전에 풀리는 문제가 있었다(실측 확인 - 반대
-		-- 방향키를 누르고 있으면 모션 도중에 방향이 바뀜). AttackSpearBurst 전체 시퀀스가 컨트롤을
-		-- 되돌리는 시점(RestoreSpearBurstControl, 0.95*mult)까지는 최소한 잠금을 유지해야 하므로, 모션
-		-- 시작(0.55*mult) 기준으로 남은 구간(0.95*mult - 0.55*mult = 0.4*mult)보다 확실히 길게(1.0*mult)
-		-- 잡아 페이드아웃 시점 이후까지 방향/모션이 풀리지 않도록 한다.
+		-- (버그 수정) "공속을 올려도 공격 횟수가 거의 안 는다"는 피드백 - 이 세 박자 길이가 mult와
+		-- 무관한 고정 초 단위였던 것이 스킬 전체 주기의 하한선이 돼 DPS 스케일링을 막고 있었다.
+		-- 재생 속도(playRate=1/mult)와 같은 비율로 박자 길이도 mult를 곱해, 공속이 빨라지면 콤보 전체가
+		-- 비례해서 짧아지도록 한다(0.12:0.25:0.2 비율 자체는 그대로 유지).
+		local beat1Hold = 0.12 * mult
+		local beat2Hold = 0.25 * mult
+		-- 2단계: beat1Hold초 뒤 마지막 전 모션(역방향 시작).
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(body) then return end
+			local beat2Event = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.ZigzagLoop)
+			body:SendEvent(beat2Event)
+			log("[SpearBurst] 2단계(마지막 전 모션, 역방향 시작) sent " .. tostring(motionName))
+		end, beat1Hold)
+
+		-- 3단계: 2단계를 0.25초 유지한 뒤 마지막 모션을 다시 재생.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(body) then return end
+			local beat3Event = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
+			body:SendEvent(beat3Event)
+			log("[SpearBurst] 3단계(마지막 모션 다시) sent " .. tostring(motionName))
+		end, beat1Hold + beat2Hold)
+
+		-- (기능 추가) "숨고르기 전 마지막 모션의 길이를 0.2로 늘려달라"는 요청으로 고정 0.2를 기준값으로
+		-- 삼았고, 이후 DPS 스케일링 수정으로 다른 두 박자와 동일하게 mult를 곱해 비례하도록 한다.
+		local beat3Hold = 0.2 * mult
 		_TimerService:SetTimerOnce(function()
 			self._T.isSpearBurstMotionPlaying = false
 			self._T.isSpearBurstDirectionLocked = false
 			log("[SpearBurst] 방향/모션 잠금 해제 t=" .. tostring(_UtilLogic.ElapsedSeconds))
-		end, 1.0 * mult)
+		end, beat1Hold + beat2Hold + beat3Hold)
 	end
 
 	@ExecSpace("Multicast")
@@ -4423,7 +4777,9 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local flipX = dirX > 0
-		_EffectService:PlayEffectAttached("3c2ee6e636924e179cca843f819f9b30", attacker, Vector3(0.3 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
+		-- (기능 추가) "몸쪽으로 조금 땡겨달라"는 피드백으로 앞쪽 오프셋을 0.3→0.15로 줄였다. 마법진
+		-- (되돌림) 마법진이 X축 이동으로 앞에 오도록 바뀌어 OrderInLayer는 원래 값(11)으로 되돌린다.
+		_EffectService:PlayEffectAttached("3c2ee6e636924e179cca843f819f9b30", attacker, Vector3(0.15 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
 		self:PlaySpearBurstAttackSound(attacker)
 	end
 
@@ -4436,7 +4792,9 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local flipX = dirX > 0
-		_EffectService:PlayEffectAttached("521bf9f60cb94a7fb9890ba2e0ede109", attacker, Vector3(0.3 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
+		-- (기능 추가) "몸쪽으로 조금 땡겨달라"는 피드백으로 앞쪽 오프셋을 0.3→0.15로 줄였다. 마법진
+		-- (되돌림) 마법진이 X축 이동으로 앞에 오도록 바뀌어 OrderInLayer는 원래 값(11)으로 되돌린다.
+		_EffectService:PlayEffectAttached("521bf9f60cb94a7fb9890ba2e0ede109", attacker, Vector3(0.15 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
 		self:PlaySpearBurstAttackSound(attacker)
 	end
 
@@ -4471,6 +4829,45 @@ script PlayerAttack extends AttackComponent
 			sc:ChangeState("MOVE")
 			sc:ChangeState("IDLE")
 		end
+
+		-- (기능 추가) "모션이 끝난 후 숨고르기 모션을 3초정도 보여달라"는 요청 - 모션 콤보가 완전히
+		-- 끝나고 컨트롤이 복구된 이 시점에, 움직이거나 다른 행동을 하면 즉시 끊기는 숨고르기 연출을 시작한다.
+		self:PlaySpearBurstBreather(self.Entity, self._T.pendingSpearBurstDirX or 1)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySpearBurstBreather(Entity attacker, number dirX)
+		-- 스피어 버스터 모션이 끝난 뒤 3초간 숨고르기(alert - 헤이스트/부스터 등에서 이미 안전 확인된
+		-- 모션) 동작을 Loop로 재생한다. 이동을 막지는 않는다 - 실제 이동/다른 행동으로 StateChangeEvent가
+		-- 발생하면 HandleStateChangeEvent의 isSpearBurstBreatherPlaying 블록이 감지해 즉시 플래그를
+		-- 내리고(강제로 되돌리지 않음) 자연스럽게 엔진 기본 애니메이션으로 넘어가게 한다. 3초 동안
+		-- 아무 행동도 없으면 아래 타이머가 IDLE로 정리한다. token으로 재사용(재시전) 시 이전 타이머가
+		-- 새 시퀀스를 잘못 정리하지 않도록 막는다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		local body = avatarRenderer:GetBodyEntity()
+		if not isvalid(body) then return end
+
+		self._T.spearBurstBreatherToken = (self._T.spearBurstBreatherToken or 0) + 1
+		local myToken = self._T.spearBurstBreatherToken
+		self._T.isSpearBurstBreatherPlaying = true
+
+		local breatherEvent = ActionStateChangedEvent("alert", "alert", 1.0, SpriteAnimClipPlayType.Loop)
+		body:SendEvent(breatherEvent)
+		log("[SpearBurst] 숨고르기 시작 (alert, 3초 또는 다른 행동 시까지)")
+
+		_TimerService:SetTimerOnce(function()
+			if self._T.spearBurstBreatherToken ~= myToken then return end
+			if not self._T.isSpearBurstBreatherPlaying then return end
+			self._T.isSpearBurstBreatherPlaying = false
+			local sc = attacker.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+			end
+			log("[SpearBurst] 숨고르기 자동 종료(3초 경과)")
+		end, 3.0)
 	end
 
 	-- 찌르는 이펙트 3종(852883a5/3c2ee6e6/521bf9f6)이 뜨는 매 순간(0.0s/0.1s/0.2s*mult)마다, 고정해둔
@@ -4537,7 +4934,8 @@ script PlayerAttack extends AttackComponent
 			-- Hp에는 영향 없음). CalcDamage의 skill.spearburst 분기와 반드시 같은 배율을 유지해야 한다.
 			local combatPower = self._T.pendingSpearBurstCombatPower or 0
 			local mult = 0.1 + _UtilLogic:RandomDouble() * (0.2 - 0.1)
-			damage = math.floor(combatPower * mult)
+			-- 콤보 어택 버프 보너스도 실제 판정(CalcDamage)과 동일하게 표시 전용 값에 반영한다.
+			damage = self:ApplyComboAttackBonus(math.floor(combatPower * mult))
 		end
 		self:ShowSpearBurstStabDamageSkin(target, damage, hitIndex)
 		-- 타격 이펙트는 실제 판정 성공 여부와 무관하게 매번 재생한다(항상 3번 느껴지도록).

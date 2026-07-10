@@ -813,18 +813,54 @@ script SkillManager extends Logic
 			-- RestoreSpearBurstControl 호출 시점이 damageStartDelay + 1.0*atkMult(여유 과다)에서
 			-- damageStartDelay + 0.2*atkMult + 0.05(3번째 실제 데미지 판정 직후 최소 여유)로 줄었다 -
 			-- 이 쿨다운도 그와 반드시 동일해야 하므로 맞춘다.
-			-- (기능 추가) 스피어 버스터는 플레이어의 실제 공격속도 단계(장비/버프로 변하는 값)와
-			-- 무관하게 "공격속도 3단계를 올린 속도"를 이 스킬 전용 기본 속도로 고정한다 - 기본 단계(5)
-			-- 대비 3단계 빠른 8단계에 해당하는 배율(CharInfoManager.GetAttackSpeedMultiplier와 동일한
-			-- 공식 0.9^(단계-5)을 8단계에 적용 = 0.9^3)을 그대로 하드코딩한다. 다른 스킬은 여전히
-			-- _CharInfoManager:GetAttackSpeedMultiplier()(플레이어의 실제 현재 단계)를 그대로 쓴다.
-			local atkMult = 0.9 ^ 3
+			-- (기능 추가) "3종 찌르기 이펙트 간 시간 간격을 1.5배 늘려달라"는 피드백으로 PlayerAttack.mlua의
+			-- 간격 상수가 0.2*mult→0.3*mult로 늘어난 것에 맞춰 이 쿨다운도 동일하게 0.3*atkMult로 맞춘다.
+			-- (기능 추가) "데미지 시점을 0.2초 앞당겨달라"는 피드백으로 damageStartDelay가 0.7→0.5로
+			-- 줄어든 것에 맞춰 이 쿨다운의 기준값도 0.7→0.5로 함께 맞춘다.
+			-- (되돌림) "공격속도 단계를 올려도 스피어 버스터에 적용되지 않는다"는 피드백으로, 이전에
+			-- 고정했던 하드코딩(0.9^3, 공격속도 3단계 고정)을 되돌리고 다른 스킬과 동일하게 플레이어의
+			-- 실제 현재 공격속도 단계를 그대로 사용한다.
+			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+			-- (버그 수정) PlayerAttack.AttackSpearBurst의 컨트롤 복구 시점과 반드시 동일한 공식으로
+			-- 맞춘다(둘이 어긋나면 "이미 진행 중" 차단 문제가 재현된다).
+			-- (버그 수정) "꾹 누르고 있으면 중간중간 1-2초씩 불규칙하게 멈춘다"는 피드백 - 로그로 실측한
+			-- 결과, 서버 쪽 isSpearBursting 잠금 해제와 클라이언트 쿨다운 해제가 평균적으로는 같은
+			-- 공식이라도 매 호출마다 클라이언트→서버 RPC 왕복 지연(네트워크 지터)이 조금씩 달라, 가끔
+			-- 클라이언트가 서버보다 미세하게 먼저 재시전을 시도해 "이미 진행 중"으로 막힌다 - 이때
+			-- 클라이언트는 이미 자기 쿨다운을 다 쓴 것으로 착각해 다음 재시전까지 꼬박 한 주기를 더
+			-- 기다리게 되고, 그 결과 직전 성공 시점부터는 정상 간격의 약 2배로 보인다. 클라이언트
+			-- 쿨다운에 지터 흡수용 여유(0.15초)를 추가로 얹어, 클라이언트가 항상 서버보다 확실히 늦게
+			-- 재시전을 시도하도록 한다.
+			-- (버그 수정) "공속을 올려도 공격 횟수가 거의 안 는다 - 파워스트라이크는 확실히 는다"는
+			-- 피드백 - damageStartDelay(0.5)가 atkMult와 무관한 고정값이라 전체 주기가 공속에 비례해
+			-- 줄지 않던 것이 원인이었다. PlayerAttack.AttackSpearBurst와 동일하게 damageStartDelay 자체를
+			-- 0.5*atkMult로 스케일링했으므로, 여기 쿨다운 공식도 반드시 동일하게 맞춘다.
+			-- (버그 수정) 이어서 "+0.05" 안전 여유도 atkMult와 무관한 고정값이라 공속이 빨라질수록 전체
+			-- 주기에서 차지하는 비중이 커져 DPS 스케일링을 계속 깎아먹고 있었다 - 0.05*atkMult로 바꿔
+			-- 파워스트라이크(0.75*atkMult)와 동일하게 순수 비례식(0.85*atkMult)이 되도록 한다. 지터
+			-- 흡수용 여유(jitterMargin)만은 실제 네트워크 왕복 지연(공속과 무관한 고정 시간)을 막기
+			-- 위한 것이므로 의도적으로 고정값(0.15초)을 유지한다.
+			local damageStartDelay = 0.5 * atkMult
+			local motionComboEnd = (0.12 + 0.25 + 0.2) * atkMult
+			local jitterMargin = 0.15
+			local spearBurstCooldownDuration = math.max(damageStartDelay + 0.3 * atkMult + 0.05 * atkMult, motionComboEnd + 0.05 * atkMult) + jitterMargin
 			self._T.skillOnCooldown = true
 			_TimerService:SetTimerOnce(function()
 				self._T.skillOnCooldown = false
-			end, 0.7 + 0.2 * atkMult + 0.05)
+			end, spearBurstCooldownDuration)
 			local combatPower = _CharInfoManager:CalcCombatPower()
 			self:RequestFireSpearBurst(combatPower, atkMult)
+		elseif slot.name == "콤보 어택" then
+			-- 콤보 어택(3차, 버프 30분): 헤이스트와 동일하게 공격이 아니라 버프이므로 combatPower는
+			-- 필요 없고, 짧은 재사용 대기시간만 둔다(연타 스팸 방지). 지속 중 다시 쓰면 서버 쪽에서
+			-- 중첩 없이 지속시간만 갱신된다.
+			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+			self._T.skillOnCooldown = true
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.75 * atkMult)
+			self:RequestFireComboAttack(atkMult)
+			log("[SkillManager] 콤보 어택 사용!")
 		end
 	end
 
@@ -1008,6 +1044,23 @@ script SkillManager extends Logic
 		end
 		pa:AttackHaste(atkMultiplier)
 		log("[SkillManager] 헤이스트 발동!")
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireComboAttack(number atkMultiplier)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireComboAttack: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireComboAttack: PlayerAttack component not found")
+			return
+		end
+		pa:AttackComboAttack(atkMultiplier)
+		log("[SkillManager] 콤보 어택 발동!")
 	end
 
 	@ExecSpace("Server")
