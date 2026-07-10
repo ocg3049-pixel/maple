@@ -127,6 +127,12 @@ script PlayerAttack extends AttackComponent
 		                return false
 		            end
 		        end
+		        -- 코마 - 드래곤로어와 동일한 패턴(이번 호출 전용 단일 대상만 통과, 최대 15명까지 순차 호출).
+		        if attackInfo == "skill.coma" then
+		            if not isvalid(self._T.comaCurrentTarget) or defender ~= self._T.comaCurrentTarget then
+		                return false
+		            end
+		        end
 		        return __base:IsAttackTarget(defender, attackInfo)
 	end
 
@@ -222,6 +228,13 @@ script PlayerAttack extends AttackComponent
 			            local combatPower = self._T.pendingPanicCombatPower or 0
 			            local orbCount = self._T.pendingPanicOrbCount or 0
 			            local perOrbMult = 10.0 + _UtilLogic:RandomDouble() * (12.0 - 10.0)
+			            return math.floor(combatPower * orbCount * perOrbMult)
+		        elseif attackInfo == "skill.coma" then
+			            -- (기능 추가) "패닉 데미지 공식의 1/5로 해달라"는 요청 - 패닉(구슬 1개당 1000%~1200%)의
+			            -- 1/5인 구슬 1개당 200%~240%. 코마는 다중 대상(최대 15명)이라 각 대상마다 독립적으로 새로 굴린다.
+			            local combatPower = self._T.pendingComaCombatPower or 0
+			            local orbCount = self._T.pendingComaOrbCount or 0
+			            local perOrbMult = 2.0 + _UtilLogic:RandomDouble() * (2.4 - 2.0)
 			            return math.floor(combatPower * orbCount * perOrbMult)
 		        end
 		        return 50
@@ -902,6 +915,28 @@ script PlayerAttack extends AttackComponent
 		        return candidates[index]
 	end
 
+	method boolean HasFinalAttackTarget(Vector2 fromPos, number dirX)
+		-- 파이널어택 발동 여부를 결정하는 "인지범위" 전용 탐색(FindSlashBlastTargets와 같은 모양의
+		-- 전방 박스지만, 슬래쉬블래스트 본체 사거리와는 완전히 분리된 범위). 기존 판정 범위
+		-- (dx<=2.0, dy<=1.0)에서 "인지범위를 1.2배 늘려달라"는 요청으로 dx<=2.4, dy<=1.2로 조정.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return false end
+		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		for _, comp in ipairs(monsterComps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local pos = mc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if dx * dirX >= 0 and math.abs(dx) <= 2.4 and math.abs(dy) <= 1.2 then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
 	@ExecSpace("ServerOnly")
 	method void TryTriggerFinalAttack(string sourceSkill, number combatPower, number atkMultiplier, boolean isSpear)
 		        -- 파워스트라이크/슬래쉬블래스트 시전 시 60% 확률로, 그 스킬의 컨트롤 잠금이 풀리는 시점(RestoreControl/
@@ -924,10 +959,14 @@ script PlayerAttack extends AttackComponent
 		        -- 박스가 나가는 전방 판정이라 - 대상이 등 뒤에 있어도 FindNearestMonster는 찾아버려서
 		        -- 실제로는 헛스윙인데도 발동해버리는 문제가 실측 확인됐다. 파워스트라이크/슬래쉬블래스트
 		        -- 둘 다 방향까지 고려하는 FindSlashBlastTargets(전방 박스 탐색)로 통일한다.
+		        -- (기능 변경) "파이널어택의 인지범위(맞을 대상이 있는지 확인하는 범위)를 1.2배 늘려달라"는
+		        -- 요청 - 예전에는 슬래쉬블래스트 실제 타격에 쓰이는 FindSlashBlastTargets를 그대로
+		        -- 재사용했는데, 이제 전용 메서드(HasFinalAttackTarget)로 분리해 슬래쉬블래스트 본체
+		        -- 사거리는 건드리지 않고 이 인지범위만 독립적으로 늘릴 수 있게 한다.
 		        local worldPos = self.Entity.TransformComponent.WorldPosition
 		        local dirX = (sourceSkill == "powerstrike") and (self._T.pendingDirX or 1) or (self._T.pendingSlashDirX or 1)
-		        local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 1)
-		        if #targets == 0 then
+		        local hasTarget = self:HasFinalAttackTarget(Vector2(worldPos.x, worldPos.y), dirX)
+		        if not hasTarget then
 		            log("PlayerAttack: TryTriggerFinalAttack 취소(타겟 없음) source=" .. sourceSkill)
 		            return
 		        end
@@ -975,10 +1014,13 @@ script PlayerAttack extends AttackComponent
 
 		        self._T.pendingFinalCombatPower = combatPower
 		        local playerCtrl = self.Entity.PlayerControllerComponent
-		        local worldPos = self.Entity.TransformComponent.WorldPosition
 		        local dirX = playerCtrl.LookDirectionX
 		        self._T.pendingFinalDirX = dirX
-		        self._T.powerStrikeFinalTarget = self:FindNearestMonster(Vector2(worldPos.x, worldPos.y), 2.0)
+		        -- (버그 수정) "히트박스가 네모가 아니다"(파워스트라이크에서 실측된 것과 동일한 버그)가
+		        -- 파이널어택에도 그대로 있었다 - 대상 선정을 시전 시점에 전방향(원형) FindNearestMonster로
+		        -- 미리 골라뒀는데, 실제 판정(NotifyFinalMotionEnded)은 전방 사각 박스라 서로 도형이 달랐다.
+		        -- 대상 선정을 실제 판정 시점으로 옮기고 그 박스와 동일한 모양으로 다시 고르도록 아래
+		        -- NotifyFinalMotionEnded로 옮긴다(파워스트라이크와 동일한 해결 방식).
 
 		        self._T.pendingFinalWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
 		        if isvalid(playerCtrl) then
@@ -1023,11 +1065,18 @@ script PlayerAttack extends AttackComponent
 		        local dirX = self._T.pendingFinalDirX or 1
 		        local swing = self._T.pendingFinalSwing or { ruid = "", name = "?" }
 		        local curWorldPos = self.Entity.TransformComponent.WorldPosition
+		        -- (기능 변경) "파이널어택일 때 사거리를 1.5배 늘려달라"는 요청 - 기존 전방 사거리(오프셋 1.0+
+		        -- 박스 반폭 1.0 = 2.0)를 1.5배 한 3.0으로 늘린다. 근접 경계는 캐릭터 바로 앞(0)에 그대로
+		        -- 붙어있어야 하므로 오프셋=박스 x폭의 절반=1.5로 맞춘다(y축은 요청 범위 밖이라 그대로 둔다).
+		        local finalForwardReach = 3.0
 		        local attackOffset = Vector2(
-		            curWorldPos.x + 1.0 * dirX,
+		            curWorldPos.x + (finalForwardReach / 2) * dirX,
 		            curWorldPos.y
 		        )
-		        local shape = BoxShape(attackOffset, Vector2(2, 2), 0)
+		        local shape = BoxShape(attackOffset, Vector2(finalForwardReach, 2), 0)
+		        -- (버그 수정) 대상 선정을 위 박스와 완전히 동일한 모양(전방 사각형)으로 실제 판정 시점에
+		        -- 다시 고른다(파워스트라이크 본체와 동일한 해결 방식 - AttackPowerStrikeFinal 주석 참고).
+		        self._T.powerStrikeFinalTarget = self:FindNearestMonsterInForwardBox(Vector2(curWorldPos.x, curWorldPos.y), dirX, finalForwardReach, 1.0)
 		        local hitComps = self:Attack(shape, "skill.powerstrike.final", CollisionGroups.HitBox)
 		        local targets = {}
 		        for _, hc in ipairs(hitComps) do
@@ -3813,6 +3862,224 @@ script PlayerAttack extends AttackComponent
 		end
 		log("[Panic] 히트 이펙트 스케일 orbCount=" .. tostring(orbCount) .. " scale=" .. tostring(hitScale))
 		log("[Panic] 히트 이펙트 재생 orbCount=" .. tostring(orbCount) .. " targets=" .. tostring(#targets))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackComa(number combatPower, number atkMultiplier)
+		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
+		self:StopBreather()
+		-- 코마: 패닉과 구조가 비슷하다 - 콤보 어택 버프로 쌓은 콤보 구슬을 전부 소모해서 발동하고,
+		-- 구슬이 하나도 없으면 사용할 수 없다. 다만 패닉(단일 대상)과 달리 코마는 드래곤로어와 동일한
+		-- 범위(FindDragonRoarTargets 재사용)에서 가까운 대상부터 최대 15명을 동시에 타격하는 다중 대상
+		-- 스킬이다. 캐릭터 모션/시전 타이밍은 패닉과 동일하게 GetPowerStrikeSwing + PlayAttackMotion을
+		-- 그대로 재사용하고, 판정도 동일한 고정 딜레이(0.45초 * 배율) 뒤에 진행한다.
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+		if self._T.isComaAttacking then
+			log("PlayerAttack: AttackComa 요청 차단됨(이미 진행 중)")
+			return
+		end
+		-- 콤보 구슬이 하나도 없으면 사용 불가 - 클라이언트(SkillManager)도 미리 확인하지만 서버가 최종 판정한다.
+		local orbCount = self.ComboOrbCount
+		if orbCount <= 0 then
+			log("PlayerAttack: AttackComa 요청 차단됨(콤보 구슬 없음)")
+			return
+		end
+		self._T.isComaAttacking = true
+		self._T.comaMotionEndHandled = false
+
+		local mult = math.max(0.1, math.min(atkMultiplier or 1.0, 3.0))
+		self._T.pendingComaCombatPower = combatPower
+		-- 소모할 구슬 개수(1~10)를 시전 시점 값으로 스냅샷해둔다 - 바로 아래에서 ClearComboOrbs로
+		-- ComboOrbCount를 0으로 되돌리기 때문에, 데미지 공식/이펙트 선택은 반드시 이 스냅샷 값을 써야 한다.
+		self._T.pendingComaOrbCount = orbCount
+
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local dirX = playerCtrl.LookDirectionX
+		self._T.pendingComaDirX = dirX
+
+		self._T.pendingComaWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+
+		-- 구슬은 시전 즉시(모션 시작과 동시에) 전부 소모한다 - 패닉과 동일한 이유(콤보 어택 버프의
+		-- +20%/개 보너스가 코마 자체 공식에 중복으로 얹히지 않도록).
+		self:ClearComboOrbs()
+
+		self:PlayComaUseSound(self.Entity)
+		self:PlayComaCastEffect(self.Entity, dirX, orbCount)
+
+		-- 캐릭터 모션은 패닉과 동일한 후보군(GetPowerStrikeSwing)에서 하나를 골라 재생한다.
+		local swing = self:GetPowerStrikeSwing()
+		self._T.pendingComaSwing = swing
+		self:PlayAttackMotion(self.Entity, swing.name, dirX, mult)
+
+		-- 타격 판정 타이밍은 패닉과 동일하게 고정 딜레이(0.45초 * 배율) 뒤에 진행한다.
+		_TimerService:SetTimerOnce(function()
+			self:NotifyComaMotionEnded()
+		end, 0.45 * mult)
+
+		-- 컨트롤 잠금 해제도 패닉과 동일한 총 딜레이(0.65초 * 배율).
+		_TimerService:SetTimerOnce(function()
+			self:RestoreComaControl()
+		end, 0.65 * mult)
+
+		log("[Coma] 발동 orbCount=" .. tostring(orbCount))
+	end
+
+	@ExecSpace("Server")
+	method void RestoreComaControl()
+		-- AttackComa에서 예약한 고정 딜레이(0.65초 = 모션 0.25초 + 추가 이동 봉인 0.4초, 패닉과 동일) 뒤 호출된다.
+		self._T.isComaAttacking = false
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) and self._T.pendingComaWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
+		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
+		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
+		self:PlayBreather(self.Entity, self._T.pendingComaDirX or 1)
+	end
+
+	method void NotifyComaMotionEnded()
+		-- AttackComa에서 예약한 고정 딜레이(0.25초 * 배율, 패닉과 동일) 타이머로 호출된다.
+		if self._T.comaMotionEndHandled then return end
+		self._T.comaMotionEndHandled = true
+
+		if not isvalid(self.Entity) then return end
+		local worldPos = self.Entity.TransformComponent.WorldPosition
+		-- 사용범위는 드래곤로어와 동일(FindDragonRoarTargets 재사용) - 전방위, 가까운 대상부터 정렬,
+		-- 최대 15명까지.
+		local targets = self:FindDragonRoarTargets(Vector2(worldPos.x, worldPos.y), 15)
+		for _, t in ipairs(targets) do
+			self:DealComaHit(t)
+		end
+		log("PlayerAttack: AttackComa targets=" .. tostring(#targets))
+	end
+
+	-- 대상 하나에게만 코마 데미지를 적중시킨다(드래곤로어/익스플로젼과 동일한 단일 대상 패턴 - 밀집
+	-- 지역에서 판정 박스가 이웃까지 겹쳐 맞히는 것을 막는다).
+	@ExecSpace("ServerOnly")
+	method void DealComaHit(Entity target)
+		if not isvalid(target) then return end
+		self._T.comaCurrentTarget = target
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		local hitComps = self:Attack(shape, "skill.coma", CollisionGroups.HitBox)
+		local actuallyHit = false
+		for _, hc in ipairs(hitComps) do
+			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
+				actuallyHit = true
+				break
+			end
+		end
+		if actuallyHit then
+			self:PlayComaHitEffect(target, self._T.pendingComaOrbCount or 0)
+			self:PlayComaStunEffect(target)
+			self:ApplyComaStun(target)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyComaStun(Entity target)
+		-- (기능 추가) "코마에 맞은 적은 3초간 이동이 제한된다"는 요청 - 몬스터 전용 AI 추적 컴포넌트
+		-- (AIChaseComponent)를 3초간 꺼서 새로운 이동 결정을 못 내리게 하고, 이미 진행 중이던 이동도
+		-- 즉시 멈춘다. 별도의 커스텀 상태이상 시스템 없이 기존 컴포넌트만으로 최소한의 스턴을 구현한다.
+		-- (버그 수정) "스턴이 걸렸는데도 이동한다"는 신고 - AIChaseComponent.Enable=false + 최초 1회
+		-- MovementComponent:Stop()만으로는 부족했다(AIChase가 이미 내려둔 이동 명령이 몇 프레임 더
+		-- 이어지거나, 다른 경로로 다시 이동이 걸릴 수 있음). MovementComponent 자체도 3초간 완전히
+		-- 꺼서(Enable=false) 그 사이엔 어떤 경로로도 이동 로직이 아예 실행되지 않게 한다.
+		if not isvalid(target) then return end
+		local aiChase = target.AIChaseComponent
+		local wasAIEnabled = isvalid(aiChase) and aiChase.Enable
+		if isvalid(aiChase) then
+			aiChase.Enable = false
+		end
+		local movement = target.MovementComponent
+		local wasMovementEnabled = isvalid(movement) and movement.Enable
+		if isvalid(movement) then
+			movement:Stop()
+			movement.Enable = false
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(target) and isvalid(aiChase) and wasAIEnabled then
+				aiChase.Enable = true
+			end
+			if isvalid(target) and isvalid(movement) and wasMovementEnabled then
+				movement.Enable = true
+			end
+		end, 3.0)
+	end
+
+	method string GetComaEffectRuid(integer orbCount)
+		-- 소모한 콤보 구슬 개수(1~10)별 캐릭터 시전 이펙트 (skill/1111.img/skill/11111003의 finish/1~10).
+		local ruids = {
+			"8f260fa8eb49460691544a8806e80342",
+			"e6eefdb13ca4452ba51437f1bca9d165",
+			"7b5b0596abbd4f44afaa332f11943ebf",
+			"6c60534394bf4fba8a2553528f3f9ec3",
+			"8d638b1a7d5a4fac9de02f4c875ab956",
+			"7805bdc3c28b471fb90fc27b51801d1b",
+			"1e5b27a588564f44ab0ffc30040c1308",
+			"895a0c9854634b88af00e658e2fb5327",
+			"2672e793d7274cb5b8e4daa716671832",
+			"3f6088e8a7134c5aaa65b4f5ac12e374",
+		}
+		return ruids[math.max(1, math.min(orbCount, #ruids))]
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComaUseSound(Entity attacker)
+		-- 코마 전용 사용 사운드. Multicast는 서버 자신도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		_SoundService:PlaySound("15cbdb9c56db4e87a379ba631e06a3d1", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComaCastEffect(Entity attacker, number dirX, integer orbCount)
+		-- 소모한 구슬 개수에 맞는 캐릭터 이펙트를 시전 즉시 1회 재생한다. 위치는 패닉의 몸쪽 이펙트와
+		-- 동일(캐릭터 중심, Y오프셋 없음). Multicast는 서버 자신도 함께 실행하므로 클라이언트에서만
+		-- 실행되게 막는다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local effectRuid = self:GetComaEffectRuid(orbCount)
+		local options = { ["FlipX"] = dirX > 0 }
+		_EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, options)
+		log("[Coma] 시전 이펙트 재생 orbCount=" .. tostring(orbCount) .. " ruid=" .. tostring(effectRuid))
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComaHitEffect(Entity target, integer orbCount)
+		-- 코마에 맞은 몬스터 전용 히트 이펙트. 소모한 구슬 개수에 따라 두 종류 중 하나를 재생한다
+		-- (5콤보 이하 / 6~10콤보).
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local hitEffectRUID = (orbCount <= 5) and "df55af646a634f62a9a167a1380a147e" or "17b87afe9f03458cbaf63c0194d699ae"
+		_EffectService:PlayEffectAttached(hitEffectRUID, target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComaStunEffect(Entity target)
+		-- 코마에 맞은 대상 머리 위에 3초간 뜨는 스턴 표시 이펙트. 몬스터마다 크기가 달라도 항상 머리
+		-- 바로 위에 뜨도록, 파이널어택 히트 이펙트와 동일하게 HitComponent의 콜라이더 크기로 머리
+		-- 높이를 계산한다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local headY = 0.5
+		local hit = target.HitComponent
+		if isvalid(hit) then
+			headY = hit.ColliderOffset.y + hit.BoxSize.y / 2
+		end
+		local serial = _EffectService:PlayEffectAttached("b798d9bdc19e4bfab33ccc906f4ccd2a", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), true, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 3.0)
 	end
 
 	@ExecSpace("ServerOnly")
