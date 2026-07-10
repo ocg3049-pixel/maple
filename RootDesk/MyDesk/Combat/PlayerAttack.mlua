@@ -281,13 +281,18 @@ script PlayerAttack extends AttackComponent
 		
 		        self._T.pendingCombatPower = combatPower
 		        local playerCtrl = self.Entity.PlayerControllerComponent
-		        local worldPos = self.Entity.TransformComponent.WorldPosition
 		        local dirX = playerCtrl.LookDirectionX
 		        self._T.pendingDirX = dirX
-		
-		        -- 단일 대상 스킬: 판정 전에 가장 가까운 몬스터 하나만 골라 IsAttackTarget에서 그 대상만 통과시킨다
-		        self._T.powerStrikeTarget = self:FindNearestMonster(Vector2(worldPos.x, worldPos.y), 2.0)
-		
+
+		        -- (버그 수정) "히트박스가 네모가 아닌 것 같다 - 멀리 있는 적이 맞고 가까이 있는 적은 안 맞는다"는
+		        -- 신고 - 원인은 대상 선정을 여기(시전 시점)에서 전방향(원형) FindNearestMonster로 미리 골라두고,
+		        -- 실제 타격 판정(NotifyMotionEnded의 전방 사각 박스)에서는 그 미리 골라둔 대상 하나만 통과시켰던
+		        -- 것. "전방향 중 가장 가까운 대상"과 "전방 사각형 박스 안의 대상"은 서로 다른 도형이라, 캐릭터
+		        -- 등 뒤나 대각선에 있는 몬스터가 전방향 기준으로는 더 가까워 먼저 선택돼버리면, 정작 박스
+		        -- 안(전방)에 있는 진짜 가까운 몬스터가 오히려 걸러지는 "네모가 아닌" 히트박스처럼 보였다.
+		        -- 대상 선정을 실제 박스 판정 시점(NotifyMotionEnded)으로 옮기고, 그 박스와 동일한 모양(전방
+		        -- 사각형)으로 다시 골라야 진짜 사각형 히트박스처럼 동작한다 - 아래 NotifyMotionEnded 참고.
+
 		        -- (주의) 기본 무기 스윙 이펙트(ShowDefaultWeaponEffects) 끄기/복구는 여기(서버)가 아니라
 		        -- PlayAttackMotion(클라이언트, Multicast)에서 직접 처리한다. ShowDefaultWeaponEffects는 @Sync라
 		        -- 서버에서 바꾸면 클라이언트에 반영되기까지 네트워크 지연이 있고, 모션을 재생하는 Multicast 호출과
@@ -826,11 +831,20 @@ script PlayerAttack extends AttackComponent
 		        local swing = self._T.pendingSwing or { ruid = "", name = "?" }
 		        local curWorldPos = self.Entity.TransformComponent.WorldPosition
 		        -- 공격범위 x축 전방으로 2배 확장 (기존 1칸 → 2칸). y축은 아래쪽으로 더 길게 - 기존 상단 경계(y+1.0)는 유지하고 하단을 y-1.0까지 확장한다.
+		        -- (기능 변경) 여러 차례 조정을 거쳐 "사거리를 2.5로 줄여달라"는 요청으로 원방 경계(사거리)를
+		        -- 2.5로 고정한다. 근접 경계는 계속 캐릭터 바로 앞(0)에 붙어있어야 하므로 오프셋=박스 x폭의
+		        -- 절반=1.25로 맞춘다.
+		        local forwardReach = 2.5
 		        local attackOffset = Vector2(
-		            curWorldPos.x + 1.0 * dirX,
+		            curWorldPos.x + (forwardReach / 2) * dirX,
 		            curWorldPos.y
 		        )
-		        self._T.shape = BoxShape(attackOffset, Vector2(2, 2), 0)
+		        self._T.shape = BoxShape(attackOffset, Vector2(forwardReach, 2), 0)
+		        -- (버그 수정) "히트박스가 네모가 아닌 것 같다" 신고 - 대상 선정을 실제 판정 직전인 여기서,
+		        -- 위와 완전히 동일한 전방 사각형 모양(x폭 forwardReach, y폭 2)으로 다시 고른다. 이제 "박스
+		        -- 안에서 가장 가까운 대상"과 "실제로 맞는 대상"이 항상 같은 도형 기준이라 예측 가능한 사각형
+		        -- 히트박스처럼 동작한다.
+		        self._T.powerStrikeTarget = self:FindNearestMonsterInForwardBox(Vector2(curWorldPos.x, curWorldPos.y), dirX, forwardReach, 1.0)
 		        local hitComps = self:Attack(self._T.shape, "skill.powerstrike", CollisionGroups.HitBox)
 		        local targets = {}
 		        for _, hc in ipairs(hitComps) do
@@ -902,6 +916,21 @@ script PlayerAttack extends AttackComponent
 		        -- 동일하게, 현재 배율(atkMultiplier)에 0.9^4를 곱해 "현재 단계+4단계"의 배율을 구한다.
 		        -- (기능 변경) "파이널어택 발동확률을 60%로 바꿔달라"는 요청으로 30%->60% 상향.
 		        if math.random() >= 0.6 then return end
+		        -- (기능 추가) "맞을 타겟이 없으면 파이널어택이 발동하지 않게 해달라"는 요청 - 확률은
+		        -- 통과했더라도 실제로 때릴 대상이 근처에 없으면(헛스윙) 모션/잠금/쿨다운 등 아무 부수효과도
+		        -- 일으키지 않고 조용히 취소한다.
+		        -- (버그 수정) 처음엔 파워스트라이크 쪽에 전방향(방향 무관) 근접 탐색인 FindNearestMonster를
+		        -- 썼는데, 실제 파이널어택 판정(NotifyFinalMotionEnded)은 캐릭터가 "바라보는 방향"으로만
+		        -- 박스가 나가는 전방 판정이라 - 대상이 등 뒤에 있어도 FindNearestMonster는 찾아버려서
+		        -- 실제로는 헛스윙인데도 발동해버리는 문제가 실측 확인됐다. 파워스트라이크/슬래쉬블래스트
+		        -- 둘 다 방향까지 고려하는 FindSlashBlastTargets(전방 박스 탐색)로 통일한다.
+		        local worldPos = self.Entity.TransformComponent.WorldPosition
+		        local dirX = (sourceSkill == "powerstrike") and (self._T.pendingDirX or 1) or (self._T.pendingSlashDirX or 1)
+		        local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 1)
+		        if #targets == 0 then
+		            log("PlayerAttack: TryTriggerFinalAttack 취소(타겟 없음) source=" .. sourceSkill)
+		            return
+		        end
 		        local finalMult = atkMultiplier * (0.9 ^ 4)
 		        local userId = self.Entity.PlayerComponent.UserId
 		        -- 파이널어택은 서버가 자체적으로(클라이언트 입력 없이) 발동시키므로, 클라이언트의 스킬 공용 쿨다운은
@@ -1409,6 +1438,36 @@ script PlayerAttack extends AttackComponent
 		                if dist <= nearestDist then
 		                    nearest = mc.Entity
 		                    nearestDist = dist
+		                end
+		            end
+		        end
+		        return nearest
+	end
+
+	method Entity FindNearestMonsterInForwardBox(Vector2 fromPos, number dirX, number xReach, number yHalfHeight)
+		        -- (기능 추가) "히트박스가 네모가 아닌 것 같다" 신고 - FindNearestMonster(전방향 원형 탐색)와
+		        -- 달리, 실제 타격 판정 박스와 완전히 동일한 모양(캐릭터 바로 앞부터 xReach만큼 전방으로,
+		        -- 위아래로 yHalfHeight만큼)의 사각형 범위 안에서만 후보를 찾고, 그중 가장 가까운 하나를 고른다.
+		        -- 박스 밖(등 뒤·대각선 등)에 있는 몬스터는 아무리 가까워도 애초에 후보에 들지 않는다.
+		        local map = self.Entity.CurrentMap
+		        if not isvalid(map) then return nil end
+		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		        local nearest = nil
+		        local nearestDist = xReach + yHalfHeight
+		        for _, comp in ipairs(monsterComps) do
+		            ---@type Monster
+		            local mc = comp
+		            if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+		                local pos = mc.Entity.TransformComponent.WorldPosition
+		                local dx = pos.x - fromPos.x
+		                local dy = pos.y - fromPos.y
+		                -- 박스 안 판정: 바라보는 방향(dirX) 기준 0~xReach 사이, 세로는 ±yHalfHeight 이내
+		                if dx * dirX >= 0 and math.abs(dx) <= xReach and math.abs(dy) <= yHalfHeight then
+		                    local dist = math.sqrt(dx * dx + dy * dy)
+		                    if dist <= nearestDist then
+		                        nearest = mc.Entity
+		                        nearestDist = dist
+		                    end
 		                end
 		            end
 		        end
