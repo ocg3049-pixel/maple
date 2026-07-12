@@ -1,0 +1,732 @@
+@Logic
+script CharacterPersistence extends Logic
+
+	-- 캐릭터 영속 저장 관리자.
+	-- 서버(UserDataStorage)에 캐릭터 목록/캐릭터별 세이브(장비·인벤토리·메소·스탯·단축키)/감사 로그를 저장하고,
+	-- GlobalDataStorage("NicknameRegistry")로 월드 전체 닉네임 중복을 막는다.
+	-- 삭제된 캐릭터는 7일(유예기간) 동안 trash에 보관 후 다음 접속 시 실제 삭제(닉네임도 그때 해제)된다.
+	--
+	-- ⚠ 직렬화: _UtilLogic:TableToString은 "중첩 테이블"을 직렬화하지 못한다(참조 문자열로 저장돼 복원 불가,
+	-- 실측 확인). 그래서 모든 저장 데이터는 자체 텍스트 포맷(줄 단위, 탭 구분)으로 인코딩한다.
+	-- 아이템 문자열("이름|RUID|...")에는 탭/줄바꿈이 없으므로 안전하다.
+	--
+	-- 저장 구조 (UserDataStorage, 유저별):
+	--   "chars"      → 줄마다 "C\tid\tcreatedAt\tdata"(활성) / "T\tid\tdeletedAt\tdata"(삭제 유예)
+	--   "account"    → "lastId\tlastName"  (가장 최근 접속 캐릭터 - 로그인 화면 아이디 표시용)
+	--   "save_<id>"  → 줄마다 M(메소)/A(스탯)/E(장비)/I(인벤)/H(단축키) 레코드
+	--   "log_<id>"   → 줄마다 "t\treason\tmeso\tdelta\twarn" (감사 로그, 최근 80건)
+	--
+	-- 쓰기 비용 절약(datastorage 가이드 준수): 클라이언트 2초 디바운스 → 서버 메모리 캐시 →
+	-- 서버 10초 주기 flush + 유저 퇴장 시 즉시 flush. 값이 안 변하면 쓰지 않는다.
+
+	method void OnBeginPlay()
+		-- 서버: 유저별 캐시 초기화 + 퇴장 시 최종 저장 연결 + 주기 flush 타이머.
+		-- 클라이언트: 월드 입장 후 서버에 캐릭터 목록을 요청(응답 올 때까지 재시도).
+		if self:IsServer() then
+			self._T.sv = {}
+			_UserService:ConnectEvent(UserLeaveEvent, self.OnUserLeave)
+			self._T.svFlushTimer = _TimerService:SetTimerRepeat(self.ServerFlushTick, 10.0)
+		else
+			self._T.cl = {
+				chars = {},          -- { {id,data}, ... } 활성 캐릭터(슬롯 순서)
+				lastName = "",
+				listReceived = false,
+				pendingCreate = false,
+				entered = false,     -- 캐릭터 입장 완료(이후부터 MarkDirty 유효)
+				enteredIndex = 0,
+				dirty = false,
+				dirtyReasons = {},
+				flushPending = false,
+				lastSentStr = "",
+			}
+			self._T.clListTries = 0
+			self._T.clListTimer = _TimerService:SetTimerRepeat(function()
+				if self._T.cl.listReceived or self._T.clListTries >= 10 then
+					_TimerService:ClearTimer(self._T.clListTimer)
+					self._T.clListTimer = nil
+					return
+				end
+				self._T.clListTries = self._T.clListTries + 1
+				self:RequestCharacterList()
+			end, 1.5)
+		end
+	end
+
+	method void OnEndPlay()
+		-- 타이머 정리 (서버 flush는 UserLeave에서 이미 처리됨).
+		if self._T.svFlushTimer then _TimerService:ClearTimer(self._T.svFlushTimer) end
+		if self._T.clListTimer then _TimerService:ClearTimer(self._T.clListTimer) end
+	end
+
+	-- ══════════════════════════ 공용: 문자열 유틸 ══════════════════════════
+
+	method table SplitLines(string s)
+		-- 줄바꿈 기준 분리.
+		local out = {}
+		for line in string.gmatch(s, "[^\n]+") do
+			table.insert(out, line)
+		end
+		return out
+	end
+
+	method table SplitTabs(string s)
+		-- 탭 기준 분리 (빈 필드 없음 전제 - 인코딩 쪽에서 빈 값은 "-"로 치환).
+		local out = {}
+		for f in string.gmatch(s, "[^\t]+") do
+			table.insert(out, f)
+		end
+		return out
+	end
+
+	-- ══════════════════════════ 서버: 내부 헬퍼 ══════════════════════════
+
+	@ExecSpace("ServerOnly")
+	method table EnsureLoadedServer(string userId)
+		-- 해당 유저의 chars/account를 스토리지에서 1회 로드해 메모리 캐시로 만든다(이후 캐시만 사용).
+		-- 로드 시점에 7일 지난 trash 캐릭터를 실제 삭제(세이브/로그/닉네임 해제)한다.
+		local sv = self._T.sv[userId]
+		if sv ~= nil then return sv end
+
+		local storage = _DataStorageService:GetUserDataStorage(userId)
+		sv = {
+			storage = storage,
+			list = {},         -- { {id,createdAt,data}, ... }
+			trash = {},        -- { {id,deletedAt,data}, ... }
+			lastId = "",
+			lastName = "",
+			saves = {},        -- id → saveStr (메모리 캐시)
+			logs = {},         -- id → { {t,r,m,d,w}, ... }
+			lastMeso = {},     -- id → 마지막으로 확인한 메소(감사용)
+			dirtySaves = {},   -- id → true
+			dirtyLogs = {},    -- id → true
+			charsDirty = false,
+			accountDirty = false,
+			activeId = "",
+		}
+		self._T.sv[userId] = sv
+
+		local ec1, charsRaw = storage:GetAndWait("chars")
+		if ec1 == 0 and charsRaw ~= nil and charsRaw ~= "" then
+			for _, line in ipairs(self:SplitLines(charsRaw)) do
+				local f = self:SplitTabs(line)
+				if #f >= 4 then
+					if f[1] == "C" then
+						table.insert(sv.list, { id = f[2], createdAt = tonumber(f[3]) or 0, data = f[4] })
+					elseif f[1] == "T" then
+						table.insert(sv.trash, { id = f[2], deletedAt = tonumber(f[3]) or 0, data = f[4] })
+					end
+				end
+			end
+		end
+		local ec2, accRaw = storage:GetAndWait("account")
+		if ec2 == 0 and accRaw ~= nil and accRaw ~= "" then
+			local f = self:SplitTabs(accRaw)
+			sv.lastId = f[1] or ""
+			sv.lastName = f[2] or ""
+			if sv.lastId == "-" then sv.lastId = "" end
+			if sv.lastName == "-" then sv.lastName = "" end
+		end
+
+		-- 7일(604,800,000ms) 지난 trash 정리
+		local now = DateTime.UtcNow.Elapsed
+		local GRACE_MS = 7 * 24 * 60 * 60 * 1000
+		local kept = {}
+		local purged = 0
+		for _, tr in ipairs(sv.trash) do
+			if now - tr.deletedAt > GRACE_MS then
+				local name = string.match(tr.data, "([^|]+)") or ""
+				storage:DeleteAsync("save_" .. tr.id, function(ec, key) end)
+				storage:DeleteAsync("log_" .. tr.id, function(ec, key) end)
+				if name ~= "" then
+					self:GetRegistry():DeleteAsync(name, function(ec, key) end)
+				end
+				purged = purged + 1
+			else
+				table.insert(kept, tr)
+			end
+		end
+		if purged > 0 then
+			sv.trash = kept
+			sv.charsDirty = true
+			log("[Persist] 유예기간 만료 캐릭터 " .. tostring(purged) .. "개 영구 삭제 (user=" .. userId .. ")")
+		end
+		return sv
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetRegistry()
+		-- 닉네임 중복 방지용 월드 전역 레지스트리 핸들 (닉네임 → userId).
+		if self._T.svRegistry == nil then
+			self._T.svRegistry = _DataStorageService:GetGlobalDataStorage("NicknameRegistry")
+		end
+		return self._T.svRegistry
+	end
+
+	@ExecSpace("ServerOnly")
+	method string EncodeCharsStore(table sv)
+		-- chars 저장용 인코딩: 활성(C) + 삭제 유예(T) 줄 목록.
+		local lines = {}
+		for _, ch in ipairs(sv.list) do
+			table.insert(lines, "C\t" .. ch.id .. "\t" .. tostring(ch.createdAt) .. "\t" .. ch.data)
+		end
+		for _, tr in ipairs(sv.trash) do
+			table.insert(lines, "T\t" .. tr.id .. "\t" .. tostring(tr.deletedAt) .. "\t" .. tr.data)
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string EncodeAccount(table sv)
+		-- account 저장용 인코딩 (빈 값은 "-").
+		local id = sv.lastId ~= "" and sv.lastId or "-"
+		local nm = sv.lastName ~= "" and sv.lastName or "-"
+		return id .. "\t" .. nm
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildCharsReply(table sv)
+		-- 클라이언트에 보낼 활성 캐릭터 목록: 줄마다 "id\tdata".
+		local lines = {}
+		for _, ch in ipairs(sv.list) do
+			table.insert(lines, ch.id .. "\t" .. ch.data)
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EnsureLogsLoaded(table sv, string id)
+		-- 캐릭터 감사 로그를 첫 기록 전에 1회 로드 (세션 간 이력 유지).
+		if sv.logs[id] ~= nil then return end
+		local lg = {}
+		local ec, raw = sv.storage:GetAndWait("log_" .. id)
+		if ec == 0 and raw ~= nil and raw ~= "" then
+			for _, line in ipairs(self:SplitLines(raw)) do
+				local f = self:SplitTabs(line)
+				if #f >= 5 then
+					table.insert(lg, { t = tonumber(f[1]) or 0, r = f[2], m = tonumber(f[3]) or 0, d = tonumber(f[4]) or 0, w = f[5] == "1" })
+				end
+			end
+		end
+		sv.logs[id] = lg
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AppendAudit(table sv, string id, string reason, integer meso, integer delta, boolean warn)
+		-- 캐릭터별 감사 로그 1건 추가 (최근 80건 유지). 메소 변동/강화/획득 이력 검증용.
+		self:EnsureLogsLoaded(sv, id)
+		local lg = sv.logs[id]
+		local r = reason ~= "" and reason or "-"
+		table.insert(lg, { t = DateTime.UtcNow.Elapsed, r = r, m = meso, d = delta, w = warn })
+		while #lg > 80 do
+			table.remove(lg, 1)
+		end
+		sv.dirtyLogs[id] = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method string EncodeLogs(table lg)
+		-- 감사 로그 저장용 인코딩.
+		local lines = {}
+		for _, e in ipairs(lg) do
+			table.insert(lines, tostring(e.t) .. "\t" .. e.r .. "\t" .. tostring(e.m) .. "\t" .. tostring(e.d) .. "\t" .. (e.w and "1" or "0"))
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlushUserNow(string userId)
+		-- 해당 유저의 dirty 데이터를 전부 동기 저장 (퇴장 시점 - 블로킹 허용).
+		local sv = self._T.sv[userId]
+		if sv == nil then return end
+		local storage = sv.storage
+		if sv.charsDirty then
+			storage:SetAndWait("chars", self:EncodeCharsStore(sv))
+			sv.charsDirty = false
+		end
+		if sv.accountDirty then
+			storage:SetAndWait("account", self:EncodeAccount(sv))
+			sv.accountDirty = false
+		end
+		for id, _ in pairs(sv.dirtySaves) do
+			local s = sv.saves[id]
+			if s ~= nil and s ~= "" then
+				storage:SetAndWait("save_" .. id, s)
+			end
+		end
+		sv.dirtySaves = {}
+		for id, _ in pairs(sv.dirtyLogs) do
+			local lg = sv.logs[id]
+			if lg ~= nil then
+				storage:SetAndWait("log_" .. id, self:EncodeLogs(lg))
+			end
+		end
+		sv.dirtyLogs = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ServerFlushTick()
+		-- 10초 주기: dirty인 것만 비동기 저장 (변경 없으면 아무것도 안 씀).
+		for userId, sv in pairs(self._T.sv) do
+			local storage = sv.storage
+			if sv.charsDirty then
+				sv.charsDirty = false
+				storage:SetAsync("chars", self:EncodeCharsStore(sv), function(ec, key)
+					if ec ~= 0 then log_warning("[Persist] chars 저장 실패 ec=" .. tostring(ec)) end
+				end)
+			end
+			if sv.accountDirty then
+				sv.accountDirty = false
+				storage:SetAsync("account", self:EncodeAccount(sv), function(ec, key)
+					if ec ~= 0 then log_warning("[Persist] account 저장 실패 ec=" .. tostring(ec)) end
+				end)
+			end
+			for id, _ in pairs(sv.dirtySaves) do
+				local s = sv.saves[id]
+				if s ~= nil and s ~= "" then
+					storage:SetAsync("save_" .. id, s, function(ec, key)
+						if ec ~= 0 then log_warning("[Persist] save 저장 실패 ec=" .. tostring(ec)) end
+					end)
+				end
+			end
+			sv.dirtySaves = {}
+			for id, _ in pairs(sv.dirtyLogs) do
+				local lg = sv.logs[id]
+				if lg ~= nil then
+					storage:SetAsync("log_" .. id, self:EncodeLogs(lg), function(ec, key) end)
+				end
+			end
+			sv.dirtyLogs = {}
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUserLeave(UserLeaveEvent event)
+		-- 유저 퇴장: 마지막으로 받아둔 상태를 즉시 저장하고 캐시 해제 (로그아웃 시 아이템 유실 방지).
+		local userId = tostring(event.UserId)
+		log("[Persist] 유저 퇴장 - 최종 저장: " .. userId)
+		self:FlushUserNow(userId)
+		self._T.sv[userId] = nil
+	end
+
+	-- ══════════════════════════ 서버: 클라이언트 요청 처리 ══════════════════════════
+
+	@ExecSpace("Server")
+	method void RequestCharacterList()
+		-- 캐릭터 목록 + 최근 접속 캐릭터 이름 회신.
+		local sv = self:EnsureLoadedServer(senderUserId)
+		self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestCreateCharacter(string dataStr)
+		-- 캐릭터 생성: 슬롯 여유 + 월드 전체 닉네임 중복 검사 후 저장.
+		local sv = self:EnsureLoadedServer(senderUserId)
+		local name = string.match(dataStr, "([^|]+)") or ""
+		if name == "" or string.find(dataStr, "\t") ~= nil or string.find(dataStr, "\n") ~= nil then
+			self:OnCreateResult(false, "잘못된 캐릭터 데이터입니다.", "", senderUserId)
+			return
+		end
+		if #sv.list >= 3 then
+			self:OnCreateResult(false, "캐릭터 슬롯이 가득 찼습니다.", "", senderUserId)
+			return
+		end
+		-- 닉네임 중복 검사 (삭제 유예 중인 캐릭터의 닉네임도 예약 상태로 유지됨)
+		local ec, owner = self:GetRegistry():GetAndWait(name)
+		if ec == 0 and owner ~= nil and owner ~= "" then
+			self:OnCreateResult(false, "이미 사용 중인 닉네임입니다.", "", senderUserId)
+			return
+		end
+		if ec ~= 0 and ec ~= 1000002 then
+			-- NotFound(1000002)만 "사용 가능"으로 간주, 그 외 오류는 안전하게 거부
+			self:OnCreateResult(false, "서버 오류로 생성에 실패했습니다. 잠시 후 다시 시도해주세요.", "", senderUserId)
+			return
+		end
+		local now = DateTime.UtcNow.Elapsed
+		local id = tostring(now) .. "_" .. tostring(#sv.list + 1)
+		table.insert(sv.list, { id = id, createdAt = now, data = dataStr })
+		local ec2 = self:GetRegistry():SetAndWait(name, senderUserId)
+		if ec2 ~= 0 then
+			log_warning("[Persist] 닉네임 레지스트리 등록 실패 ec=" .. tostring(ec2))
+		end
+		-- 캐릭터 목록은 중요 데이터라 즉시 저장
+		sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
+		sv.charsDirty = false
+		self:AppendAudit(sv, id, "create:" .. name, 0, 0, false)
+		log("[Persist] 캐릭터 생성: " .. name .. " (id=" .. id .. ", user=" .. senderUserId .. ")")
+		self:OnCreateResult(true, "", self:BuildCharsReply(sv), senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestDeleteCharacter(integer index)
+		-- 캐릭터 삭제: 목록에서 빼서 trash로 이동(7일 보관). 세이브/로그/닉네임은 유예기간 후 정리.
+		local sv = self:EnsureLoadedServer(senderUserId)
+		local ch = sv.list[index]
+		if ch == nil then return end
+		table.remove(sv.list, index)
+		table.insert(sv.trash, { id = ch.id, deletedAt = DateTime.UtcNow.Elapsed, data = ch.data })
+		sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
+		sv.charsDirty = false
+		self:AppendAudit(sv, ch.id, "delete", 0, 0, false)
+		local name = string.match(ch.data, "([^|]+)") or "?"
+		log("[Persist] 캐릭터 삭제(7일 보관): " .. name .. " (id=" .. ch.id .. ")")
+		self:OnDeleteResult(self:BuildCharsReply(sv), senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestEnterCharacter(integer index)
+		-- 캐릭터 입장: 최근 접속 기록 갱신 + 저장된 세이브 회신(없으면 빈 문자열 = 신규).
+		local sv = self:EnsureLoadedServer(senderUserId)
+		local ch = sv.list[index]
+		if ch == nil then return end
+		local id = ch.id
+		local name = string.match(ch.data, "([^|]+)") or ""
+		sv.lastId = id
+		sv.lastName = name
+		sv.accountDirty = true
+		sv.activeId = id
+
+		local saveStr = sv.saves[id]
+		if saveStr == nil then
+			local ec, raw = sv.storage:GetAndWait("save_" .. id)
+			if ec == 0 and raw ~= nil then
+				saveStr = raw
+			else
+				saveStr = ""
+			end
+			sv.saves[id] = saveStr
+		end
+		-- 감사용 기준 메소 기록 (세이브 첫 줄 "M\t<메소>")
+		sv.lastMeso[id] = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
+		self:AppendAudit(sv, id, "enter", sv.lastMeso[id], 0, false)
+		log("[Persist] 캐릭터 입장: " .. name .. " (저장데이터 " .. (saveStr == "" and "없음-신규" or tostring(#saveStr) .. "바이트") .. ")")
+		self:ReceiveCharacterSave(saveStr, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void PushCharacterSave(string saveStr, string reason)
+		-- 클라이언트가 보낸 최신 상태 스냅샷을 캐시에 반영 + 감사 로그(메소 변동 검증) 기록.
+		-- 실제 스토리지 쓰기는 10초 주기 flush/퇴장 시점에 수행(비용 절약).
+		local sv = self._T.sv[senderUserId]
+		if sv == nil or sv.activeId == "" then return end
+		local id = sv.activeId
+		if sv.saves[id] == saveStr then return end
+
+		local meso = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
+		local prev = sv.lastMeso[id] or 0
+		local delta = meso - prev
+		local warn = false
+		if delta > 1000000 or delta < -1000000 then
+			-- 비정상 급증/급감 의심 - 로그에 표식을 남긴다 (자동 차단은 하지 않음)
+			warn = true
+			log_warning("[Persist] 메소 변동 이상 감지: " .. tostring(prev) .. " → " .. tostring(meso) .. " (reason=" .. reason .. ", user=" .. senderUserId .. ")")
+		end
+		if delta ~= 0 or string.find(reason, "enhance") ~= nil or string.find(reason, "item") ~= nil then
+			self:AppendAudit(sv, id, reason, meso, delta, warn)
+		end
+		sv.lastMeso[id] = meso
+		sv.saves[id] = saveStr
+		sv.dirtySaves[id] = true
+	end
+
+	-- ══════════════════════════ 클라이언트: 서버 응답 ══════════════════════════
+
+	method table DecodeCharsReply(string charsStr)
+		-- "id\tdata" 줄 목록 → { {id,data}, ... }
+		local out = {}
+		if charsStr == "" then return out end
+		for _, line in ipairs(self:SplitLines(charsStr)) do
+			local tabPos = string.find(line, "\t", 1, true)
+			if tabPos ~= nil then
+				table.insert(out, { id = string.sub(line, 1, tabPos - 1), data = string.sub(line, tabPos + 1) })
+			end
+		end
+		return out
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveCharacterList(string charsStr, string lastName)
+		-- 캐릭터 목록 수신: 캐시 갱신 + 로그인 화면 아이디칸에 최근 접속 캐릭터 닉네임 표시.
+		local cl = self._T.cl
+		cl.listReceived = true
+		cl.chars = self:DecodeCharsReply(charsStr)
+		cl.lastName = tostring(lastName or "")
+		log("[Persist] 캐릭터 목록 수신: " .. tostring(#cl.chars) .. "개, 최근접속=" .. (cl.lastName == "" and "(없음)" or cl.lastName))
+
+		if cl.lastName ~= "" then
+			local accountText = _EntityService:GetEntityByPath("/ui/DefaultGroup/LoginGroup/LoginBackground/AccountText")
+			if isvalid(accountText) and isvalid(accountText.TextComponent) then
+				accountText.TextComponent.Text = cl.lastName
+			end
+		end
+
+		-- 캐릭터 선택창이 이미 열려 있으면 즉시 채움
+		local csg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup")
+		if isvalid(csg) and csg.Enable then
+			self:PopulateSelectUI()
+		end
+	end
+
+	@ExecSpace("Client")
+	method void OnCreateResult(boolean success, string reason, string charsStr)
+		-- 캐릭터 생성 결과: 성공 시 목록 갱신 + (생성창이 열려있었다면) 선택창으로 전환.
+		local cl = self._T.cl
+		cl.pendingCreate = false
+		if not success then
+			print(reason)
+			log("[Persist] 캐릭터 생성 거부: " .. reason)
+			return
+		end
+		cl.chars = self:DecodeCharsReply(charsStr)
+
+		local createGroup = _EntityService:GetEntityByPath("/ui/DefaultGroup/CreateCharacter")
+		local wasCreateOpen = isvalid(createGroup) and createGroup.Enable
+		if wasCreateOpen then
+			createGroup.Enable = false
+		end
+
+		-- 선택창 표시 준비 (Enable 전 위치 리셋 - 기존 CreateCharacterok과 동일)
+		local function sp(path, x, y)
+			local e = _EntityService:GetEntityByPath(path)
+			if isvalid(e) then e.UITransformComponent.anchoredPosition = Vector2(x, y) end
+		end
+		local base = "/ui/DefaultGroup/CharacterSelectGroup/SelectBackground/"
+		sp(base .. "CharacterSlot1",          -300,  0)
+		sp(base .. "CharacterSlot1/SlotAvatar",   0, 50)
+		sp(base .. "CharacterSlot2",             0,  0)
+		sp(base .. "CharacterSlot2/SlotAvatar",   0, 50)
+		sp(base .. "CharacterSlot3",           300,  0)
+		sp(base .. "CharacterSlot3/SlotAvatar",   0, 50)
+		sp(base .. "CreateCharacterButton",    700, 100)
+		sp(base .. "DeleteCharacterButton",    700, -100)
+
+		local charSelectGroup = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup")
+		if isvalid(charSelectGroup) then charSelectGroup.Enable = true end
+
+		self:PopulateSelectUI()
+		-- 방금 만든 캐릭터(마지막 슬롯) 선택
+		local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
+		if isvalid(selectBg) then
+			local comp = selectBg:GetComponent(CharacterSelectComponent)
+			if isvalid(comp) then comp:SelectSlot(#cl.chars) end
+		end
+	end
+
+	@ExecSpace("Client")
+	method void OnDeleteResult(string charsStr)
+		-- 캐릭터 삭제 결과: 목록 갱신 + 선택창 다시 채움.
+		local cl = self._T.cl
+		cl.chars = self:DecodeCharsReply(charsStr)
+		self:PopulateSelectUI()
+		local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
+		if isvalid(selectBg) then
+			local comp = selectBg:GetComponent(CharacterSelectComponent)
+			if isvalid(comp) then comp:SelectSlot(0) end
+		end
+		print("캐릭터가 삭제되었습니다. (7일간 보관 후 영구 삭제)")
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveCharacterSave(string saveStr)
+		-- 입장한 캐릭터의 저장 데이터 수신: 있으면 복원, 없으면(신규) 현재 초기 지급 상태를 첫 저장.
+		local cl = self._T.cl
+		if saveStr ~= "" then
+			self:RestoreSave(saveStr)
+		else
+			log("[Persist] 신규 캐릭터 - 초기 상태를 저장합니다")
+		end
+		cl.entered = true
+		cl.lastSentStr = ""
+		self:MarkDirty("init")
+	end
+
+	-- ══════════════════════════ 클라이언트: 공개 API ══════════════════════════
+
+	@ExecSpace("ClientOnly")
+	method void PopulateSelectUI()
+		-- 서버에서 받은 캐릭터 목록으로 선택창 3슬롯을 채운다 (loginbutton/DoLogin의 LoadCharacters 직후 호출).
+		local cl = self._T.cl
+		local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
+		if not isvalid(selectBg) then return end
+		local comp = selectBg:GetComponent(CharacterSelectComponent)
+		if not isvalid(comp) then return end
+		for i = 1, 3 do
+			comp:SetSlotData(i, "")
+			comp:ClearSlotUI(i)
+		end
+		for i, ch in ipairs(cl.chars) do
+			if i <= 3 then
+				comp:SetSlotData(i, ch.data)
+				comp:ApplySlotDataToUI(i, ch.data)
+			end
+		end
+		comp:UpdateCreateButton()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClientRequestCreate(string dataStr)
+		-- 캐릭터 생성 요청 (CreateCharacterok/Y키 자동생성에서 호출). 응답은 OnCreateResult로 온다.
+		local cl = self._T.cl
+		if cl.pendingCreate then return end
+		cl.pendingCreate = true
+		self:RequestCreateCharacter(dataStr)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClientRequestDelete(integer index)
+		-- 캐릭터 삭제 요청 (DeleteCharacterButton에서 호출). 응답은 OnDeleteResult로 온다.
+		if index < 1 or index > #self._T.cl.chars then
+			print("삭제할 캐릭터를 선택해주세요.")
+			return
+		end
+		self:RequestDeleteCharacter(index)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCharacterEntered(number slotNum)
+		-- 캐릭터 입장 확정 시점(CharacterSlotButton:EnterLobby 끝) 호출 - 서버에 세이브 로드를 요청한다.
+		local cl = self._T.cl
+		cl.entered = false
+		cl.enteredIndex = math.floor(slotNum)
+		self:RequestEnterCharacter(math.floor(slotNum))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MarkDirty(string reason)
+		-- 상태 변경 통지 (RefreshUI/AddMeso/스킬배정 등에서 호출). 2초 디바운스 후 서버로 스냅샷 전송.
+		local cl = self._T.cl
+		if cl == nil or not cl.entered then return end
+		cl.dirty = true
+		cl.dirtyReasons[reason] = true
+		if cl.flushPending then return end
+		cl.flushPending = true
+		_TimerService:SetTimerOnce(function()
+			self:FlushToServer()
+		end, 2.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FlushToServer()
+		-- 현재 상태 스냅샷을 직렬화해 서버로 보낸다 (직전 전송과 같으면 생략).
+		local cl = self._T.cl
+		cl.flushPending = false
+		if not cl.dirty or not cl.entered then return end
+		cl.dirty = false
+		local reasons = {}
+		for r, _ in pairs(cl.dirtyReasons) do table.insert(reasons, r) end
+		cl.dirtyReasons = {}
+		local reason = table.concat(reasons, ",")
+
+		local saveStr = self:BuildSaveString()
+		if saveStr == cl.lastSentStr then return end
+		cl.lastSentStr = saveStr
+		self:PushCharacterSave(saveStr, reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string BuildSaveString()
+		-- 장비/인벤토리/메소(UIEquipInventoryManager) + 스탯(CharInfoManager) + 단축키(SkillManager)를
+		-- 자체 텍스트 포맷으로 직렬화한다. 첫 줄은 반드시 "M\t<메소>" (서버 감사 로그가 파싱).
+		local t = _UIEquipInventoryManager:ExportSaveTable()
+		local lines = {}
+		table.insert(lines, "M\t" .. tostring(math.floor(tonumber(t.meso) or 0)))
+		table.insert(lines, "A\t" .. tostring(_CharInfoManager.atkSpeedStage) .. "\t" .. tostring(_CharInfoManager.potionAttackBonus))
+		for i = 1, 7 do
+			local s = t.equips[tostring(i)] or ""
+			if s ~= "" then
+				table.insert(lines, "E\t" .. tostring(i) .. "\t" .. s)
+			end
+		end
+		for _, tab in ipairs({"equip","consume","etc","install","cash","decorate"}) do
+			local tt = t.tabs[tab] or {}
+			for idxStr, s in pairs(tt) do
+				if s ~= nil and s ~= "" then
+					table.insert(lines, "I\t" .. tab .. "\t" .. idxStr .. "\t" .. s)
+				end
+			end
+		end
+		local hotkeys = _SkillManager:ExportHotkeys()
+		for key, slot in pairs(hotkeys) do
+			if slot ~= nil and slot.ruid ~= "" then
+				local nm = slot.name ~= "" and slot.name or "-"
+				table.insert(lines, "H\t" .. key .. "\t" .. slot.ruid .. "\t" .. nm)
+			end
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreSave(string saveStr)
+		-- 저장 데이터로 클라이언트 상태 복원: 인벤토리/장비/메소 → 스탯 → 아바타 코스튬 → 단축키 순.
+		local t = { equips = {}, tabs = { equip = {}, consume = {}, etc = {}, install = {}, cash = {}, decorate = {} }, meso = 0 }
+		local hotkeys = {}
+		local atkSpeed = 5
+		local potionAtk = 0
+		for _, line in ipairs(self:SplitLines(saveStr)) do
+			local kind = string.sub(line, 1, 1)
+			if kind == "M" then
+				t.meso = tonumber(string.sub(line, 3)) or 0
+			elseif kind == "A" then
+				local f = self:SplitTabs(line)
+				atkSpeed = math.floor(tonumber(f[2]) or 5)
+				potionAtk = math.floor(tonumber(f[3]) or 0)
+			elseif kind == "E" then
+				-- "E\t<slot>\t<itemStr>" - itemStr에 탭이 없으므로 캡처를 하나씩 따로 뽑는다
+				-- (mlua LSP가 다중 캡처 반환을 경고해 단일 캡처 호출로 분리)
+				local slotStr = string.match(line, "^E\t(%d+)\t")
+				local itemStr = string.match(line, "^E\t%d+\t(.+)$")
+				if slotStr ~= nil and itemStr ~= nil then
+					t.equips[slotStr] = itemStr
+				end
+			elseif kind == "I" then
+				local tab = string.match(line, "^I\t([a-z]+)\t")
+				local idxStr = string.match(line, "^I\t[a-z]+\t(%d+)\t")
+				local itemStr = string.match(line, "^I\t[a-z]+\t%d+\t(.+)$")
+				if tab ~= nil and t.tabs[tab] ~= nil and idxStr ~= nil and itemStr ~= nil then
+					t.tabs[tab][idxStr] = itemStr
+				end
+			elseif kind == "H" then
+				local key = string.match(line, "^H\t([^\t]+)\t")
+				local ruid = string.match(line, "^H\t[^\t]+\t([^\t]+)\t")
+				local nm = string.match(line, "^H\t[^\t]+\t[^\t]+\t(.+)$")
+				if key ~= nil and ruid ~= nil and nm ~= nil then
+					hotkeys[key] = { ruid = ruid, name = nm == "-" and "" or nm }
+				end
+			end
+		end
+		_UIEquipInventoryManager:ImportSaveTable(t)
+		_CharInfoManager.atkSpeedStage = atkSpeed
+		_CharInfoManager.potionAttackBonus = potionAtk
+		self:ApplyCostumeFromEquips()
+		_SkillManager:ImportHotkeys(hotkeys)
+		log("[Persist] 캐릭터 데이터 복원 완료 (메소=" .. tostring(t.meso) .. ")")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyCostumeFromEquips()
+		-- 복원된 장비 슬롯 상태를 실제 아바타 외형에 반영한다 (MoveInvenToEquip의 코스튬 로직과 동일 매핑).
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		local cm = player.CostumeManagerComponent
+		if not isvalid(cm) then return end
+		local cats = {
+			MapleAvatarItemCategory.Face, MapleAvatarItemCategory.Hair,
+			MapleAvatarItemCategory.Coat, MapleAvatarItemCategory.Pants,
+			MapleAvatarItemCategory.Shoes, MapleAvatarItemCategory.TwoHandedWeapon,
+			MapleAvatarItemCategory.Cap,
+		}
+		for i = 1, 7 do
+			local s = _UIEquipInventoryManager:GetEquip(i)
+			local ruid = s ~= "" and _UIEquipInventoryManager:ParseRUID(s) or ""
+			local name = s ~= "" and _UIEquipInventoryManager:ParseName(s) or ""
+			if i == 6 then
+				-- 무기: 한손/두손 슬롯이 달라 반대쪽을 비우고 올바른 쪽에 장착
+				local oneHand = ruid ~= "" and _UIEquipInventoryManager:IsOneHandedJobWeapon(name)
+				cm:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, oneHand and ruid or "")
+				cm:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, (not oneHand) and ruid or "")
+			else
+				cm:SetEquip(cats[i], ruid)
+			end
+		end
+	end
+
+end
