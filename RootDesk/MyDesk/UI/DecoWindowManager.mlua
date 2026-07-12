@@ -1,0 +1,404 @@
+@Logic
+script DecoWindowManager extends Logic
+
+    -- 장비창의 장비/펫 탭 전환, 치장창(DecoWindow) 열기/닫기, 치장 슬롯 장착/해제,
+    -- 그리고 치장(외형 우선) + 장비(스탯) 상태를 합쳐 아바타 외형에 적용하는 관리자.
+    -- 치장 아이템 문자열 포맷: "이름|ruid|deco|<catKey>"
+    -- catKey: cap coat pants shoes glove cape weapon1 weapon2 subweapon faceacc eyeacc earacc
+
+    property number lastDecoTime = 0
+    property string lastDecoSlot = ""
+    property number lastEquipWinTab = 0
+
+    method void OnBeginPlay()
+        -- 클라이언트에서 탭/버튼/슬롯 터치 이벤트를 연결한다
+        if not self:IsClient() then return end
+        self._T.handlers = {}
+        self._T.decoData = {}
+        for _, k in ipairs(self:AllSlotKeys()) do
+            self._T.decoData[k] = ""
+        end
+
+        local eBase = "/ui/DefaultGroup/EquipWindow/"
+        local dBase = "/ui/DefaultGroup/DecoWindow/"
+
+        self:WireTouch(eBase .. "TabEquip/Touch", function() self:SetEquipTab("equip") end)
+        self:WireTouch(eBase .. "TabPet/Touch", function() self:SetEquipTab("pet") end)
+        self:WireTouch(eBase .. "BtnDeco/Touch", function() self:SwitchToDeco() end)
+
+        self:WireTouch(dBase .. "CloseDeco/Touch", function() self:CloseDecoWindow() end)
+        self:WireTouch(dBase .. "BtnEquipSwitch/Touch", function() self:SwitchToEquip() end)
+        self:WireTouch(dBase .. "TabCoord/Touch", function() self:SetDecoTab("coord") end)
+        self:WireTouch(dBase .. "TabAndroid/Touch", function() self:SetDecoTab("android") end)
+        self:WireTouch(dBase .. "TabDamageSkin/Touch", function() self:SetDecoTab("damageskin") end)
+
+        for _, k in ipairs(self:SlotUIKeys()) do
+            local capturedKey = k
+            self:WireTouch(dBase .. "DSlot_" .. k .. "/Touch", function() self:OnDecoSlotClick(capturedKey) end)
+        end
+        log("[DecoWin] ready")
+    end
+
+    method void OnEndPlay()
+        -- 이벤트 해제
+        if self._T.handlers ~= nil then
+            for _, rec in ipairs(self._T.handlers) do
+                if isvalid(rec.entity) then
+                    rec.entity:DisconnectEvent(UITouchDownEvent, rec.eventHandler)
+                end
+            end
+            self._T.handlers = {}
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method table AllSlotKeys()
+        -- decoData 저장 키 목록 (weapon 슬롯은 weapon1/weapon2 아이템을 모두 담는다)
+        return {"cap","coat","pants","shoes","glove","cape","weapon","subweapon","faceacc","eyeacc","earacc"}
+    end
+
+    @ExecSpace("ClientOnly")
+    method table SlotUIKeys()
+        -- DecoWindow의 DSlot_<key> UI 슬롯 키 목록 (AllSlotKeys와 동일)
+        return self:AllSlotKeys()
+    end
+
+    @ExecSpace("ClientOnly")
+    method string SlotKeyForCat(string cat)
+        -- 아이템 catKey → decoData/UI 슬롯 키
+        if cat == "weapon1" or cat == "weapon2" then return "weapon" end
+        return cat
+    end
+
+    @ExecSpace("ClientOnly")
+    method void WireTouch(string path, any callback)
+        -- UITouchDownEvent 좌클릭 연결 (프로젝트 표준: 스프라이트 엔티티는 ButtonClickEvent가 안 옴)
+        local e = _EntityService:GetEntityByPath(path)
+        if not isvalid(e) then
+            log("[DecoWin] wire 실패: " .. path)
+            return
+        end
+        local h = e:ConnectEvent(UITouchDownEvent, function(evt)
+            ---@type UITouchDownEvent
+            local te = evt
+            if te.TouchId == -1 then callback() end
+        end)
+        table.insert(self._T.handlers, { entity = e, eventHandler = h })
+    end
+
+    -- ── 장비창 장비/펫 탭 ─────────────────────────────────────────────
+
+    @ExecSpace("ClientOnly")
+    method void SetEquipTab(string tab)
+        -- 장비 탭: 장비 콘텐츠 표시 / 펫 탭: "준비입니다"만 표시
+        local base = "/ui/DefaultGroup/EquipWindow/"
+        local isEquip = (tab == "equip")
+
+        self:TintTab(base .. "TabEquip", isEquip)
+        self:TintTab(base .. "TabPet", not isEquip)
+
+        local content = {
+            "HeaderLabel","BtnDeco","Preview","GreySlots","HintText",
+            "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap",
+        }
+        for _, n in ipairs(content) do
+            local e = _EntityService:GetEntityByPath(base .. n)
+            if isvalid(e) then e.Enable = isEquip end
+        end
+        local notice = _EntityService:GetEntityByPath(base .. "PetNotice")
+        if isvalid(notice) then notice.Enable = not isEquip end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetDecoTab(string tab)
+        -- 코디 탭: 치장 콘텐츠 표시 / 안드로이드·데미지스킨: "준비입니다"
+        local base = "/ui/DefaultGroup/DecoWindow/"
+        local isCoord = (tab == "coord")
+
+        self:TintTab(base .. "TabCoord", isCoord)
+        self:TintTab(base .. "TabAndroid", tab == "android")
+        self:TintTab(base .. "TabDamageSkin", tab == "damageskin")
+
+        local content = { "HeaderLabel", "BtnEquipSwitch", "Preview", "GreySlots", "HintText" }
+        for _, n in ipairs(content) do
+            local e = _EntityService:GetEntityByPath(base .. n)
+            if isvalid(e) then e.Enable = isCoord end
+        end
+        for _, k in ipairs(self:SlotUIKeys()) do
+            local e = _EntityService:GetEntityByPath(base .. "DSlot_" .. k)
+            if isvalid(e) then e.Enable = isCoord end
+        end
+        local notice = _EntityService:GetEntityByPath(base .. "DecoNotice")
+        if isvalid(notice) then notice.Enable = not isCoord end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TintTab(string path, boolean active)
+        -- 탭 배경/글자 색을 활성/비활성으로 전환
+        local bg = _EntityService:GetEntityByPath(path .. "/TabBG")
+        if isvalid(bg) and isvalid(bg.SpriteGUIRendererComponent) then
+            if active then
+                bg.SpriteGUIRendererComponent.Color = Color(0.18, 0.64, 0.78, 1)
+            else
+                bg.SpriteGUIRendererComponent.Color = Color(0.23, 0.24, 0.29, 1)
+            end
+        end
+        local lb = _EntityService:GetEntityByPath(path .. "/Label")
+        if isvalid(lb) and isvalid(lb.TextComponent) then
+            if active then
+                lb.TextComponent.FontColor = Color(1, 1, 1, 1)
+            else
+                lb.TextComponent.FontColor = Color(0.62, 0.64, 0.7, 1)
+            end
+        end
+    end
+
+    -- ── 창 전환 ──────────────────────────────────────────────────────
+
+    @ExecSpace("ClientOnly")
+    method void SwitchToDeco()
+        -- 장비창 → 치장창
+        local ew = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow")
+        if isvalid(ew) and ew.Enable then
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/EquipWindow")
+        end
+        local dw = _EntityService:GetEntityByPath("/ui/DefaultGroup/DecoWindow")
+        if isvalid(dw) and not dw.Enable then
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/DecoWindow")
+        end
+        self:SetDecoTab("coord")
+        self:RefreshDecoUI()
+        self:ApplyAppearance()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SwitchToEquip()
+        -- 치장창 → 장비창
+        local dw = _EntityService:GetEntityByPath("/ui/DefaultGroup/DecoWindow")
+        if isvalid(dw) and dw.Enable then
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/DecoWindow")
+        end
+        local ew = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow")
+        if isvalid(ew) and not ew.Enable then
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/EquipWindow")
+        end
+        self:SetEquipTab("equip")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseDecoWindow()
+        -- 치장창 닫기
+        local dw = _EntityService:GetEntityByPath("/ui/DefaultGroup/DecoWindow")
+        if isvalid(dw) and dw.Enable then
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/DecoWindow")
+        end
+    end
+
+    -- ── 치장 장착/해제 ────────────────────────────────────────────────
+
+    @ExecSpace("ClientOnly")
+    method void OnDecoSlotClick(string slotKey)
+        -- 치장 슬롯 더블클릭 → 해제
+        local t = _UtilLogic.ElapsedSeconds
+        if self.lastDecoSlot == slotKey and t - self.lastDecoTime < 0.5 then
+            self:UnequipDeco(slotKey)
+            self.lastDecoSlot = ""
+        else
+            self.lastDecoSlot = slotKey
+            self.lastDecoTime = t
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EquipDecoFromInven(number invenIdx)
+        -- 인벤토리 치장 탭 아이템 더블클릭 → 해당 부위에 장착 (기존 아이템과 교체)
+        local s = _UIEquipInventoryManager:GetTabItem("decorate", invenIdx)
+        if s == "" then return end
+        local marker = _UIEquipInventoryManager:GetField(s, 3)
+        if marker ~= "deco" then
+            log("[DecoWin] 치장 아이템이 아님: " .. s)
+            return
+        end
+        local cat = _UIEquipInventoryManager:GetField(s, 4)
+        local slotKey = self:SlotKeyForCat(cat)
+        if self._T.decoData[slotKey] == nil then
+            log("[DecoWin] 알 수 없는 치장 부위: " .. cat)
+            return
+        end
+
+        local old = self._T.decoData[slotKey]
+        self._T.decoData[slotKey] = s
+        _UIEquipInventoryManager:SetTabItem("decorate", invenIdx, old)
+
+        self:RefreshDecoUI()
+        self:ApplyAppearance()
+        _UIEquipInventoryManager:RefreshUI()
+        _CharacterPersistence:MarkDirty("deco")
+        log("[DecoWin] 장착: [" .. slotKey .. "] " .. _UIEquipInventoryManager:ParseName(s))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UnequipDeco(string slotKey)
+        -- 치장 슬롯 해제 → 인벤토리 치장 탭의 빈 칸으로
+        local s = self._T.decoData[slotKey]
+        if s == nil or s == "" then return end
+
+        local emptyIdx = 0
+        for i = 1, 128 do
+            if _UIEquipInventoryManager:GetTabItem("decorate", i) == "" then
+                emptyIdx = i
+                break
+            end
+        end
+        if emptyIdx == 0 then
+            log("[DecoWin] 치장 인벤토리 가득 참")
+            return
+        end
+
+        _UIEquipInventoryManager:SetTabItem("decorate", emptyIdx, s)
+        self._T.decoData[slotKey] = ""
+
+        self:RefreshDecoUI()
+        self:ApplyAppearance()
+        _UIEquipInventoryManager:RefreshUI()
+        _CharacterPersistence:MarkDirty("deco")
+        log("[DecoWin] 해제: [" .. slotKey .. "]")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshDecoUI()
+        -- 치장 슬롯 아이콘 갱신
+        local base = "/ui/DefaultGroup/DecoWindow/DSlot_"
+        for _, k in ipairs(self:SlotUIKeys()) do
+            local s = self._T.decoData[k] or ""
+            local ruid = s ~= "" and _UIEquipInventoryManager:ParseRUID(s) or ""
+            local icon = _EntityService:GetEntityByPath(base .. k .. "/Icon")
+            if isvalid(icon) and isvalid(icon.SpriteGUIRendererComponent) then
+                if ruid ~= "" then
+                    icon.SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. ruid
+                    icon.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+                else
+                    icon.SpriteGUIRendererComponent.ImageRUID = ""
+                    icon.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
+                end
+            end
+        end
+    end
+
+    -- ── 외형 적용 (치장 우선, 없으면 장비) ─────────────────────────────
+
+    @ExecSpace("ClientOnly")
+    method string DecoRuid(string slotKey)
+        -- 치장 슬롯의 RUID ("" = 비어있음)
+        local s = self._T.decoData[slotKey]
+        if s == nil or s == "" then return "" end
+        return _UIEquipInventoryManager:ParseRUID(s)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyAppearance()
+        -- 장비 7슬롯에서 기본 외형을 얻고, 치장 장착 부위는 치장이 덮어쓴다.
+        -- 플레이어 본체 + 장비창/치장창 미리보기 아바타에 동일하게 적용.
+        local eq = {}
+        for i = 1, 7 do
+            local s = _UIEquipInventoryManager:GetEquip(i)
+            eq[i] = { ruid = "", name = "" }
+            if s ~= "" then
+                eq[i].ruid = _UIEquipInventoryManager:ParseRUID(s)
+                eq[i].name = _UIEquipInventoryManager:ParseName(s)
+            end
+        end
+
+        -- 무기: 치장 무기 > 장비 무기 (한손/두손 슬롯 분리)
+        local oneHandR, twoHandR = "", ""
+        local decoWeapon = self._T.decoData["weapon"] or ""
+        if decoWeapon ~= "" then
+            local cat = _UIEquipInventoryManager:GetField(decoWeapon, 4)
+            local r = _UIEquipInventoryManager:ParseRUID(decoWeapon)
+            if cat == "weapon2" then twoHandR = r else oneHandR = r end
+        elseif eq[6].ruid ~= "" then
+            if _UIEquipInventoryManager:IsOneHandedJobWeapon(eq[6].name) then
+                oneHandR = eq[6].ruid
+            else
+                twoHandR = eq[6].ruid
+            end
+        end
+
+        local function pick(decoKey, equipRuid)
+            local d = self:DecoRuid(decoKey)
+            if d ~= "" then return d end
+            return equipRuid
+        end
+
+        local finals = {
+            { MapleAvatarItemCategory.Face,             eq[1].ruid },
+            { MapleAvatarItemCategory.Hair,             eq[2].ruid },
+            { MapleAvatarItemCategory.Coat,             pick("coat", eq[3].ruid) },
+            { MapleAvatarItemCategory.Pants,            pick("pants", eq[4].ruid) },
+            { MapleAvatarItemCategory.Shoes,            pick("shoes", eq[5].ruid) },
+            { MapleAvatarItemCategory.Cap,              pick("cap", eq[7].ruid) },
+            { MapleAvatarItemCategory.Glove,            self:DecoRuid("glove") },
+            { MapleAvatarItemCategory.Cape,             self:DecoRuid("cape") },
+            { MapleAvatarItemCategory.SubWeapon,        self:DecoRuid("subweapon") },
+            { MapleAvatarItemCategory.FaceAccessory,    self:DecoRuid("faceacc") },
+            { MapleAvatarItemCategory.EyeAccessory,     self:DecoRuid("eyeacc") },
+            { MapleAvatarItemCategory.EarAccessory,     self:DecoRuid("earacc") },
+            { MapleAvatarItemCategory.OneHandedWeapon,  oneHandR },
+            { MapleAvatarItemCategory.TwoHandedWeapon,  twoHandR },
+        }
+
+        local player = _UserService.LocalPlayer
+        local playerCM = nil
+        if isvalid(player) then playerCM = player.CostumeManagerComponent end
+
+        local targets = {}
+        if isvalid(playerCM) then table.insert(targets, playerCM) end
+        for _, path in ipairs({ "/ui/DefaultGroup/EquipWindow/Preview/Avatar", "/ui/DefaultGroup/DecoWindow/Preview/Avatar" }) do
+            local e = _EntityService:GetEntityByPath(path)
+            if isvalid(e) and isvalid(e.CostumeManagerComponent) then
+                -- 미리보기는 플레이어 피부(Body)도 따라간다
+                if isvalid(playerCM) then
+                    e.CostumeManagerComponent:SetEquip(MapleAvatarItemCategory.Body, playerCM:GetEquip(MapleAvatarItemCategory.Body))
+                end
+                table.insert(targets, e.CostumeManagerComponent)
+            end
+        end
+
+        for _, cm in ipairs(targets) do
+            for _, f in ipairs(finals) do
+                cm:SetEquip(f[1], f[2])
+            end
+        end
+        log("[DecoWin] 외형 적용 완료")
+    end
+
+    -- ── 영속화 (CharacterPersistence 전용) ─────────────────────────────
+
+    @ExecSpace("ClientOnly")
+    method table ExportDeco()
+        -- 치장 장착 상태를 저장용 테이블로 (slotKey → 아이템 문자열)
+        local out = {}
+        for _, k in ipairs(self:AllSlotKeys()) do
+            local s = self._T.decoData[k]
+            if s ~= nil and s ~= "" then out[k] = s end
+        end
+        return out
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ImportDeco(table deco)
+        -- 저장된 치장 장착 상태 복원 (전체 초기화 후 유효 항목만)
+        for _, k in ipairs(self:AllSlotKeys()) do
+            self._T.decoData[k] = ""
+        end
+        if deco ~= nil then
+            for k, s in pairs(deco) do
+                if self._T.decoData[tostring(k)] ~= nil and s ~= nil and s ~= "" then
+                    self._T.decoData[tostring(k)] = tostring(s)
+                end
+            end
+        end
+        self:RefreshDecoUI()
+    end
+
+end

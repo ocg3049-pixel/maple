@@ -1,0 +1,181 @@
+@Logic
+script SkillBarCollapseManager extends Logic
+
+    -- 스킬 단축키창 접기/펼치기: < > 화살표는 마우스가 근처에 있을 때만 보이고, 클릭 시 4x2로 축소/전체로 확장
+    property Entity skillBar = "8004403d-a47a-4c5b-b450-011be8768a2e"
+    property Entity barBG = "84d5f8e9-77f5-43b5-95df-47ec19d3a03e"
+    property Entity hoverZone = "51afffc0-3ff9-4ee4-90a8-72d75caa2309"
+    property ButtonComponent btnExpand = "b86f809b-c244-4690-8c9a-15ce794b40b4"
+    property ButtonComponent btnCollapse = "12ef21e1-de1a-422c-a68e-96516ffed824"
+
+    property number expandedX = 430
+    property number collapsedX = 942
+    property number animDuration = 0.22
+    property boolean isCollapsed = false
+    property integer animTimer = 0
+    property integer hideTimer = 0
+
+    method void OnBeginPlay()
+        -- 클라이언트에서 화살표 버튼 클릭/호버 이벤트를 연결한다. 두 버튼은 같은 위치에 겹쳐 있고
+        -- 현재 상태에 맞는 하나만 클릭 가능하다: 펼쳐진 상태 -> 접기 버튼, 접힌 상태 -> 펼치기 버튼.
+        -- 둘 다 기본은 투명하고, 마우스가 근처에 있을 때만 보인다.
+        if not self:IsClient() then return end
+        self._T.handlers = {}
+
+        self:UpdateArrowVisibility()
+
+        self:WireArrow(self.btnCollapse, function() self:Collapse() end)
+        self:WireArrow(self.btnExpand, function() self:Expand() end)
+        log("[SkillBarCollapse] ready")
+    end
+
+    method void OnEndPlay()
+        -- 타이머/이벤트 해제
+        if self.animTimer ~= 0 then _TimerService:ClearTimer(self.animTimer) self.animTimer = 0 end
+        if self.hideTimer ~= 0 then _TimerService:ClearTimer(self.hideTimer) self.hideTimer = 0 end
+        if self._T.handlers ~= nil then
+            for _, rec in ipairs(self._T.handlers) do
+                if isvalid(rec.entity) then
+                    rec.entity:DisconnectEvent(rec.eventType, rec.eventHandler)
+                end
+            end
+            self._T.handlers = {}
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void WireArrow(ButtonComponent btn, any onClick)
+        -- 화살표 버튼 클릭 + 호버 이벤트를 연결한다. 호버 중일 때만 불투명하게 보이고,
+        -- 마우스가 벗어나면 잠시 후 다시 투명해진다 (클릭 가능 여부는 Entity.Enable이 별도로 관리).
+        if not isvalid(btn) then return end
+        local hClick = btn.Entity:ConnectEvent(ButtonClickEvent, function()
+            onClick()
+        end)
+        local hState = btn.Entity:ConnectEvent(ButtonStateChangeEvent, function(evt)
+            ---@type ButtonStateChangeEvent
+            local e = evt
+            if e.state == ButtonState.Hover or e.state == ButtonState.Pressed then
+                if self.hideTimer ~= 0 then
+                    _TimerService:ClearTimer(self.hideTimer)
+                    self.hideTimer = 0
+                end
+                self:SetButtonAlpha(btn, 1)
+            else
+                self:ScheduleHideButton(btn)
+            end
+        end)
+        table.insert(self._T.handlers, { entity = btn.Entity, eventType = ButtonClickEvent, eventHandler = hClick })
+        table.insert(self._T.handlers, { entity = btn.Entity, eventType = ButtonStateChangeEvent, eventHandler = hState })
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetButtonAlpha(ButtonComponent btn, number alpha)
+        -- 화살표 버튼의 스프라이트 투명도를 바꾼다 (Enable은 그대로 두어 클릭은 계속 가능)
+        if not isvalid(btn) then return end
+        local spr = btn.Entity.SpriteGUIRendererComponent
+        if isvalid(spr) then
+            local c = spr.Color
+            spr.Color = Color(c.r, c.g, c.b, alpha)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ScheduleHideButton(ButtonComponent btn)
+        -- 잠시 뒤 화살표를 투명하게 되돌린다 (그 사이 다시 호버하면 취소)
+        if self.hideTimer ~= 0 then
+            _TimerService:ClearTimer(self.hideTimer)
+        end
+        self.hideTimer = _TimerService:SetTimerOnce(function()
+            self.hideTimer = 0
+            self:SetButtonAlpha(btn, 0)
+        end, 0.2)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateArrowVisibility()
+        -- 같은 위치에 겹쳐진 두 버튼 중 현재 상태에 맞는 하나만 클릭 가능하게 한다 (투명도는 건드리지 않음 -
+        -- 마우스가 근처에 있을 때만 보이는 건 WireArrow의 호버 이벤트가 전담한다).
+        if isvalid(self.btnCollapse) then self.btnCollapse.Entity.Enable = not self.isCollapsed end
+        if isvalid(self.btnExpand) then self.btnExpand.Entity.Enable = self.isCollapsed end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetRightColumnsEnable(boolean enabled)
+        -- 왼쪽 4열(Q W E R / A S D F)을 제외한 나머지 열 표시/숨김
+        local keys = {"1","2","3","4","T","U","V","X","5","6","7","8","G","H","J","L"}
+        for _, k in ipairs(keys) do
+            local slot = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. k)
+            if isvalid(slot) then slot.Enable = enabled end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyBGShape(boolean collapsed)
+        -- 배경 스프라이트를 현재 상태 폭에 맞춘다
+        if not isvalid(self.barBG) then return end
+        local tf = self.barBG.UITransformComponent
+        if collapsed then
+            tf.RectSize = Vector2(272, 144)
+            tf.anchoredPosition = Vector2(-128, 0)
+        else
+            tf.RectSize = Vector2(784, 144)
+            tf.anchoredPosition = Vector2(128, 0)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AnimateBarTo(number targetX, any onComplete)
+        -- 스킬바 루트를 targetX까지 부드럽게 이동
+        if not isvalid(self.skillBar) then return end
+        if self.animTimer ~= 0 then return end
+
+        local tf = self.skillBar.UITransformComponent
+        local startX = tf.anchoredPosition.x
+        local startY = tf.anchoredPosition.y
+        local elapsed = 0
+        local preTime = _UtilLogic.ElapsedSeconds
+
+        self.animTimer = _TimerService:SetTimerRepeat(function()
+            local now = _UtilLogic.ElapsedSeconds
+            elapsed = elapsed + (now - preTime)
+            preTime = now
+            local t = math.min(1, elapsed / self.animDuration)
+            local ease = t * t * (3 - 2 * t)
+            tf.anchoredPosition = Vector2(startX + (targetX - startX) * ease, startY)
+            if t >= 1 then
+                _TimerService:ClearTimer(self.animTimer)
+                self.animTimer = 0
+                if onComplete ~= nil then onComplete() end
+            end
+        end, 1/60)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Collapse()
+        -- 전체 -> 4x2 축소 (오른쪽으로 슬라이드 후 우측 열 숨김)
+        if self.isCollapsed or self.animTimer ~= 0 then return end
+        self.isCollapsed = true
+        self:UpdateArrowVisibility()
+        self:SetButtonAlpha(self.btnExpand, 1)
+        self:AnimateBarTo(self.collapsedX, function()
+            self:SetRightColumnsEnable(false)
+            self:ApplyBGShape(true)
+            log("[SkillBarCollapse] collapsed")
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Expand()
+        -- 4x2 -> 전체 확장 (우측 열 복원 후 왼쪽으로 슬라이드)
+        if (not self.isCollapsed) or self.animTimer ~= 0 then return end
+        self.isCollapsed = false
+        self:UpdateArrowVisibility()
+        self:SetButtonAlpha(self.btnCollapse, 1)
+        self:ApplyBGShape(false)
+        self:SetRightColumnsEnable(true)
+        self:AnimateBarTo(self.expandedX, function()
+            log("[SkillBarCollapse] expanded")
+        end)
+    end
+
+end

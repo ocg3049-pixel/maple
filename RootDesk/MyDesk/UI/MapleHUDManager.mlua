@@ -1,0 +1,160 @@
+@Logic
+script MapleHUDManager extends Logic
+
+    -- 원작 스타일 하단 HUD(HP/MP 바, 메뉴 아이콘, 레벨/이름, 채팅) 관리
+    property Entity hudRoot = "c8a4004e-0198-458b-99f9-89104c549867"
+    property SpriteGUIRendererComponent hpFill = "9a8ada51-6a71-4a0d-8c13-b5838a6c2942"
+    property TextComponent hpText = "ce1cb4ad-ea67-47a8-b476-b79b8af34db2"
+    property SpriteGUIRendererComponent mpFill = "d9bd1fb9-e25a-474d-9a29-3be7e1eae1e8"
+    property TextComponent mpText = "64519d7e-641b-4fe0-8fff-6bdb2e0ded35"
+    property TextComponent levelText = "35fc53d7-e296-4358-825a-c65c915b6ea7"
+    property TextComponent nameText = "4cdaa49d-6a30-408b-acd2-6e7cd68df892"
+    property ButtonComponent btnEquip = "8c75fac1-af72-4025-b06f-9905fb2316e7"
+    property ButtonComponent btnEnhance = "152a8836-ad06-4ed3-b85a-f3544467385b"
+    property ButtonComponent btnMap = "e3eeb78b-4375-4e90-9e9f-eb57ad3b6aec"
+    property ButtonComponent btnInven = "c0bf9547-1e34-4f32-b20c-488c6b3b365d"
+    property ButtonComponent btnSkill = "483fb007-2a85-44c4-b91a-5d88fbbc67b1"
+    property ButtonComponent btnCharInfo = "92265a6a-993d-4593-b7f6-3aa31102c493"
+    property Entity chatBox = "7133c9ab-4d94-4db3-94cd-fce80acaa63f"
+
+    -- MP는 표시 전용 (실제 MP 시스템 없음)
+    property integer displayMaxMp = 50
+    property integer updateTimer = 0
+
+    method void OnBeginPlay()
+        -- 클라이언트에서만 HUD 갱신 타이머와 버튼 이벤트를 연결한다
+        if not self:IsClient() then return end
+
+        self._T.buttonHandlers = {}
+        self:ConnectMenuButton(self.btnEquip, function()
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/EquipWindow")
+        end)
+        self:ConnectMenuButton(self.btnEnhance, function()
+            _EnhancementManager:ToggleWindow()
+        end)
+        self:ConnectMenuButton(self.btnMap, function()
+            _WorldMapManager:OnMKey()
+        end)
+        self:ConnectMenuButton(self.btnInven, function()
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/InvenWindow")
+        end)
+        self:ConnectMenuButton(self.btnSkill, function()
+            _SkillManager:ToggleWindow()
+        end)
+        self:ConnectMenuButton(self.btnCharInfo, function()
+            _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/CharInfoWindow")
+        end)
+
+        self.updateTimer = _TimerService:SetTimerRepeat(self.UpdateHUD, 0.25)
+        self:UpdateHUD()
+        log("[MapleHUD] OnBeginPlay - 버튼 연결 및 타이머 시작")
+    end
+
+    method void OnEndPlay()
+        -- 타이머/이벤트 해제
+        if self.updateTimer ~= 0 then
+            _TimerService:ClearTimer(self.updateTimer)
+            self.updateTimer = 0
+        end
+        if self._T.buttonHandlers ~= nil then
+            for _, rec in ipairs(self._T.buttonHandlers) do
+                if isvalid(rec.entity) then
+                    rec.entity:DisconnectEvent(ButtonClickEvent, rec.eventHandler)
+                end
+            end
+            self._T.buttonHandlers = {}
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ConnectMenuButton(ButtonComponent btn, any callback)
+        -- 메뉴 아이콘 버튼 하나에 클릭 콜백을 연결하고 해제용으로 기록한다
+        if not isvalid(btn) then return end
+        local h = btn.Entity:ConnectEvent(ButtonClickEvent, function()
+            callback()
+        end)
+        table.insert(self._T.buttonHandlers, { entity = btn.Entity, eventHandler = h })
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity FindLocalPlayerEntity()
+        -- 맵 트리에서 PlayerComponent가 붙은 첫 엔티티를 찾는다 (UIMyInfoManager와 동일 패턴)
+        local mapsEnt = _EntityService:GetEntityByPath("/maps")
+        if not isvalid(mapsEnt) then return nil end
+        for _, map in ipairs(mapsEnt.Children:ToTable()) do
+            if not isvalid(map) then continue end
+            for _, child in ipairs(map.Children:ToTable()) do
+                if isvalid(child) and isvalid(child.PlayerComponent) then
+                    return child
+                end
+            end
+        end
+        return nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateHUD()
+        -- 로그인/캐릭터선택/생성 화면에서는 HUD 전체 숨김, 인게임에서는 표시 + 수치 갱신
+        if not isvalid(self.hudRoot) then return end
+
+        local function isUIOpen(path)
+            local e = _EntityService:GetEntityByPath(path)
+            return isvalid(e) and e.Enable
+        end
+        local inMenu = isUIOpen("/ui/DefaultGroup/LoginGroup")
+                    or isUIOpen("/ui/DefaultGroup/CharacterSelectGroup")
+                    or isUIOpen("/ui/DefaultGroup/CreateCharacter")
+
+        local playerEntity = self:FindLocalPlayerEntity()
+
+        if inMenu or not isvalid(playerEntity) then
+            if self.hudRoot.Enable then self.hudRoot.Enable = false end
+            return
+        end
+
+        if not self.hudRoot.Enable then
+            self.hudRoot.Enable = true
+            log("[MapleHUD] HUD 표시 시작")
+        end
+
+        -- 기존 좌상단 UIMyInfo 박스는 원작 디자인에 없으므로 숨긴다
+        local oldInfo = _EntityService:GetEntityByPath("/ui/ToastGroup/UIMyInfo")
+        if isvalid(oldInfo) and oldInfo.Enable then
+            oldInfo.Enable = false
+        end
+
+        -- HP
+        local pc = playerEntity.PlayerComponent
+        local hp = math.floor(pc.Hp or 0)
+        local maxHp = math.floor(pc.MaxHp or 0)
+        if isvalid(self.hpFill) then
+            if maxHp > 0 then
+                self.hpFill.FillAmount = math.max(0, math.min(1, hp / maxHp))
+            else
+                self.hpFill.FillAmount = 1
+            end
+        end
+        if isvalid(self.hpText) then
+            self.hpText.Text = tostring(hp) .. " / " .. tostring(maxHp)
+        end
+
+        -- MP (표시 전용, 항상 가득)
+        if isvalid(self.mpFill) then
+            self.mpFill.FillAmount = 1
+        end
+        if isvalid(self.mpText) then
+            self.mpText.Text = tostring(self.displayMaxMp) .. " / " .. tostring(self.displayMaxMp)
+        end
+
+        -- 레벨 / 이름 (전투력 10당 1레벨, UIMyInfoManager와 동일 공식)
+        local combatPower = _CharInfoManager:CalcCombatPower()
+        local displayLevel = math.floor(combatPower / 10)
+        if isvalid(self.levelText) then
+            self.levelText.Text = "Lv." .. tostring(displayLevel)
+        end
+        if isvalid(self.nameText) then
+            self.nameText.Text = _CharInfoManager:GetCurrentCharName()
+        end
+    end
+
+end
