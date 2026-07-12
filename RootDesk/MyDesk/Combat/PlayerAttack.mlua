@@ -5,6 +5,11 @@ script PlayerAttack extends AttackComponent
 	-- ComboOrb(구슬 엔티티)가 균등 간격 공전 계산에 읽어 쓴다. 구슬 1개당 데미지 +20%.
 	@Sync property integer ComboOrbCount = 0
 
+	-- 쉐도우 파트너 버프 활성 여부. 서버(AttackShadowPartner/만료 타이머)가 켜고 끄며 모든 클라이언트에
+	-- 동기화된다 - 클라이언트에서 실행되는 이펙트 재생 메서드들이 이 값을 보고 그림자 몫의
+	-- 스킬 이펙트(x축 뒤쪽, 투명도 70%)와 히트 이펙트(시간차 2배)를 복제 재생한다.
+	@Sync property boolean ShadowPartnerOn = false
+
 	@ExecSpace("ClientOnly")
 	method void OnSyncProperty(string name, any value)
 		-- (버그 수정) "스탯창의 데미지가 오르지 않는다 - 스탯창이 열려있어도 즉시 반영돼야 한다"는
@@ -38,7 +43,7 @@ script PlayerAttack extends AttackComponent
 		        -- IsAttackTarget에서 그 대상만 통과시킨다 (파워스트라이크와 동일한 FindNearestMonster 재사용).
 		        self._T.normalAttackTarget = self:FindNearestMonster(Vector2(worldPos.x, worldPos.y), 1.5)
 		        self._T.shape = BoxShape(attackOffset, Vector2.one, 0)
-		        self:AttackFast(self._T.shape, nil, CollisionGroups.HitBox)
+		        self:AttackFastShadowSafe(self._T.shape, nil, self._T.normalAttackTarget)
 		        log("PlayerAttack: AttackNormal at x=" .. tostring(attackOffset.x) .. " y=" .. tostring(attackOffset.y))
 	end
 
@@ -133,7 +138,21 @@ script PlayerAttack extends AttackComponent
 		                return false
 		            end
 		        end
+		        -- 어썰터 - 텔레포트로 나타난 자리의 그 대상만 통과시킨다(익스플로젼과 동일한 패턴).
+		        if attackInfo == "skill.assaulter" then
+		            if not isvalid(self._T.assaulterCurrentTarget) or defender ~= self._T.assaulterCurrentTarget then
+		                return false
+		            end
+		        end
 		        return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	-- 캐릭터 정보창과 동일한 크리티컬 확률(%)을 서버로 동기화한다 - CalcCritical/CalcDamage는 서버에서만
+	-- 실행되는데 장비 잠재능력은 클라이언트 전용 상태라(인벤토리와 동일한 이유) 직접 읽을 수 없다.
+	-- SkillManager가 스킬을 사용할 때마다 CharInfoManager:CalcCritRate()의 최신값을 넘겨준다.
+	@ExecSpace("Server")
+	method void SyncCritRate(number ratePercent)
+		self._T.currentCritRatePercent = ratePercent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
@@ -142,12 +161,71 @@ script PlayerAttack extends AttackComponent
 		-- Base 안에서 보너스 미반영 값으로 먼저 채워지므로, 여기서 보너스 반영값으로 재갱신해
 		-- 화면 표시와 실제 적용량을 일치시킨다.
 		local dmg = self:ApplyComboAttackBonus(self:CalcDamageBase(attacker, defender, attackInfo))
+		local isManualSkin = (attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst")
+		local critRate = (self._T.currentCritRatePercent or 50) / 100
+
+		-- (버그 수정) 더블스탭/매직클로/스피어버스터(수동 다중 표시 스킬)는 각 타격(hitIndex)이 이미
+		-- 별도의 진짜 Attack() 호출이므로, 이 히트 하나에 대해서만 독립적으로 크리티컬을 굴리고 배율을
+		-- 직접 곱해 반환값(dmg)에 반영한다. CalcCritical은 이 attackInfo들에 대해 항상 false를 반환해
+		-- (아래 참고) 엔진이 여기서 이미 곱한 배율 위에 또 곱하는 이중 적용을 막는다. 이전에는 이
+		-- attackInfo들의 크리티컬 자체를 통째로 꺼두어 "원래 2/3줄 뜨던 스킬에 크리티컬이 전혀 안 뜬다"는
+		-- 문제가 있었다.
+		local baseIsCritical = false
+		if isManualSkin then
+			-- math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 이 파일에 이미 문서화된 버그(짧은
+			-- 간격으로 잇따라 호출되면 math.random()이 같은 가상난수 시퀀스를 그대로 반복 소비해 값이
+			-- 편향되는 현상, 더블스탭/스피어버스터 등에서 실측)를 원본/보너스 크리티컬 굴림에도 동일하게 피한다.
+			baseIsCritical = _UtilLogic:RandomDouble() < critRate
+			if baseIsCritical then
+				dmg = math.floor(dmg * 2.0)
+			end
+		end
 		if attackInfo == "skill.doublestab" then
 			self._T.lastDoubleStabDamage = dmg
+			self._T.lastDoubleStabIsCritical = baseIsCritical
 		elseif attackInfo == "skill.magicclaw" then
 			self._T.lastMagicClawDamage = dmg
+			self._T.lastMagicClawIsCritical = baseIsCritical
 		elseif attackInfo == "skill.spearburst" then
 			self._T.lastSpearBurstDamage = dmg
+			self._T.lastSpearBurstIsCritical = baseIsCritical
+		end
+		-- (기능 변경) 쉐도우 파트너 - "타수 2배"를 별도의 진짜 히트(재진입 Attack() 호출)로 처리하던
+		-- 기존 방식은 (1) 죽는 순간의 히트에서 대상이 이미 죽어 [LEA-3002]로 실패하거나 그 경우 통째로
+		-- 생략됐고, (2) 두 줄이 한 번에 묶여 뜨지 않고 서로 다른 타이밍에 각각 한 줄씩 떴다는 문제가
+		-- 실측 확인됐다. 이제는 이번 한 번의 진짜 히트 안에서 "원본 데미지 + 원본의 55~65%"를 합산한
+		-- 값을 그대로 총 데미지로 반환하고(대상이 그 즉시 죽어도 항상 함께 적용됨), 표시만 OnAttack에서
+		-- 두 줄(원본/보너스)로 묶어 한 번에 띄운다(ShowShadowEchoDamageSkin 참고). 더블스탭/매직클로/
+		-- 스피어버스터는 이미 자기 전용 수동 표시가 있으므로 그 쪽에서 직접 보너스를 추가한다(아래
+		-- Show*DamageSkin 메서드들 참고) - 여기서는 원본 값만 그대로 캐싱해둔다.
+		self._T.shadowEchoOriginal = nil
+		self._T.shadowEchoBonus = nil
+		-- (버그 수정) "쉐도우 파트너로 뜬 2줄이 항상 같이 크리가 뜨거나 같이 안 뜬다" - 원본/보너스가 하나의
+		-- CalcCritical 결과(shadowEchoIsCritical)를 공유해서 생긴 문제. 원본은 위에서 이미 독립적으로 구한
+		-- baseIsCritical을 쓰고, 보너스는 아래에서 별도로 새로 굴려 서로 완전히 독립되게 한다.
+		self._T.shadowEchoOriginalIsCritical = baseIsCritical
+		self._T.shadowEchoBonusIsCritical = false
+		self._T.shadowEchoIsManualSkin = isManualSkin
+		if self._T.shadowPartnerActive then
+			if not isManualSkin then
+				-- 수동 표시가 아닌 일반 스킬도 쉐도우 파트너 중에는 이 히트 안에서만 크리티컬을 직접
+				-- 처리한다(엔진 자동표시가 꺼져 있으므로 - GetDisplayHitCount 참고). isManualSkin 분기와
+				-- 동일하게 baseIsCritical을 독립적으로 새로 굴린다.
+				baseIsCritical = _UtilLogic:RandomDouble() < critRate
+				if baseIsCritical then
+					dmg = math.floor(dmg * 2.0)
+				end
+				self._T.shadowEchoOriginalIsCritical = baseIsCritical
+			end
+			local bonus = math.floor(dmg * (0.55 + _UtilLogic:RandomDouble() * 0.10))
+			local bonusIsCritical = _UtilLogic:RandomDouble() < critRate
+			if bonusIsCritical then
+				bonus = math.floor(bonus * 2.0)
+			end
+			self._T.shadowEchoOriginal = dmg
+			self._T.shadowEchoBonus = bonus
+			self._T.shadowEchoBonusIsCritical = bonusIsCritical
+			dmg = dmg + bonus
 		end
 		return dmg
 	end
@@ -236,18 +314,32 @@ script PlayerAttack extends AttackComponent
 			            local orbCount = self._T.pendingComaOrbCount or 0
 			            local perOrbMult = 2.0 + _UtilLogic:RandomDouble() * (2.4 - 2.0)
 			            return math.floor(combatPower * orbCount * perOrbMult)
+		        elseif attackInfo == "skill.assaulter" then
+			            -- 어썰터: 대상 뒤로 순간이동해 찌르는 확정 히트 단일 대상 데미지. 전투력의 300%~450%
+			            -- (사용자가 정확한 %를 지정하지 않아 다른 단일 대상 스킬들과 비슷한 수준으로 설정 - 조정 가능).
+			            local combatPower = self._T.pendingAssaulterCombatPower or 0
+			            local mult = 3.0 + _UtilLogic:RandomDouble() * (4.5 - 3.0)
+			            return math.floor(combatPower * mult)
 		        end
 		        return 50
 	end
 
 	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
-		        -- 더블스탭/매직클로는 크리티컬 미적용 - 수동 2줄 데미지 스킨이 CalcDamage 반환값만 캐싱해
-		        -- 보여주는데, 크리티컬이 뜨면 엔진이 실제 적용 데미지에 배율을 추가로 곱해 화면 표시와
-		        -- 실제 적용량이 어긋나는 문제가 있었다.
-		        if attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" then
+		        -- 더블스탭/매직클로/스피어버스터(수동 다중 표시 스킬)와 쉐도우 파트너 활성 중인 모든 히트는
+		        -- CalcDamage에서 각 줄(원본/보너스, 또는 각 타격)마다 독립적으로 크리티컬을 굴려 배율까지
+		        -- 이미 반환값(dmg)에 직접 곱해뒀다 - 여기서 또 true를 반환하면 엔진이 그 위에 배율을 한 번
+		        -- 더 곱해 실제 적용 데미지가 표시값의 2~4배로 이중 적용된다. 이 경우엔 항상 false를 반환해
+		        -- 이중 적용을 막는다(크리티컬 자체를 끄는 것이 아니라, 반영 지점만 CalcDamage로 옮긴 것).
+		        local isManualSkin = (attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst")
+		        if isManualSkin or self._T.shadowPartnerActive then
 		            return false
 		        end
-		        return math.random() < 0.3
+		        -- (기능 수정) "크리티컬 확률은 캐릭터 정보창의 크리티컬 확률을 참고해야 한다"는 요청 -
+		        -- 하드코딩된 30% 대신 SyncCritRate로 동기화해둔 실제 스탯(기본 50% + 장비 잠재능력)을 쓴다.
+		        -- 썬더볼트/코마처럼 여러 대상에게 같은 프레임 안에서 연달아 호출될 수 있어, math.random()
+		        -- 대신 이 파일에서 이미 문서화된 대체제 _UtilLogic:RandomDouble()을 쓴다.
+		        local critRate = (self._T.currentCritRatePercent or 50) / 100
+		        return _UtilLogic:RandomDouble() < critRate
 	end
 
 	method float GetCriticalDamageRate()
@@ -262,6 +354,15 @@ script PlayerAttack extends AttackComponent
 		        -- 버스터는 "3번 찌르기" 타격감을 위해 대상 하나당 실제 판정을 3회 진행하도록 재설계돼
 		        -- 이 목록에 추가한다. 다른 스킬(파워스트라이크/슬래쉬블래스트/기본공격)은 부모 기본값(1) 유지.
 		        if attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst" then
+		            return 0
+		        end
+		        -- (버그 수정) 쉐도우 파트너 활성 중에는 항상 엔진 자동 표시를 끈다. 이전에는
+		        -- self._T.shadowEchoBonus(이번 CalcDamage가 방금 계산해둔 값)를 기준으로 판단했는데,
+		        -- GetDisplayHitCount가 attackInfo 단위로 CalcDamage와 다른 시점에 평가될 수 있어
+		        -- (실측: "1줄로 뜨던 스킬"이 첫 줄 2개+둘째 줄 1개, 총 3번 표시되는 문제로 재현됨) 직전
+		        -- 히트의 잔여값에 의존하는 shadowEchoBonus 체크는 타이밍에 취약했다. 버프 활성 여부
+		        -- (shadowPartnerActive)는 히트 도중 값이 바뀌지 않으므로 이걸로 직접 판단한다.
+		        if self._T.shadowPartnerActive then
 		            return 0
 		        end
 		        return 1
@@ -408,7 +509,7 @@ script PlayerAttack extends AttackComponent
 		
 		        -- 전방 판정 범위(파워스트라이크 최종 판정 박스와 동일한 가로 2칸·세로 1칸) 안의 적을
 		        -- 가까운 순으로 최대 6명까지 미리 골라둔다. 실제 Attack 판정 없이 위치만으로 탐색한다.
-		        local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 6)
+		        local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 6, 2.0, 1.0)
 		
 		        self._T.pendingSlashWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
 		        if isvalid(playerCtrl) then
@@ -485,7 +586,7 @@ script PlayerAttack extends AttackComponent
 		                curWorldPos.y
 		            )
 		            local shape = BoxShape(attackOffset, Vector2(2, 2), 0)
-		            local hitComps = self:Attack(shape, "skill.slashblast", CollisionGroups.HitBox)
+		            local hitComps = self:AttackShadowSafe(shape, "skill.slashblast", target)
 		            -- IsHitTarget 등으로 실제로는 빗나갔을 수 있으므로, Attack()이 반환한 실제 명중 목록에서
 		            -- 이번 대상이 있는지 확인한 뒤에만 히트 이펙트/사운드를 재생한다.
 		            local actuallyHit = false
@@ -610,10 +711,34 @@ script PlayerAttack extends AttackComponent
 		        local pc = proj:GetComponent("script.LuckySevenProjectile")
 		        if pc == nil then return end
 		        pc.CombatPower = self._T.pendingLuckySevenCombatPower or 0
+		        pc.CritRate = self._T.currentCritRatePercent or 50
 		        pc.HitIndex = idx
+		        -- 쉐도우 파트너 활성 여부를 원본 표창에 새겨둔다 - 히트 시 원본+보너스(타수 2배) 합산과
+		        -- 데미지 숫자 2줄 표시, 그리고 히트 이펙트 시간차 2배 재생에 쓰인다.
+		        pc.ShadowEchoOn = self._T.shadowPartnerActive == true
 		        pc:Fire(target, fallbackPos)
 		        local targetLabel = isvalid(target) and target.Name or "(대상 소멸, 마지막 위치로 발사)"
 		        log("[LuckySeven] 표창 발사 idx=" .. tostring(idx) .. " target=" .. tostring(targetLabel))
+
+		        -- 쉐도우 파트너: 그림자 몫의 표창은 "시각 전용"이다(그림자 스킬 이펙트는 몬스터에게 직접적인
+		        -- 데미지를 주지 않는다는 요청). 타수 2배는 원본 표창의 히트 하나에 원본+보너스를 합산하고
+		        -- 2줄로 나눠 표시하는 방식(LuckySevenProjectileAttack.CalcDamage + ShowDamageSkin)으로
+		        -- 처리하고, 이 표창은 x축 뒤쪽에서 투명도 70%로 원본을 따라 날아가는 연출만 담당한다.
+		        if self._T.shadowPartnerActive then
+		            self._T.shadowEchoProjCount = (self._T.shadowEchoProjCount or 0) + 1
+		            local echoName = "shadowecho_lucky_" .. tostring(self._T.shadowEchoProjCount)
+		            local echoDirX = self._T.pendingLuckySevenDirX or 1
+		            local echoPos = Vector3(spawnPos.x - 0.45 * echoDirX, spawnPos.y, spawnPos.z)
+		            local echoProj = _SpawnService:SpawnByModelId("luckysevenprojectile", echoName, echoPos, parent)
+		            if isvalid(echoProj) then
+		                ---@type LuckySevenProjectile
+		                local echoComp = echoProj:GetComponent("script.LuckySevenProjectile")
+		                if isvalid(echoComp) then
+		                    echoComp.VisualOnly = true
+		                    echoComp:Fire(target, fallbackPos)
+		                end
+		            end
+		        end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -664,6 +789,8 @@ script PlayerAttack extends AttackComponent
 		        -- 이펙트 자체 아트의 피벗이 바깥쪽으로 치우쳐 있어 몸에서 멀어 보이던 것을 몸통 높이로 당김
 		        -- (0.3은 너무 높다는 피드백으로 0.12로 낮춤)
 		        _EffectService:PlayEffectAttached(startEffectRUID, attacker, Vector3(0, 0.12, 0), 0, Vector3(1, 1, 1), false, startOptions)
+		        -- 쉐도우 파트너: 같은 시작 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		        self:EchoShadowSkillEffectAttached(startEffectRUID, attacker, Vector3(0, 0.12, 0), 0, Vector3(1, 1, 1), startOptions, dirX)
 		        log("[LuckySeven] 시작 이펙트 재생")
 	end
 
@@ -722,9 +849,13 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method table FindSlashBlastTargets(Vector2 fromPos, number dirX, integer maxCount)
+	method table FindSlashBlastTargets(Vector2 fromPos, number dirX, integer maxCount, number forwardRange, number verticalRange)
 		        -- 슬래쉬블래스트 대상 선정: 전방 판정 범위(가로 2칸, 세로 1칸) 안의 살아있는 script.Monster를
 		        -- 가까운 순으로 정렬해 최대 maxCount명까지 후보로 반환한다 (실제 Attack 판정 없이 위치만으로 탐색).
+		        -- 스피어 버스터도 이 탐색을 그대로 재사용하지만 사거리가 달라야 하므로, forwardRange/verticalRange를
+		        -- 선택 인자로 받는다 - 생략(nil)하면 기존 슬래쉬블래스트 기본값(2.0/1.0)을 그대로 쓴다.
+		        forwardRange = forwardRange or 2.0
+		        verticalRange = verticalRange or 1.0
 		        local map = self.Entity.CurrentMap
 		        if not isvalid(map) then return {} end
 		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
@@ -736,7 +867,7 @@ script PlayerAttack extends AttackComponent
 		                local pos = mc.Entity.TransformComponent.WorldPosition
 		                local dx = pos.x - fromPos.x
 		                local dy = pos.y - fromPos.y
-		                if dx * dirX >= 0 and math.abs(dx) <= 2.0 and math.abs(dy) <= 1.0 then
+		                if dx * dirX >= 0 and math.abs(dx) <= forwardRange and math.abs(dy) <= verticalRange then
 		                    table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx) })
 		                end
 		            end
@@ -757,6 +888,8 @@ script PlayerAttack extends AttackComponent
 		        local startEffectRUID = "44c1d14578e24c639e480f54b156a8a2"
 		        local startOptions = { ["FlipX"] = dirX > 0 }
 		        _EffectService:PlayEffectAttached(startEffectRUID, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, startOptions)
+		        -- 쉐도우 파트너: 같은 시작 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		        self:EchoShadowSkillEffectAttached(startEffectRUID, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), startOptions, dirX)
 		        log("[SlashBlast] 시작 이펙트 재생")
 	end
 
@@ -776,6 +909,8 @@ script PlayerAttack extends AttackComponent
 		            }
 		            local index = _UtilLogic:RandomIntegerRange(1, #hitEffects)
 		            _EffectService:PlayEffectAttached(hitEffects[index], target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		            -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		            self:EchoShadowHitEffect(hitEffects[index], target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {})
 		        end
 		        -- 슬래쉬블래스트로 몬스터가 데미지를 받는 순간마다(대상 무관) 지정된 사운드를 1회 재생한다.
 		        _SoundService:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
@@ -858,7 +993,7 @@ script PlayerAttack extends AttackComponent
 		        -- 안에서 가장 가까운 대상"과 "실제로 맞는 대상"이 항상 같은 도형 기준이라 예측 가능한 사각형
 		        -- 히트박스처럼 동작한다.
 		        self._T.powerStrikeTarget = self:FindNearestMonsterInForwardBox(Vector2(curWorldPos.x, curWorldPos.y), dirX, forwardReach, 1.0)
-		        local hitComps = self:Attack(self._T.shape, "skill.powerstrike", CollisionGroups.HitBox)
+		        local hitComps = self:AttackShadowSafe(self._T.shape, "skill.powerstrike", self._T.powerStrikeTarget)
 		        local targets = {}
 		        for _, hc in ipairs(hitComps) do
 		            if isvalid(hc) and isvalid(hc.Entity) then
@@ -1077,7 +1212,7 @@ script PlayerAttack extends AttackComponent
 		        -- (버그 수정) 대상 선정을 위 박스와 완전히 동일한 모양(전방 사각형)으로 실제 판정 시점에
 		        -- 다시 고른다(파워스트라이크 본체와 동일한 해결 방식 - AttackPowerStrikeFinal 주석 참고).
 		        self._T.powerStrikeFinalTarget = self:FindNearestMonsterInForwardBox(Vector2(curWorldPos.x, curWorldPos.y), dirX, finalForwardReach, 1.0)
-		        local hitComps = self:Attack(shape, "skill.powerstrike.final", CollisionGroups.HitBox)
+		        local hitComps = self:AttackShadowSafe(shape, "skill.powerstrike.final", self._T.powerStrikeFinalTarget)
 		        local targets = {}
 		        for _, hc in ipairs(hitComps) do
 		            if isvalid(hc) and isvalid(hc.Entity) then
@@ -1112,7 +1247,7 @@ script PlayerAttack extends AttackComponent
 		        local dirX = playerCtrl.LookDirectionX
 		        self._T.pendingFinalSlashDirX = dirX
 
-		        local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 6)
+		        local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 6, 2.0, 1.0)
 
 		        self._T.pendingFinalSlashWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
 		        if isvalid(playerCtrl) then
@@ -1163,7 +1298,7 @@ script PlayerAttack extends AttackComponent
 		                curWorldPos.y
 		            )
 		            local shape = BoxShape(attackOffset, Vector2(2, 2), 0)
-		            local hitComps = self:Attack(shape, "skill.slashblast.final", CollisionGroups.HitBox)
+		            local hitComps = self:AttackShadowSafe(shape, "skill.slashblast.final", self._T.slashBlastFinalCurrentTarget)
 		            local actuallyHit = false
 		            for _, hc in ipairs(hitComps) do
 		                if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
@@ -1196,6 +1331,8 @@ script PlayerAttack extends AttackComponent
 		            headY = hit.ColliderOffset.y + hit.BoxSize.y / 2
 		        end
 		        local serial = _EffectService:PlayEffectAttached("c36e70d7b1d84845bf4067d069ba5e1a", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), false, {})
+		        -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		        self:EchoShadowHitEffect("c36e70d7b1d84845bf4067d069ba5e1a", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), {})
 		        _TimerService:SetTimerOnce(function()
 		            _EffectService:RemoveEffect(serial)
 		        end, 1.0)
@@ -1465,6 +1602,8 @@ script PlayerAttack extends AttackComponent
 		        local startEffectRUID = "522793cef4ff4b79bdf73b9eda9386f8"
 		        local startOptions = { ["FlipX"] = dirX > 0 }
 		        _EffectService:PlayEffectAttached(startEffectRUID, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, startOptions)
+		        -- 쉐도우 파트너: 같은 시작 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		        self:EchoShadowSkillEffectAttached(startEffectRUID, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), startOptions, dirX)
 		        log("[PowerStrike] 시전 시작 이펙트 재생")
 	end
 
@@ -1538,6 +1677,8 @@ script PlayerAttack extends AttackComponent
 		        -- 스킬 이펙트 투명도 80%
 		        local swingOptions = { ["FlipX"] = dirX > 0, ["Alpha"] = 0.8 }
 		        _EffectService:PlayEffectAttached(swingEffectRUID, attacker, Vector3(0.1 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, swingOptions)
+		        -- 쉐도우 파트너: 스윙 궤적 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		        self:EchoShadowSkillEffectAttached(swingEffectRUID, attacker, Vector3(0.1 * dirX, 0, 0), 0, Vector3(1, 1, 1), swingOptions, dirX)
 
 		        -- (기능 변경) "파이널어택이 뜰 때 원래 히트 이펙트를 대체해서 파이널어택 히트 이펙트만 떠야
 		        -- 한다"는 요청 - isFinal이면 몬스터 뒤쪽 후방 히트 이펙트(backEffectRUID)를 재생하지 않는다.
@@ -1552,6 +1693,8 @@ script PlayerAttack extends AttackComponent
 		                local backOffset = dirX > 0 and 0.4 or -0.4
 		                local backOptions = { ["FlipX"] = flipBack }
 		                _EffectService:PlayEffectAttached(backEffectRUID, target, Vector3(backOffset, 0, 0), 0, Vector3(1, 1, 1), false, backOptions)
+		                -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		                self:EchoShadowHitEffect(backEffectRUID, target, Vector3(backOffset, 0, 0), 0, Vector3(1, 1, 1), backOptions)
 		                _SoundService:PlaySound(swingSoundRUID, 1.0)
 		            end
 		        end
@@ -2186,14 +2329,35 @@ script PlayerAttack extends AttackComponent
 		            end
 		        end
 		        local damage = self._T.lastDoubleStabDamage or 0
+		        local baseCrit = self._T.lastDoubleStabIsCritical or false
+		        local bonus = self._T.shadowEchoBonus or 0
+		        local bonusCrit = self._T.shadowEchoBonusIsCritical or false
 		        if not actuallyHit then
 		            -- 대상이 1타에 이미 죽어 판정 자체가 실패해도(코르프스가 더 이상 충돌 판정에 걸리지 않음),
 		            -- 럭키세븐과 동일하게 표시용 데미지를 동일 공식으로 새로 굴려 2줄이 항상 뜨도록 한다
 		            -- (실제 Hp에는 영향 없는 표시 전용 값 - 이미 죽은 대상이므로 실제 데미지 적용은 불필요).
+		            -- (버그 수정) "1타가 대상을 처치하면 2타는 항상 이 표시 전용 경로로 빠지는데, 크리티컬을
+		            -- 통째로 꺼둬서 2번째 줄만 크리티컬이 거의 안 뜨는 것처럼 보였다"는 신고(럭키세븐에서
+		            -- 동일 증상 실측) - 이 경로도 실제 히트와 동일하게 크리티컬을 독립적으로 굴린다. 또한
+		            -- CalcDamage가 이번 호출에서 실행되지 않아 self._T.shadowEchoBonus가 이전 타격의 값을
+		            -- 그대로 들고 있을 수 있어(stale), 쉐도우 파트너 보너스도 여기서 새로 굴린다.
+		            local critRate = (self._T.currentCritRatePercent or 50) / 100
 		            local mult = 1.0 + _UtilLogic:RandomDouble() * (2.6 - 1.0)
 		            damage = math.floor((self._T.pendingDoubleStabCombatPower or 0) * mult)
+		            baseCrit = _UtilLogic:RandomDouble() < critRate
+		            if baseCrit then damage = math.floor(damage * 2.0) end
+		            bonus = 0
+		            bonusCrit = false
+		            if self._T.shadowPartnerActive then
+		                bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
+		                bonusCrit = _UtilLogic:RandomDouble() < critRate
+		                if bonusCrit then bonus = math.floor(bonus * 2.0) end
+		            end
 		        end
-		        self:ShowDoubleStabDamageSkin(target, damage, idx)
+		        self:ShowDoubleStabDamageSkin(target, damage, idx, bonus, baseCrit, bonusCrit)
+		        if bonus > 0 then
+		            self:PlayShadowEchoHitSound(target)
+		        end
 		        self:PlayDoubleStabHitEffect(target, dirX)
 		        log("PlayerAttack: AttackDoubleStab hit idx=" .. tostring(idx) .. " actuallyHit=" .. tostring(actuallyHit) .. " damage=" .. tostring(damage))
 	end
@@ -2208,18 +2372,43 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("Client")
-	method void ShowDoubleStabDamageSkin(Entity target, integer damage, integer hitIndex)
+	method void ShowDoubleStabDamageSkin(Entity target, integer damage, integer hitIndex, integer bonus, boolean baseIsCritical, boolean bonusIsCritical)
 		        -- 다른 스킬과 동일한 기본 히트 데미지 스킨(RUID)을 사용해 룩앤필을 통일한다.
 		        -- 럭키세븐과 동일한 간격(±0.2)으로 1번째/2번째 찌르기가 위아래로 나뉘어 2줄로 쌓인 것처럼 보이게 한다.
 		        if not isvalid(target) then return end
 		        local offsetY = -0.2
+		        -- (버그 수정) "원래 2줄 뜨던 스킬이 한 줄에 겹쳐 뜬다" - hitIndex==2일 때 offsetY를 아래로
+		        -- 내리는 분기가 누락되어 1타/2타가 항상 같은 위치(-0.2)에서 겹쳐 떴다. 쉐도우 파트너 보너스가
+		        -- 없을 때는 기존 ±0.2 배치를 그대로 복원한다.
 		        if hitIndex == 2 then offsetY = 0.2 end
+		        local bonusGap = 0.15
+		        if bonus > 0 then
+		            -- (기능 수정) "1줄->2줄"로 늘어난 스킬들의 간격(0.3)은 적절하지만, 원래 2줄이던 스킬이
+		            -- 쉐도우 파트너로 4줄이 될 때는 기존 간격(±0.2, 보너스는 +0.15)이 좁아 보인다는 피드백.
+		            -- 버프가 없을 때의 2줄 배치(-0.2/0.2)는 그대로 두고, 버프로 4줄이 될 때만 "1->2줄" 간격과
+		            -- 동일한 0.3 단위로 전체를 -0.45/-0.15/0.15/0.45로 재배치해 4줄 모두 균등하게 벌린다.
+		            offsetY = (hitIndex == 2) and 0.15 or -0.45
+		            bonusGap = 0.3
+		        end
+		        -- (버그 수정) 쉐도우 파트너 보너스를 damages 배열에 같이 묶어 한 번에 Play()하면 두 숫자가
+		        -- 같은 위치에서 시간차로만 분리돼(DelayPerAttack) "2줄이 겹쳐 보인다"는 문제가 있었다(스피어
+		        -- 버스터에서 동일 증상 실측). 원본과 보너스를 서로 다른 offsetY를 가진 별도의 Play() 호출로
+		        -- 나눠, 항상 공간적으로도 분리된 줄로 보이게 한다.
+		        -- (버그 수정) "각자 크리티컬 여부를 독립적으로 판단해야 한다" - 하드코딩된 false 대신 각 줄에
+		        -- 대해 CalcDamage에서 독립적으로 굴린 크리티컬 결과를 그대로 전달해 강조 표시가 실제와 맞게 한다.
 		        _DamageSkinService:Play(
 		            target, "3271c3e79bf04ecba9a107d55495970d", 0,
-		            { damage }, DamageSkinTweenType.Default, false,
+		            { damage }, DamageSkinTweenType.Default, baseIsCritical,
 		            Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		        )
-		        log("[DoubleStab] ShowDoubleStabDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY))
+		        if bonus > 0 then
+		            _DamageSkinService:Play(
+		                target, "3271c3e79bf04ecba9a107d55495970d", 0,
+		                { bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+		                Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		            )
+		        end
+		        log("[DoubleStab] ShowDoubleStabDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " baseCrit=" .. tostring(baseIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
 	end
 
 	@ExecSpace("Client")
@@ -2229,6 +2418,8 @@ script PlayerAttack extends AttackComponent
 		        local flipBack = dirX > 0
 		        local hitOptions = { ["FlipX"] = flipBack }
 		        local serial = _EffectService:PlayEffectAttached("8de01c7022964b1b9d6cf96070073446", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, hitOptions)
+		        -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		        self:EchoShadowHitEffect("8de01c7022964b1b9d6cf96070073446", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), hitOptions)
 		        -- 몬스터에 어태치된 이펙트가 자연 종료 전에 몬스터가 죽고(Enable=false) 다시 리젠(Enable=true)되면
 		        -- 재생이 멈췄다가 리젠 순간 다시 보이는 문제가 있었다 - 짧은 타이머로 명시적으로 제거해 방지한다.
 		        _TimerService:SetTimerOnce(function()
@@ -2436,13 +2627,31 @@ script PlayerAttack extends AttackComponent
 		            end
 		        end
 		        local damage = self._T.lastMagicClawDamage or 0
+		        local magicClawBaseCrit = self._T.lastMagicClawIsCritical or false
+		        local bonus = self._T.shadowEchoBonus or 0
+		        local bonusCrit = self._T.shadowEchoBonusIsCritical or false
 		        if not actuallyHit then
 		            -- 대상이 1타에 이미 죽어 판정 자체가 실패해도, 럭키세븐과 동일하게 표시용 데미지를
 		            -- 동일 공식으로 새로 굴려 2줄이 항상 뜨도록 한다(실제 Hp에는 영향 없는 표시 전용 값).
+		            -- (버그 수정) 더블스탭과 동일한 이유로, 이 경로도 크리티컬을 독립적으로 굴리고
+		            -- self._T.shadowEchoBonus의 stale 값 대신 쉐도우 파트너 보너스도 여기서 새로 굴린다.
+		            local critRate = (self._T.currentCritRatePercent or 50) / 100
 		            local mult = 1.0 + _UtilLogic:RandomDouble() * (1.5 - 1.0)
 		            damage = math.floor((self._T.pendingMagicClawCombatPower or 0) * mult)
+		            magicClawBaseCrit = _UtilLogic:RandomDouble() < critRate
+		            if magicClawBaseCrit then damage = math.floor(damage * 2.0) end
+		            bonus = 0
+		            bonusCrit = false
+		            if self._T.shadowPartnerActive then
+		                bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
+		                bonusCrit = _UtilLogic:RandomDouble() < critRate
+		                if bonusCrit then bonus = math.floor(bonus * 2.0) end
+		            end
 		        end
-		        self:ShowMagicClawDamageSkin(target, damage, idx)
+		        self:ShowMagicClawDamageSkin(target, damage, idx, bonus, magicClawBaseCrit, bonusCrit)
+		        if bonus > 0 then
+		            self:PlayShadowEchoHitSound(target)
+		        end
 		        self:PlayMagicClawHitEffect(target, dirX)
 		        log("PlayerAttack: AttackMagicClaw hit idx=" .. tostring(idx) .. " actuallyHit=" .. tostring(actuallyHit) .. " damage=" .. tostring(damage))
 	end
@@ -2462,20 +2671,41 @@ script PlayerAttack extends AttackComponent
 		        if not isvalid(attacker) then return end
 		        local startOptions = { ["FlipX"] = dirX > 0 }
 		        _EffectService:PlayEffectAttached("2a0d72e836fb4862aae83087035f3d2a", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, startOptions)
+		        -- 쉐도우 파트너: 같은 시작 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		        self:EchoShadowSkillEffectAttached("2a0d72e836fb4862aae83087035f3d2a", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), startOptions, dirX)
 	end
 
 	@ExecSpace("Client")
-	method void ShowMagicClawDamageSkin(Entity target, integer damage, integer hitIndex)
+	method void ShowMagicClawDamageSkin(Entity target, integer damage, integer hitIndex, integer bonus, boolean baseIsCritical, boolean bonusIsCritical)
 		        -- 다른 스킬과 동일한 기본 히트 데미지 스킨(RUID)을 사용해 룩앤필을 통일한다.
 		        -- 럭키세븐/더블스탭과 동일한 간격(±0.2)으로 1번째/2번째 타격이 위아래로 나뉘어 2줄로 쌓인 것처럼 보이게 한다.
 		        if not isvalid(target) then return end
 		        local offsetY = -0.2
+		        -- (버그 수정) 더블스탭과 동일한 원인 - hitIndex==2일 때 아래로 내리는 분기가 누락되어 1타/2타가
+		        -- 항상 같은 위치(-0.2)에서 겹쳐 떴다. 쉐도우 파트너 보너스가 없을 때의 기존 ±0.2 배치를 복원한다.
 		        if hitIndex == 2 then offsetY = 0.2 end
+		        local bonusGap = 0.15
+		        if bonus > 0 then
+		            -- (기능 수정) 더블스탭과 동일한 이유 - 버프로 4줄이 될 때만 "1->2줄" 간격(0.3)과 동일한
+		            -- 단위로 -0.45/-0.15/0.15/0.45로 재배치한다(버프가 없을 때의 2줄 배치는 그대로 유지).
+		            offsetY = (hitIndex == 2) and 0.15 or -0.45
+		            bonusGap = 0.3
+		        end
+		        -- (버그 수정) 더블스탭과 동일한 이유로 원본/보너스를 하나의 Play() 배열로 묶지 않고, 서로 다른
+		        -- offsetY를 가진 별도의 Play() 호출로 나눠 겹쳐 보이지 않게 한다. 또한 각 줄의 크리티컬 여부도
+		        -- 하드코딩된 false 대신 CalcDamage가 독립적으로 굴린 결과를 그대로 전달한다.
 		        _DamageSkinService:Play(
 		            target, "3271c3e79bf04ecba9a107d55495970d", 0,
-		            { damage }, DamageSkinTweenType.Default, false,
+		            { damage }, DamageSkinTweenType.Default, baseIsCritical,
 		            Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		        )
+		        if bonus > 0 then
+		            _DamageSkinService:Play(
+		                target, "3271c3e79bf04ecba9a107d55495970d", 0,
+		                { bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+		                Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		            )
+		        end
 	end
 
 	@ExecSpace("Client")
@@ -2485,6 +2715,8 @@ script PlayerAttack extends AttackComponent
 		        local flipBack = dirX > 0
 		        local hitOptions = { ["FlipX"] = flipBack }
 		        local serial = _EffectService:PlayEffectAttached("598d2d1859e84eaab18ae460a0a1e0a4", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, hitOptions)
+		        -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		        self:EchoShadowHitEffect("598d2d1859e84eaab18ae460a0a1e0a4", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), hitOptions)
 		        _SoundService:PlaySound("5f0c2e9b04ee4a3a9d493a863b8a1379", 1.0)
 		        -- 몬스터에 어태치된 이펙트가 자연 종료 전에 몬스터가 죽고(Enable=false) 다시 리젠(Enable=true)되면
 		        -- 재생이 멈췄다가 리젠 순간 다시 보이는 문제가 있었다 - 짧은 타이머로 명시적으로 제거해 방지한다.
@@ -2699,8 +2931,13 @@ script PlayerAttack extends AttackComponent
 		        if not isvalid(attacker) then return end
 		        _SoundService:PlaySound("4c1eb6001e9c47eda239cc58443b79cd", 1.0)
 		        local serial = _EffectService:PlayEffect("b34e818d784f4a3891c2d50e48ca559d", attacker, Vector3(originPos.x, originPos.y, 0), 0, Vector3(1, 1, 1), false, {})
+		        -- 쉐도우 파트너: 텔레포트 잔상 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
+		        local echoSerial = self:EchoShadowSkillEffect("b34e818d784f4a3891c2d50e48ca559d", Vector3(originPos.x, originPos.y, 0), 0, Vector3(1, 1, 1), {}, 0)
 		        _TimerService:SetTimerOnce(function()
 		            _EffectService:RemoveEffect(serial)
+		            if echoSerial ~= 0 then
+		                _EffectService:RemoveEffect(echoSerial)
+		            end
 		        end, 0.1)
 		        -- 텔레포트 전용 카메라 제어(Damping 임시 조정)는 사용자 요청으로 제거함 - 기본 카메라 동작만 남긴다.
 	end
@@ -2812,7 +3049,7 @@ script PlayerAttack extends AttackComponent
 				self._T.thunderboltCurrentTarget = target
 				local targetPos = target.TransformComponent.WorldPosition
 				local shape = CircleShape(Vector2(targetPos.x, targetPos.y), 0.6)
-				local hitComps = self:Attack(shape, "skill.thunderbolt", CollisionGroups.HitBox)
+				local hitComps = self:AttackShadowSafe(shape, "skill.thunderbolt", target)
 				local actuallyHit = false
 				for _, hc in ipairs(hitComps) do
 					if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
@@ -2852,6 +3089,8 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(attacker) then return end
 		local startOptions = { ["FlipX"] = dirX > 0 }
 		_EffectService:PlayEffectAttached("7b1fbc817b9a478e9f5c384dfc1a7176", attacker, Vector3(0.08 * dirX, 0.0, 0), 0, Vector3(1, 1, 1), false, startOptions)
+		-- 쉐도우 파트너: 같은 시작 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("7b1fbc817b9a478e9f5c384dfc1a7176", attacker, Vector3(0.08 * dirX, 0.0, 0), 0, Vector3(1, 1, 1), startOptions, dirX)
 	end
 
 	method table GetThunderboltSwing()
@@ -2922,6 +3161,8 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
 		local serial = _EffectService:PlayEffectAttached("bb8d0c3c8b9940dfa5e4678bc642fa8d", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		self:EchoShadowHitEffect("bb8d0c3c8b9940dfa5e4678bc642fa8d", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), {})
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
@@ -3067,7 +3308,7 @@ script PlayerAttack extends AttackComponent
 					self._T.healCurrentUndeadTarget = t.entity
 					local targetPos = t.entity.TransformComponent.WorldPosition
 					local shape = CircleShape(Vector2(targetPos.x, targetPos.y), 0.6)
-					local hitComps = self:Attack(shape, "skill.heal", CollisionGroups.HitBox)
+					local hitComps = self:AttackShadowSafe(shape, "skill.heal", t.entity)
 					local actuallyHit = false
 					for _, hc in ipairs(hitComps) do
 						if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == t.entity then
@@ -3118,6 +3359,8 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		_EffectService:PlayEffectAttached("26a8af1751324d2c9f14b1719a28d3c8", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 시작 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("26a8af1751324d2c9f14b1719a28d3c8", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 	end
 
 	@ExecSpace("Multicast")
@@ -3149,6 +3392,8 @@ script PlayerAttack extends AttackComponent
 			headY = hit.ColliderOffset.y + hit.BoxSize.y / 2
 		end
 		local serial = _EffectService:PlayEffectAttached("e81f0ba3f2b545d7895b98b1cf9be879", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		self:EchoShadowHitEffect("e81f0ba3f2b545d7895b98b1cf9be879", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), {})
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
@@ -3285,9 +3530,14 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local serial = _EffectService:PlayEffectAttached("410e6a09f8ec471f87bd8d55c34cc48d", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
+		local echoSerial = self:EchoShadowSkillEffectAttached("410e6a09f8ec471f87bd8d55c34cc48d", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 		_SoundService:PlaySound("64795afda95e4b7dbdbdfe731e7d405a", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
 		end, 1.5)
 	end
 
@@ -3460,6 +3710,8 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(attacker) then return end
 		local flipX = dirX > 0
 		_EffectService:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX })
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
+		self:EchoShadowSkillEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), { ["FlipX"] = flipX }, dirX)
 		_SoundService:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
 		log("[ComboAttack] 시전 이펙트/사운드 재생")
 	end
@@ -3481,6 +3733,342 @@ script PlayerAttack extends AttackComponent
 		self:PlayBreather(self.Entity, self._T.pendingComboDirX or 1)
 	end
 
+	@ExecSpace("ServerOnly")
+	method void AttackShadowPartner(number atkMultiplier)
+		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
+		self:StopBreather()
+		-- 쉐도우 파트너(버프, 30분): 헤이스트/콤보어택과 동일한 패턴 - 지속 중 재사용하면 중첩 없이
+		-- 지속시간만 갱신된다(토큰 비교). 그림자 시각 표현(등뒤에 붙어 본체 모션을 따라하는 실루엣)은
+		-- ShadowPartnerVisual 컴포넌트가 전담하고, 여기서는 그 엔티티를 최초 1회만 스폰해 재사용한다.
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" then
+			return
+		end
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local dirX = isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1
+		self._T.pendingShadowPartnerDirX = dirX
+		self._T.pendingShadowPartnerWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+
+		self:PlayShadowPartnerMotion(self.Entity, "alert", dirX, mult)
+		_TimerService:SetTimerOnce(function()
+			self:RestoreShadowPartnerControl()
+		end, 0.6 * mult)
+
+		self:PlayShadowPartnerCastEffect(self.Entity, dirX)
+		self:SpawnOrShowShadowEntity()
+
+		self._T.shadowPartnerToken = (self._T.shadowPartnerToken or 0) + 1
+		local myToken = self._T.shadowPartnerToken
+		local duration = 1800 -- 30분
+		self._T.shadowPartnerActive = true
+		self.ShadowPartnerOn = true
+
+		local userId = self.Entity.PlayerComponent.UserId
+		self:NotifyShadowPartnerStart(duration, userId)
+
+		_TimerService:SetTimerOnce(function()
+			if self._T.shadowPartnerToken ~= myToken then return end
+			self._T.shadowPartnerActive = false
+			self.ShadowPartnerOn = false
+			if isvalid(self._T.shadowPartnerEntity) then
+				self._T.shadowPartnerEntity.Enable = false
+			end
+			log("[ShadowPartner] 버프 종료(30분 경과)")
+		end, duration)
+		log("[ShadowPartner] 버프 시작 duration=" .. tostring(duration))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnOrShowShadowEntity()
+		-- 그림자 엔티티는 최초 1회만 스폰하고(플레이어의 자식 - SpearBurstFadingEffect/ComboOrb와 동일한
+		-- 부모-자식 스폰 패턴), 이후 재사용 시에는 Enable만 다시 켠다. ShadowPartnerVisual 스크립트는
+		-- .model 자체에 포함돼 있어(런타임 AddComponent는 클라이언트로 복제되지 않아 OnBeginPlay의
+		-- ClientOnly 분기가 실행되지 않는 문제가 실측됨) 스폰과 동시에 모든 클라이언트에 정상 복제된다.
+		if isvalid(self._T.shadowPartnerEntity) then
+			self._T.shadowPartnerEntity.Enable = true
+			return
+		end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local shadow = _SpawnService:SpawnByModelId("shadowpartnershadow", "ShadowPartnerShadow_" .. self.Entity.Name, Vector3(-0.22, -0.02, 0), self.Entity)
+		if not isvalid(shadow) then
+			log_warning("[ShadowPartner] 그림자 엔티티 스폰 실패")
+			return
+		end
+		shadow.Enable = true
+		self._T.shadowPartnerEntity = shadow
+		log("[ShadowPartner] 그림자 엔티티 스폰 완료")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayShadowPartnerMotion(Entity attacker, string motionName, number dirX, number atkMultiplier)
+		-- 쉐도우 파트너 시전 모션(헤이스트/콤보어택과 동일한 방식 - 별도 플래그로 서로 간섭하지 않는다).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		local body = avatarRenderer:GetBodyEntity()
+		if not isvalid(body) then return end
+
+		avatarRenderer.ShowDefaultWeaponEffects = false
+
+		local playerCtrl = attacker.PlayerControllerComponent
+		if isvalid(attacker.MovementComponent) then
+			attacker.MovementComponent:Stop()
+		end
+		if isvalid(playerCtrl) then
+			playerCtrl.LookDirectionX = dirX
+		end
+		self._T.isShadowPartnerDirectionLocked = true
+		self._T.lockedShadowPartnerDirX = dirX
+		self._T.lockedShadowPartnerMotionName = motionName
+		self._T.isShadowPartnerMotionPlaying = true
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local playRate = 1.0 / mult
+		self._T.lockedShadowPartnerPlayRate = playRate
+
+		local motionEvent = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
+		body:SendEvent(motionEvent)
+		log("[ShadowPartner] PlayShadowPartnerMotion sent: " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
+
+		_TimerService:SetTimerOnce(function()
+			if isvalid(avatarRenderer) then
+				avatarRenderer.ShowDefaultWeaponEffects = true
+			end
+			self._T.isShadowPartnerMotionPlaying = false
+		end, 0.55 * mult)
+
+		_TimerService:SetTimerOnce(function()
+			self._T.isShadowPartnerDirectionLocked = false
+			local sc = self.Entity.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+				sc:ChangeState("MOVE")
+				sc:ChangeState("IDLE")
+			end
+		end, 0.80 * mult)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayShadowPartnerCastEffect(Entity attacker, number dirX)
+		-- 시전 이펙트: 캐릭터 몸쪽에서 1회 재생되는 이펙트 2종 + 사용 사운드.
+		-- (사용자 확정) 8ef08d99...(effect, 큰 이미지)가 앞, 6db426f9...(effect0, 작은 이미지)가 뒤(zorder).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local flipX = dirX > 0
+		local backSerial = _EffectService:PlayEffectAttached("6db426f91ed54b83beddb7837d96fb4c", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 5 })
+		local frontSerial = _EffectService:PlayEffectAttached("8ef08d990aeb452bad114479f6bc76fd", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 10 })
+		_SoundService:PlaySound("6c7c28167b9049419435cc53001cef0c", 1.0)
+		log("[ShadowPartner] 시전 이펙트/사운드 재생")
+	end
+
+	@ExecSpace("Client")
+	method void NotifyShadowPartnerStart(number duration)
+		-- 쉐도우 파트너 버프 타이머 UI 표시(본인 클라이언트에게만 - 호출부에서 UserId를 마지막 인자로 타겟팅).
+		_ShadowPartnerBuffUI:ShowBuff(duration)
+	end
+
+	@ExecSpace("Server")
+	method void RestoreShadowPartnerControl()
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) and self._T.pendingShadowPartnerWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
+		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
+		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
+		self:PlayBreather(self.Entity, self._T.pendingShadowPartnerDirX or 1)
+	end
+
+	-- 쉐도우 파트너 활성 중 self:Attack()으로 단일 대상을 판정할 때 공용으로 쓰는 래퍼. 대상의
+	-- MOD.Core.DamageSkinSpawnerComponent를 판정 직전 잠깐 떼었다가 붙인다 - 이 컴포넌트가 붙어있는 채로
+	-- 같은 AttackComponent 인스턴스가 같은 대상을 짧은 간격으로(예: 기본공격 연타) 반복 타격하면
+	-- GetDisplayHitCount=0을 반환해도 엔진이 히트마다 자동 데미지 숫자를 하나씩 추가로 띄우는 문제가
+	-- DoubleStab/MagicClaw/SpearBurst에서 실측 확인됐다(DealDoubleStabHit 등 참고) - 이 래퍼로 모든
+	-- 일반 스킬(기본공격/파워스트라이크/슬래쉬블래스트/썬더볼트/힐/익스플로젼/드래곤로어/패닉/코마)의
+	-- Attack() 호출에도 동일하게 적용해 "1줄이던 스킬이 3번 뜨는" 버그를 없앤다. 버프가 꺼져있으면
+	-- 평소와 동일하게 그냥 self:Attack()만 호출한다(불필요한 컴포넌트 탈부착 방지).
+	-- shape는 BoxShape/CircleShape 등 여러 Shape 하위 타입을 그대로 받아 넘기기 위해 any로 선언한다
+	-- (커스텀 스크립트 메서드 파라미터에 추상 타입 Shape을 직접 쓰면 LEA-4002 컴파일 에러가 난다).
+	method table AttackShadowSafe(any shape, string attackInfo, Entity target)
+		if not self._T.shadowPartnerActive or not isvalid(target) then
+			return self:Attack(shape, attackInfo, CollisionGroups.HitBox)
+		end
+		local skin = target:GetComponent("MOD.Core.DamageSkinSpawnerComponent")
+		local stripped = isvalid(skin)
+		if stripped then
+			target:RemoveComponent("MOD.Core.DamageSkinSpawnerComponent")
+		end
+		local hitComps = self:Attack(shape, attackInfo, CollisionGroups.HitBox)
+		if stripped and isvalid(target) and not isvalid(target:GetComponent("MOD.Core.DamageSkinSpawnerComponent")) then
+			target:AddComponent("MOD.Core.DamageSkinSpawnerComponent")
+		end
+		return hitComps
+	end
+
+	-- AttackShadowSafe의 AttackFast 버전(기본공격 전용 - AttackFast는 히트 목록을 만들지 않아 반환값이 없다).
+	method void AttackFastShadowSafe(any shape, string attackInfo, Entity target)
+		if not self._T.shadowPartnerActive or not isvalid(target) then
+			self:AttackFast(shape, attackInfo, CollisionGroups.HitBox)
+			return
+		end
+		local skin = target:GetComponent("MOD.Core.DamageSkinSpawnerComponent")
+		local stripped = isvalid(skin)
+		if stripped then
+			target:RemoveComponent("MOD.Core.DamageSkinSpawnerComponent")
+		end
+		self:AttackFast(shape, attackInfo, CollisionGroups.HitBox)
+		if stripped and isvalid(target) and not isvalid(target:GetComponent("MOD.Core.DamageSkinSpawnerComponent")) then
+			target:AddComponent("MOD.Core.DamageSkinSpawnerComponent")
+		end
+	end
+
+	-- 쉐도우 파트너 - 투척류가 아닌 스킬(모션만 그림자가 따라하는 스킬)은 실제 히트가 여전히 1번뿐이므로,
+	-- 타격음도 함께 2배로 들리도록 몬스터의 기본 피격음을 한 번 더 재생해준다("타격음이 2배로 많이
+	-- 들리고" 요청). 던지는 스킬(파이어에로우/아이언에로우/럭키세븐)은 그림자가 실제로 투사체를 하나
+	-- 더 쏴서 자연스럽게 히트음도 2번 나므로 이 메서드를 호출하지 않는다.
+	@ExecSpace("Server")
+	method void PlayShadowEchoHitSound(Entity defender)
+		if not isvalid(defender) then return end
+		---@type Monster
+		local monsterComp = defender:GetComponent("script.Monster")
+		if isvalid(monsterComp) then
+			monsterComp:PlayHitSound()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnShadowEchoArrowProjectile(string modelId, string projScriptType, string arrowRuid, Vector3 spawnPos, number dirX, number dirY, number combatPower)
+		-- 쉐도우 파트너 - 그림자가 화살을 하나 더 쏴서 2개가 날아가는 것처럼 보이는 연출.
+		-- (기능 변경) 그림자 화살은 "시각 전용"이다 - 그림자 스킬 이펙트는 몬스터에게 직접적인 데미지를
+		-- 주지 않는다는 요청. 타수 2배는 원본 화살의 히트 하나에 원본+보너스(55~65%)를 합산하고 데미지
+		-- 숫자를 2줄로 나눠 표시하는 방식(각 *ProjectileAttack.CalcDamage)으로 처리한다.
+		-- 화살 자체는 발사 방향의 반대쪽(x축 뒤쪽)에서 원본과 같은 모습, 투명도 70%로 날아간다.
+		if not self._T.shadowPartnerActive then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		self._T.shadowEchoProjCount = (self._T.shadowEchoProjCount or 0) + 1
+		local name = "shadowecho_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.shadowEchoProjCount)
+		local echoPos = Vector3(spawnPos.x - 0.45 * dirX, spawnPos.y - 0.45 * dirY, spawnPos.z)
+		local proj = _SpawnService:SpawnByModelId(modelId, name, echoPos, map)
+		if not isvalid(proj) then return end
+		local sprite = proj.SpriteRendererComponent
+		if isvalid(sprite) then
+			sprite.SpriteRUID = arrowRuid
+			sprite.Color = Color(1, 1, 1, 0.7)
+		end
+		local projComp = proj:GetComponent(projScriptType)
+		if isvalid(projComp) then
+			projComp.VisualOnly = true
+			projComp:Fire(dirX, dirY)
+		end
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowShadowEchoDamageSkin(Entity defender, integer original, integer bonus, boolean originalIsCritical, boolean bonusIsCritical)
+		-- 쉐도우 파트너 - 이번 진짜 히트 하나(원본+보너스가 이미 합산된 실제 적용 데미지)를 화면에는
+		-- 더블스탭과 동일한 방식으로 [원본, 보너스] 두 줄을 한 번에 묶어서 표시한다("공격도 개별로
+		-- 공격하면 안되고 묶어서 2줄로 떠야 한다"는 요청). 대상이 이 히트로 즉시 죽어도 실제 적용된
+		-- 데미지는 CalcDamage가 이미 합산해 반환했으므로 표시만 여기서 그리는 것 - 별도의 재진입
+		-- Attack() 호출이 없어 "죽는 순간엔 에코가 안 붙는다"는 문제가 구조적으로 사라진다.
+		if not self:IsClient() then return end
+		if not isvalid(defender) then return end
+		local skinRuid = "3271c3e79bf04ecba9a107d55495970d"
+		-- (버그 수정) 원본/보너스를 하나의 Play() 배열로 묶으면 두 숫자가 같은 위치에서 시간차로만
+		-- 분리돼 겹쳐 보인다(더블스탭/스피어버스터에서 실측된 것과 동일한 증상) - "데미지가 겹치지 않게"
+		-- 요청에 따라 서로 다른 offsetY를 가진 별도의 Play() 호출 2번으로 나눠 항상 2줄로 분리해 띄운다.
+		-- (버그 수정) "2줄 중 하나만 뜨는 경우 없이 항상 같이 뜬다" - 원본/보너스가 CalcCritical의 결과
+		-- 하나(isCritical)를 공유해서 생긴 문제였다. CalcDamage에서 각 줄에 대해 독립적으로 굴린 결과를
+		-- 각각 별도 파라미터(originalIsCritical/bonusIsCritical)로 받아 그대로 전달한다.
+		_DamageSkinService:Play(defender, skinRuid, 0, { original }, DamageSkinTweenType.Default, originalIsCritical, Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		_DamageSkinService:Play(defender, skinRuid, 0, { bonus }, DamageSkinTweenType.Default, bonusIsCritical, Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		log("[ShadowPartner] 데미지 2줄 표시 original=" .. tostring(original) .. " bonus=" .. tostring(bonus) .. " originalCrit=" .. tostring(originalIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
+	end
+
+	-- ===== 쉐도우 파트너 그림자 이펙트 헬퍼 =====
+	-- 아래 4개 헬퍼는 전부 클라이언트에서 실행 중인 이펙트 메서드(Multicast/Client) 안에서 호출된다.
+	-- ShadowPartnerOn(@Sync)이 꺼져 있으면 아무것도 하지 않으므로, 버프가 없을 때 기존 동작은 그대로다.
+
+	method table BuildShadowEffectOptions(table options)
+		-- 그림자 몫 이펙트 옵션: 원본 옵션을 복사하고 투명도 70%(Alpha=0.7)를 얹는다.
+		-- 원본에 이미 Alpha가 있으면(예: 파워스트라이크 스윙 0.8) 그 값에 70%를 곱한다.
+		local copy = {}
+		if options ~= nil then
+			for k, v in pairs(options) do
+				copy[k] = v
+			end
+		end
+		local baseAlpha = copy["Alpha"] or 1.0
+		copy["Alpha"] = baseAlpha * 0.7
+		return copy
+	end
+
+	method number ResolveShadowDirX(number dirX)
+		-- 그림자 이펙트를 띄울 "뒤쪽" 방향 계산용. dirX가 0(미지정/수직 발사)이면 현재 바라보는 방향을 쓴다.
+		local d = dirX or 0
+		if d == 0 then
+			local pc = self.Entity.PlayerControllerComponent
+			d = isvalid(pc) and pc.LookDirectionX or 1
+			if d == 0 then d = 1 end
+		end
+		return d
+	end
+
+	method integer EchoShadowSkillEffectAttached(string ruid, Entity parent, Vector3 localPos, number zRot, Vector3 scale, table options, number dirX)
+		-- 그림자 스킬 이펙트(시전/궤적): 버프 중이면 같은 이펙트를 x축 뒤쪽(-0.45 * 바라보는 방향)에서
+		-- 투명도 70%로 1회 더 재생한다. 반환값은 이펙트 시리얼(재생 안 했으면 0) - 원본이 RemoveEffect
+		-- 타이머로 정리되는 호출부는 이 시리얼도 같이 정리한다.
+		if not self.ShadowPartnerOn then return 0 end
+		if not isvalid(parent) then return 0 end
+		local d = self:ResolveShadowDirX(dirX)
+		log("[ShadowPartner] 그림자 스킬이펙트(부착) 재생 ruid=" .. tostring(ruid) .. " dirX=" .. tostring(d))
+		return _EffectService:PlayEffectAttached(ruid, parent, Vector3(localPos.x - 0.45 * d, localPos.y, localPos.z), zRot, scale, false, self:BuildShadowEffectOptions(options))
+	end
+
+	method integer EchoShadowSkillEffect(string ruid, Vector3 pos, number zRot, Vector3 scale, table options, number dirX)
+		-- 그림자 스킬 이펙트의 고정 좌표(맵 기준) 버전 - 텔레포트 잔상/독구름 파열처럼 월드 좌표에
+		-- 직접 재생되는 이펙트용. x축 뒤쪽 오프셋 + 투명도 70%는 부착형과 동일하다.
+		if not self.ShadowPartnerOn then return 0 end
+		local mapEntity = self.Entity.CurrentMap
+		if not isvalid(mapEntity) then return 0 end
+		local d = self:ResolveShadowDirX(dirX)
+		log("[ShadowPartner] 그림자 스킬이펙트(고정) 재생 ruid=" .. tostring(ruid) .. " dirX=" .. tostring(d))
+		return _EffectService:PlayEffect(ruid, mapEntity, Vector3(pos.x - 0.45 * d, pos.y, pos.z), zRot, scale, false, self:BuildShadowEffectOptions(options))
+	end
+
+	method void EchoShadowHitEffectAtPos(string ruid, Vector3 pos, number zRot, Vector3 scale, table options)
+		-- 히트 이펙트 2배(고정 좌표 버전): 지금 좌표를 그대로 캡처해 0.25초 뒤 한 번 더(투명도 70%) 재생한다.
+		-- 고정 좌표(PlayEffect)라서 그 사이 대상이 죽어 사라져도 항상 그 자리(허공)에서 발동한다.
+		if not self.ShadowPartnerOn then return end
+		local mapEntity = self.Entity.CurrentMap
+		if not isvalid(mapEntity) then return end
+		local px, py, pz = pos.x, pos.y, pos.z
+		local shadowOptions = self:BuildShadowEffectOptions(options)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(mapEntity) then return end
+			_EffectService:PlayEffect(ruid, mapEntity, Vector3(px, py, pz), zRot, scale, false, shadowOptions)
+			log("[ShadowPartner] 그림자 히트이펙트 발동(0.25초 지연, 고정좌표) ruid=" .. tostring(ruid) .. " pos=(" .. tostring(px) .. "," .. tostring(py) .. ")")
+		end, 0.25)
+	end
+
+	method void EchoShadowHitEffect(string ruid, Entity target, Vector3 localOffset, number zRot, Vector3 scale, table options)
+		-- 히트 이펙트 2배(대상 부착형 원본용): 대상의 현재 월드 위치 + 원본의 로컬 오프셋을 즉시 스냅샷해
+		-- 시간차(0.25초)를 두고 고정 좌표로 한 번 더 재생한다 - "플레이어가 몬스터를 바로 죽였어도
+		-- 그자리에 허공에서라도 발동해야 한다"는 요청을 고정 좌표 재생으로 보장한다.
+		if not self.ShadowPartnerOn then return end
+		if not isvalid(target) then return end
+		local wp = target.TransformComponent.WorldPosition
+		self:EchoShadowHitEffectAtPos(ruid, Vector3(wp.x + localOffset.x, wp.y + localOffset.y, wp.z + localOffset.z), zRot, scale, options)
+	end
+
 	method void OnAttack(Entity defender)
 		-- 콤보 어택 버프 지속 중 적을 실제로 적중시킬 때마다 콤보 구슬 +1(최대 10).
 		-- 부모 AttackComponent.OnAttack은 ExecSpace 미지정(All)이라 어노테이션 없이 오버라이드해야
@@ -3490,6 +4078,14 @@ script PlayerAttack extends AttackComponent
 		-- 0.4초 이내에 몰려서 들어오고(가장 느린 스피어버스터도 히트 간격 최대 ~0.3초), 다음 재사용은
 		-- 쿨다운(0.7초 이상)이 지난 뒤라 서로 겹치지 않는다는 실측 타이밍에 기반한 시간창 방식.
 		if not self:IsServer() then return end
+		-- (기능 추가) 쉐도우 파트너 - 더블스탭/매직클로/스피어버스터(수동 표시 스킬)는 각자 전용
+		-- Show*DamageSkin에서 직접 보너스를 묶어 표시하므로 여기서는 건너뛴다(shadowEchoIsManualSkin).
+		if self._T.shadowEchoBonus ~= nil and not self._T.shadowEchoIsManualSkin and isvalid(defender) then
+			self:ShowShadowEchoDamageSkin(defender, self._T.shadowEchoOriginal, self._T.shadowEchoBonus, self._T.shadowEchoOriginalIsCritical or false, self._T.shadowEchoBonusIsCritical or false)
+			-- (기능 추가) "타격음이 2배로 많이 들리게 해달라" 요청 - 실제 히트는 1번뿐이므로 몬스터 기본
+			-- 피격음을 한 번 더 재생해 청각적으로도 2배처럼 느껴지게 한다.
+			self:PlayShadowEchoHitSound(defender)
+		end
 		-- (기능 추가) "패닉 공격으로는 콤보 어택이 차면 안 된다"는 요청 - 패닉은 구슬을 모두 소모하는
 		-- 스킬이라, 그 판정 자체가 다시 구슬을 채워버리면 소모한 의미가 없어진다. 패닉 판정(Attack)이
 		-- 진행 중인 구간(AttackPanic~RestorePanicControl 사이, isPanicking=true)에는 구슬 획득을 건너뛴다.
@@ -3777,7 +4373,7 @@ script PlayerAttack extends AttackComponent
 			curWorldPos.y
 		)
 		local shape = BoxShape(attackOffset, Vector2(4, 4), 0)
-		local hitComps = self:Attack(shape, "skill.panic", CollisionGroups.HitBox)
+		local hitComps = self:AttackShadowSafe(shape, "skill.panic", self._T.panicTarget)
 		local targets = {}
 		for _, hc in ipairs(hitComps) do
 			if isvalid(hc) and isvalid(hc.Entity) then
@@ -3829,6 +4425,8 @@ script PlayerAttack extends AttackComponent
 		-- (기능 추가) "패닉 이펙트의 전체적인 위치를 조금 아래로 내려달라"는 요청 - 이전에 위로
 		-- 올렸던 y오프셋(0.15)을 다시 낮춰 원래 높이(0)로 되돌린다.
 		_EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(0, 0, 0), 0, Vector3(1.1, 1.1, 1.1), false, options)
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(0, 0, 0), 0, Vector3(1.1, 1.1, 1.1), options, dirX)
 		log("[Panic] 시전 이펙트 재생 orbCount=" .. tostring(orbCount) .. " ruid=" .. tostring(effectRuid))
 	end
 
@@ -3845,6 +4443,8 @@ script PlayerAttack extends AttackComponent
 		if swingEffectRUID ~= "" then
 			local swingOptions = { ["FlipX"] = dirX > 0, ["Alpha"] = 0.8 }
 			_EffectService:PlayEffectAttached(swingEffectRUID, attacker, Vector3(0.1 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, swingOptions)
+			-- 쉐도우 파트너: 스윙 궤적 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+			self:EchoShadowSkillEffectAttached(swingEffectRUID, attacker, Vector3(0.1 * dirX, 0, 0), 0, Vector3(1, 1, 1), swingOptions, dirX)
 		end
 
 		-- (기능 추가) "히트 이펙트 크기를 소모한 구슬 개수에 따라 1.1배씩 크게 하고 y축을 약간 위로
@@ -3857,6 +4457,8 @@ script PlayerAttack extends AttackComponent
 			if isvalid(target) then
 				local hitOptions = { ["FlipX"] = dirX > 0 }
 				_EffectService:PlayEffectAttached(hitEffectRUID, target, Vector3(0, 0.1, 0), 0, Vector3(hitScale, hitScale, hitScale), false, hitOptions)
+				-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+				self:EchoShadowHitEffect(hitEffectRUID, target, Vector3(0, 0.1, 0), 0, Vector3(hitScale, hitScale, hitScale), hitOptions)
 				_SoundService:PlaySound(swingSoundRUID, 1.0)
 			end
 		end
@@ -3970,7 +4572,7 @@ script PlayerAttack extends AttackComponent
 		self._T.comaCurrentTarget = target
 		local pos = target.TransformComponent.WorldPosition
 		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
-		local hitComps = self:Attack(shape, "skill.coma", CollisionGroups.HitBox)
+		local hitComps = self:AttackShadowSafe(shape, "skill.coma", target)
 		local actuallyHit = false
 		for _, hc in ipairs(hitComps) do
 			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
@@ -4051,6 +4653,8 @@ script PlayerAttack extends AttackComponent
 		local effectRuid = self:GetComaEffectRuid(orbCount)
 		local options = { ["FlipX"] = dirX > 0 }
 		_EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, options)
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), options, dirX)
 		log("[Coma] 시전 이펙트 재생 orbCount=" .. tostring(orbCount) .. " ruid=" .. tostring(effectRuid))
 	end
 
@@ -4062,6 +4666,8 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(target) then return end
 		local hitEffectRUID = (orbCount <= 5) and "df55af646a634f62a9a167a1380a147e" or "17b87afe9f03458cbaf63c0194d699ae"
 		_EffectService:PlayEffectAttached(hitEffectRUID, target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		self:EchoShadowHitEffect(hitEffectRUID, target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {})
 	end
 
 	@ExecSpace("Multicast")
@@ -4121,9 +4727,14 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(attacker) then return end
 		local ruid = isMage and "b65a4879ddf44d2a9fcdc09fa00c610c" or "c960275509274d72b540f18f5f53f01f"
 		local serial = _EffectService:PlayEffectAttached(ruid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
+		local echoSerial = self:EchoShadowSkillEffectAttached(ruid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 		_SoundService:PlaySound("a83d56a314fd449cad236fd7d9b2fa63", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
 		end, 1.5)
 	end
 
@@ -4242,9 +4853,14 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local serial = _EffectService:PlayEffectAttached("b0d47a8948314a5ea04a00690d921fc3", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
+		local echoSerial = self:EchoShadowSkillEffectAttached("b0d47a8948314a5ea04a00690d921fc3", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 		_SoundService:PlaySound("eb7f504670a14802a48cc94f4eb66848", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
 		end, 1.5)
 	end
 
@@ -4418,6 +5034,8 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		_EffectService:PlayEffectAttached("419e26654a5e470fa386a8a4e92e9eb3", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 준비 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("419e26654a5e470fa386a8a4e92e9eb3", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4444,6 +5062,8 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		_EffectService:PlayEffectAttached("38f9aa42ec39406987a9fd92ba2c14ad", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 몸쪽/스페셜 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("38f9aa42ec39406987a9fd92ba2c14ad", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 		local specials = {
 			"154a7b585c474b07ae77d96a465756e6",
 			"ff046ea8281f4ed48430594340ddf6af",
@@ -4451,6 +5071,7 @@ script PlayerAttack extends AttackComponent
 		}
 		local index = _UtilLogic:RandomIntegerRange(1, #specials)
 		_EffectService:PlayEffectAttached(specials[index], attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		self:EchoShadowSkillEffectAttached(specials[index], attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 	end
 
 	-- 익스플로젼 판정 범위(전방위 - 방향 무관) 안의 살아있는 script.Monster를 가까운 순으로 최대 maxCount명까지 반환한다.
@@ -4518,7 +5139,7 @@ script PlayerAttack extends AttackComponent
 		self._T.explosionCurrentTarget = target
 		local pos = target.TransformComponent.WorldPosition
 		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
-		self:Attack(shape, "skill.explosion", CollisionGroups.HitBox)
+		self:AttackShadowSafe(shape, "skill.explosion", target)
 	end
 
 	-- 폭발 지점 주변(독구름의 확대된 시각적 크기의 1.0배 - 1.5배의 2/3로 축소) 안에 있는 독구름을 최대 6개까지 찾아 0.1초 간격으로 하나씩 터뜨린다.
@@ -4613,6 +5234,8 @@ script PlayerAttack extends AttackComponent
 		}
 		local index = _UtilLogic:RandomIntegerRange(1, #specials)
 		_EffectService:PlayEffect(specials[index], mapEntity, Vector3(px, py, pz), 0, Vector3(1, 1, 1), false)
+		-- 쉐도우 파트너: 독구름 파열 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffect(specials[index], Vector3(px, py, pz), 0, Vector3(1, 1, 1), {}, 0)
 		_SoundService:PlaySound("3edd6d189b9b4bf1ac48162339848e36", 1.0)
 	end
 
@@ -4737,6 +5360,8 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		_EffectService:PlayEffectAttached("5468cadd2f60428e925bc368968e1a1e", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("5468cadd2f60428e925bc368968e1a1e", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
 		_SoundService:PlaySound("7dd03981265b4d9a8c638bf0b18649cc", 1.0)
 		local cam = _CameraService:GetCurrentCameraComponent()
 		if isvalid(cam) then
@@ -4775,7 +5400,7 @@ script PlayerAttack extends AttackComponent
 		self._T.dragonRoarCurrentTarget = target
 		local pos = target.TransformComponent.WorldPosition
 		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
-		local hitComps = self:Attack(shape, "skill.dragonroar", CollisionGroups.HitBox)
+		local hitComps = self:AttackShadowSafe(shape, "skill.dragonroar", target)
 		local actuallyHit = false
 		for _, hc in ipairs(hitComps) do
 			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
@@ -4794,6 +5419,8 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
 		local serial = _EffectService:PlayEffectAttached("01c803531e2c4e5aa3c3ef66f14711b8", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		self:EchoShadowHitEffect("01c803531e2c4e5aa3c3ef66f14711b8", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {})
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
@@ -4959,8 +5586,13 @@ script PlayerAttack extends AttackComponent
 		local projComp = proj:GetComponent("script.FireArrowProjectile")
 		if isvalid(projComp) then
 			projComp.CombatPower = combatPower
+			projComp.CritRate = self._T.currentCritRatePercent or 50
+			-- 쉐도우 파트너 활성 여부를 원본 화살에 새겨둔다 - 히트 시 원본+보너스(타수 2배) 합산과 2줄 표시에 쓰인다.
+			projComp.ShadowEchoOn = self._T.shadowPartnerActive == true
 			projComp:Fire(dirX, dirY)
 		end
+
+		self:SpawnShadowEchoArrowProjectile("firearrowprojectile", "script.FireArrowProjectile", arrowRuid, Vector3(myPos.x, myPos.y + 0.35, myPos.z), dirX, dirY, combatPower)
 	end
 
 	@ExecSpace("Multicast")
@@ -5004,9 +5636,14 @@ script PlayerAttack extends AttackComponent
 		end
 		local castOptions = { ["FlipX"] = flipX }
 		local serial = _EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), false, castOptions)
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		local echoSerial = self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), castOptions, dirX)
 		_SoundService:PlaySound("6f972ab4e14841398281f3fc2a8f376e", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
 		end, 1.0)
 	end
 
@@ -5167,8 +5804,14 @@ script PlayerAttack extends AttackComponent
 		local projComp = proj:GetComponent("script.IronArrowProjectile")
 		if isvalid(projComp) then
 			projComp.CombatPower = combatPower
+			projComp.CritRate = self._T.currentCritRatePercent or 50
+			-- 쉐도우 파트너 활성 여부를 원본 화살에 새겨둔다 - 히트 시 원본+보너스(타수 2배) 합산과 2줄 표시,
+			-- 히트 이펙트 시간차 2배 재생에 쓰인다.
+			projComp.ShadowEchoOn = self._T.shadowPartnerActive == true
 			projComp:Fire(dirX, dirY)
 		end
+
+		self:SpawnShadowEchoArrowProjectile("ironarrowprojectile", "script.IronArrowProjectile", arrowRuid, Vector3(myPos.x, myPos.y + 0.35, myPos.z), dirX, dirY, combatPower)
 	end
 
 	@ExecSpace("Multicast")
@@ -5223,10 +5866,573 @@ script PlayerAttack extends AttackComponent
 		end
 		local castOptions = { ["FlipX"] = flipX }
 		local serial = _EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), false, castOptions)
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		local echoSerial = self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), castOptions, dirX)
 		_SoundService:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
 		end, 1.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackAvenger(number combatPower, number atkMultiplier, number rawDirX, number rawDirY)
+		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
+		self:StopBreather()
+		-- 어벤져: 파이어에로우/아이언에로우와 동일한 구조(8방향 발사·기모으는 딜레이·이동봉인)를 재사용한다.
+		-- 전투력의 500% 고정 데미지로 최대 10명을 관통하고, 사거리는 파이어에로우의 2/3(AvengerProjectile.MaxLifetime로 조절).
+		-- 몸쪽 이펙트(공식 어벤져 리소스팩 skill/800033.img/skill/80003327의 "effect")가 끝난 뒤 투사체(같은 팩의 "ball/0",
+		-- RUID 0477b2c75e4b4fbcaf795e03bd8da11a)를 발사한다.
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+
+		local dirX, dirY = rawDirX, rawDirY
+		local mag = math.sqrt(dirX * dirX + dirY * dirY)
+		if mag > 0.0001 then
+			dirX = dirX / mag
+			dirY = dirY / mag
+		else
+			local playerCtrl = self.Entity.PlayerControllerComponent
+			dirX = (isvalid(playerCtrl) and playerCtrl.LookDirectionX >= 0) and 1 or -1
+			dirY = 0
+		end
+		self._T.pendingAvengerDirX = dirX
+
+		local castRuid = "954896b2b40a4d8085586ea0ec2f0e19"
+		local ballRuid = "0477b2c75e4b4fbcaf795e03bd8da11a"
+
+		-- 기모으는 딜레이 동안 이동이 되지 않도록 컨트롤러를 잠근다 (파이어에로우/아이언에로우와 동일한
+		-- 첫-시전-캡처 + 토큰 가드 패턴 - 홀드 지속발동 중에도 안전).
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if not self._T.isAvengerMovementLocked then
+			self._T.pendingAvengerWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+			self._T.isAvengerMovementLocked = true
+		end
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+		self._T.avengerMoveLockToken = (self._T.avengerMoveLockToken or 0) + 1
+		local myMoveLockToken = self._T.avengerMoveLockToken
+
+		-- 순수 상하 방향(dirX==0)은 캐릭터가 원래 보던 좌우 방향을 그대로 유지한다.
+		local horizDirX
+		if dirX ~= 0 then
+			horizDirX = (dirX > 0) and 1 or -1
+		else
+			horizDirX = (isvalid(playerCtrl) and playerCtrl.LookDirectionX >= 0) and 1 or -1
+		end
+
+		-- 몸쪽 이펙트(14프레임 차지 모션) 재생 + 럭키세븐과 동일한 모션(swingO1/O2/O3 순환). 이펙트가
+		-- 끝나는 시점(0.6*mult)에서 0.2*mult 더 기다린 뒤 투사체를 발사한다("이펙트가 끝나고 0.2초 뒤
+		-- 투사체가 날아가야 한다"는 요청).
+		self:PlayAvengerCastEffect(self.Entity, castRuid, horizDirX)
+		local swing = self:GetAvengerSwing()
+		-- (기능 수정) "방향키를 누르면서 스킬을 써도 모션이 안 끊기게 해달라"는 요청 - 스킬 시전과 같은
+		-- 프레임에 모션을 보내면 이동 입력으로 인한 상태변경 이벤트와 경합해 스윙 모션이 씹힐 수 있다.
+		-- 0.15초 늦춰서 보내면(사용자 권장값) 그 사이 이동 관련 상태변경이 먼저 정리되어 안전하다.
+		_TimerService:SetTimerOnce(function()
+			self:PlayAvengerMotion(self.Entity, swing.name, horizDirX, atkMultiplier)
+		end, 0.15)
+		local fireDelay = (0.6 + 0.2) * atkMultiplier
+		_TimerService:SetTimerOnce(function()
+			self:SpawnAvengerProjectile(ballRuid, combatPower, dirX, dirY)
+		end, fireDelay)
+		-- 이동 잠금은 모션 재생 시간이 아니라 스킬 재사용 대기시간(SkillManager의 0.85*atkMultiplier 쿨다운)과
+		-- 동일하게 끝까지 유지한다 - 투사체 발사 시점(fireDelay=0.8*mult)보다 늦어야 하므로 0.75가 아닌 0.85로 맞춘다.
+		_TimerService:SetTimerOnce(function()
+			self:RestoreAvengerControl(myMoveLockToken)
+		end, 0.85 * atkMultiplier)
+	end
+
+	method table GetAvengerSwing()
+		-- (기능 수정) "모션을 럭키세븐하고 같아야 한다"는 요청 - 럭키세븐의 GetLuckySevenSwing과
+		-- 동일한 후보군(swingO1/O2/O3, 한손무기 계열)을 매 시전마다 순차 순환시킨다. 인덱스는 럭키세븐과
+		-- 섞이지 않도록 어벤져 전용 필드(avengerSwingIndex)로 별도 관리한다.
+		local candidates = {
+			{ name = "swingO1" },
+			{ name = "swingO2" },
+			{ name = "swingO3" },
+		}
+		self._T.avengerSwingIndex = (self._T.avengerSwingIndex or 0) % #candidates + 1
+		return candidates[self._T.avengerSwingIndex]
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAvengerMotion(Entity attacker, string motionName, number dirX, number atkMultiplier)
+		-- 어벤져 전용 모션 재생. 파이어에로우/아이언에로우와 동일한 방식 - 별도 플래그로 서로 간섭하지 않는다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		local body = avatarRenderer:GetBodyEntity()
+		if not isvalid(body) then return end
+
+		avatarRenderer.ShowDefaultWeaponEffects = false
+
+		local playerCtrl = attacker.PlayerControllerComponent
+		if isvalid(attacker.MovementComponent) then
+			attacker.MovementComponent:Stop()
+		end
+		if isvalid(playerCtrl) then
+			playerCtrl.LookDirectionX = dirX
+		end
+		self._T.isAvengerDirectionLocked = true
+		self._T.lockedAvengerDirX = dirX
+		self._T.lockedAvengerMotionName = motionName
+		self._T.isAvengerMotionPlaying = true
+		self._T.avengerLockToken = (self._T.avengerLockToken or 0) + 1
+		local myAvengerLockToken = self._T.avengerLockToken
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		-- (기능 수정) "방향키를 누르면서 쓰다 보니 모션이 자주 끊긴다 - 캐릭터 모션을 1.3배 오래 걸리게
+		-- 해달라"는 요청 - playRate를 1.3으로 나눠 재생 시간을 1.3배 늘린다.
+		local playRate = 1.0 / mult / 1.3
+		self._T.lockedAvengerPlayRate = playRate
+
+		local motionEvent = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
+		body:SendEvent(motionEvent)
+		log("[Avenger] PlayAvengerMotion sent: " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
+
+		-- 모션 재생 자체(포즈 유지)는 투사체가 발사되는 시점((0.6+0.2)*mult, 기모으는 딜레이와 동일하게
+		-- 맞춤)에 끝나지만, 이동 잠금(방향 고정)은 스킬 재사용 대기시간 전체(0.85*mult, SkillManager
+		-- 쿨다운과 동일)까지 유지한다.
+		_TimerService:SetTimerOnce(function()
+			if isvalid(avatarRenderer) then
+				avatarRenderer.ShowDefaultWeaponEffects = true
+			end
+			self._T.isAvengerMotionPlaying = false
+		end, (0.6 + 0.2) * mult)
+
+		_TimerService:SetTimerOnce(function()
+			if self._T.avengerLockToken ~= myAvengerLockToken then return end
+			self._T.isAvengerDirectionLocked = false
+			local sc = self.Entity.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+				sc:ChangeState("MOVE")
+				sc:ChangeState("IDLE")
+			end
+		end, 0.85 * mult)
+	end
+
+	@ExecSpace("Server")
+	method void RestoreAvengerControl(integer moveLockToken)
+		-- 기모으는 딜레이가 끝나 투사체가 발사된 직후 컨트롤러를 되돌린다. 홀드 지속발동으로 더 최근 시전이
+		-- 이미 다시 잠가둔 상태라면(토큰 불일치) 여기서 섣불리 풀지 않는다.
+		if self._T.avengerMoveLockToken ~= moveLockToken then return end
+		self._T.isAvengerMovementLocked = false
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) and self._T.pendingAvengerWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
+		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
+		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
+		self:PlayBreather(self.Entity, self._T.pendingAvengerDirX or 1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnAvengerProjectile(string ballRuid, number combatPower, number dirX, number dirY)
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		self._T.avengerCount = (self._T.avengerCount or 0) + 1
+		local name = "avenger_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.avengerCount)
+		-- 발쪽(원점)이 아니라 몸통 중심 높이에서 날아가도록 y를 올린다 (다른 화살류 스킬과 동일한 body-center 기준값 0.35).
+		-- (기능 수정) "투사체의 y값을 원상복귀해달라"는 요청 - 낮추는 대신 이펙트(954896b2...) 쪽만 내린다.
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local proj = _SpawnService:SpawnByModelId("avengerprojectile", name, Vector3(myPos.x, myPos.y + 0.35, myPos.z), map)
+		if not isvalid(proj) then
+			log_warning("[PlayerAttack] Avenger 투사체 스폰 실패")
+			return
+		end
+
+		local sprite = proj.SpriteRendererComponent
+		if isvalid(sprite) then
+			sprite.SpriteRUID = ballRuid
+		end
+
+		---@type AvengerProjectile
+		local projComp = proj:GetComponent("script.AvengerProjectile")
+		if isvalid(projComp) then
+			projComp.CombatPower = combatPower
+			projComp.CritRate = self._T.currentCritRatePercent or 50
+			-- 쉐도우 파트너 활성 여부를 원본 투사체에 새겨둔다 - 히트 시 원본+보너스(타수 2배) 합산과 2줄 표시에 쓰인다.
+			projComp.ShadowEchoOn = self._T.shadowPartnerActive == true
+			projComp:Fire(dirX, dirY)
+		end
+
+		self:SpawnShadowEchoArrowProjectile("avengerprojectile", "script.AvengerProjectile", ballRuid, Vector3(myPos.x, myPos.y + 0.35, myPos.z), dirX, dirY, combatPower)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAvengerCastEffect(Entity attacker, string effectRuid, number dirX)
+		-- 사용자 몸 쪽에서 1회 재생되는 시전(차지) 이펙트 + 사운드. (기능 수정) "954896b2...의 값을
+		-- 내려야 한다"는 요청 - 기존 0.15보다 더 내려 0.0(몸통 중심)으로 맞춘다. 회전/방향별 오프셋
+		-- 없이 항상 같은 고정 위치에서 좌우 반전만 적용한다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		-- (기능 수정) "954896b2...를 1.3배 빨리 진행해달라"는 요청 - PlayRate 옵션으로 이펙트 재생 속도를 올린다.
+		local castOptions = { ["FlipX"] = dirX > 0, ["PlayRate"] = 1.3 }
+		local serial = _EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), false, castOptions)
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		local echoSerial = self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), castOptions, dirX)
+		-- (기능 추가) "사용시 사운드입니다" 요청 - 스킬 사용 시점에 1회 재생.
+		_SoundService:PlaySound("28d565bf11b242f8b55b05c1fe252b69", 1.0)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
+		end, 1.0)
+	end
+
+	-- 어썰터 전용 판정 범위(전방위) 안의 살아있는 script.Monster 중 가장 가까운 하나를 찾는다.
+	-- 범위는 드래곤 로어(가로 15.0, 세로 7.5)의 1/5(가로 3.0, 세로 1.5) - 사용자 요청.
+	-- (기능 수정) "사거리를 전방으로만 하고 3배 늘려달라"는 요청 - 기존 전방위 판정(가로 3.0/세로 1.5)을
+	-- 캐릭터가 바라보는 방향(dirX) 전방으로만 판정하도록 바꾸고 3배(가로 9.0/세로 4.5)로 늘린다.
+	method Entity FindAssaulterTarget(Vector2 fromPos, number dirX)
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return nil end
+		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local nearest = nil
+		local nearestDist = 999999
+		-- (기능 수정) "위아래 사거리를 2.0으로 해달라"는 요청 - 세로 판정을 2.0으로 늘린다(가로는 그대로).
+		local xReach = 9.0
+		local yHalfHeight = 2.0
+		for _, comp in ipairs(monsterComps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local pos = mc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if dx * dirX >= 0 and math.abs(dx) <= xReach and math.abs(dy) <= yHalfHeight then
+					local dist = math.sqrt(dx * dx + dy * dy)
+					if dist < nearestDist then
+						nearestDist = dist
+						nearest = mc.Entity
+					end
+				end
+			end
+		end
+		return nearest
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackAssaulter(number combatPower)
+		-- 어썰터: 캐릭터가 사라졌다가 0.25초 뒤 가장 가까운 적을 통과한 뒤쪽(진행 방향으로 더 나아간 자리)에
+		-- 나타나며 그 적과 주변 적들(최대 6명)을 찌른다. 사라지는 자리에 78ea5621...(대상이 왼쪽=그대로/오른쪽=반전),
+		-- 나타나는 자리에서 손을 바닥에 짚는 착지 모션(prone) + 맞은 대상들 위치마다 흑백톤 히트 이펙트(5fd114...)를 재생한다.
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+		if self._T.isAssaulting then
+			log("PlayerAttack: AttackAssaulter 요청 차단됨(이미 진행 중)")
+			return
+		end
+
+		local worldPos = self.Entity.TransformComponent.WorldPosition
+		local originPos = Vector2(worldPos.x, worldPos.y)
+		local playerCtrl0 = self.Entity.PlayerControllerComponent
+		local facingDirX = (isvalid(playerCtrl0) and playerCtrl0.LookDirectionX >= 0) and 1 or -1
+		local target = self:FindAssaulterTarget(originPos, facingDirX)
+		local userId = self.Entity.PlayerComponent.UserId
+		if target == nil then
+			log("PlayerAttack: AttackAssaulter 실패 - 사거리 내 대상 없음")
+			-- (기능 추가) "범위 내 타겟이 없으면 사용이 되지 않아야 한다"는 요청 - 클라이언트에 실패를
+			-- 알려 쿨타임이 소모되지 않도록 한다.
+			self:NotifyAssaulterResult(false, userId)
+			return
+		end
+		self:NotifyAssaulterResult(true, userId)
+
+		self._T.isAssaulting = true
+		self._T.pendingAssaulterCombatPower = combatPower
+
+		local targetPos = target.TransformComponent.WorldPosition
+		local dirX = (targetPos.x >= originPos.x) and 1 or -1
+		self._T.pendingAssaulterTarget = target
+		self._T.pendingAssaulterDirX = dirX
+
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		self._T.pendingAssaulterWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+
+		self:PlayAssaulterVanishEffect(self.Entity, Vector3(originPos.x, originPos.y, 0), dirX)
+
+		-- (기능 수정) "0.5초 뒤 나타나면서 데미지를 주던 것을 0.25초로 바꿔달라"는 요청.
+		_TimerService:SetTimerOnce(function()
+			self:ReappearAssaulter()
+		end, 0.25)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyAssaulterResult(boolean success)
+		-- 어썰터 발동 성공/실패를 시전한 클라이언트에게만 알려, 실패 시(사거리 내 대상 없음) 쿨타임/쿨타임
+		-- UI가 소모되지 않도록 SkillManager에 전달한다.
+		_SkillManager:OnAssaulterResult(success)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAssaulterVanishEffect(Entity attacker, Vector3 originPos, number dirX)
+		-- 사라지는 연출: 아바타를 투명화하고, 원래 있던 자리에 78ea5621...을 1회 재생한다.
+		-- 대상이 왼쪽에 있으면(dirX<0) 그대로, 오른쪽에 있으면(dirX>0) 좌우 반전.
+		-- (기능 수정) "시작이펙트는 이동 후에도 캐릭터를 따라오지 말고 이동한 그 자리에 남아야 한다"는
+		-- 요청 - 캐릭터에 부착(PlayEffectAttached)하면 순간이동할 때 이펙트도 같이 딸려가버리므로,
+		-- 캐릭터가 사라지기 직전의 월드 좌표에 고정 재생(PlayEffect)한다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		-- (기능 추가) "스킬 사용 즉시 사운드"를 넣어달라는 요청 - 도착 사운드와 별개로, 시전 시작 시점에
+		-- 1회만 재생한다(쉐도우 파트너 에코는 없음 - 다른 즉시발동 캐스트 사운드들과 동일한 패턴).
+		_SoundService:PlaySound("3cc6e9d3ad6b41fbbe2a6ab17b364b94", 1.0)
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if isvalid(avatarRenderer) then
+			avatarRenderer:SetAlpha(0, nil)
+		end
+		local options = { ["FlipX"] = dirX > 0 }
+		local serial = _EffectService:PlayEffect("78ea5621bb574c8d8d7f84848262014d", attacker, originPos, 0, Vector3(1, 1, 1), false, options)
+		-- 쉐도우 파트너: 사라지는 이펙트도 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫) - 이것도 고정 좌표 버전을 쓴다.
+		local echoSerial = self:EchoShadowSkillEffect("78ea5621bb574c8d8d7f84848262014d", originPos, 0, Vector3(1, 1, 1), options, dirX)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+			if echoSerial ~= 0 then
+				_EffectService:RemoveEffect(echoSerial)
+			end
+		end, 1.0)
+	end
+
+	@ExecSpace("Server")
+	method void ReappearAssaulter()
+		-- 0.25초 뒤 실제로 대상 뒤(진행 방향으로 더 나아간 자리)에 순간이동해 나타난다.
+		local target = self._T.pendingAssaulterTarget
+		local dirX = self._T.pendingAssaulterDirX or 1
+
+		if not isvalid(target) then
+			-- 대기하는 사이 대상이 죽거나 사라졌다면: 원래 자리에서 그냥 다시 나타난다.
+			self:PlayAssaulterReappearEffects(self.Entity)
+			self:RestoreAssaulterControl()
+			return
+		end
+
+		local rb = self.Entity.RigidbodyComponent
+		local map = self.Entity.CurrentMap
+		if isvalid(rb) and isvalid(map) then
+			local fh = map.FootholdComponent
+			-- (기능 수정) "몬스터 뒤로 이동한 뒤 너무 가깝다 - 조금 더 이동시켜달라"는 요청 - 0.6 → 1.0.
+			local targetPos = target.TransformComponent.WorldPosition
+			local BEHIND_OFFSET = 1.0
+			local landX = targetPos.x + dirX * BEHIND_OFFSET
+			local landY = targetPos.y
+			if isvalid(fh) then
+				local nearFh = self:FindNearbyFootholdAtX(fh, landX, targetPos.y, 1.2)
+				if nearFh ~= nil then
+					landY = nearFh:GetYByX(landX) + 0.05
+				end
+			end
+			if isvalid(self.Entity.MovementComponent) then
+				self.Entity.MovementComponent:Stop()
+			end
+			rb:SetWorldPosition(Vector2(landX, landY))
+		end
+
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) then
+			-- 나타난 뒤 대상 쪽(왔던 방향의 반대)을 바라본다.
+			playerCtrl.LookDirectionX = -dirX
+		end
+
+		self:PlayAssaulterReappearEffects(self.Entity)
+
+		-- (기능 추가) "대상 주변 적들도 최대 6명까지 데미지를 입히면서 히트이펙트를 달아달라"는 요청 -
+		-- 썬더볼트와 동일한 패턴(위치 기반 탐색 후 동시 타격)으로, 착지한 대상의 위치를 중심으로 근처
+		-- 적을 가까운 순으로 최대 6명까지 찾는다(주 대상 자신도 거리 0으로 포함됨).
+		local targetPos = target.TransformComponent.WorldPosition
+		local splashTargets = self:FindAssaulterSplashTargets(Vector2(targetPos.x, targetPos.y), 6)
+		self:DealAssaulterHits(splashTargets)
+
+		_TimerService:SetTimerOnce(function()
+			self:RestoreAssaulterControl()
+		end, 0.5)
+	end
+
+	-- 어썰터 착지 지점 주변의 살아있는 script.Monster를 가까운 순으로 최대 maxCount명까지 반환한다
+	-- (썬더볼트의 FindThunderboltTargets와 동일한 구조 - 방향 무관, 위치 기반 박스 탐색).
+	method table FindAssaulterSplashTargets(Vector2 fromPos, integer maxCount)
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return {} end
+		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local candidates = {}
+		for _, comp in ipairs(monsterComps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local pos = mc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if math.abs(dx) <= 2.0 and math.abs(dy) <= 1.5 then
+					table.insert(candidates, { entity = mc.Entity, dist = math.sqrt(dx * dx + dy * dy) })
+				end
+			end
+		end
+		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		local result = {}
+		for i = 1, math.min(#candidates, maxCount) do
+			table.insert(result, candidates[i].entity)
+		end
+		return result
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAssaulterReappearEffects(Entity attacker)
+		-- 나타나는 연출: 아바타를 다시 보이게 하고, swingO1 모션의 마지막 프레임(사진 속 자세 - 찌르듯
+		-- 내지르는 동작의 끝 포즈)만 1초간 고정해서 보여준 뒤 원래 자세(stand1)로 복귀한다 + 도착 사운드
+		-- (bbb8c45c...)를 재생한다. 맞은 대상들 각각의 히트 이펙트는 PlayAssaulterHitEffect에서 대상별로
+		-- 따로 재생한다(요청: "대상 주변 적들도 최대 6명까지 데미지+히트이펙트").
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		_SoundService:PlaySound("bbb8c45c0d21491a97deb363a9d95e0c", 1.0)
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if isvalid(avatarRenderer) then
+			avatarRenderer:SetAlpha(1, nil)
+			-- (버그 수정) "이동 후 착지 모션이 없다" - 순간이동 직후 같은 프레임에 모션을 보내면 텔레포트로
+			-- 인한 위치 갱신(및 그로 인한 일시적 FALL 상태 전환)이 곧바로 이 one-shot 모션을 덮어써버리는
+			-- 것으로 보인다. 위치가 안정된 뒤 보내도록 짧게 지연한다(0.1초).
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(attacker) then return end
+				local body = avatarRenderer:GetBodyEntity()
+				if isvalid(body) then
+					-- StartFrameIndex/EndFrameIndex에 총 프레임 수를 초과하는 큰 값을 넣으면 엔진이 실제
+					-- 마지막 프레임 값으로 자동 보정한다(공식 문서 명시) - 두 값을 동일하게 최대치로 주면
+					-- swingO1 애니메이션의 "끝 프레임 한 장"만 정지된 상태로 보여줄 수 있다.
+					local motionEvent = ActionStateChangedEvent("swingO1", "swingO1", 1.0, SpriteAnimClipPlayType.Onetime, 2147483647, 2147483647)
+					body:SendEvent(motionEvent)
+				end
+			end, 0.1)
+			-- 1초 뒤 원래 서있는 자세(stand1)로 복귀시킨다(요청: "해당 자세만 1초간").
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(attacker) then return end
+				local body = avatarRenderer:GetBodyEntity()
+				if isvalid(body) then
+					local resetEvent = ActionStateChangedEvent("stand1", "stand1", 1.0, SpriteAnimClipPlayType.Loop)
+					body:SendEvent(resetEvent)
+				end
+			end, 1.1)
+		end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAssaulterHitEffect(Entity target)
+		-- 맞은 대상 한 명의 자리에 흑백톤(어둡게 틴트한) 히트 이펙트(5fd114...)를 재생한다 - 주 대상/주변
+		-- 적 모두 동일하게 대상마다 따로 호출된다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		-- 검은색/회색 느낌으로 어둡게 틴트.
+		local hitOptions = { ["Color"] = Color(0.2, 0.2, 0.2, 1.0) }
+		-- (기능 수정) "y값을 조금 위로 올려달라"는 요청 - 0 -> 0.3.
+		local serial = _EffectService:PlayEffectAttached("5fd114c93ac7453e9b54e228f2c62064", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, hitOptions)
+		-- 쉐도우 파트너: 같은 히트 이펙트를 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생.
+		self:EchoShadowHitEffect("5fd114c93ac7453e9b54e228f2c62064", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), hitOptions)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealAssaulterHits(table targets)
+		-- 예약된 대상 전원(주 대상 + 주변 최대 6명)에게 같은 프레임 안에서 동시에 타격 판정과 이펙트를
+		-- 발생시킨다 (썬더볼트의 DealThunderboltHits와 동일한 구조).
+		if not isvalid(self.Entity) then return end
+		local hitCount = 0
+		for _, target in ipairs(targets) do
+			if isvalid(target) then
+				-- 이번 Attack() 호출은 이 대상 하나만 통과하도록 지정 (몬스터 밀집 지역에서 이웃까지
+				-- 겹쳐 중복 피해가 들어가는 것을 방지 - IsAttackTarget의 assaulterCurrentTarget 체크 참고).
+				self._T.assaulterCurrentTarget = target
+				local pos = target.TransformComponent.WorldPosition
+				local shape = CircleShape(Vector2(pos.x, pos.y), 0.6)
+				local hitComps = self:AttackShadowSafe(shape, "skill.assaulter", target)
+				local actuallyHit = false
+				for _, hc in ipairs(hitComps) do
+					if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
+						actuallyHit = true
+						break
+					end
+				end
+				-- (기능 추가) "코마처럼 몬스터를 3초간 행동불능 상태로 만들고 b0bd80f44c...를 스턴 동안 띄워달라"는 요청 -
+				-- 주 대상뿐 아니라 이번에 맞은 주변 적 전원에게 동일하게 적용한다.
+				if actuallyHit then
+					self:PlayAssaulterHitEffect(target)
+					self:PlayAssaulterStunEffect(target)
+					self:ApplyAssaulterStun(target)
+					hitCount = hitCount + 1
+				end
+			end
+		end
+		log("PlayerAttack: AttackAssaulter " .. tostring(#targets) .. "명 동시 타격, 실제 명중 " .. tostring(hitCount) .. "명")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyAssaulterStun(Entity target)
+		-- 코마의 ApplyComaStun과 동일한 방식 - 몬스터 AI 추적/이동을 3초간 완전히 꺼서 행동불능으로 만든다.
+		if not isvalid(target) then return end
+		local aiChase = target.AIChaseComponent
+		local wasAIEnabled = isvalid(aiChase) and aiChase.Enable
+		if isvalid(aiChase) then
+			aiChase.Enable = false
+		end
+		local movement = target.MovementComponent
+		local wasMovementEnabled = isvalid(movement) and movement.Enable
+		if isvalid(movement) then
+			movement:Stop()
+			movement.Enable = false
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(target) and isvalid(aiChase) and wasAIEnabled then
+				aiChase.Enable = true
+			end
+			if isvalid(target) and isvalid(movement) and wasMovementEnabled then
+				movement.Enable = true
+			end
+		end, 3.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAssaulterStunEffect(Entity target)
+		-- 코마의 PlayComaStunEffect와 동일한 방식 - 대상 머리 위에 3초간 스턴 표시 이펙트(b0bd80f4...)를 띄운다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local headY = 0.5
+		local hit = target.HitComponent
+		if isvalid(hit) then
+			headY = hit.ColliderOffset.y + hit.BoxSize.y / 2
+		end
+		local serial = _EffectService:PlayEffectAttached("b0bd80f44c1543438ddf8c2c31a0a7ce", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), true, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 3.0)
+	end
+
+	@ExecSpace("Server")
+	method void RestoreAssaulterControl()
+		-- 착지 모션까지 끝난 뒤 컨트롤을 복구한다.
+		self._T.isAssaulting = false
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) and self._T.pendingAssaulterWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5267,8 +6473,10 @@ script PlayerAttack extends AttackComponent
 
 		-- 대상을 시전 시작 시점에 한 번만 찾아 고정한다(더블스탭/럭키세븐과 동일한 방식) - 드래곤머리가
 		-- 발사되는 1.1초 시점까지 몬스터가 다른 공격으로 죽어 후보에서 빠지는 것을 방지한다.
+		-- (기능 추가) "전방 2.5·상하 1.2로 해달라"는 요청으로 스피어 버스터 전용 탐색 범위를 직접 지정한다.
+		-- 슬래쉬블래스트 쪽 호출부는 기존 값(2.0/1.0)을 그대로 유지하므로 이 변경은 스피어 버스터에만 적용된다.
 		local worldPos = self.Entity.TransformComponent.WorldPosition
-		self._T.spearBurstLockedTargets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 3)
+		self._T.spearBurstLockedTargets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 3, 2.5, 1.2)
 
 		-- 날개 이펙트는 진짜 라이브 트윈이 가능한 전용 엔티티(SpearBurstFadingEffect)로 재생한다
 		-- (PlayEffectAttached 재생-재생 반복 방식은 깜빡임을 완전히 없앨 수 없어 실측 확인됨).
@@ -5281,6 +6489,17 @@ script PlayerAttack extends AttackComponent
 			"c7051cc242c54208a7c22df2b4bcc28e", Vector2(-0.2 * dirX, 0.05), dirX > 0,
 			1.0, 1.0, 1.0, 0.0, 0.45, 0.45, -1, false, "", 0, 0, 0, 0
 		)
+		-- (버그 수정) "쉐도우 파트너가 스피어버스터의 날개 이펙트는 따라하지 않는다" - 이 날개 이펙트는
+		-- 다른 스킬 이펙트들과 달리 EchoShadowSkillEffectAttached(찌르기 이펙트 3종 등이 쓰는 공용
+		-- 그림자 복제 경로)를 거치지 않고 SpawnSpearBurstFadingEffect라는 전용 라이브 트윈 엔티티로
+		-- 직접 재생되고 있어, 그림자 몫 복제 호출 자체가 빠져 있었다. 다른 그림자 복제 이펙트와 동일한
+		-- 관례(x축 뒤쪽으로 추가 오프셋 -0.45*dirX, 투명도 70%)를 그대로 적용해 별도로 한 번 더 재생한다.
+		if self._T.shadowPartnerActive then
+			self:SpawnSpearBurstFadingEffect(
+				"c7051cc242c54208a7c22df2b4bcc28e", Vector2(-0.2 * dirX - 0.45 * dirX, 0.05), dirX > 0,
+				1.0, 1.0, 0.7, 0.0, 0.45, 0.45, -1, false, "", 0, 0, 0, 0
+			)
+		end
 		-- 몸쪽 마법진 이펙트(176da561...)도 전용 엔티티(SpawnSpearBurstFadingEffect)로 재생해 투명도 50%→0%로
 		-- 서서히 사라지면서 살짝 커지는 라이브 트윈을 재현한다 - PlayEffectAttached로 한 번 바꿨었지만
 		-- 그러면 이 트윈 자체가 불가능해서(정적 1회 재생만 지원) 되돌렸다.
@@ -5490,6 +6709,8 @@ script PlayerAttack extends AttackComponent
 		-- (되돌림) 마법진이 X축 이동으로 앞에 오도록 바뀌어 OrderInLayer 경쟁이 더 이상 없으므로
 		-- 원래 값(11)으로 되돌린다.
 		_EffectService:PlayEffectAttached("852883a5b27442e88ac5a23f5a218a58", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
+		-- 쉐도우 파트너: 같은 찌르기 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("852883a5b27442e88ac5a23f5a218a58", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 }, dirX)
 		self:PlaySpearBurstAttackSound(attacker)
 	end
 
@@ -5589,6 +6810,8 @@ script PlayerAttack extends AttackComponent
 		-- (기능 추가) "몸쪽으로 조금 땡겨달라"는 피드백으로 앞쪽 오프셋을 0.3→0.15로 줄였다. 마법진
 		-- (되돌림) 마법진이 X축 이동으로 앞에 오도록 바뀌어 OrderInLayer는 원래 값(11)으로 되돌린다.
 		_EffectService:PlayEffectAttached("3c2ee6e636924e179cca843f819f9b30", attacker, Vector3(0.15 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
+		-- 쉐도우 파트너: 같은 찌르기 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("3c2ee6e636924e179cca843f819f9b30", attacker, Vector3(0.15 * dirX, 0, 0), 0, Vector3(1, 1, 1), { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 }, dirX)
 		self:PlaySpearBurstAttackSound(attacker)
 	end
 
@@ -5604,6 +6827,8 @@ script PlayerAttack extends AttackComponent
 		-- (기능 추가) "몸쪽으로 조금 땡겨달라"는 피드백으로 앞쪽 오프셋을 0.3→0.15로 줄였다. 마법진
 		-- (되돌림) 마법진이 X축 이동으로 앞에 오도록 바뀌어 OrderInLayer는 원래 값(11)으로 되돌린다.
 		_EffectService:PlayEffectAttached("521bf9f60cb94a7fb9890ba2e0ede109", attacker, Vector3(0.15 * dirX, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 })
+		-- 쉐도우 파트너: 같은 찌르기 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("521bf9f60cb94a7fb9890ba2e0ede109", attacker, Vector3(0.15 * dirX, 0, 0), 0, Vector3(1, 1, 1), { ["FlipX"] = flipX, ["OrderInLayer"] = 11, ["StartFrameIndex"] = 1 }, dirX)
 		self:PlaySpearBurstAttackSound(attacker)
 	end
 
@@ -5812,16 +7037,36 @@ script PlayerAttack extends AttackComponent
 			end
 		end
 		local damage = self._T.lastSpearBurstDamage or 0
+		local spearBurstBaseCrit = self._T.lastSpearBurstIsCritical or false
+		local bonus = self._T.shadowEchoBonus or 0
+		local bonusCrit = self._T.shadowEchoBonusIsCritical or false
 		if not actuallyHit then
 			-- 더블스탭과 동일하게, 앞선 타격에 대상이 이미 죽어 판정 자체가 실패해도(콜라이더가 더
 			-- 이상 걸리지 않음) 3줄이 항상 뜨도록 표시 전용 데미지를 동일 공식으로 새로 굴린다(실제
 			-- Hp에는 영향 없음). CalcDamage의 skill.spearburst 분기와 반드시 같은 배율을 유지해야 한다.
+			-- (버그 수정) 더블스탭/매직클로와 동일한 이유로, 이 경로도 크리티컬을 독립적으로 굴리고
+			-- self._T.shadowEchoBonus의 stale 값 대신 쉐도우 파트너 보너스도 여기서 새로 굴린다.
+			local critRate = (self._T.currentCritRatePercent or 50) / 100
 			local combatPower = self._T.pendingSpearBurstCombatPower or 0
 			local mult = 0.1 + _UtilLogic:RandomDouble() * (0.2 - 0.1)
 			-- 콤보 어택 버프 보너스도 실제 판정(CalcDamage)과 동일하게 표시 전용 값에 반영한다.
 			damage = self:ApplyComboAttackBonus(math.floor(combatPower * mult))
+			spearBurstBaseCrit = _UtilLogic:RandomDouble() < critRate
+			if spearBurstBaseCrit then damage = math.floor(damage * 2.0) end
+			bonus = 0
+			bonusCrit = false
+			if self._T.shadowPartnerActive then
+				bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
+				bonusCrit = _UtilLogic:RandomDouble() < critRate
+				if bonusCrit then bonus = math.floor(bonus * 2.0) end
+			end
 		end
-		self:ShowSpearBurstStabDamageSkin(target, damage, hitIndex)
+		self:ShowSpearBurstStabDamageSkin(target, damage, hitIndex, bonus, spearBurstBaseCrit, bonusCrit)
+		-- (기능 추가) "타격음이 2배로 많이 들리게 해달라" 요청 - 쉐도우 파트너 보너스가 있으면 아래의
+		-- 중복 방지 로직과 별개로 항상 추가 1회를 더 재생한다.
+		if bonus > 0 then
+			self:PlayShadowEchoHitSound(target)
+		end
 		-- 타격 이펙트는 실제 판정 성공 여부와 무관하게 매번 재생한다(항상 3번 느껴지도록).
 		self:PlaySpearBurstHitEffect(target, dirX, hitIndex)
 		-- (버그 수정) 실제로 명중했고(actuallyHit) 대상이 이번 타격 전까지 살아있었다면
@@ -5836,22 +7081,50 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("Client")
-	method void ShowSpearBurstStabDamageSkin(Entity target, integer damage, integer hitIndex)
+	method void ShowSpearBurstStabDamageSkin(Entity target, integer damage, integer hitIndex, integer bonus, boolean baseIsCritical, boolean bonusIsCritical)
 		-- 다른 스킬과 동일한 기본 히트 데미지 스킨(RUID)을 사용한다. 3번의 찌르기가 위/중간/아래로
 		-- 나뉘어 3줄로 쌓인 것처럼 보이도록 세로 오프셋을 준다(더블스탭의 ±0.2 2줄 배치와 동일한 방식).
 		if not isvalid(target) then return end
 		local offsetY = 0.0
-		if hitIndex == 1 then
-			offsetY = -0.3
-		elseif hitIndex == 3 then
-			offsetY = 0.3
+		local bonusGap = 0.15
+		if bonus > 0 then
+			-- (기능 수정) 3줄->6줄로 늘어날 때 기존 간격(0.15)이 좁다는 피드백 - "1->2줄" 간격(0.3)과
+			-- 동일한 단위로 6줄 전체를 -0.75/-0.45/-0.15/0.15/0.45/0.75로 재배치한다(버프가 없을 때의
+			-- 3줄 배치는 그대로 유지).
+			if hitIndex == 1 then
+				offsetY = -0.75
+			elseif hitIndex == 3 then
+				offsetY = 0.45
+			else
+				offsetY = -0.15
+			end
+			bonusGap = 0.3
+		else
+			if hitIndex == 1 then
+				offsetY = -0.3
+			elseif hitIndex == 3 then
+				offsetY = 0.3
+			end
 		end
+		-- (버그 수정) 원본/보너스를 하나의 Play() 배열로 묶으면 3연타(3곳)가 각각 2줄씩이라 총 6줄이어야
+		-- 하는데 실제로는 4줄처럼 겹쳐 보이는 문제가 있었다 - 배열로 묶인 두 값은 시간차(DelayPerAttack)로만
+		-- 분리되고 같은 위치에서 뜨기 때문. 보너스를 별도의 Play() 호출로 분리해 offsetY를 bonusGap만큼
+		-- 더 얹어서 서로 다른 위치에 뜨도록 한다.
+		-- (버그 수정) "각자 크리티컬 여부를 독립적으로 판단해야 한다" - 하드코딩된 false 대신 CalcDamage가
+		-- 이 타격(hitIndex)에 대해 독립적으로 굴린 결과를 그대로 전달한다.
 		_DamageSkinService:Play(
 			target, "3271c3e79bf04ecba9a107d55495970d", 0,
-			{ damage }, DamageSkinTweenType.Default, false,
+			{ damage }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
-		log("[SpearBurst] ShowSpearBurstStabDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY))
+		if bonus > 0 then
+			_DamageSkinService:Play(
+			    target, "3271c3e79bf04ecba9a107d55495970d", 0,
+			    { bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+			    Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+			)
+		end
+		log("[SpearBurst] ShowSpearBurstStabDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " baseCrit=" .. tostring(baseIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
 	end
 
 	@ExecSpace("Multicast")
@@ -5869,6 +7142,8 @@ script PlayerAttack extends AttackComponent
 		local pos = target.TransformComponent.WorldPosition
 		local flipX = dirX > 0
 		_EffectService:PlayEffect("84c06a061ae74a10a96fd55947769868", target, Vector3(pos.x, pos.y, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX })
+		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
+		self:EchoShadowHitEffectAtPos("84c06a061ae74a10a96fd55947769868", Vector3(pos.x, pos.y, 0), 0, Vector3(1, 1, 1), { ["FlipX"] = flipX })
 		log("[SpearBurst] PlaySpearBurstHitEffect hitIndex=" .. tostring(hitIndex) .. " t=" .. tostring(_UtilLogic.ElapsedSeconds))
 	end
 

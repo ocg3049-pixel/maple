@@ -1,0 +1,89 @@
+@Component
+script AvengerProjectileAttack extends AttackComponent
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- 투사체는 관통하며 여러 몬스터를 맞힐 수 있지만, 같은 몬스터를 하나의 투사체로 중복 타격하지 않도록
+		-- AvengerProjectile에 기록된 명중 목록(이름 기준)으로 필터링하고, 최대 관통 수(10명)를 넘으면
+		-- 판정 자체를 막는다 - 한 프레임 안에 여러 대상이 동시에 겹쳐도(AttackFast 1회 호출) 11번째부터는
+		-- 여기서 바로 걸러지므로 OnUpdate의 사후 파괴 체크보다 먼저 안전하게 막힌다.
+		if isvalid(defender.PlayerComponent) then return false end
+		---@type AvengerProjectile
+		local proj = self.Entity:GetComponent("script.AvengerProjectile")
+		if proj ~= nil and (proj:HasHit(defender.Name) or proj:HasReachedMaxHits()) then
+			return false
+		end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 전투력의 500% 고정 데미지(랜덤 범위 없음).
+		-- (기능 변경) 쉐도우 파트너의 "타수 2배"는 이 진짜 히트 하나 안에서 원본+보너스(원본의 55~65%)를
+		-- 합산해 적용하고, 데미지 숫자는 원본/보너스 2줄로 나눠 표시한다 - 그림자가 쏘는 에코 투사체는
+		-- 시각 전용(무데미지)이다.
+		---@type AvengerProjectile
+		local proj = self.Entity:GetComponent("script.AvengerProjectile")
+		local combatPower = 0
+		local echoOn = false
+		local critRate = 0.5
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			echoOn = proj.ShadowEchoOn
+			critRate = (proj.CritRate or 50) / 100
+			proj:MarkHit(defender.Name)
+		end
+		local dmg = math.floor(combatPower * 5.0)
+		-- 다른 화살류 스킬과 동일한 방식으로 크리티컬을 독립적으로 굴리고 배율을 반환값에 바로 곱한다
+		-- (아래 CalcCritical은 엔진의 이중 배율 적용을 막기 위해 계속 false 반환). math.random() 대신
+		-- _UtilLogic:RandomDouble()을 쓴다 - 관통 히트가 짧은 간격으로 잇따라 호출되어(PlayerAttack.mlua에
+		-- 문서화된 버그) math.random()이 같은 시퀀스를 반복 소비할 위험이 크다.
+		local dmgIsCritical = _UtilLogic:RandomDouble() < critRate
+		if dmgIsCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		local bonus = 0
+		local bonusIsCritical = false
+		if echoOn then
+			bonus = math.floor(dmg * (0.55 + math.random() * 0.10))
+			bonusIsCritical = _UtilLogic:RandomDouble() < critRate
+			if bonusIsCritical then
+				bonus = math.floor(bonus * 2.0)
+			end
+		end
+		self:ShowAvengerDamageSkin(defender, dmg, bonus, dmgIsCritical, bonusIsCritical)
+		return dmg + bonus
+	end
+
+	-- CalcDamage가 자체적으로 크리티컬을 굴리고 배율을 이미 반환값에 곱했으므로, 엔진이 여기서 또 true를
+	-- 반환하면 실제 적용 데미지가 표시값의 2배로 이중 적용된다. 항상 false를 반환해 이중 적용을 막는다.
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		return false
+	end
+
+	@ExecSpace("Client")
+	method void ShowAvengerDamageSkin(Entity target, integer damage, integer bonus, boolean damageIsCritical, boolean bonusIsCritical)
+		-- 다른 스킬(파이어에로우 등)과 동일한 기본 히트 데미지 스킨(RUID)을 명시적으로 재생해 룩앤필을
+		-- 통일한다. 모델의 DamageSkinSettingComponent(자동표시)는 꺼뒀으므로 여기서만 표시된다.
+		-- 쉐도우 파트너 중에는 원본/보너스를 서로 다른 세로 위치의 2줄로 나눠 겹치지 않게 표시하고,
+		-- 각 줄의 크리티컬 강조도 CalcDamage에서 독립적으로 굴린 결과를 그대로 반영한다.
+		if not isvalid(target) then return end
+		_DamageSkinService:Play(
+			target, "3271c3e79bf04ecba9a107d55495970d", 0,
+			{ damage }, DamageSkinTweenType.Default, damageIsCritical,
+			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+		if bonus > 0 then
+			_DamageSkinService:Play(
+				target, "3271c3e79bf04ecba9a107d55495970d", 0,
+				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+				Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+			)
+		end
+	end
+
+	method int32 GetDisplayHitCount(string attackInfo)
+		-- 어벤져는 데미지 스킨을 이 스크립트에서 수동(_DamageSkinService:Play)으로 직접 띄우므로,
+		-- 엔진의 자동 데미지 스킨 표시 개수를 0으로 만들어 이중으로 뜨는 걸 막는다.
+		return 0
+	end
+
+end

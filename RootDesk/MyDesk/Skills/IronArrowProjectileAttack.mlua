@@ -17,33 +17,73 @@ script IronArrowProjectileAttack extends AttackComponent
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
 		-- 파이어에로우의 8/10 배율(전투력의 300~700% -> 240~560%). 실제 명중이 확정된 시점(이 훅)에만
 		-- 호출되므로 여기서 명중 기록.
+		-- (기능 변경) 쉐도우 파트너의 "타수 2배"는 이 진짜 히트 하나 안에서 원본+보너스(원본의 55~65%)를
+		-- 합산해 적용하고, 데미지 숫자는 원본/보너스 2줄로 나눠 표시한다 - 그림자가 쏘는 에코 화살은
+		-- 시각 전용(무데미지)이다(그림자 스킬 이펙트는 직접적인 데미지를 주지 않는다는 요청).
 		---@type IronArrowProjectile
 		local proj = self.Entity:GetComponent("script.IronArrowProjectile")
 		local combatPower = 0
+		local echoOn = false
+		local critRate = 0.5
 		if proj ~= nil then
 			combatPower = proj.CombatPower
+			echoOn = proj.ShadowEchoOn
+			critRate = (proj.CritRate or 50) / 100
 			proj:MarkHit(defender.Name)
 		end
 		local mult = 2.4 + math.random() * (5.6 - 2.4)
 		local dmg = math.floor(combatPower * mult)
-		self:ShowIronArrowDamageSkin(defender, dmg)
-		self:PlayIronArrowHitEffect(defender)
-		return dmg
+		-- (버그 수정) "각자 크리티컬 여부를 캐릭터 정보창의 크리티컬 확률로 독립 판단해야 한다" - 이
+		-- 화살은 CalcCritical을 오버라이드하지 않아 항상 false(무크리)였다. 여기서 직접 굴리고 배율을
+		-- 반환값에 바로 곱해 반영한다(아래 CalcCritical은 엔진의 이중 배율 적용을 막기 위해 계속 false 반환).
+		-- math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - PlayerAttack.mlua에 문서화된 버그(짧은
+		-- 간격의 연속 호출에서 math.random()이 같은 시퀀스를 반복 소비하는 현상)를 피하기 위함.
+		local dmgIsCritical = _UtilLogic:RandomDouble() < critRate
+		if dmgIsCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		local bonus = 0
+		local bonusIsCritical = false
+		if echoOn then
+			bonus = math.floor(dmg * (0.55 + math.random() * 0.10))
+			bonusIsCritical = _UtilLogic:RandomDouble() < critRate
+			if bonusIsCritical then
+				bonus = math.floor(bonus * 2.0)
+			end
+		end
+		self:ShowIronArrowDamageSkin(defender, dmg, bonus, dmgIsCritical, bonusIsCritical)
+		self:PlayIronArrowHitEffect(defender, echoOn)
+		return dmg + bonus
+	end
+
+	-- CalcDamage가 자체적으로 크리티컬을 굴리고 배율을 이미 반환값에 곱했으므로, 엔진이 여기서 또 true를
+	-- 반환하면 실제 적용 데미지가 표시값의 2배로 이중 적용된다. 항상 false를 반환해 이중 적용을 막는다.
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		return false
 	end
 
 	@ExecSpace("Client")
-	method void ShowIronArrowDamageSkin(Entity target, integer damage)
+	method void ShowIronArrowDamageSkin(Entity target, integer damage, integer bonus, boolean damageIsCritical, boolean bonusIsCritical)
 		-- 다른 스킬들과 동일한 기본 히트 데미지 스킨(RUID)을 재생해 룩앤필을 통일한다.
+		-- 쉐도우 파트너 중에는 원본/보너스를 서로 다른 세로 위치의 2줄로 나눠 겹치지 않게 표시하고,
+		-- 각 줄의 크리티컬 강조도 CalcDamage에서 독립적으로 굴린 결과를 그대로 반영한다.
 		if not isvalid(target) then return end
 		_DamageSkinService:Play(
 			target, "3271c3e79bf04ecba9a107d55495970d", 0,
-			{ damage }, DamageSkinTweenType.Default, false,
+			{ damage }, DamageSkinTweenType.Default, damageIsCritical,
 			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		if bonus > 0 then
+			_DamageSkinService:Play(
+				target, "3271c3e79bf04ecba9a107d55495970d", 0,
+				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+				Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+			)
+		end
 	end
 
 	@ExecSpace("Client")
-	method void PlayIronArrowHitEffect(Entity target)
+	method void PlayIronArrowHitEffect(Entity target, boolean echo)
 		-- 아이언에로우 전용: 맞은 몬스터에게서 일어나는 이펙트 + 히트 사운드를 1회 재생한다.
 		if not isvalid(target) then return end
 		local offsetY = 0.3
@@ -51,6 +91,18 @@ script IronArrowProjectileAttack extends AttackComponent
 		if isvalid(hit) then offsetY = hit.ColliderOffset.y end
 		local serial = _EffectService:PlayEffectAttached("f6658089b9774f4bb0026efe2757e375", target, Vector3(0, offsetY, 0), 0, Vector3(1, 1, 1), false, {})
 		_SoundService:PlaySound("eb49560ca2a84e0585e0e83cd61c9dc6", 1.0)
+		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 같은 자리(고정 좌표)에 한 번 더
+		-- 재생한다(투명도 70%) - 대상이 그 사이 죽어 사라져도 허공의 그 자리에서 발동한다.
+		if echo then
+			local wp = target.TransformComponent.WorldPosition
+			local px, py, pz = wp.x, wp.y + offsetY, wp.z
+			local mapEnt = self.Entity.CurrentMap
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(mapEnt) then return end
+				_EffectService:PlayEffect("f6658089b9774f4bb0026efe2757e375", mapEnt, Vector3(px, py, pz), 0, Vector3(1, 1, 1), false, { ["Alpha"] = 0.7 })
+				log("[IronArrow] 그림자 히트이펙트 발동(0.25초 지연) pos=(" .. tostring(px) .. "," .. tostring(py) .. ")")
+			end, 0.25)
+		end
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)

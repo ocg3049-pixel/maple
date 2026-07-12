@@ -1,0 +1,103 @@
+@Component
+script AvengerProjectile extends Component
+
+	property number Speed = 6
+
+	-- 사거리는 파이어에로우(Speed 6 * MaxLifetime 1.5 = 9칸)의 2/3(6칸) - Speed는 그대로 두고
+	-- MaxLifetime만 2/3(1.0)로 줄여 사거리를 맞춘다.
+	property number MaxLifetime = 1.0
+
+	-- (기능 추가) "투사체를 회전하면서 날아가게 해달라"는 요청 - 진행 방향을 바라보는 고정 각도 대신,
+	-- 매 프레임 이 속도(초당 도)만큼 계속 돌려 빙글빙글 도는 것처럼 보이게 한다.
+	property number RotationSpeed = 720
+
+	property number CombatPower = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcCritical/CalcDamage가
+	-- 서버에서 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 직접 읽을 수 없어, 발사한 플레이어가
+	-- SyncCritRate로 동기화해둔 값을 그대로 넘겨받는다.
+	property number CritRate = 50
+
+	-- 최대 10명까지 관통하고 사라진다.
+	property integer MaxHitCount = 10
+
+	-- 쉐도우 파트너: true면 그림자 몫의 "시각 전용" 투사체 - 판정(AttackFast) 없이 날아가기만 한다
+	-- (그림자 스킬 이펙트는 몬스터에게 직접적인 데미지를 주지 않는다는 요청).
+	property boolean VisualOnly = false
+
+	-- 원본 투사체 전용(서버에서만 읽음): 쉐도우 파트너 버프 중에 발사됐는지 여부.
+	-- 히트 시 원본+보너스(타수 2배) 합산과 데미지 숫자 2줄 표시에 쓰인다.
+	property boolean ShadowEchoOn = false
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화 (서버 전용 필드). 방향은 기본적으로 전방(+X)을 가리킨다.
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hitSet = {}
+			self._T.hitCount = 0
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 방향 벡터를 받아 발사 시작. 진행 방향을 바라보는 고정 각도 대신 OnUpdate에서 계속
+		-- 회전시키므로(RotationSpeed) 여기서는 초기 각도를 0으로 둔다.
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = 0
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHit(string defenderName)
+		return self._T.hitSet[defenderName] == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasReachedMaxHits()
+		return self._T.hitCount >= self.MaxHitCount
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkHit(string defenderName)
+		self._T.hitSet[defenderName] = true
+		self._T.hitCount = self._T.hitCount + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		self._T.lifetime = self._T.lifetime + delta
+		if self._T.lifetime >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		-- 최대 관통 수(10명)만큼 맞혔으면(직전 프레임에 기록됨) 더 이상 판정하지 않고 사라진다.
+		if self._T.hitCount >= self.MaxHitCount then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * delta, self._T.dirY * self.Speed * delta)
+		-- 회전하면서 날아가도록 매 프레임 각도를 누적한다(그림자 몫 시각 전용 투사체도 함께 회전).
+		self.Entity.TransformComponent.ZRotation = self.Entity.TransformComponent.ZRotation + self.RotationSpeed * delta
+
+		-- 쉐도우 파트너의 그림자 몫(시각 전용) 투사체는 판정 자체를 하지 않는다 - 직접적인 데미지 없음.
+		if self.VisualOnly then return end
+
+		---@type AvengerProjectileAttack
+		local ac = self.Entity:GetComponent("script.AvengerProjectileAttack") -- (파이어에로우와 동일한 관통 판정 패턴)
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			ac:AttackFast(CircleShape(Vector2(pos.x, pos.y), 0.3), "skill.avenger", CollisionGroups.HitBox)
+		end
+	end
+
+end

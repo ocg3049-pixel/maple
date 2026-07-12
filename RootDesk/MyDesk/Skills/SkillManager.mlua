@@ -18,6 +18,8 @@ script SkillManager extends Logic
 		-- 텔레포트 전용 쿨다운 - 다른 스킬들의 공용 쿨다운(skillOnCooldown)과 분리해서, 다른 스킬의
 		-- 모션/딜레이 중에도 텔레포트를 쓸 수 있게 한다.
 		self._T.teleportOnCooldown = false
+		-- 어썰터 전용 쿨다운(고정 3초) - 텔레포트와 동일한 이유로 공용 쿨다운(skillOnCooldown)과 분리한다.
+		self._T.assaulterOnCooldown = false
 		-- 스킬 키 홀드 상태 (키를 누르고 있는 동안 쿨다운이 끝나면 자동으로 이어서 발동)
 		self._T.heldSkillKeys = {}
 
@@ -573,6 +575,14 @@ script SkillManager extends Logic
 	method void UseSkillInSlot(string key)
 		local slot = self._T.slotData[key]
 		if slot == nil or slot.ruid == "" then return end
+		-- 캐릭터 정보창의 실제 크리티컬 확률(장비 잠재능력 반영)을 스킬 사용 시마다 서버로 동기화한다 -
+		-- CalcCritical은 서버에서만 실행되고 장비/인벤토리는 클라이언트 전용 상태라, combatPower와
+		-- 동일한 이유로 매 시전 직전에 최신값을 넘겨줘야 한다.
+		local localPlayerForCrit = _UserService.LocalPlayer
+		local paForCrit = isvalid(localPlayerForCrit) and localPlayerForCrit:GetComponent(PlayerAttack) or nil
+		if paForCrit ~= nil then
+			paForCrit:SyncCritRate(_CharInfoManager:CalcCritRate())
+		end
 		if slot.name == "HP포션" then
 			_PotionShopManager:RequestUsePotion()
 			self._T.slotData[key] = { ruid = "", name = "" }
@@ -612,6 +622,23 @@ script SkillManager extends Logic
 				self._T.teleportOnCooldown = false
 			end, 0.45)
 			self:RequestFireTeleport(dirKey)
+			return
+		end
+		if slot.name == "어썰터" then
+			-- 어썰터는 다른 스킬들의 공용 쿨다운(skillOnCooldown)과 무관하게 고정 3초의 독립 쿨다운으로 동작한다(텔레포트와 동일한 패턴).
+			-- (기능 수정) "사거리 내 타겟이 없으면 사용이 되지 않아야 한다"는 요청 - 서버가 대상 존재 여부를
+			-- 실제로 확인한 뒤(PlayerAttack.NotifyAssaulterResult) 결과를 돌려줘야 알 수 있으므로, 여기서는
+			-- 쿨다운을 곧바로 시작하지 않고 응답 대기 상태만 표시한다 (OnAssaulterResult에서 성공시에만 쿨다운 시작).
+			if self._T.assaulterOnCooldown or self._T.assaulterRequestPending then return end
+			log("[SkillManager] 스킬 사용 요청: " .. slot.name .. " (단축키: " .. key .. ")")
+			self._T.assaulterRequestPending = true
+			self._T.assaulterPendingKey = key
+			-- 서버 응답이 비정상적으로 늦어지는 경우를 대비한 안전장치 - 최대 1초 뒤 자동으로 다시 시도 가능하게 한다.
+			_TimerService:SetTimerOnce(function()
+				self._T.assaulterRequestPending = false
+			end, 1.0)
+			local combatPower = _CharInfoManager:CalcCombatPower()
+			self:RequestFireAssaulter(combatPower)
 			return
 		end
 		if self._T.skillOnCooldown then return end
@@ -747,6 +774,28 @@ script SkillManager extends Logic
 			end, 0.75 * atkMult)
 			local combatPower = _CharInfoManager:CalcCombatPower()
 			self:RequestFireIronArrow(combatPower, atkMult, dirX, dirY)
+		elseif slot.name == "어벤져" then
+			-- 파이어에로우/아이언에로우와 동일한 8방향 입력 처리.
+			local dirX, dirY = 0, 0
+			if _InputService:IsKeyPressed(KeyboardKey.LeftArrow) then
+				dirX = -1
+			elseif _InputService:IsKeyPressed(KeyboardKey.RightArrow) then
+				dirX = 1
+			end
+			if _InputService:IsKeyPressed(KeyboardKey.UpArrow) then
+				dirY = 1
+			elseif _InputService:IsKeyPressed(KeyboardKey.DownArrow) then
+				dirY = -1
+			end
+			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+			self._T.skillOnCooldown = true
+			-- (기능 수정) 몸쪽 이펙트(0.6) + 0.2초 뒤 투사체 발사로 PlayerAttack.AttackAvenger의 실제
+			-- 발동 주기가 0.85*mult로 늘어난 것에 맞춰 쿨다운도 동일하게 맞춘다(다른 화살류 스킬과 같은 이유).
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.85 * atkMult)
+			local combatPower = _CharInfoManager:CalcCombatPower()
+			self:RequestFireAvenger(combatPower, atkMult, dirX, dirY)
 		elseif slot.name == "헤이스트" then
 			-- 헤이스트는 공격이 아니라 버프이므로 combatPower는 필요 없다. 다른 스킬과 동일하게
 			-- 공격속도 배율만큼 짧은 재사용 대기시간만 두고(연타 스팸 방지), 5분 지속시간 자체는
@@ -757,6 +806,16 @@ script SkillManager extends Logic
 				self._T.skillOnCooldown = false
 			end, 0.75 * atkMult)
 			self:RequestFireHaste(atkMult)
+		elseif slot.name == "쉐도우 파트너" then
+			-- 쉐도우 파트너도 헤이스트와 동일하게 공격이 아니라 버프(30분)이므로 combatPower는 필요 없다.
+			-- 연타 스팸 방지용 짧은 재사용 대기시간만 두고, 지속 중 다시 쓰면 서버에서 중첩 없이
+			-- 지속시간만 갱신된다.
+			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+			self._T.skillOnCooldown = true
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.75 * atkMult)
+			self:RequestFireShadowPartner(atkMult)
 		elseif slot.name == "부스터" then
 			-- 부스터: 5분간 공격속도 1단계 상승. 이 스탯(atkSpeedStage)은 CharInfoManager가 클라이언트
 			-- 전용으로 들고 있어(서버에 대응 데이터 없음) 실제 효과는 이 클라이언트에서 즉시 적용하고,
@@ -1068,6 +1127,23 @@ script SkillManager extends Logic
 	end
 
 	@ExecSpace("Server")
+	method void RequestFireAvenger(number combatPower, number atkMultiplier, number dirX, number dirY)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireAvenger: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireAvenger: PlayerAttack component not found")
+			return
+		end
+		pa:AttackAvenger(combatPower, atkMultiplier, dirX, dirY)
+		log("[SkillManager] 어벤져 발동! combatPower=" .. tostring(combatPower) .. " atkMultiplier=" .. tostring(atkMultiplier) .. " dir=(" .. tostring(dirX) .. "," .. tostring(dirY) .. ")")
+	end
+
+	@ExecSpace("Server")
 	method void RequestFireHaste(number atkMultiplier)
 		local player = _UserService:GetUserEntityByUserId(senderUserId)
 		if not isvalid(player) then
@@ -1082,6 +1158,23 @@ script SkillManager extends Logic
 		end
 		pa:AttackHaste(atkMultiplier)
 		log("[SkillManager] 헤이스트 발동!")
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireShadowPartner(number atkMultiplier)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireShadowPartner: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireShadowPartner: PlayerAttack component not found")
+			return
+		end
+		pa:AttackShadowPartner(atkMultiplier)
+		log("[SkillManager] 쉐도우 파트너 발동!")
 	end
 
 	@ExecSpace("Server")
@@ -1167,6 +1260,23 @@ script SkillManager extends Logic
 		end
 		pa:AttackTeleport(direction)
 		log("[SkillManager] 텔레포트 요청! direction=" .. tostring(direction))
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireAssaulter(number combatPower)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireAssaulter: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireAssaulter: PlayerAttack component not found")
+			return
+		end
+		pa:AttackAssaulter(combatPower)
+		log("[SkillManager] 어썰터 발동! combatPower=" .. tostring(combatPower))
 	end
 
 	@ExecSpace("Server")
@@ -1467,6 +1577,25 @@ script SkillManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OnAssaulterResult(boolean success)
+		-- PlayerAttack.NotifyAssaulterResult가 서버 판정 결과를 알려주면 호출된다. 성공했을 때만 쿨다운을
+		-- 시작하고 쿨타임 UI(스킬 슬롯 위 오버레이)를 표시한다 - 실패(사거리 내 대상 없음)면 아무것도
+		-- 소모하지 않아 즉시 다시 시도할 수 있다.
+		self._T.assaulterRequestPending = false
+		if not success then
+			log("[SkillManager] 어썰터 실패 - 사거리 내 대상 없음(쿨다운 소모 안 함)")
+			return
+		end
+		log("[SkillManager] 어썰터 발동 성공")
+		self._T.assaulterOnCooldown = true
+		-- (기능 수정) "쿨타임을 5초에서 3초로 줄여달라"는 요청.
+		_TimerService:SetTimerOnce(function()
+			self._T.assaulterOnCooldown = false
+		end, 3.0)
+		_AssaulterCooldownUI:ShowCooldownV2(3.0, self._T.assaulterPendingKey or "Q")
+	end
+
+	@ExecSpace("ClientOnly")
 	method void AssignSkillToSlot(string key, string ruid, string name)
 		self._T.slotData[key] = { ruid = ruid, name = name }
 		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
@@ -1602,7 +1731,7 @@ script SkillManager extends Logic
 			for key, held in pairs(self._T.heldSkillKeys) do
 				if held and not self._T.skillOnCooldown then
 					local slot = self._T.slotData[key]
-					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터") then
+					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터" or slot.name == "어벤져") then
 						self:UseSkillInSlot(key)
 					end
 				end
@@ -1617,6 +1746,19 @@ script SkillManager extends Logic
 				if held then
 					local slot = self._T.slotData[key]
 					if slot ~= nil and slot.name == "텔레포트" then
+						self:UseSkillInSlot(key)
+					end
+				end
+			end
+		end
+
+		-- (기능 추가) "누르고 있으면 쿨타임이 돌았을 시 바로 재사용되게 해달라"는 요청 - 텔레포트와 동일한
+		-- 패턴으로, 어썰터 전용 독립 쿨다운(assaulterOnCooldown)만 확인해 키를 누르고 있으면 계속 이어서 사용된다.
+		if not self._T.assaulterOnCooldown and not self._T.assaulterRequestPending then
+			for key, held in pairs(self._T.heldSkillKeys) do
+				if held then
+					local slot = self._T.slotData[key]
+					if slot ~= nil and slot.name == "어썰터" then
 						self:UseSkillInSlot(key)
 					end
 				end
