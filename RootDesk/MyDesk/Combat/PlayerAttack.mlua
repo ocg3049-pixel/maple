@@ -155,6 +155,16 @@ script PlayerAttack extends AttackComponent
 		self._T.currentCritRatePercent = ratePercent
 	end
 
+	-- 캐릭터 정보창과 동일한 크리티컬 데미지(%, 기본 125%)를 서버로 동기화한다 - SyncCritRate와 동일한
+	-- 이유(장비 잠재능력은 클라이언트 전용 상태)로 SkillManager가 스킬을 사용할 때마다
+	-- CharInfoManager:CalcCritDamage()의 최신값을 넘겨준다. CalcDamage/GetCriticalDamageRate의
+	-- 크리티컬 배율이 이 값을 참조한다(기존 하드코딩된 200% 대신).
+	@ExecSpace("Server")
+	method void SyncCritDamage(number damagePercent)
+		self._T.currentCritDamagePercent = damagePercent
+		log("[PlayerAttack] SyncCritDamage 수신: " .. tostring(damagePercent) .. "%")
+	end
+
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
 		-- 실제 공식은 CalcDamageBase에 있고, 여기서는 콤보 어택 버프 보너스(구슬 1개당 +20%)만
 		-- 모든 스킬/기본공격에 일괄 적용한다. 수동 데미지 표시용 캐시(lastDoubleStabDamage 등)는
@@ -163,6 +173,10 @@ script PlayerAttack extends AttackComponent
 		local dmg = self:ApplyComboAttackBonus(self:CalcDamageBase(attacker, defender, attackInfo))
 		local isManualSkin = (attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst")
 		local critRate = (self._T.currentCritRatePercent or 50) / 100
+		-- 크리티컬 데미지 배율: 기본 125%(1.25배) + 장비 잠재능력의 "크리티컬 데미지" 옵션. SyncCritDamage로
+		-- 동기화된 값을 쓴다(GetCriticalDamageRate와 동일 소스) - 이 아래의 수동 다중 표시 분기들은 엔진
+		-- 자동배율을 거치지 않으므로 여기서 직접 곱해야 한다.
+		local critMult = (self._T.currentCritDamagePercent or 125) / 100
 
 		-- (버그 수정) 더블스탭/매직클로/스피어버스터(수동 다중 표시 스킬)는 각 타격(hitIndex)이 이미
 		-- 별도의 진짜 Attack() 호출이므로, 이 히트 하나에 대해서만 독립적으로 크리티컬을 굴리고 배율을
@@ -177,7 +191,7 @@ script PlayerAttack extends AttackComponent
 			-- 편향되는 현상, 더블스탭/스피어버스터 등에서 실측)를 원본/보너스 크리티컬 굴림에도 동일하게 피한다.
 			baseIsCritical = _UtilLogic:RandomDouble() < critRate
 			if baseIsCritical then
-				dmg = math.floor(dmg * 2.0)
+				dmg = math.floor(dmg * critMult)
 			end
 		end
 		if attackInfo == "skill.doublestab" then
@@ -213,14 +227,14 @@ script PlayerAttack extends AttackComponent
 				-- 동일하게 baseIsCritical을 독립적으로 새로 굴린다.
 				baseIsCritical = _UtilLogic:RandomDouble() < critRate
 				if baseIsCritical then
-					dmg = math.floor(dmg * 2.0)
+					dmg = math.floor(dmg * critMult)
 				end
 				self._T.shadowEchoOriginalIsCritical = baseIsCritical
 			end
 			local bonus = math.floor(dmg * (0.55 + _UtilLogic:RandomDouble() * 0.10))
 			local bonusIsCritical = _UtilLogic:RandomDouble() < critRate
 			if bonusIsCritical then
-				bonus = math.floor(bonus * 2.0)
+				bonus = math.floor(bonus * critMult)
 			end
 			self._T.shadowEchoOriginal = dmg
 			self._T.shadowEchoBonus = bonus
@@ -343,7 +357,9 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method float GetCriticalDamageRate()
-		        return 2.0
+		        -- (기능 수정) "크리티컬이 뜨면 캐릭터 정보창의 크리티컬 데미지 스탯(기본 125%)을 참고해야
+		        -- 한다"는 요청 - 하드코딩된 200%(2.0배) 대신 SyncCritDamage로 동기화해둔 실제 스탯을 쓴다.
+		        return (self._T.currentCritDamagePercent or 125) / 100
 	end
 
 	method int32 GetDisplayHitCount(string attackInfo)
@@ -2342,16 +2358,17 @@ script PlayerAttack extends AttackComponent
 		            -- CalcDamage가 이번 호출에서 실행되지 않아 self._T.shadowEchoBonus가 이전 타격의 값을
 		            -- 그대로 들고 있을 수 있어(stale), 쉐도우 파트너 보너스도 여기서 새로 굴린다.
 		            local critRate = (self._T.currentCritRatePercent or 50) / 100
+		            local critMult = (self._T.currentCritDamagePercent or 125) / 100
 		            local mult = 1.0 + _UtilLogic:RandomDouble() * (2.6 - 1.0)
 		            damage = math.floor((self._T.pendingDoubleStabCombatPower or 0) * mult)
 		            baseCrit = _UtilLogic:RandomDouble() < critRate
-		            if baseCrit then damage = math.floor(damage * 2.0) end
+		            if baseCrit then damage = math.floor(damage * critMult) end
 		            bonus = 0
 		            bonusCrit = false
 		            if self._T.shadowPartnerActive then
 		                bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
 		                bonusCrit = _UtilLogic:RandomDouble() < critRate
-		                if bonusCrit then bonus = math.floor(bonus * 2.0) end
+		                if bonusCrit then bonus = math.floor(bonus * critMult) end
 		            end
 		        end
 		        self:ShowDoubleStabDamageSkin(target, damage, idx, bonus, baseCrit, bonusCrit)
@@ -2636,16 +2653,17 @@ script PlayerAttack extends AttackComponent
 		            -- (버그 수정) 더블스탭과 동일한 이유로, 이 경로도 크리티컬을 독립적으로 굴리고
 		            -- self._T.shadowEchoBonus의 stale 값 대신 쉐도우 파트너 보너스도 여기서 새로 굴린다.
 		            local critRate = (self._T.currentCritRatePercent or 50) / 100
+		            local critMult = (self._T.currentCritDamagePercent or 125) / 100
 		            local mult = 1.0 + _UtilLogic:RandomDouble() * (1.5 - 1.0)
 		            damage = math.floor((self._T.pendingMagicClawCombatPower or 0) * mult)
 		            magicClawBaseCrit = _UtilLogic:RandomDouble() < critRate
-		            if magicClawBaseCrit then damage = math.floor(damage * 2.0) end
+		            if magicClawBaseCrit then damage = math.floor(damage * critMult) end
 		            bonus = 0
 		            bonusCrit = false
 		            if self._T.shadowPartnerActive then
 		                bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
 		                bonusCrit = _UtilLogic:RandomDouble() < critRate
-		                if bonusCrit then bonus = math.floor(bonus * 2.0) end
+		                if bonusCrit then bonus = math.floor(bonus * critMult) end
 		            end
 		        end
 		        self:ShowMagicClawDamageSkin(target, damage, idx, bonus, magicClawBaseCrit, bonusCrit)
@@ -7047,18 +7065,19 @@ script PlayerAttack extends AttackComponent
 			-- (버그 수정) 더블스탭/매직클로와 동일한 이유로, 이 경로도 크리티컬을 독립적으로 굴리고
 			-- self._T.shadowEchoBonus의 stale 값 대신 쉐도우 파트너 보너스도 여기서 새로 굴린다.
 			local critRate = (self._T.currentCritRatePercent or 50) / 100
+			local critMult = (self._T.currentCritDamagePercent or 125) / 100
 			local combatPower = self._T.pendingSpearBurstCombatPower or 0
 			local mult = 0.1 + _UtilLogic:RandomDouble() * (0.2 - 0.1)
 			-- 콤보 어택 버프 보너스도 실제 판정(CalcDamage)과 동일하게 표시 전용 값에 반영한다.
 			damage = self:ApplyComboAttackBonus(math.floor(combatPower * mult))
 			spearBurstBaseCrit = _UtilLogic:RandomDouble() < critRate
-			if spearBurstBaseCrit then damage = math.floor(damage * 2.0) end
+			if spearBurstBaseCrit then damage = math.floor(damage * critMult) end
 			bonus = 0
 			bonusCrit = false
 			if self._T.shadowPartnerActive then
 				bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
 				bonusCrit = _UtilLogic:RandomDouble() < critRate
-				if bonusCrit then bonus = math.floor(bonus * 2.0) end
+				if bonusCrit then bonus = math.floor(bonus * critMult) end
 			end
 		end
 		self:ShowSpearBurstStabDamageSkin(target, damage, hitIndex, bonus, spearBurstBaseCrit, bonusCrit)
