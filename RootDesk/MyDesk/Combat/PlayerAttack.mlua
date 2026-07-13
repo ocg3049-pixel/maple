@@ -6174,6 +6174,9 @@ script PlayerAttack extends AttackComponent
 
 		self._T.isAssaulting = true
 		self._T.pendingAssaulterCombatPower = combatPower
+		-- 시전 세대 번호 - 연속 시전 시 이전 시전의 컨트롤 복구 타이머(0.5초)가 새 시전 도중에
+		-- 끼어들어 컨트롤을 되살리지 않도록 구분하는 용도.
+		self._T.assaulterCastSerial = (self._T.assaulterCastSerial or 0) + 1
 
 		local targetPos = target.TransformComponent.WorldPosition
 		local dirX = (targetPos.x >= originPos.x) and 1 or -1
@@ -6181,7 +6184,13 @@ script PlayerAttack extends AttackComponent
 		self._T.pendingAssaulterDirX = dirX
 
 		local playerCtrl = self.Entity.PlayerControllerComponent
-		self._T.pendingAssaulterWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		-- (버그 방지) 연속 시전(체인) 중에는 직전 시전이 이미 컨트롤을 꺼둔 상태(Enable=false)라
+		-- 그대로 캡처하면 마지막 복구 때 컨트롤이 영영 안 살아난다 - 체인의 첫 시전에서 캡처한
+		-- 원래 값을 유지한다.
+		if not self._T.assaulterControlSuppressed then
+			self._T.pendingAssaulterWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+			self._T.assaulterControlSuppressed = true
+		end
 		if isvalid(playerCtrl) then
 			playerCtrl.Enable = false
 		end
@@ -6199,9 +6208,16 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Client")
 	method void NotifyAssaulterResult(boolean success)
-		-- 어썰터 발동 성공/실패를 시전한 클라이언트에게만 알려, 실패 시(사거리 내 대상 없음) 쿨타임/쿨타임
+		-- 어썰터 발동 성공/실패를 시전한 클라이언트에게만 알려, 실패 시(사거리 내 대상 없음) 스택/쿨타임
 		-- UI가 소모되지 않도록 SkillManager에 전달한다.
 		_SkillManager:OnAssaulterResult(success)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyAssaulterChainReady()
+		-- 착지(순간이동 완료) 시점을 시전한 클라이언트에게만 알린다 - 어썰터만은 착지 즉시 딜레이 없이
+		-- 연속 시전할 수 있게 하기 위한 신호 (SkillManager.OnAssaulterChainReady에서 잠금 해제).
+		_SkillManager:OnAssaulterChainReady()
 	end
 
 	@ExecSpace("Multicast")
@@ -6242,6 +6258,7 @@ script PlayerAttack extends AttackComponent
 			-- 대기하는 사이 대상이 죽거나 사라졌다면: 원래 자리에서 그냥 다시 나타난다.
 			self:PlayAssaulterReappearEffects(self.Entity)
 			self:RestoreAssaulterControl()
+			self:NotifyAssaulterChainReady(self.Entity.PlayerComponent.UserId)
 			return
 		end
 
@@ -6268,8 +6285,9 @@ script PlayerAttack extends AttackComponent
 
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) then
-			-- 나타난 뒤 대상 쪽(왔던 방향의 반대)을 바라본다.
-			playerCtrl.LookDirectionX = -dirX
+			-- (기능 수정) "이동 후 보는 방향을 바꾸지 말고 그대로 보게 해달라"는 요청 - 기존에는 착지 후
+			-- 대상 쪽(-dirX)으로 돌아봤지만, 이제 이동(진행) 방향(dirX)을 그대로 유지한다.
+			playerCtrl.LookDirectionX = dirX
 		end
 
 		self:PlayAssaulterReappearEffects(self.Entity)
@@ -6281,8 +6299,17 @@ script PlayerAttack extends AttackComponent
 		local splashTargets = self:FindAssaulterSplashTargets(Vector2(targetPos.x, targetPos.y), 6)
 		self:DealAssaulterHits(splashTargets)
 
+		-- (기능 변경) 착지 즉시 어썰터만은 딜레이 없이 연속 시전할 수 있게 한다 (요청사항) -
+		-- isAssaulting을 여기서 바로 풀고 시전한 클라이언트에 착지를 알린다(OnAssaulterChainReady).
+		-- 이동/다른 스킬용 컨트롤 복구는 기존대로 0.5초 뒤 진행하되, 그 사이 새 어썰터 시전이
+		-- 시작됐다면(세대 번호 불일치) 복구를 건너뛰어 새 시전을 방해하지 않는다.
+		self._T.isAssaulting = false
+		self:NotifyAssaulterChainReady(self.Entity.PlayerComponent.UserId)
+		local mySerial = self._T.assaulterCastSerial
 		_TimerService:SetTimerOnce(function()
-			self:RestoreAssaulterControl()
+			if self._T.assaulterCastSerial == mySerial then
+				self:RestoreAssaulterControl()
+			end
 		end, 0.5)
 	end
 
@@ -6316,11 +6343,15 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("Multicast")
 	method void PlayAssaulterReappearEffects(Entity attacker)
 		-- 나타나는 연출: 아바타를 다시 보이게 하고, swingO1 모션의 마지막 프레임(사진 속 자세 - 찌르듯
-		-- 내지르는 동작의 끝 포즈)만 1초간 고정해서 보여준 뒤 원래 자세(stand1)로 복귀한다 + 도착 사운드
+		-- 내지르는 동작의 끝 포즈)만 2초간 고정해서 보여준 뒤 원래 자세(stand1)로 복귀한다 + 도착 사운드
 		-- (bbb8c45c...)를 재생한다. 맞은 대상들 각각의 히트 이펙트는 PlayAssaulterHitEffect에서 대상별로
 		-- 따로 재생한다(요청: "대상 주변 적들도 최대 6명까지 데미지+히트이펙트").
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
+		-- 연속 시전(체인) 시 이전 시전의 stand1 복귀 타이머가 새 시전의 끝 포즈를 중간에 덮어쓰지
+		-- 않도록 세대 번호로 구분한다.
+		self._T.assaulterMotionSerial = (self._T.assaulterMotionSerial or 0) + 1
+		local motionSerial = self._T.assaulterMotionSerial
 		_SoundService:PlaySound("bbb8c45c0d21491a97deb363a9d95e0c", 1.0)
 		local avatarRenderer = attacker.AvatarRendererComponent
 		if isvalid(avatarRenderer) then
@@ -6339,15 +6370,16 @@ script PlayerAttack extends AttackComponent
 					body:SendEvent(motionEvent)
 				end
 			end, 0.1)
-			-- 1초 뒤 원래 서있는 자세(stand1)로 복귀시킨다(요청: "해당 자세만 1초간").
+			-- (기능 수정) "끝 모션의 길이를 1초 늘려달라"는 요청 - 1초 → 2초 고정 후 stand1로 복귀한다.
 			_TimerService:SetTimerOnce(function()
 				if not isvalid(attacker) then return end
+				if self._T.assaulterMotionSerial ~= motionSerial then return end
 				local body = avatarRenderer:GetBodyEntity()
 				if isvalid(body) then
 					local resetEvent = ActionStateChangedEvent("stand1", "stand1", 1.0, SpriteAnimClipPlayType.Loop)
 					body:SendEvent(resetEvent)
 				end
-			end, 1.1)
+			end, 2.1)
 		end
 	end
 
@@ -6445,8 +6477,10 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Server")
 	method void RestoreAssaulterControl()
-		-- 착지 모션까지 끝난 뒤 컨트롤을 복구한다.
+		-- 착지 모션까지 끝난 뒤 컨트롤을 복구한다. 체인(연속 시전)의 마지막 복구 시점에만 호출되며,
+		-- 다음 시전이 원래 컨트롤 값을 새로 캡처할 수 있도록 억제 플래그도 함께 푼다.
 		self._T.isAssaulting = false
+		self._T.assaulterControlSuppressed = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingAssaulterWasControllerEnabled then
 			playerCtrl.Enable = true

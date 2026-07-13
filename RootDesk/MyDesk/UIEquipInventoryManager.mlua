@@ -375,13 +375,15 @@ script UIEquipInventoryManager extends Logic
 			"/ui/DefaultGroup/InvenWindow/TitleText",
 			"/ui/DefaultGroup/EquipWindow/TitleText",
 			"/ui/DefaultGroup/EnhanceWindow/TitleText",
-			"/ui/DefaultGroup/CharInfoWindow/TitleText/DragHandle"
+			"/ui/DefaultGroup/CharInfoWindow/TitleText/DragHandle",
+			"/ui/DefaultGroup/DecoWindow/TitleText"
 		}
 		local titleHandlers = {
 			self.OnInvenTitleDown,
 			self.OnEquipTitleDown,
 			self.OnEnhanceTitleDown,
-			self.OnCharInfoTitleDown
+			self.OnCharInfoTitleDown,
+			self.OnDecoTitleDown
 		}
 		for i, tp in ipairs(titlePaths) do
 			local te = _EntityService:GetEntityByPath(tp)
@@ -443,6 +445,9 @@ script UIEquipInventoryManager extends Logic
 		elseif event.key == KeyboardKey.C then
 			self:ToggleWin("/ui/DefaultGroup/CharInfoWindow")
 		elseif event.key == KeyboardKey.Tab then
+			-- 강화창이 열려있으면 Tab은 강화창 탭 순환 전용 (EnhancementManager.OnKeyDown이 처리)
+			local enhWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+			if isvalid(enhWin) and enhWin.Enable then return end
 			local invenWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
 			if isvalid(invenWin) and invenWin.Enable and invenWin.Visible then
 				local tabOrder = {"equip","consume","etc","install","cash","decorate"}
@@ -457,7 +462,12 @@ script UIEquipInventoryManager extends Logic
 				self:OnTabSwitch(tabOrder[nextIdx])
 			end
 		elseif event.key == KeyboardKey.Escape then
-			self:CloseTopWindow()
+			-- 강화 확인 다이얼로그가 열려있으면 다이얼로그만 닫는다 (강화창은 유지)
+			if _EnhancementManager:IsConfirmDialogOpen() then
+				_EnhancementManager:HideEnhanceConfirm()
+			else
+				self:CloseTopWindow()
+			end
 		end
 	end
 
@@ -1302,7 +1312,8 @@ script UIEquipInventoryManager extends Logic
 	method string BuildPotentialText(string s)
 		local result = ""
 		local validGrades = {["레어"]=true,["에픽"]=true,["유니크"]=true,["레전드리"]=true}
-		local potGrade = self:GetField(s, 9)
+		-- 등급 필드는 두 포맷이 공존: 주문서 부여="레어" 등 이름, 큐브 재설정=숫자 "1"~"4"
+		local potGrade = self:NormalizeGradeName(self:GetField(s, 9))
 		if validGrades[potGrade] then
 			local color = self:GetGradeColor(potGrade)
 			local label = self:GetGradeLabel(potGrade)
@@ -1314,7 +1325,7 @@ script UIEquipInventoryManager extends Logic
 			if p2 ~= "" and p2 ~= "0" then result = result .. "\n" .. p2 end
 			if p3 ~= "" and p3 ~= "0" then result = result .. "\n" .. p3 end
 		end
-		local addPotGrade = self:GetField(s, 13)
+		local addPotGrade = self:NormalizeGradeName(self:GetField(s, 13))
 		if validGrades[addPotGrade] then
 			local color = self:GetGradeColor(addPotGrade)
 			local label = self:GetGradeLabel(addPotGrade)
@@ -1327,6 +1338,18 @@ script UIEquipInventoryManager extends Logic
 			if a3 ~= "" and a3 ~= "0" then result = result .. "\n" .. a3 end
 		end
 		return result
+	end
+
+	-- 등급 필드 정규화: 숫자 코드("1"~"4", 큐브 재설정 포맷) → 등급 이름. 이름이면 그대로 반환.
+	@ExecSpace("ClientOnly")
+	method string NormalizeGradeName(string g)
+		local n = tonumber(g)
+		if n == nil then return g end
+		if n == 1 then return "레어" end
+		if n == 2 then return "에픽" end
+		if n == 3 then return "유니크" end
+		if n == 4 then return "레전드리" end
+		return ""
 	end
 
 	-- 주문서 드래그 탭에서 주문서 소모 (탭 전환 후 사용 시 올바른 탭 참조)
@@ -1617,6 +1640,11 @@ script UIEquipInventoryManager extends Logic
 	method void AddMeso(integer amount)
 		self.meso = self.meso + amount
 		self:UpdateMesoUI()
+		-- 강화창이 열려있을 때도 사이드바 메소 표시가 즉시 반영되도록 함께 갱신
+		-- (기존엔 강화창 내부 표시가 열 때 한 번만 갱신돼 껐다 켜야 반영되는 문제가 있었음)
+		if _EnhancementManager:IsWindowOpen() then
+			_EnhancementManager:UpdateMesoDisplay()
+		end
 		log("[Meso] +" .. tostring(amount) .. "원  합계: " .. tostring(self.meso) .. "원")
 		-- 메소 변동 영속 저장 예약 (변동 이력은 서버 감사 로그에 기록됨)
 		_CharacterPersistence:MarkDirty("meso")
@@ -1742,123 +1770,372 @@ script UIEquipInventoryManager extends Logic
 		self._T.pendingShowSlotIdx = invenIdx
 	end
 
-	-- 툴팁 표시 (7필드 아이템 스트링 기반, 메이플스타일 재설계)
+	-- 툴팁 표시 (원작 스타일: 장비=착용중 비교+전투력증가량 / 치장=간단+비교 / 소비 주문서=효과·확률 / 기타=설명만)
 	@ExecSpace("ClientOnly")
 	method void ShowTooltipFromStr(string s, boolean isEquip, string slotPath, string winPath)
 		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
 		if not isvalid(tp) then return end
 
-		local baseName = self:ParseName(s)
-		local ruid     = self:ParseInvenRUID(s)
-		local stars    = self:ParseStars(s)
-		local scrolls  = self:ParseScrolls(s)
-		local upgrade  = self:ParseUpgrade(s)
-
-		-- 1. 이름 (+주문서강화수)
-		local displayName = scrolls > 0 and (baseName .. " (+" .. tostring(scrolls) .. ")") or baseName
-		local titleEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipTitle")
-		if isvalid(titleEnt) then
-			titleEnt.TextComponent.Text = displayName
+		-- 종류 판별: 장비(slotIdx 1~7) / 치장(3번 필드 "deco") / 주문서(설명에 성공률) / 기타
+		local si = self:ParseSlotIdx(s)
+		local isDeco = (self:GetField(s, 3) == "deco")
+		local kind = "etc"
+		if si >= 1 then
+			kind = "equip"
+		elseif isDeco then
+			kind = "deco"
+		else
+			local desc = self:GetItemBaseDescription(self:ParseName(s))
+			if string.find(desc, "성공률") ~= nil then kind = "scroll" end
 		end
 
-		-- 2. 별 표시: TpStarFull (★/☆, 5+공백+5+공백+5 × 7행 = 최대 100개, 상단 중앙)
-		local STAR_MAX       = 100
-		local STARS_PER_GROUP = 5
-		local PER_ROW        = 15  -- 5+space+5+space+5
-		local fullStarEnt  = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TpStarFull")
-		local emptyStarEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/StarText")
-		if isvalid(fullStarEnt) then
-			local rows = {}
-			local rowStr  = ""
-			local colInRow = 0
-			for i = 1, STAR_MAX do
-				if colInRow > 0 and colInRow % STARS_PER_GROUP == 0 then
-					rowStr = rowStr .. " "
+		-- 비교 대상: 인벤 호버 + 같은 부위에 착용 중인 다른 아이템이 있을 때만
+		local cmpStr = ""
+		if self.tooltipSource ~= "equip" then
+			if kind == "equip" then
+				local eqS = self:GetEquip(si)
+				if eqS ~= "" and eqS ~= s then cmpStr = eqS end
+			elseif kind == "deco" then
+				local slotKey = _DecoWindowManager:SlotKeyForCat(self:GetField(s, 4))
+				local d = _DecoWindowManager:GetDecoItem(slotKey)
+				if d ~= "" and d ~= s then cmpStr = d end
+			end
+		end
+
+		local mainH = self:PaintTooltipSide("Main", s, kind, false)
+		local cmpH = 0
+		local cmpEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/Cmp")
+		if cmpStr ~= "" then
+			cmpH = self:PaintTooltipSide("Cmp", cmpStr, kind, true)
+		end
+		if isvalid(cmpEnt) then cmpEnt.Enable = (cmpStr ~= "") end
+
+		-- 위치: 슬롯 오른쪽 (오른쪽 공간 부족 시 왼쪽), 화면 상/하 클램프
+		local W = 340
+		local GAP = 8
+		local slotEnt = _EntityService:GetEntityByPath(slotPath)
+		local winEnt  = _EntityService:GetEntityByPath(winPath)
+		local cx, cy = 0, 0
+		if isvalid(slotEnt) and isvalid(winEnt) then
+			local sp = slotEnt.UITransformComponent.anchoredPosition
+			local wp = winEnt.UITransformComponent.anchoredPosition
+			cx = wp.x + sp.x
+			cy = wp.y + sp.y
+		end
+		local totalW = W
+		if cmpStr ~= "" then totalW = W * 2 + GAP end
+		local rootX = cx + 60 + W / 2
+		local cmpX = W + GAP
+		if cx + 60 + totalW > 950 then
+			rootX = cx - 60 - W / 2
+			cmpX = -(W + GAP)
+		end
+		local rootY = cy
+		local topLimit = 530
+		local maxH = math.max(mainH, cmpH)
+		if rootY + maxH / 2 > topLimit then rootY = topLimit - maxH / 2 end
+		if rootY - maxH / 2 < -topLimit then rootY = -topLimit + maxH / 2 end
+		tp.UITransformComponent.anchoredPosition = Vector2(rootX, rootY)
+		if isvalid(cmpEnt) and cmpStr ~= "" then
+			-- 두 패널의 상단을 맞춘다
+			cmpEnt.UITransformComponent.anchoredPosition = Vector2(cmpX, mainH / 2 - cmpH / 2)
+		end
+
+		self:BringWindowToFront("/ui/DefaultGroup/TooltipPanel")
+		tp.Enable = true
+	end
+
+	-- 툴팁 한쪽 패널(Main/Cmp)을 채우고 패널 높이를 반환한다
+	@ExecSpace("ClientOnly")
+	method number PaintTooltipSide(string side, string s, string kind, boolean isCmp)
+		local base = "/ui/DefaultGroup/TooltipPanel/" .. side
+		local panel = _EntityService:GetEntityByPath(base)
+		if not isvalid(panel) then return 0 end
+
+		local W = 340
+		local PADX = 14
+		local baseName = self:ParseName(s)
+		local ruid = self:ParseInvenRUID(s)
+		local stars = self:ParseStars(s)
+		local scrolls = self:ParseScrolls(s)
+		local upgrade = self:ParseUpgrade(s)
+		local si2 = self:ParseSlotIdx(s)
+
+		local function ent(n) return _EntityService:GetEntityByPath(base .. "/" .. n) end
+		local function setText(n, txt, fs, col)
+			local e = ent(n)
+			if not isvalid(e) then return end
+			e.TextComponent.Text = txt
+			if fs ~= nil then e.TextComponent.FontSize = fs end
+			if col ~= nil then e.TextComponent.FontColor = col end
+		end
+		local function place(n, x, y, w, h)
+			local e = ent(n)
+			if not isvalid(e) then return end
+			e.Enable = true
+			e.UITransformComponent.anchoredPosition = Vector2(x, y)
+			if w ~= nil then e.UITransformComponent.RectSize = Vector2(w, h) end
+		end
+		local function hide(n)
+			local e = ent(n)
+			if isvalid(e) then e.Enable = false end
+		end
+		local function countLines(t)
+			if t == "" then return 0 end
+			local n = 1
+			for _ in string.gmatch(t, "\n") do n = n + 1 end
+			return n
+		end
+
+		-- 1) 제목 (+주문서 강화 수)
+		local titleText = scrolls > 0 and (baseName .. " (+" .. tostring(scrolls) .. ")") or baseName
+
+		-- 2) 별 (장비만: 보유 별을 덮는 행까지, 15개/행)
+		local starText = ""
+		local starRows = 0
+		if kind == "equip" then
+			starRows = math.max(1, math.ceil(stars / 15))
+			if starRows > 7 then starRows = 7 end
+			local lines = {}
+			local idx = 0
+			for r = 1, starRows do
+				local line = ""
+				for c = 1, 15 do
+					idx = idx + 1
+					if c > 1 and (c - 1) % 5 == 0 then line = line .. " " end
+					line = line .. (idx <= stars and "<color=#FFD700>★</color>" or "<color=#5A6470>☆</color>")
 				end
-				rowStr = rowStr .. (i <= stars and "<color=#FFD700>★</color>" or "<color=#888888>☆</color>")
-				colInRow = colInRow + 1
-				if colInRow == PER_ROW then
-					rows[#rows + 1] = rowStr
-					rowStr   = ""
-					colInRow = 0
+				lines[#lines + 1] = line
+			end
+			starText = table.concat(lines, "\n")
+		end
+
+		-- 3) 전투력 증가량 (장비/치장) - 증가 흰색, 감소 붉은색, 착용 중이면 문구로 대체
+		local showCP = (kind == "equip" or kind == "deco")
+		local cpText = ""
+		local cpSize = 24
+		local cpColor = Color(1, 1, 1, 1)
+		if showCP then
+			if isCmp or self.tooltipSource == "equip" then
+				cpText = "현재 장착 중인 장비"
+				cpSize = 18
+				cpColor = Color(0.85, 0.89, 0.95, 1)
+			elseif kind == "deco" then
+				cpText = "0"
+			else
+				local cur = _CharInfoManager:CalcCombatPower()
+				local hyp = _CharInfoManager:CalcCombatPowerSwap(si2, s)
+				local delta = hyp - cur
+				if delta < 0 then
+					cpText = "- " .. self:FormatKoreanNumber(-delta)
+					cpColor = Color(1, 0.35, 0.42, 1)
+				else
+					cpText = "+ " .. self:FormatKoreanNumber(delta)
 				end
 			end
-			if colInRow > 0 then rows[#rows + 1] = rowStr end
-			fullStarEnt.TextComponent.Text = table.concat(rows, "\n")
-		end
-		if isvalid(emptyStarEnt) then
-			emptyStarEnt.TextComponent.Text = ""
 		end
 
-		-- 3. 아이콘
-		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipIcon")
+		-- 4) 아이콘 옆 메타/설명 + 하단 상세
+		local metaText = ""
+		local infoText = ""
+		if kind == "equip" then
+			metaText = "착용 직업 : 공용"
+			if baseName == "연두색 머리띠" then metaText = metaText .. "\n요구 레벨 : 5" end
+			infoText = self:BuildTooltipStatsText(baseName, stars, upgrade) .. self:BuildPotentialText(s)
+		elseif kind == "deco" then
+			metaText = "착용 직업 : 공용"
+			infoText = "치장용 아이템입니다.\n장착 시 외형이 장비보다 우선 적용됩니다."
+		else
+			local d = self:GetItemBaseDescription(baseName)
+			if d == "" then d = "설명이 없는 아이템입니다." end
+			if kind == "scroll" then
+				-- 주문서: 성공률은 금색, 실패/파괴 경고는 붉은색으로 강조
+				local out = {}
+				for line in string.gmatch(d, "[^\n]+") do
+					if string.find(line, "성공률") ~= nil then
+						out[#out + 1] = "<color=#FFD700>" .. line .. "</color>"
+					elseif string.find(line, "실패") ~= nil or string.find(line, "파괴") ~= nil then
+						out[#out + 1] = "<color=#FF6A6A>" .. line .. "</color>"
+					else
+						out[#out + 1] = line
+					end
+				end
+				d = table.concat(out, "\n")
+			end
+			metaText = d
+		end
+
+		-- 5) 분류 알약 (장비/치장만)
+		local pill1 = ""
+		local pill2 = ""
+		if kind == "equip" then
+			if si2 == 6 then
+				pill1 = "무기"
+			elseif si2 == 1 or si2 == 2 then
+				pill1 = "외형"
+			else
+				pill1 = "방어구"
+			end
+			pill2 = self:GetEquipTypeFullBySlot(si2)
+		elseif kind == "deco" then
+			pill1 = "치장"
+			pill2 = self:GetDecoCatLabel(self:GetField(s, 4))
+		end
+
+		-- 6) 레이아웃: 위에서 아래로 배치하며 총 높이 계산
+		local titleH = 30
+		local starH = 0
+		if starRows > 0 then starH = starRows * 20 + 2 end
+		local cpH = 0
+		if showCP then cpH = 52 end
+		local metaLines = countLines(metaText)
+		local iconH = math.max(90, metaLines * 19 + 14)
+		local pillH = 0
+		if pill1 ~= "" then pillH = 30 end
+		local infoLines = countLines(infoText)
+		local infoH = 0
+		if infoLines > 0 then infoH = infoLines * 20 + 10 end
+		local divH = 0
+		if infoH > 0 then divH = 10 end
+		local H = 12 + titleH + starH + cpH + iconH + pillH + divH + infoH + 12
+
+		panel.UITransformComponent.RectSize = Vector2(W, H)
+		local y = H / 2 - 12
+
+		place("Title", 0, y - titleH / 2, W - 20, titleH)
+		setText("Title", titleText, nil, nil)
+		y = y - titleH
+
+		if starH > 0 then
+			place("Stars", 0, y - starH / 2, W - 20, starH)
+			setText("Stars", starText, nil, nil)
+		else
+			hide("Stars")
+		end
+		y = y - starH
+
+		if showCP then
+			place("CPLabel", 0, y - 10, W - 20, 16)
+			place("CPValue", 0, y - 34, W - 20, 30)
+			setText("CPValue", cpText, cpSize, cpColor)
+		else
+			hide("CPLabel")
+			hide("CPValue")
+		end
+		y = y - cpH
+
+		local iconCY = y - iconH / 2
+		place("IconSlot", -W / 2 + PADX + 39, iconCY, 78, 78)
+		place("Icon", -W / 2 + PADX + 39, iconCY, 66, 66)
+		local iconEnt = ent("Icon")
 		if isvalid(iconEnt) then
 			local spr = iconEnt.SpriteGUIRendererComponent
 			if ruid ~= "" then
-				spr.ImageRUID = isEquip and ("thumbnail://" .. ruid) or ruid
+				if kind == "equip" or kind == "deco" then
+					spr.ImageRUID = "thumbnail://" .. ruid
+				else
+					spr.ImageRUID = ruid
+				end
 				spr.Color = Color(1, 1, 1, 1)
 			else
 				spr.ImageRUID = ""
 				spr.Color = Color(1, 1, 1, 0)
 			end
 		end
+		local metaX = -W / 2 + PADX + 78 + 12
+		local metaW = W - PADX * 2 - 78 - 12
+		place("Meta", metaX + metaW / 2, iconCY, metaW, iconH - 10)
+		setText("Meta", metaText, nil, nil)
+		y = y - iconH
 
-		-- 4. REQ 조건 텍스트
-		local reqEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/ReqText")
-		if isvalid(reqEnt) then
-			reqEnt.TextComponent.Text = self:GetItemReqText(baseName)
-		end
-
-		-- 5. 직업 텍스트 색상 (연두색 머리띠: 모두 착용 가능 → 흰색)
-		local WHITE = Color(1, 1, 1, 1)
-		local GRAY  = Color(0.5, 0.5, 0.5, 1)
-		local jobCanUse = {true, true, true, true}
-		for i = 1, 4 do
-			local je = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/Job" .. tostring(i))
-			if isvalid(je) then
-				je.TextComponent.FontColor = jobCanUse[i] and WHITE or GRAY
+		if pill1 ~= "" then
+			local p1w = self:PillWidth(pill1)
+			local p2w = self:PillWidth(pill2)
+			local x2 = W / 2 - PADX - p2w / 2
+			local x1 = W / 2 - PADX - p2w - 8 - p1w / 2
+			place("Pill1", x1, y - 15, p1w, 22)
+			place("Pill1Text", x1, y - 15, p1w, 22)
+			setText("Pill1Text", pill1, nil, nil)
+			if pill2 ~= "" then
+				place("Pill2", x2, y - 15, p2w, 22)
+				place("Pill2Text", x2, y - 15, p2w, 22)
+				setText("Pill2Text", pill2, nil, nil)
+			else
+				hide("Pill2")
+				hide("Pill2Text")
 			end
+		else
+			hide("Pill1")
+			hide("Pill1Text")
+			hide("Pill2")
+			hide("Pill2Text")
+		end
+		y = y - pillH
+
+		if infoH > 0 then
+			place("Divider", 0, y - 5, W - 28, 2)
+			y = y - divH
+			place("Info", 0, y - infoH / 2, W - 28, infoH)
+			setText("Info", infoText, nil, nil)
+		else
+			hide("Divider")
+			hide("Info")
 		end
 
-		-- 6. 능력치 텍스트 + 잠재능력 섹션 + TooltipInfo·패널·BG 높이 동적 조정
-		local infoEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipInfo")
-		if isvalid(infoEnt) then
-			local statsText = self:BuildTooltipStatsText(baseName, stars, upgrade)
-			local potText = self:BuildPotentialText(s)
-			infoEnt.TextComponent.Text = statsText .. potText
-			-- 줄 수 계산
-			local txt = infoEnt.TextComponent.Text
-			local lineCount = 1
-			for _ in string.gmatch(txt, "\n") do lineCount = lineCount + 1 end
-			local infoH = math.max(lineCount * 22, 44)
-			-- TooltipInfo 높이를 내용에 맞게 축소 (MiddleCenter 정렬이 패널 밖으로 밀리는 현상 방지)
-			infoEnt.UITransformComponent.RectSize = Vector2(379, infoH)
-			-- 패널·BG도 동일하게 조정 (너비 403)
-			local newH = 348 + infoH + 15
-			tp.UITransformComponent.RectSize = Vector2(403, newH)
-			local bgEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/TooltipBG")
-			if isvalid(bgEnt) then
-				bgEnt.UITransformComponent.RectSize = Vector2(403, newH)
-				bgEnt.UITransformComponent.anchoredPosition = Vector2(0, 0)
+		return H
+	end
+
+	-- 알약(분류 뱃지) 너비: 한글 글자 수 기반 근사
+	@ExecSpace("ClientOnly")
+	method number PillWidth(string t)
+		local chars = math.ceil(string.len(t) / 3)
+		return math.max(46, chars * 14 + 18)
+	end
+
+	-- 슬롯 인덱스 → 상세 분류명 (툴팁 알약용)
+	@ExecSpace("ClientOnly")
+	method string GetEquipTypeFullBySlot(number slotIdx)
+		if slotIdx == 1 then return "얼굴장식" end
+		if slotIdx == 2 then return "헤어" end
+		if slotIdx == 3 then return "상의" end
+		if slotIdx == 4 then return "하의" end
+		if slotIdx == 5 then return "신발" end
+		if slotIdx == 6 then return "무기" end
+		if slotIdx == 7 then return "모자" end
+		return "장비"
+	end
+
+	-- 치장 catKey → 한글 분류명
+	@ExecSpace("ClientOnly")
+	method string GetDecoCatLabel(string cat)
+		if cat == "cap" then return "모자" end
+		if cat == "coat" then return "상의" end
+		if cat == "pants" then return "하의" end
+		if cat == "shoes" then return "신발" end
+		if cat == "glove" then return "장갑" end
+		if cat == "cape" then return "망토" end
+		if cat == "weapon1" then return "한손무기" end
+		if cat == "weapon2" then return "두손무기" end
+		if cat == "subweapon" then return "보조무기" end
+		if cat == "faceacc" then return "얼굴장식" end
+		if cat == "eyeacc" then return "눈장식" end
+		if cat == "earacc" then return "귀고리" end
+		return "치장"
+	end
+
+	-- 숫자를 원작식 "N만 M" 표기로 (만 단위 미만은 그대로)
+	@ExecSpace("ClientOnly")
+	method string FormatKoreanNumber(number n)
+		n = math.floor(n)
+		if n >= 10000 then
+			local man = math.floor(n / 10000)
+			local rem = n % 10000
+			if rem > 0 then
+				return tostring(man) .. "만 " .. tostring(rem)
 			end
+			return tostring(man) .. "만"
 		end
-
-		-- 7. 툴팁 위치 (슬롯 우측에 배치, 190px 오프셋)
-		local slotEnt = _EntityService:GetEntityByPath(slotPath)
-		local winEnt  = _EntityService:GetEntityByPath(winPath)
-		if isvalid(slotEnt) and isvalid(winEnt) then
-			local sp = slotEnt.UITransformComponent.anchoredPosition
-			local wp = winEnt.UITransformComponent.anchoredPosition
-			local cx = wp.x + sp.x
-			local cy = wp.y + sp.y
-			local offset = 230
-			local tx = cx + offset
-			if tx + 202 > 960 then tx = cx - offset end
-			tp.UITransformComponent.anchoredPosition = Vector2(tx, cy)
-		end
-
-		self:BringWindowToFront("/ui/DefaultGroup/TooltipPanel")
-		tp.Enable = true
+		return tostring(n)
 	end
 
 	-- 스타포스 누적 수치 포함 능력치 텍스트 생성
@@ -1907,7 +2184,8 @@ script UIEquipInventoryManager extends Logic
 			end
 		end
 
-		local text = "장비분류 : " .. equipType .. "\n"
+		-- 분류는 툴팁 알약(Pill)으로 표시하므로 본문에서는 생략한다 (equipType은 옵션 분기용으로만 사용)
+		local text = ""
 
 		-- 스타포스로 오른 수치 표시: 전체합 (기존 +강화)
 		if str_sf > 0 then
@@ -1974,6 +2252,16 @@ script UIEquipInventoryManager extends Logic
 			return "사용 시 공격속도가 1단계 증가합니다.\n(더블클릭으로 사용)"
 		elseif name == "공격력 물약" then
 			return "사용 시 공격력이 500 증가합니다.\n효과는 게임 종료 시 사라집니다.\n(더블클릭으로 사용)"
+		elseif name == "레벨 70 물약" then
+			return "사용 시 공격력과 마력이\n각각 1000 증가합니다.\n효과는 게임 종료 시 사라집니다.\n(더블클릭으로 사용)"
+		elseif name == "레드큐브" or name == "블랙큐브" then
+			return "장비의 잠재능력을\n재설정할 수 있는 큐브이다.\n(더블클릭으로 강화창 열기)"
+		elseif name == "에디셔널큐브" or name == "화이트 에디셔널큐브" then
+			return "장비의 에디셔널 잠재능력을\n재설정할 수 있는 큐브이다.\n(더블클릭으로 강화창 열기)"
+		elseif name == "드롭 아이템" then
+			return "몬스터가 떨어뜨린 상자이다.\n장비 또는 주문서 중 하나를\n선택해 획득할 수 있다.\n(더블클릭으로 사용)"
+		elseif string.find(name, "포션") ~= nil then
+			return "사용 시 HP를 회복한다.\n스킬바에 드래그해 등록할 수 있다."
 		end
 		return ""
 	end
@@ -2489,6 +2777,14 @@ script UIEquipInventoryManager extends Logic
 				end
 			end
 		end
+		-- 인벤창이 닫히면 진행 중인 클릭-클릭 픽업(아이템/주문서/포션/강화드롭)을 모두 취소
+		local ivWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+		if isvalid(ivWin) and not ivWin.Enable then
+			if self.isDragging then self:CancelDrag() end
+			if self._T.isDraggingInvenItem then self:CancelInvenDrag() end
+			if self._T.isDraggingPotion then self:CancelPotionDrag() end
+			if self._T.isDraggingEquipToEnhance then self:CancelEquipDrag() end
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -2516,6 +2812,13 @@ script UIEquipInventoryManager extends Logic
 				end
 			end
 			-- isDraggingInvenItem=true이고 장비슬롯이 아닌 경우: 아래 블록에서 처리
+		end
+		if self._T.isDraggingInvenItem then
+			-- 클릭-클릭 픽업 중 빈 곳(슬롯 밖) 클릭 → 픽업 취소
+			-- (슬롯 위 드롭은 해당 슬롯의 TouchDown 핸들러가 이미 처리해 이 시점엔 플래그가 꺼져 있다)
+			self:CancelInvenDrag()
+			if self.isDragging then self:CancelDrag() end
+			log("[InvenDrag] 빈 곳 클릭 — 픽업 취소")
 		end
 		if self._T.isDraggingPotion then
 			local cursor = _InputService:GetCursorPosition()
@@ -2559,6 +2862,8 @@ script UIEquipInventoryManager extends Logic
 			return Vector2(550, 0)
 		elseif path == "/ui/DefaultGroup/CharInfoWindow" then
 			return Vector2(350, 0)
+		elseif path == "/ui/DefaultGroup/DecoWindow" then
+			return Vector2(-230, 0)
 		end
 		return Vector2(0, 0)
 	end
@@ -2584,6 +2889,7 @@ script UIEquipInventoryManager extends Logic
 		local paths = {
 			"/ui/DefaultGroup/InvenWindow",
 			"/ui/DefaultGroup/EquipWindow",
+			"/ui/DefaultGroup/DecoWindow",
 			"/ui/DefaultGroup/EnhanceWindow",
 			"/ui/DefaultGroup/SkillWindow",
 			"/ui/DefaultGroup/CharInfoWindow",
@@ -2628,6 +2934,13 @@ script UIEquipInventoryManager extends Logic
 	method void OnEnhanceTitleDown(UITouchDownEvent e)
 		if e.TouchId ~= -1 then return end
 		self:StartWindowDrag("/ui/DefaultGroup/EnhanceWindow")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnDecoTitleDown(UITouchDownEvent e)
+		-- 치장창(DecoWindow) 타이틀 드래그 시작
+		if e.TouchId ~= -1 then return end
+		self:StartWindowDrag("/ui/DefaultGroup/DecoWindow")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -2727,6 +3040,8 @@ script UIEquipInventoryManager extends Logic
 				log("[PotScroll] 실패! 아이템 파괴됨")
 			end
 			self:RefreshUI()
+			-- 강화창이 이 아이템을 대상으로 열려있다면 다시 올린 것처럼 즉시 재동기화(잠재능력 탭 갱신)
+			_EnhancementManager:RefreshTargetIfCurrent(invenSlot)
 			self:CancelDrag()
 			if success then self:ShowInvenTooltip(invenSlot) else self:HideTooltip() end
 			return
@@ -2763,6 +3078,8 @@ script UIEquipInventoryManager extends Logic
 				log("[AddPotScroll] 실패! 아이템 파괴됨")
 			end
 			self:RefreshUI()
+			-- 강화창이 이 아이템을 대상으로 열려있다면 다시 올린 것처럼 즉시 재동기화(에디셔널 탭 갱신)
+			_EnhancementManager:RefreshTargetIfCurrent(invenSlot)
 			self:CancelDrag()
 			if success then self:ShowInvenTooltip(invenSlot) else self:HideTooltip() end
 			return
@@ -2791,6 +3108,8 @@ script UIEquipInventoryManager extends Logic
 		local newStr = self:BuildItemStr(baseName, ruid, slotIdx, stars, scrolls, newUpgrade)
 		self:SetInvenStr(invenSlot, newStr)
 		self:RefreshUI()
+		-- 강화창이 이 아이템을 대상으로 열려있다면 강화 단계(★) 표시를 즉시 재동기화
+		_EnhancementManager:RefreshTargetIfCurrent(invenSlot)
 		self:CancelDrag()
 		self:ShowInvenTooltip(invenSlot)
 	end

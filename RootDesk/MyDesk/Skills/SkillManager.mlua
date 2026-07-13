@@ -18,8 +18,15 @@ script SkillManager extends Logic
 		-- 텔레포트 전용 쿨다운 - 다른 스킬들의 공용 쿨다운(skillOnCooldown)과 분리해서, 다른 스킬의
 		-- 모션/딜레이 중에도 텔레포트를 쓸 수 있게 한다.
 		self._T.teleportOnCooldown = false
-		-- 어썰터 전용 쿨다운(고정 3초) - 텔레포트와 동일한 이유로 공용 쿨다운(skillOnCooldown)과 분리한다.
-		self._T.assaulterOnCooldown = false
+		-- 어썰터 스택형 충전(3초당 1스택, 최대 3스택) - "쿨타임 동안 아예 못 쓰는" 방식에서 "스택이
+		-- 1개 이상이면 언제든 쓸 수 있는" 충전형으로 변경 (요청사항). 시작은 풀스택(3개)이다.
+		self._T.assaulterStacks = 3
+		self._T.assaulterMaxStacks = 3
+		self._T.assaulterRechargeTimerId = nil
+		-- 시전 진행 중(사라짐~착지 사이) 재시전 잠금 - 착지 즉시(OnAssaulterChainReady) 풀려서
+		-- 딜레이 없이 어썰터만은 연속 시전할 수 있다 (요청사항).
+		self._T.assaulterCastActive = false
+		self._T.assaulterCastGuardSerial = 0
 		-- 스킬 키 홀드 상태 (키를 누르고 있는 동안 쿨다운이 끝나면 자동으로 이어서 발동)
 		self._T.heldSkillKeys = {}
 
@@ -681,11 +688,13 @@ script SkillManager extends Logic
 			return
 		end
 		if slot.name == "어썰터" then
-			-- 어썰터는 다른 스킬들의 공용 쿨다운(skillOnCooldown)과 무관하게 고정 3초의 독립 쿨다운으로 동작한다(텔레포트와 동일한 패턴).
-			-- (기능 수정) "사거리 내 타겟이 없으면 사용이 되지 않아야 한다"는 요청 - 서버가 대상 존재 여부를
-			-- 실제로 확인한 뒤(PlayerAttack.NotifyAssaulterResult) 결과를 돌려줘야 알 수 있으므로, 여기서는
-			-- 쿨다운을 곧바로 시작하지 않고 응답 대기 상태만 표시한다 (OnAssaulterResult에서 성공시에만 쿨다운 시작).
-			if self._T.assaulterOnCooldown or self._T.assaulterRequestPending then return end
+			-- (기능 변경) 어썰터는 스택형 충전 스킬 - 3초마다 스택이 1개씩 차고(최대 3개), 스택이 1개
+			-- 이상이면 언제든 사용할 수 있다. 사용 시 스택 1개 소모 (요청사항).
+			-- assaulterCastActive: 시전 진행 중(사라짐~착지 사이)에는 재시전 불가 - 착지 즉시
+			-- (OnAssaulterChainReady) 풀려서 딜레이 없이 연속 시전된다.
+			-- "사거리 내 타겟이 없으면 사용이 되지 않아야 한다"는 기존 동작 유지 - 서버가 대상 존재를
+			-- 확인한 뒤(PlayerAttack.NotifyAssaulterResult) 성공시에만 스택을 소모한다.
+			if self._T.assaulterStacks <= 0 or self._T.assaulterRequestPending or self._T.assaulterCastActive then return end
 			log("[SkillManager] 스킬 사용 요청: " .. slot.name .. " (단축키: " .. key .. ")")
 			self._T.assaulterRequestPending = true
 			self._T.assaulterPendingKey = key
@@ -1486,6 +1495,7 @@ script SkillManager extends Logic
 		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
 		if isvalid(w) then w.Enable = false end
 		self:HideSkillTooltip()
+		self:ClearSkillSelection()
 		log("[SkillManager] 닫기")
 	end
 
@@ -1550,6 +1560,8 @@ script SkillManager extends Logic
 		log("[SkillManager] SkillBar 드래그 시작: [" .. key .. "] " .. slot.name)
 		-- 슬롯에서 스킬을 떼어내는 것도 단축키 변경이므로 저장 예약
 		_CharacterPersistence:MarkDirty("hotkey")
+		-- 어썰터를 슬롯에서 떼어냈다면 스택 수 표시를 숨기거나 갱신한다.
+		self:UpdateAssaulterStackUI()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1638,21 +1650,71 @@ script SkillManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnAssaulterResult(boolean success)
-		-- PlayerAttack.NotifyAssaulterResult가 서버 판정 결과를 알려주면 호출된다. 성공했을 때만 쿨다운을
-		-- 시작하고 쿨타임 UI(스킬 슬롯 위 오버레이)를 표시한다 - 실패(사거리 내 대상 없음)면 아무것도
+		-- PlayerAttack.NotifyAssaulterResult가 서버 판정 결과를 알려주면 호출된다. 성공했을 때만 스택을
+		-- 1개 소모하고 충전 사이클을 (돌고 있지 않다면) 시작한다 - 실패(사거리 내 대상 없음)면 아무것도
 		-- 소모하지 않아 즉시 다시 시도할 수 있다.
 		self._T.assaulterRequestPending = false
 		if not success then
-			log("[SkillManager] 어썰터 실패 - 사거리 내 대상 없음(쿨다운 소모 안 함)")
+			log("[SkillManager] 어썰터 실패 - 사거리 내 대상 없음(스택 소모 안 함)")
 			return
 		end
-		log("[SkillManager] 어썰터 발동 성공")
-		self._T.assaulterOnCooldown = true
-		-- (기능 수정) "쿨타임을 5초에서 3초로 줄여달라"는 요청.
+		self._T.assaulterStacks = math.max(0, self._T.assaulterStacks - 1)
+		log("[SkillManager] 어썰터 발동 성공 (남은 스택 " .. tostring(self._T.assaulterStacks) .. "/" .. tostring(self._T.assaulterMaxStacks) .. ")")
+		-- 시전 진행 중 잠금 - 착지 알림(OnAssaulterChainReady)이 오면 즉시 풀린다. 알림이 유실되는
+		-- 비정상 상황 대비 2초 뒤 자동 해제 안전장치(세대 번호로 다음 시전의 잠금을 건드리지 않게 한다).
+		self._T.assaulterCastActive = true
+		self._T.assaulterCastGuardSerial = self._T.assaulterCastGuardSerial + 1
+		local guardSerial = self._T.assaulterCastGuardSerial
 		_TimerService:SetTimerOnce(function()
-			self._T.assaulterOnCooldown = false
+			if self._T.assaulterCastGuardSerial == guardSerial then
+				self._T.assaulterCastActive = false
+			end
+		end, 2.0)
+		self:UpdateAssaulterStackUI()
+		self:StartAssaulterRecharge()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnAssaulterChainReady()
+		-- 서버(PlayerAttack.ReappearAssaulter)가 착지(순간이동 완료)를 알려주면 곧바로 재시전 가능
+		-- 상태로 만든다 - "이동 즉시 딜레이 없이 어썰터만은 연속으로 사용" 요청의 핵심 신호.
+		self._T.assaulterCastActive = false
+		log("[SkillManager] 어썰터 착지 - 연속 시전 가능")
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FindAssaulterSlotKey()
+		-- 어썰터가 현재 배정된 단축키를 찾는다(없으면 빈 문자열).
+		for key, slot in pairs(self._T.slotData) do
+			if slot ~= nil and slot.name == "어썰터" then return key end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartAssaulterRecharge()
+		-- 스택이 최대 미만이고 충전 타이머가 없으면 3초 충전 사이클을 시작한다. 사이클 완료 시 스택 +1,
+		-- 아직 최대가 아니면 다음 사이클을 이어서 시작한다 - 그림자(회색 오버레이) 효과도 사이클마다
+		-- 다시 차오르므로 풀스택까지 최대 3번 반복해서 차오른다 (요청사항).
+		if self._T.assaulterRechargeTimerId ~= nil then return end
+		if self._T.assaulterStacks >= self._T.assaulterMaxStacks then return end
+		local key = self:FindAssaulterSlotKey()
+		if key ~= "" then
+			_AssaulterCooldownUI:ShowCooldownV2(3.0, key)
+		end
+		self._T.assaulterRechargeTimerId = _TimerService:SetTimerOnce(function()
+			self._T.assaulterRechargeTimerId = nil
+			self._T.assaulterStacks = math.min(self._T.assaulterMaxStacks, self._T.assaulterStacks + 1)
+			log("[SkillManager] 어썰터 스택 충전 완료 (" .. tostring(self._T.assaulterStacks) .. "/" .. tostring(self._T.assaulterMaxStacks) .. ")")
+			self:UpdateAssaulterStackUI()
+			self:StartAssaulterRecharge()
 		end, 3.0)
-		_AssaulterCooldownUI:ShowCooldownV2(3.0, self._T.assaulterPendingKey or "Q")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateAssaulterStackUI()
+		-- 스택 수 표시(단축키 아이콘 우측 아래)를 최신 상태로 갱신한다.
+		_AssaulterCooldownUI:UpdateStackDisplay(self._T.assaulterStacks, self._T.assaulterMaxStacks, self:FindAssaulterSlotKey())
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1667,6 +1729,8 @@ script SkillManager extends Logic
 		log("[SkillManager] 슬롯 배정: [" .. key .. "] = " .. name)
 		-- 단축키 배정 변경 영속 저장 예약 (캐릭터별로 저장되어 재접속 시 복원됨)
 		_CharacterPersistence:MarkDirty("hotkey")
+		-- 어썰터 배정 위치가 바뀌었을 수 있으므로 스택 수 표시 위치/표시 여부를 갱신한다.
+		self:UpdateAssaulterStackUI()
 	end
 
 	-- 현재 단축키 배정 상태를 저장용 테이블로 내보낸다 (CharacterPersistence 전용).
@@ -1773,6 +1837,30 @@ script SkillManager extends Logic
 			if isvalid(ghost) then
 				ghost.UITransformComponent.anchoredPosition = ghostUI
 			end
+			-- 스킬창이 닫히면 배정 모드도 취소
+			local cWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+			if not isvalid(cWin) or not cWin.Enable then
+				self:ClearSkillSelection()
+			else
+				-- 새 클릭이 스킬바 슬롯도, 스킬창 내부도 아니면(빈 곳 클릭) 배정 취소
+				local mouseDown = _InputService:IsKeyPressed(KeyboardKey.Mouse0)
+				if mouseDown and self._T.clickModePrevMouse ~= true then
+					local slotKey = self:FindSkillBarSlot(ghostUI.x, ghostUI.y)
+					local insideWin = false
+					local wp = cWin.UITransformComponent.anchoredPosition
+					local ws = cWin.UITransformComponent.RectSize
+					if math.abs(ghostUI.x - wp.x) <= ws.x / 2 and math.abs(ghostUI.y - wp.y) <= ws.y / 2 then
+						insideWin = true
+					end
+					if slotKey == "" and not insideWin then
+						self:ClearSkillSelection()
+						log("[SkillManager] 빈 곳 클릭 — 클릭 배정 취소")
+					end
+				end
+				self._T.clickModePrevMouse = mouseDown
+			end
+		else
+			self._T.clickModePrevMouse = _InputService:IsKeyPressed(KeyboardKey.Mouse0)
 		end
 
 		-- 스킬 드래그 (고스트 이동 + 드롭)
@@ -1842,9 +1930,10 @@ script SkillManager extends Logic
 			end
 		end
 
-		-- (기능 추가) "누르고 있으면 쿨타임이 돌았을 시 바로 재사용되게 해달라"는 요청 - 텔레포트와 동일한
-		-- 패턴으로, 어썰터 전용 독립 쿨다운(assaulterOnCooldown)만 확인해 키를 누르고 있으면 계속 이어서 사용된다.
-		if not self._T.assaulterOnCooldown and not self._T.assaulterRequestPending then
+		-- (기능 변경) 어썰터 홀드 지속 사용 - 스택형 충전으로 바뀌면서, 키를 누르고 있으면 스택이 있고
+		-- 시전 중이 아닐 때(착지 즉시 잠금 해제) 계속 이어서 사용된다. 착지하자마자 다음 시전이 나가므로
+		-- 스택이 남아있는 한 딜레이 없이 연속 발동된다.
+		if self._T.assaulterStacks > 0 and not self._T.assaulterRequestPending and not self._T.assaulterCastActive then
 			for key, held in pairs(self._T.heldSkillKeys) do
 				if held then
 					local slot = self._T.slotData[key]

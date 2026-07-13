@@ -20,6 +20,7 @@ script EnhancementManager extends Logic
 	property integer addSelectedSlot = 0   -- 에디셔널 탭 선택 큐브 슬롯
 	property integer potCurrencyTab  = 0   -- 0=큐브, 1=메소
 	property integer addCurrencyTab  = 0
+	property integer scrollSelectedSlot = 0   -- 주문서 탭 선택 슬롯 (1-8, 0=미선택)
 	property string enhanceTargetItemStr = ""  -- 대상 아이템 전체 문자열
 	property string enhanceTargetSrcTab  = ""  -- 대상 아이템이 위치한 인벤 탭 키
 
@@ -27,8 +28,10 @@ script EnhancementManager extends Logic
 	method void OnBeginPlay()
 		self._T.potCubeSlots = {}
 		self._T.addCubeSlots = {}
+		self._T.scrollSlots = {}
 		self._T.tabPotDisabled = true   -- 아이템 없으면 기본 비활성화
 		self._T.tabAddDisabled = true
+		self._T.confirmInfoOnly = false   -- ConfirmDialog가 "사용 불가 아이템" 안내 전용인지 여부
 		-- 강화 열기 버튼 (인벤창 하단)
 		local openBtn = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/MesoBar/EnhanceOpenBtn")
 		log("[Enhance] openBtn isvalid=" .. tostring(isvalid(openBtn)))
@@ -42,6 +45,9 @@ script EnhancementManager extends Logic
 
 		-- 창 버튼 와이어링 후 숨기기
 		self:WireWindowButtons()
+		-- (원작 개편) 새 배경 스프라이트들의 렌더 순서 보정 - .ui 로드 시 배열 뒤에 추가된 배경이
+		-- 기존 형제 위에 그려지므로 형제 맨 앞(index 0 = 맨 뒤 렌더)으로 내린다.
+		self:ApplyRedesignZOrder()
 		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
 		if isvalid(w) then w.Enable = false end
 
@@ -50,6 +56,36 @@ script EnhancementManager extends Logic
 		-- 탭 클릭 (ScreenTouchReleaseEvent: 마우스 클릭 100% 감지)
 		_InputService:ConnectEvent(ScreenTouchReleaseEvent, self.OnScreenTabRelease)
 		log("[Enhance] EnhancementManager ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyRedesignZOrder()
+		-- 원작 스타일 리디자인으로 추가된 "배경" 스프라이트들을 각 부모의 형제 index 0으로 내려
+		-- 기존 컨텐츠(탭/슬롯/별 그리드/큐브 슬롯)가 배경 위에 그려지도록 보정한다.
+		-- 같은 부모 안에서 여러 개를 내릴 때는 "가장 아래에 깔릴 것"을 마지막에 호출한다.
+		local bgPaths = {
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/SlotArea/NamePillBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/SlotArea/RankupBarBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/SlotArea/SlotSectionBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/StarforceContent/ArrowPillBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/StarforceContent/StatBoxBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/StarforceContent/RateBoxBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/StarforceContent/CostBoxBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/StarforceContent/StarBoxBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/PotentialContent/CubePanel/CubePanelBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/PotentialContent/MesoPanel/MesoPanelBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/AdditionalContent/CubePanel/CubePanelBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/AdditionalContent/MesoPanel/MesoPanelBG",
+			"/ui/DefaultGroup/EnhanceWindow/LeftPanel/SideBG",
+			"/ui/DefaultGroup/EnhanceWindow/RightPanel/MainBG",
+		}
+		for _, p in ipairs(bgPaths) do
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) and isvalid(e.UITransformComponent) then
+				_UILogic:SetSiblingIndex(e.UITransformComponent, 0)
+			end
+		end
+		log("[Enhance] 리디자인 배경 z-order 보정 완료")
 	end
 
 	-- ─── 버튼 / 탭 와이어링 ──────────────────────────────────────────────
@@ -194,17 +230,64 @@ script EnhancementManager extends Logic
 			end)
 			log("[Enhance] TargetSlotBG hover/더블클릭 연결")
 		end
+
+		-- 주문서 탭: 주문서 슬롯 8개 + 사용하기 버튼 와이어링 (탭 버튼과 동일 패턴)
+		local smPath = self.pathContent .. "/ScrollContent/ScrollMain"
+		for i = 1, 8 do
+			local sBG = _EntityService:GetEntityByPath(smPath .. "/ScrollSlot" .. tostring(i) .. "/SlotBG")
+			if isvalid(sBG) then
+				sBG.SpriteGUIRendererComponent.RaycastTarget = true
+				if not isvalid(sBG:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					sBG:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				local captSlot = i
+				sBG:ConnectEvent(UITouchDownEvent, function(e)
+					if e.TouchId ~= -1 then return end
+					self:OnScrollSlotTouch(captSlot)
+				end)
+			end
+		end
+		local useBtn = _EntityService:GetEntityByPath(smPath .. "/ScrollUseBtn")
+		if isvalid(useBtn) then
+			useBtn.SpriteGUIRendererComponent.RaycastTarget = true
+			if not isvalid(useBtn:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+				useBtn:AddComponent("MOD.Core.UITouchReceiveComponent")
+			end
+			useBtn:ConnectEvent(UITouchDownEvent, function(e)
+				if e.TouchId ~= -1 then return end
+				self:UseScrollOnTarget()
+			end)
+			log("[Enhance] 주문서 탭 와이어링 완료")
+		end
+
+		-- 강화 확인 다이얼로그 확인/취소 버튼 (스프라이트에 UITouchReceive 연결 - 탭 버튼과 동일 패턴)
+		local dlgBtns = {
+			{ name = "DlgOkBG",     onTouch = self.OnConfirmOk },
+			{ name = "DlgCancelBG", onTouch = self.OnConfirmCancel },
+		}
+		for _, info in ipairs(dlgBtns) do
+			local btn = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/" .. info.name)
+			if isvalid(btn) then
+				btn.SpriteGUIRendererComponent.RaycastTarget = true
+				if not isvalid(btn:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+					btn:AddComponent("MOD.Core.UITouchReceiveComponent")
+				end
+				btn:ConnectEvent(UITouchDownEvent, info.onTouch)
+				log("[Enhance] 확인 다이얼로그 버튼 연결: " .. info.name)
+			end
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void SelectTab(integer idx)
+		-- (원작 개편) 탭 색상을 원작 ENCHANT 사이드바 톤(짙은 남색 바탕 + 밝은 강청색 활성)으로 교체.
 		self.currentTab = idx
-		local TAB_ACTIVE    = Color(0.27, 0.75, 1.0, 1.0)
-		local TAB_NORMAL    = Color(0.22, 0.22, 0.28, 1.0)
-		local TAB_DISABLED  = Color(0.15, 0.15, 0.17, 0.7)
-		local TAB_TEXT_ON   = Color(1.0, 1.0, 0.6, 1.0)
-		local TAB_TEXT_OFF  = Color(1.0, 1.0, 1.0, 1.0)
-		local TAB_TEXT_DIS  = Color(0.4, 0.4, 0.4, 1.0)
+		local TAB_ACTIVE    = Color(0.30, 0.62, 0.85, 1.0)
+		local TAB_NORMAL    = Color(0.11, 0.17, 0.25, 1.0)
+		local TAB_DISABLED  = Color(0.07, 0.10, 0.15, 0.8)
+		local TAB_TEXT_ON   = Color(1.0, 1.0, 1.0, 1.0)
+		local TAB_TEXT_OFF  = Color(0.72, 0.79, 0.87, 1.0)
+		local TAB_TEXT_DIS  = Color(0.32, 0.37, 0.43, 1.0)
 
 		local tabNames = {
 			"EnhanceTab_Starforce",
@@ -253,10 +336,32 @@ script EnhancementManager extends Logic
 		-- 스타포스 탭 선택 시 현재 레벨로 UI 갱신
 		if idx == 1 then self:UpdateStarforceUI(self.enhanceLevel) end
 
+		-- 주문서 탭 선택 시 주문서 그리드/효과 갱신
+		if idx == 2 then self:RefreshScrollContent() end
+
 		-- 잠재능력 / 에디셔널 탭 선택 시 큐브 UI 갱신
 		if idx == 4 or idx == 5 then self:RefreshCubeContent(idx) end
 
+		-- (원작 개편) 우측 패널 좌상단 노란 영문 제목(STARFORCE/SCROLL/...)을 탭에 맞게 갱신
+		local titles = { "STARFORCE", "SCROLL", "ADD OPTION", "POTENTIAL", "ADDITIONAL" }
+		local titleEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/RightTitleText")
+		if isvalid(titleEnt) then
+			titleEnt.TextComponent.Text = (idx >= 1 and idx <= 5) and titles[idx] or "ENCHANT"
+		end
+		-- 사이드바 하단 보유 메소 갱신 + 탭 전환 시 열려있던 확인 다이얼로그는 닫는다
+		self:UpdateMesoDisplay()
+		self:HideEnhanceConfirm()
+
 		log("[Enhance] SelectTab=" .. tostring(idx))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateMesoDisplay()
+		-- 사이드바 하단 "보유 메소" 값을 원작 표기(억/만)로 갱신한다.
+		local t = _EntityService:GetEntityByPath(self.pathLeft .. "/MesoValueText")
+		if isvalid(t) then
+			t.TextComponent.Text = _UIEquipInventoryManager:FormatMeso(_UIEquipInventoryManager.meso)
+		end
 	end
 
 	-- ─── 키보드 / 버튼 이벤트 ────────────────────────────────────────────
@@ -265,7 +370,45 @@ script EnhancementManager extends Logic
 		if event.key == KeyboardKey.O then
 			self:ToggleWindow()
 		elseif event.key == KeyboardKey.P then
-			if self:IsWindowOpen() then self:DoEnhance() end
+			-- (원작 개편) P 단축키도 버튼과 동일하게 확인 다이얼로그를 거친다.
+			if self:IsWindowOpen() then self:ShowEnhanceConfirm() end
+		elseif event.key == KeyboardKey.Space then
+			-- 스페이스바 = 확인 클릭: 다이얼로그가 열려있으면 확인, 스타포스 탭이면 강화하기 버튼과 동일
+			if not self:IsWindowOpen() then return end
+			if self:IsConfirmDialogOpen() then
+				log("[Enhance] Space → 확인")
+				self:HideEnhanceConfirm()
+				self:DoEnhance()
+			elseif self.currentTab == 1 then
+				log("[Enhance] Space → 강화하기")
+				self:ShowEnhanceConfirm()
+			end
+		elseif event.key == KeyboardKey.Tab then
+			-- Tab = 탭 순환 (잠긴 탭은 건너뜀)
+			if self:IsWindowOpen() then self:CycleTab() end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsConfirmDialogOpen()
+		-- 강화 확인 다이얼로그가 화면에 떠 있는지 (ESC/Space 분기용)
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		return self:IsWindowOpen() and isvalid(dlg) and dlg.Enable
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CycleTab()
+		-- Tab 키: 스타포스→주문서→추가옵션→잠재능력→에디셔널→스타포스, 비활성(잠긴) 탭은 건너뜀
+		local idx = self.currentTab
+		if idx < 1 or idx > 5 then idx = 0 end
+		for _ = 1, 5 do
+			idx = idx % 5 + 1
+			local disabled = (idx == 4 and self._T.tabPotDisabled) or (idx == 5 and self._T.tabAddDisabled)
+			if not disabled then
+				self:SelectTab(idx)
+				log("[Enhance] Tab 순환 → " .. tostring(idx))
+				return
+			end
 		end
 	end
 
@@ -287,7 +430,75 @@ script EnhancementManager extends Logic
 	method void OnEnhanceBtnClick(UITouchDownEvent e)
 		if e.TouchId ~= -1 then return end
 		log("[Enhance] EnhanceBtn clicked")
+		-- (원작 개편) 바로 강화하지 않고 원작처럼 "N 메소 / 강화를 시도하시겠습니까?" 확인 다이얼로그를 띄운다.
+		self:ShowEnhanceConfirm()
+	end
+
+	-- ─── 강화 확인 다이얼로그 (원작 스타일) ──────────────────────────────
+	@ExecSpace("ClientOnly")
+	method void ShowEnhanceConfirm()
+		-- 대상/최대단계/메소 부족은 기존 DoEnhance와 동일한 기준으로 미리 걸러 로그로 안내한다.
+		if self.enhanceTargetRUID == "" then
+			self:AppendLog("아이템을 먼저 선택하세요.")
+			return
+		end
+		if self.enhanceLevel >= 100 then
+			self:AppendLog("최대 강화 단계입니다.")
+			return
+		end
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		if not isvalid(dlg) then
+			-- 다이얼로그 엔티티가 없으면 기존 동작(즉시 강화)으로 폴백
+			self:DoEnhance()
+			return
+		end
+		local cost = self:GetStarforceCost(self.enhanceLevel)
+		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
+		if isvalid(txt) then
+			txt.TextComponent.Text = tostring(cost) .. " 메소\n\n강화를 시도하시겠습니까?"
+		end
+		self._T.confirmInfoOnly = false
+		dlg.Enable = true
+	end
+
+	-- 큐브(잠재능력/에디셔널)를 사용할 수 없는 아이템에 대해 시도했을 때 보여주는 안내 전용 다이얼로그.
+	-- 기존 강화 확인 다이얼로그(ConfirmDialog)를 재사용하되, 확인을 눌러도 강화를 실행하지 않는다.
+	@ExecSpace("ClientOnly")
+	method void ShowItemUnusableDialog()
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		if not isvalid(dlg) then return end
+		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
+		if isvalid(txt) then
+			txt.TextComponent.Text = "해당 아이템을 사용할 수 없는 아이템입니다."
+		end
+		self._T.confirmInfoOnly = true
+		dlg.Enable = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideEnhanceConfirm()
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		if isvalid(dlg) then dlg.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirmOk(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		log("[Enhance] 확인 다이얼로그: 확인")
+		self:HideEnhanceConfirm()
+		-- 안내 전용(사용 불가 아이템) 다이얼로그였다면 강화를 실행하지 않고 닫기만 한다.
+		if self._T.confirmInfoOnly then
+			self._T.confirmInfoOnly = false
+			return
+		end
 		self:DoEnhance()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirmCancel(UITouchDownEvent e)
+		if e.TouchId ~= -1 then return end
+		log("[Enhance] 확인 다이얼로그: 취소")
+		self:HideEnhanceConfirm()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -320,6 +531,16 @@ script EnhancementManager extends Logic
 				w.UITransformComponent.anchoredPosition = Vector2(550, 0)
 			end
 		end
+		-- 이미 대상 아이템이 올라가 있고, 그 아이템이 해당 잠재능력을 아직 개방하지 않았다면
+		-- 탭을 열지 않는다 (좌측 탭 버튼 클릭과 동일한 기준 - tabPotDisabled/tabAddDisabled).
+		-- 대상이 아직 없는 경우(enhanceTargetRUID=="")는 "아이템을 올려주세요" 안내 상태이므로 막지 않는다.
+		local hasTarget = self.enhanceTargetRUID ~= ""
+		local blocked = hasTarget and ((tabIdx == 4 and self._T.tabPotDisabled) or (tabIdx == 5 and self._T.tabAddDisabled))
+		if blocked then
+			self:ShowItemUnusableDialog()
+			log("[Enhance] OpenWindowWithTab 차단(미개방 잠재능력): tab=" .. tostring(tabIdx))
+			return
+		end
 		self:SelectTab(tabIdx)
 		if self.enhanceTargetRUID == "" then self:ClearTarget() end
 		log("[Enhance] OpenWindowWithTab tab=" .. tostring(tabIdx))
@@ -349,6 +570,7 @@ script EnhancementManager extends Logic
 		else
 			log("[Enhance] 창 닫힘")
 			self:ClearTarget()
+			self:HideEnhanceConfirm()
 		end
 	end
 
@@ -357,6 +579,7 @@ script EnhancementManager extends Logic
 		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
 		if isvalid(w) then w.Enable = false end
 		self:ClearTarget()
+		self:HideEnhanceConfirm()
 	end
 
 	-- ─── 강화 대상 설정 (더블클릭 / 드래그 드롭 공통) ────────────────────
@@ -414,6 +637,38 @@ script EnhancementManager extends Logic
 		log("[Enhance] 대상 설정: " .. name .. " 인벤=" .. tostring(invenIdx))
 	end
 
+	-- 강화창이 열린 상태로 대상 아이템에 외부 변화(잠재능력/에디셔널 주문서 성공 등)가 생겼을 때
+	-- 대상을 다시 올린 것처럼 캐시(enhanceTargetItemStr)와 표시를 즉시 재동기화한다.
+	-- invenIdx가 현재 강화 대상과 다르면 아무 것도 하지 않는다.
+	@ExecSpace("ClientOnly")
+	method void RefreshTargetIfCurrent(number invenIdx)
+		if self.enhanceTargetRUID == "" then return end
+		if self.enhanceTargetInvenIdx ~= invenIdx then return end
+
+		local s = _UIEquipInventoryManager:GetInven(invenIdx)
+		if s == "" then
+			-- 아이템이 사라짐(주문서 실패로 파괴 등) - 대상 해제
+			self:ClearTarget()
+			return
+		end
+
+		self.enhanceTargetItemStr = s
+		self.enhanceLevel = _UIEquipInventoryManager:ParseStars(s)
+
+		local starEnt = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/StarLabel")
+		if isvalid(starEnt) then
+			starEnt.TextComponent.Text = _UIEquipInventoryManager:GetStarText(self.enhanceLevel)
+		end
+		if self.currentTab == 1 then
+			self:UpdateStarforceUI(self.enhanceLevel)
+		end
+
+		-- 잠재능력/에디셔널 부여 여부가 바뀌었을 수 있으므로 탭 비활성화 상태 + 큐브 탭 내용을 다시 계산한다
+		-- (현재 탭이 4/5면 RefreshCubeContent가 자동 호출되어 잠재능력 탭이 새로 올린 것처럼 갱신됨)
+		self:UpdateTabDisabledState()
+		log("[Enhance] 대상 재동기화: " .. self.enhanceTargetName .. " 인벤=" .. tostring(invenIdx))
+	end
+
 	-- ─── 강화 실행 ────────────────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void DoEnhance()
@@ -435,6 +690,8 @@ script EnhancementManager extends Logic
 		end
 
 		_UIEquipInventoryManager:AddMeso(-cost)
+		-- 사이드바 보유 메소 표시 갱신 (원작 개편)
+		self:UpdateMesoDisplay()
 
 		local roll = _UtilLogic:RandomDouble()
 		log("[Enhance] roll=" .. tostring(roll))
@@ -529,18 +786,241 @@ script EnhancementManager extends Logic
 		self:ClearTarget()
 	end
 
+	-- ─── 주문서 탭 (전용 주문서 그리드 + 사용하기) ──────────────────────
+	@ExecSpace("ClientOnly")
+	method void SetScrollLog(string msg)
+		-- 주문서 탭 하단 결과 로그 한 줄 표시
+		local ent = _EntityService:GetEntityByPath(self.pathContent .. "/ScrollContent/ScrollMain/ScrollLogText")
+		if isvalid(ent) then ent.TextComponent.Text = msg end
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetTargetFieldNum(integer fieldIdx)
+		-- 강화 대상 아이템 문자열의 N번째 파이프 필드를 숫자로 반환 (없으면 0)
+		local s = self.enhanceTargetItemStr
+		if s == "" then return 0 end
+		local fields = {}
+		local pos = 1
+		while true do
+			local j, _ = string.find(s, "|", pos, true)
+			if j then fields[#fields+1] = string.sub(s, pos, j-1); pos = j+1
+			else fields[#fields+1] = string.sub(s, pos); break end
+		end
+		return math.floor(tonumber(fields[fieldIdx]) or 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshScrollContent()
+		-- 주문서 탭 UI 갱신: 대상 없음 → 안내 문구, 대상 있음 → 주문서 그리드/효과/사용 버튼
+		local scPath = self.pathContent .. "/ScrollContent"
+		local main = _EntityService:GetEntityByPath(scPath .. "/ScrollMain")
+		local chev = _EntityService:GetEntityByPath(scPath .. "/PlaceholderChevron")
+		local msg  = _EntityService:GetEntityByPath(scPath .. "/PlaceholderMsg")
+		local hasItem = self.enhanceTargetItemStr ~= ""
+		if isvalid(chev) then chev.Enable = not hasItem end
+		if isvalid(msg)  then msg.Enable  = not hasItem end
+		if isvalid(main) then main.Enable = hasItem end
+		if not hasItem then return end
+
+		-- 소비 탭에서 사용 가능한 주문서(연두색주문서) 수집
+		local validRUIDs = {}
+		validRUIDs["314215aface349c48b81eee58065e1b7"] = true
+		local consumeData = _UIEquipInventoryManager._T.tabData["consume"] or {}
+		local slotFill = {}
+		local found = 0
+		for consumeSlot = 1, 128 do
+			local cs = consumeData[consumeSlot] or ""
+			if cs ~= "" then
+				local ruid  = _UIEquipInventoryManager:ParseInvenRUID(cs)
+				local count = _UIEquipInventoryManager:ParseCount(cs)
+				if validRUIDs[ruid] and count > 0 then
+					found = found + 1
+					if found <= 8 then
+						slotFill[found] = {
+							consumeSlot = consumeSlot, ruid = ruid, count = count,
+							itemName = _UIEquipInventoryManager:ParseName(cs),
+						}
+					end
+				end
+			end
+		end
+		self._T.scrollSlots = slotFill
+
+		-- 선택 유지: 소진되면 해제, 미선택이면 첫 주문서 자동 선택
+		if self.scrollSelectedSlot > 0 and slotFill[self.scrollSelectedSlot] == nil then
+			self.scrollSelectedSlot = 0
+		end
+		if self.scrollSelectedSlot == 0 and slotFill[1] ~= nil then
+			self.scrollSelectedSlot = 1
+		end
+
+		local SEL = Color(0.35, 0.70, 0.95, 1.0)
+		local DEF = Color(0.98, 0.98, 1.00, 1.0)
+		local smPath = scPath .. "/ScrollMain"
+		for i = 1, 8 do
+			local slotPath = smPath .. "/ScrollSlot" .. tostring(i)
+			local bgEnt    = _EntityService:GetEntityByPath(slotPath .. "/SlotBG")
+			local iconEnt  = _EntityService:GetEntityByPath(slotPath .. "/SlotIcon")
+			local countEnt = _EntityService:GetEntityByPath(slotPath .. "/CountText")
+			if isvalid(bgEnt) then
+				bgEnt.SpriteGUIRendererComponent.Color = (i == self.scrollSelectedSlot) and SEL or DEF
+			end
+			if slotFill[i] then
+				if isvalid(iconEnt) then
+					iconEnt.SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. slotFill[i].ruid
+					iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+				end
+				if isvalid(countEnt) then countEnt.TextComponent.Text = tostring(slotFill[i].count) end
+			else
+				if isvalid(iconEnt) then
+					iconEnt.SpriteGUIRendererComponent.ImageRUID = ""
+					iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
+				end
+				if isvalid(countEnt) then countEnt.TextComponent.Text = "" end
+			end
+		end
+
+		local emptyEnt = _EntityService:GetEntityByPath(smPath .. "/ScrollEmptyText")
+		if isvalid(emptyEnt) then emptyEnt.Enable = (found == 0) end
+
+		-- 선택 주문서 설명 + 효과/횟수
+		local descEnt = _EntityService:GetEntityByPath(smPath .. "/ScrollDescText")
+		local sel = slotFill[self.scrollSelectedSlot]
+		if isvalid(descEnt) then
+			if sel then
+				descEnt.TextComponent.Text = sel.itemName .. "  |  성공 확률 60%"
+			else
+				descEnt.TextComponent.Text = ""
+			end
+		end
+		local infoEnt = _EntityService:GetEntityByPath(smPath .. "/ScrollInfoText")
+		if isvalid(infoEnt) then
+			local scrolls = self:GetTargetFieldNum(5)
+			local upgrade = self:GetTargetFieldNum(6)
+			infoEnt.TextComponent.Text = "성공 시 주문서 강화 +1 (현재 +" .. tostring(scrolls) .. ")\n남은 업그레이드 가능 횟수 : " .. tostring(upgrade) .. "회"
+		end
+		log("[Enhance] RefreshScrollContent found=" .. tostring(found) .. " sel=" .. tostring(self.scrollSelectedSlot))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnScrollSlotTouch(integer slotIdx)
+		-- 주문서 슬롯 클릭 → 선택
+		if not self._T.scrollSlots or self._T.scrollSlots[slotIdx] == nil then
+			log("[Enhance] 빈 주문서 슬롯: " .. tostring(slotIdx))
+			return
+		end
+		self.scrollSelectedSlot = slotIdx
+		self:RefreshScrollContent()
+		log("[Enhance] 주문서 선택 slot=" .. tostring(slotIdx))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UseScrollOnTarget()
+		-- 사용하기: 선택된 주문서를 강화 대상 장비에 적용 (60% 성공, 성공 시 주문서 강화 +1, 항상 업그레이드 횟수 -1)
+		if self.enhanceTargetItemStr == "" then
+			self:SetScrollLog("강화할 장비를 먼저 올려주세요.")
+			return
+		end
+		local sel = self._T.scrollSlots and self._T.scrollSlots[self.scrollSelectedSlot] or nil
+		if sel == nil then
+			self:SetScrollLog("사용할 주문서를 선택하세요.")
+			return
+		end
+
+		-- 파이프 필드 파싱 (잠재능력 등 추가 필드 보존)
+		local s = self.enhanceTargetItemStr
+		local fields = {}
+		local pos = 1
+		while true do
+			local j, _ = string.find(s, "|", pos, true)
+			if j then fields[#fields+1] = string.sub(s, pos, j-1); pos = j+1
+			else fields[#fields+1] = string.sub(s, pos); break end
+		end
+
+		local slotIdx = math.floor(tonumber(fields[3]) or 0)
+		if slotIdx < 1 or slotIdx > 7 then
+			self:SetScrollLog("장비 아이템에만 사용할 수 있습니다.")
+			return
+		end
+		local upgrade = math.floor(tonumber(fields[6]) or 0)
+		if upgrade <= 0 then
+			self:SetScrollLog("업그레이드 가능 횟수가 없습니다.")
+			return
+		end
+
+		-- 주문서 1개 소비 (소비 탭 직접 감소 — 큐브 소비와 동일 패턴)
+		local consumeIdx = sel.consumeSlot
+		local cd = _UIEquipInventoryManager._T.tabData["consume"][consumeIdx] or ""
+		if cd ~= "" then
+			local cf = {}
+			local cp = 1
+			while true do
+				local cj, _ = string.find(cd, "|", cp, true)
+				if cj then cf[#cf+1] = string.sub(cd, cp, cj-1); cp = cj+1
+				else cf[#cf+1] = string.sub(cd, cp); break end
+			end
+			while #cf < 7 do cf[#cf+1] = "0" end
+			local cnt = (tonumber(cf[7]) or 0) - 1
+			if cnt <= 0 then
+				_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = ""
+			else
+				cf[7] = tostring(cnt)
+				_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = table.concat(cf, "|")
+			end
+		end
+
+		-- 60% 성공: 성공 시 scrolls(+N) 증가, 성공/실패 무관 업그레이드 횟수 1 차감
+		local success = _UtilLogic:RandomDouble() < 0.6
+		fields[6] = tostring(upgrade - 1)
+		if success then
+			fields[5] = tostring(math.floor(tonumber(fields[5]) or 0) + 1)
+		end
+		local newStr = table.concat(fields, "|")
+		self.enhanceTargetItemStr = newStr
+
+		-- 인벤 원본 탭에 반영
+		local srcTab = self.enhanceTargetSrcTab
+		if srcTab == "" then srcTab = "equip" end
+		_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newStr
+		_UIEquipInventoryManager:RefreshUI()
+
+		-- 대상 이름 라벨 갱신 ("이름+N")
+		local nameLabel = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetNameLabel")
+		if isvalid(nameLabel) then
+			nameLabel.TextComponent.Text = _UIEquipInventoryManager:GetDisplayName(newStr)
+		end
+
+		if success then
+			self:SetScrollLog("성공! 주문서 강화 +" .. fields[5] .. "  (남은 횟수 " .. fields[6] .. "회)")
+		else
+			self:SetScrollLog("실패.  (남은 횟수 " .. fields[6] .. "회)")
+		end
+		self:RefreshScrollContent()
+		log("[Enhance] 주문서 사용 success=" .. tostring(success) .. " scrolls=" .. fields[5] .. " upgrade=" .. fields[6])
+	end
+
 	-- ─── 스타포스 UI 업데이트 ────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void UpdateStarforceUI(integer level)
 		local sfPath = self.pathContent .. "/StarforceContent"
-		local STAR_ON  = Color(1.0, 0.85, 0.0, 1.0)
-		local STAR_OFF = Color(0.55, 0.55, 0.60, 0.85)
+		local STAR_ON    = Color(1.0, 0.85, 0.0, 1.0)
+		local STAR_HIDE  = Color(1.0, 1.0, 1.0, 0.0)
+		local EMPTY_ON   = Color(0.55, 0.58, 0.65, 1.0)   -- 미강화: 빈 별(☆) 표시
+		local EMPTY_HIDE = Color(0.55, 0.58, 0.65, 0.0)
 
-		-- 100개 별 색상
+		-- 100개 별: 강화된 별 = 채워진 별 스프라이트, 미강화 별 = 빈 별(☆) 글리프
 		for i = 1, 100 do
 			local star = _EntityService:GetEntityByPath(sfPath .. "/Star_" .. tostring(i))
 			if isvalid(star) then
-				star.SpriteGUIRendererComponent.Color = (i <= level) and STAR_ON or STAR_OFF
+				local spr = star.SpriteGUIRendererComponent
+				local txt = star.TextComponent
+				if i <= level then
+					spr.Color = STAR_ON
+					if isvalid(txt) then txt.FontColor = EMPTY_HIDE end
+				else
+					spr.Color = STAR_HIDE
+					if isvalid(txt) then txt.FontColor = EMPTY_ON end
+				end
 			end
 		end
 
@@ -735,11 +1215,12 @@ script EnhancementManager extends Logic
 		local opt3 = (#fields >= opt3Idx) and fields[opt3Idx] or ""
 
 		local gradeNames  = {"레어", "에픽", "유니크", "레전드리"}
+		-- (원작 개편) 등급 바 색을 원작 잠재능력 등급색(레어=하늘색/에픽=보라/유니크=노랑/레전드리=연두)으로 교체
 		local gradeColors = {
-			Color(0.55, 0.55, 0.65, 1.0),
-			Color(0.55, 0.20, 0.80, 1.0),
-			Color(0.90, 0.55, 0.00, 1.0),
-			Color(0.20, 0.80, 0.20, 1.0),
+			Color(0.25, 0.69, 0.90, 1.0),
+			Color(0.62, 0.35, 0.89, 1.0),
+			Color(0.93, 0.75, 0.18, 1.0),
+			Color(0.45, 0.83, 0.25, 1.0),
 		}
 
 		local barEnt = _EntityService:GetEntityByPath(cPath .. "/ItemInfoPanel/GradeBarBG")
@@ -808,8 +1289,8 @@ script EnhancementManager extends Logic
 		if tabIdx == 4 then self.potSelectedSlot = newSel
 		else self.addSelectedSlot = newSel end
 
-		local SEL = Color(0.20, 0.50, 0.90, 1.0)
-		local DEF = Color(0.15, 0.15, 0.18, 1.0)
+		local SEL = Color(0.35, 0.70, 0.95, 1.0)
+		local DEF = Color(0.98, 0.98, 1.00, 1.0)
 		for i = 1, 18 do
 			local slotPath = gridPath .. "/CubeSlot" .. tostring(i)
 			local iconEnt  = _EntityService:GetEntityByPath(slotPath .. "/SlotIcon")
@@ -844,6 +1325,11 @@ script EnhancementManager extends Logic
 	-- ─── 큐브 리셋: 슬롯 클릭 ────────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void OnCubeSlotTouch(integer tabIdx, integer slotIdx)
+		local isDisabled = (tabIdx == 4 and self._T.tabPotDisabled) or (tabIdx == 5 and self._T.tabAddDisabled)
+		if isDisabled then
+			self:ShowItemUnusableDialog()
+			return
+		end
 		local cubeSlots = (tabIdx == 4) and self._T.potCubeSlots or self._T.addCubeSlots
 		if not cubeSlots or not cubeSlots[slotIdx] then
 			log("[Cube] 빈 슬롯: " .. tostring(slotIdx))
@@ -856,8 +1342,8 @@ script EnhancementManager extends Logic
 		local contentName = tabIdx == 4 and "PotentialContent" or "AdditionalContent"
 		local gridPath = self.pathContent .. "/" .. contentName .. "/CubePanel/CubeGrid"
 
-		local SEL = Color(0.20, 0.50, 0.90, 1.0)
-		local DEF = Color(0.15, 0.15, 0.18, 1.0)
+		local SEL = Color(0.35, 0.70, 0.95, 1.0)
+		local DEF = Color(0.98, 0.98, 1.00, 1.0)
 		for i = 1, 18 do
 			local bgEnt = _EntityService:GetEntityByPath(gridPath .. "/CubeSlot" .. tostring(i) .. "/SlotBG")
 			if isvalid(bgEnt) then
@@ -882,13 +1368,13 @@ script EnhancementManager extends Logic
 
 		local mesoBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBG")
 		local cubeBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBG")
-		if isvalid(mesoBG) then mesoBG.SpriteGUIRendererComponent.Color = Color(0.22, 0.22, 0.28, 1.0) end
-		if isvalid(cubeBG) then cubeBG.SpriteGUIRendererComponent.Color = Color(0.12, 0.12, 0.15, 1.0) end
+		if isvalid(mesoBG) then mesoBG.SpriteGUIRendererComponent.Color = Color(0.25, 0.69, 0.85, 1.0) end
+		if isvalid(cubeBG) then cubeBG.SpriteGUIRendererComponent.Color = Color(0.14, 0.17, 0.22, 1.0) end
 
 		local mesoTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBtn/MesoTabText")
 		local cubeTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBtn/CubeTabText")
 		if isvalid(mesoTxt) then mesoTxt.TextComponent.FontColor = Color(1,1,1,1) end
-		if isvalid(cubeTxt) then cubeTxt.TextComponent.FontColor = Color(0.5,0.5,0.5,1) end
+		if isvalid(cubeTxt) then cubeTxt.TextComponent.FontColor = Color(0.50, 0.56, 0.62, 1) end
 
 		if tabIdx == 4 then self.potCurrencyTab = 1 else self.addCurrencyTab = 1 end
 	end
@@ -903,12 +1389,12 @@ script EnhancementManager extends Logic
 
 		local mesoBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBG")
 		local cubeBG = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBG")
-		if isvalid(mesoBG) then mesoBG.SpriteGUIRendererComponent.Color = Color(0.12, 0.12, 0.15, 1.0) end
-		if isvalid(cubeBG) then cubeBG.SpriteGUIRendererComponent.Color = Color(0.22, 0.22, 0.28, 1.0) end
+		if isvalid(mesoBG) then mesoBG.SpriteGUIRendererComponent.Color = Color(0.14, 0.17, 0.22, 1.0) end
+		if isvalid(cubeBG) then cubeBG.SpriteGUIRendererComponent.Color = Color(0.25, 0.69, 0.85, 1.0) end
 
 		local mesoTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/MesoTabBtn/MesoTabText")
 		local cubeTxt = _EntityService:GetEntityByPath(cPath .. "/CurrencyTabRow/CubeTabBtn/CubeTabText")
-		if isvalid(mesoTxt) then mesoTxt.TextComponent.FontColor = Color(0.5,0.5,0.5,1) end
+		if isvalid(mesoTxt) then mesoTxt.TextComponent.FontColor = Color(0.50, 0.56, 0.62, 1) end
 		if isvalid(cubeTxt) then cubeTxt.TextComponent.FontColor = Color(1,1,1,1) end
 
 		if tabIdx == 4 then self.potCurrencyTab = 0 else self.addCurrencyTab = 0 end
@@ -917,6 +1403,11 @@ script EnhancementManager extends Logic
 	-- ─── 큐브 리셋: 재설정 실행 ─────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void OnResetBtnTouch(integer tabIdx)
+		local isDisabled = (tabIdx == 4 and self._T.tabPotDisabled) or (tabIdx == 5 and self._T.tabAddDisabled)
+		if isDisabled then
+			self:ShowItemUnusableDialog()
+			return
+		end
 		local selectedSlot = (tabIdx == 4) and self.potSelectedSlot or self.addSelectedSlot
 		if selectedSlot == 0 then
 			log("[Cube] 큐브 미선택")
