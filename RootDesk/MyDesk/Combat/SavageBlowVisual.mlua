@@ -1,0 +1,100 @@
+@Component
+script SavageBlowVisual extends Component
+
+	-- 새비지블로우 시전 이펙트: 캐릭터 앞에서 1→2→3→4→5→6→7→8번 이미지를 순서대로 빠르게 보여준다.
+	-- 프레임이 바뀔 때마다 히트 사운드를 1회 재생한다(요청사항).
+	--
+	-- 왜 전용 엔티티 + 클라이언트 스크립트인가:
+	-- (1) 이 8장은 애니메이션클립이 아니라 개별 정지 스프라이트라 _EffectService로는 순서 재생이 안 된다.
+	-- (2) SpriteRendererComponent.SpriteRUID를 서버에서 8번 바꿔치는 방식은 스폰 직후 첫 스냅샷 이후의
+	--     변경이 클라이언트에 확실히 도달한다는 보장이 없다 - 프레임 전환은 클라이언트가 스스로 돌린다
+	--     (SpearBurstFadingEffect가 알파/스케일 트윈을 클라이언트에서 직접 도는 것과 동일한 이유).
+
+	-- 프레임 간격(초). 서버(PlayerAttack.AttackSavageBlow)가 공격속도 배율을 곱해 넣어준다.
+	-- 데미지 판정 타이밍(2·3·4·5·6·8번 프레임)도 서버가 같은 값으로 계산하므로 이 값이 화면과 판정의
+	-- 공통 기준이다. 기본값(0.09)은 배율 1.0일 때의 값과 같게 맞춰, @Sync 값이 한 프레임 늦게 도착해도
+	-- 첫 프레임 타이밍이 크게 어긋나지 않게 한다.
+	-- (기능 변경 이력) 0.06 → 0.12("1/2 속도로") → 0.09("후딜을 더 줄이고 모션을 더 빠르게")
+	-- (PlayerAttack.AttackSavageBlow의 frameInterval과 반드시 같은 값이어야 한다).
+	@Sync property number FrameInterval = 0.09
+	@Sync property integer OrderInLayerValue = 11
+
+	@HideFromInspector property integer FrameIndex = 0
+	@HideFromInspector property number Elapsed = 0
+	@HideFromInspector property boolean IsDone = false
+
+	method table GetFrameRUIDs()
+		-- msw-dev-tools/resources/새비지블로우/RUID.md 의 1~8번 프레임 **정렬본**.
+		-- (버그 수정) 원본 8장은 캔버스 폭이 제각각(81~106px)이고 그 안에서 공통 요소(파란 문양 다이아몬드)의
+		-- 위치도 최대 15px씩 어긋나 있어, 프레임이 바뀔 때마다 그림 전체가 좌우로 튀는 "지진" 현상이 있었다.
+		-- 파란 문양을 기준으로 8장을 모두 같은 캔버스(108x116)에 재배치해(aligned/) 다시 업로드한 RUID다.
+		return {
+			"0c10c7f12e7445c2a840c593fbfc9513",
+			"c517f7f05a844af580b80bf420743ce8",
+			"3e556b633f4f4b358ae54cf4add11fd7",
+			"ed2c5cd4ceea4090813802f4143b3cfc",
+			"d99ee75c6cb041b48067b61fbb8734a0",
+			"4fa59e6d33d94917a8a4c9ea03745acf",
+			"f565ca85888249faad6eddf86992a486",
+			"61d7141ba8d047f4a2b8d514e64d3dfc",
+		}
+	end
+
+	method void OnBeginPlay()
+		-- 클라이언트에서만 프레임을 돌린다(서버는 이 엔티티의 그림을 그리지 않는다).
+		if not self:IsClient() then return end
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		spr.OrderInLayer = self.OrderInLayerValue
+		spr.Color = Color(1, 1, 1, 1)
+		self.Elapsed = 0
+		self.FrameIndex = 0
+		self.IsDone = false
+		self:ApplyFrame(1)
+		log("[SavageBlow] Visual OnBeginPlay interval=" .. tostring(self.FrameInterval))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- 서버가 AddComponent 직후 설정한 @Sync 값이 클라이언트 OnBeginPlay보다 늦게 도착하는 경쟁 상태
+		-- 보정(SpearBurstFadingEffect와 동일한 이유). OrderInLayer는 도착 시점에 다시 적용한다.
+		if name ~= "OrderInLayerValue" then return end
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		spr.OrderInLayer = self.OrderInLayerValue
+	end
+
+	method void ApplyFrame(integer index)
+		-- index번째 프레임 스프라이트로 교체하고, 교체할 때마다 히트 사운드를 1회 재생한다.
+		local frames = self:GetFrameRUIDs()
+		if index < 1 or index > #frames then return end
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		spr.SpriteRUID = frames[index]
+		self.FrameIndex = index
+		_SoundService:PlaySound("23250468023a4767b32611f2fd8ec49b", 1.0)
+	end
+
+	method void OnUpdate(number delta)
+		if not self:IsClient() then return end
+		if self.IsDone then return end
+		if not isvalid(self.Entity) then return end
+
+		self.Elapsed = self.Elapsed + delta
+		local interval = math.max(self.FrameInterval, 0.01)
+		local want = math.floor(self.Elapsed / interval) + 1
+
+		if want > 8 then
+			-- 8번 프레임까지 다 보여줬으면 즉시 투명하게 만든다(엔티티 파괴는 서버 타이머가 담당).
+			self.IsDone = true
+			local spr = self.Entity.SpriteRendererComponent
+			if isvalid(spr) then spr.Color = Color(1, 1, 1, 0) end
+			return
+		end
+
+		if want > self.FrameIndex then
+			self:ApplyFrame(want)
+		end
+	end
+
+end

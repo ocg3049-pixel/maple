@@ -82,6 +82,9 @@ script SkillManager extends Logic
 				{ ruid = "0cfe777a9cd04df9bbb22a18a598e9b7", name = "아이언 에로우",  level = 1, desc = "강한 관통력을 가진 화살을 발사한다." },
 				{ ruid = "e223bdc2a6cd46f98639e00b34083332", name = "헤이스트",       level = 1, desc = "5분간 이동 속도 40%, 점프력 20%를 증가시킨다." },
 				{ ruid = "03b1da381bf046c68488fae4690e4f6f", name = "부스터",         level = 1, desc = "5분간 공격 속도가 1단계 상승한다." },
+				-- 새비지블로우: MSW 기본 리소스에 없어 직접 구해와 업로드한 아이콘이다
+				-- (원본/RUID 대응표: msw-dev-tools/resources/새비지블로우/RUID.md).
+				{ ruid = "e4e5bf026b7c4976a1842de4418326ab", name = "새비지블로우",   level = 1, desc = "전방의 적 하나를 빠르게 6번 난도질한다.\n한 타당 전투력의 220%~300% 피해를 입힌다." },
 			},
 			["3"] = {
 				{ ruid = "efb2d49b00ea433d80379fa679614920", name = "포이즌 미스트",     level = 1, desc = "독 안개를 뿌려 범위 내 적에게 지속 피해를 입힌다." },
@@ -635,6 +638,15 @@ script SkillManager extends Logic
 	method void UseSkillInSlot(string key)
 		local slot = self._T.slotData[key]
 		if slot == nil or slot.ruid == "" then return end
+		-- (기능 추가) "사망했을 때 부활 전까지 다른 행동을 못하게 해달라"는 요청 - 사망(DEAD) 상태에서는
+		-- 어떤 슬롯도 사용할 수 없다(HP포션 포함). 이동/점프/기본공격은 서버 쪽에서 조작 자체를 꺼서 막는다
+		-- (PlayerAttack.HandleDeadLockStateEvent). 부활하면 자동으로 다시 풀린다.
+		local localPlayerForDeath = _UserService.LocalPlayer
+		local deathState = isvalid(localPlayerForDeath) and localPlayerForDeath.StateComponent or nil
+		if isvalid(deathState) and deathState.CurrentStateName == "DEAD" then
+			log("[SkillManager] 사망 상태 - 스킬 사용 불가 (부활 후 사용 가능)")
+			return
+		end
 		-- 캐릭터 정보창의 실제 크리티컬 확률(장비 잠재능력 반영)을 스킬 사용 시마다 서버로 동기화한다 -
 		-- CalcCritical은 서버에서만 실행되고 장비/인벤토리는 클라이언트 전용 상태라, combatPower와
 		-- 동일한 이유로 매 시전 직전에 최신값을 넘겨줘야 한다.
@@ -765,6 +777,19 @@ script SkillManager extends Logic
 			end, 0.75 * atkMult)
 			local combatPower = _CharInfoManager:CalcCombatPower()
 			self:RequestFireDoubleStab(combatPower, atkMult)
+		elseif slot.name == "새비지블로우" then
+			-- 새비지블로우: 전방 1명을 6번 때리는 단일 대상 스킬. 다른 스킬들과 동일하게 공격속도 배율을
+			-- 재사용 대기시간에 함께 적용한다.
+			-- 재사용 대기시간은 마지막 타격(0.12 + 7*0.09 = 0.75*배율)과 컨트롤 복구(0.77*배율) 직후로 잡는다 -
+			-- "끝 딜레이를 더 줄여달라"는 피드백으로 0.90 → 0.82*배율까지 줄였다(키 홀드 연속 시전 포함).
+			-- 8번 이미지는 전용 이펙트 엔티티가 자기 타이머로 끝까지 재생하므로 잘리지 않는다.
+			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+			self._T.skillOnCooldown = true
+			_TimerService:SetTimerOnce(function()
+				self._T.skillOnCooldown = false
+			end, 0.82 * atkMult)
+			local combatPower = _CharInfoManager:CalcCombatPower()
+			self:RequestFireSavageBlow(combatPower, atkMult)
 		elseif slot.name == "매직클로" then
 			-- 파워스트라이크와 동일하게 공격속도 배율을 쿨다운(재사용 대기시간)에 함께 적용한다.
 			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
@@ -1257,6 +1282,25 @@ script SkillManager extends Logic
 		end
 		pa:AttackComboAttack(atkMultiplier)
 		log("[SkillManager] 콤보 어택 발동!")
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireSavageBlow(number combatPower, number atkMultiplier)
+		-- 새비지블로우 시전 요청 (다른 스킬들과 동일한 Server RPC 패턴 - 클라이언트가 계산한 전투력/공격속도
+		-- 배율을 넘겨받아 서버의 PlayerAttack에서 실제 판정을 진행한다).
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireSavageBlow: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireSavageBlow: PlayerAttack component not found")
+			return
+		end
+		pa:AttackSavageBlow(combatPower, atkMultiplier)
+		log("[SkillManager] 새비지블로우 발동!")
 	end
 
 	@ExecSpace("Server")
@@ -1909,7 +1953,7 @@ script SkillManager extends Logic
 			for key, held in pairs(self._T.heldSkillKeys) do
 				if held and not self._T.skillOnCooldown then
 					local slot = self._T.slotData[key]
-					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터" or slot.name == "어벤져" or slot.name == "드래곤 로어") then
+					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터" or slot.name == "어벤져" or slot.name == "드래곤 로어" or slot.name == "새비지블로우") then
 						self:UseSkillInSlot(key)
 					end
 				end

@@ -10,13 +10,90 @@ script PlayerHit extends HitComponent
     -- IsAttackTarget 쪽에서 걸러내야 한다.
     property boolean IsInvincible = false
 
-    @ExecSpace("ServerOnly")
     method void OnBeginPlay()
-        -- BoxSize/ColliderOffset가 (0,0)으로 비어있으면 아바타 크기에 맞춘 자동 판정 박스가
-        -- TransformComponent 원점(발밑)을 중심으로 계산되어 절반이 땅 밑으로 파고들었다 - 몬스터가
-        -- 멀리 있거나 아래쪽에 있어도 맞는 것처럼 보인 원인. 발밑(0)부터 머리(0.7)까지를 덮도록 명시적으로 설정.
-        self.BoxSize = Vector2(0.45, 0.7)
-        self.ColliderOffset = Vector2(0, 0.35)
+        if self:IsServer() then
+            -- BoxSize/ColliderOffset가 (0,0)으로 비어있으면 아바타 크기에 맞춘 자동 판정 박스가
+            -- TransformComponent 원점(발밑)을 중심으로 계산되어 절반이 땅 밑으로 파고들었다 - 몬스터가
+            -- 멀리 있거나 아래쪽에 있어도 맞는 것처럼 보인 원인. 발밑(0)부터 머리(0.7)까지를 덮도록 명시적으로 설정.
+            self.BoxSize = Vector2(0.45, 0.7)
+            self.ColliderOffset = Vector2(0, 0.35)
+
+            -- (버그 수정) "피격돼도 HP가 안 깎이고 죽지도 않는다"는 신고에 대한 자가복구 안전장치.
+            -- OnHit이 무적(Enable=false)을 걸어두고 푸는 타이머가 어떤 이유로든 유실되면 영구 무적이 된다.
+            -- 무적이 ImmuneCooldown보다 한참 오래 유지되면 강제로 풀어준다.
+            self._T.invincibleFor = 0
+            self._T.serverWatchdogId = _TimerService:SetTimerRepeat(function()
+                self:ServerWatchdogTick()
+            end, 0.25)
+        end
+
+        if self:IsClient() then
+            -- (버그 수정) "이동이 안 된다"는 신고의 직접 원인.
+            -- 플레이어 아바타의 상태 전이 권한은 **클라이언트**에 있다(서버에서 ChangeState를 호출하면
+            -- [LEA-3022] InvalidExecSpace로 실패한다 - 실제 로그에서 299회 확인). 기존 코드는 경직 단축을
+            -- 위해 서버에서 HIT -> IDLE 전이를 시도했기 때문에 매번 실패했고, OnHit이 HitComponent를
+            -- 즉시 Enable=false로 꺼버리는 탓에 엔진의 "HIT 자동 종료"까지 동작하지 않아 플레이어가
+            -- HIT 상태에 갇혀 이동 입력이 먹지 않는 상황이 생겼다(스킬은 PlayerAttack을 직접 호출하므로
+            -- 그대로 나가서 "스킬로는 움직이는데 이동만 안 되는" 증상이 된다).
+            -- → 경직 단축과 HIT 갇힘 복구를 모두 권한이 있는 클라이언트 쪽에서 처리한다.
+            self._T.hitFor = 0
+            self._T.clientWatchdogId = _TimerService:SetTimerRepeat(function()
+                self:ClientWatchdogTick()
+            end, 0.1)
+        end
+    end
+
+    method void OnEndPlay()
+        if self._T.serverWatchdogId then
+            _TimerService:ClearTimer(self._T.serverWatchdogId)
+            self._T.serverWatchdogId = nil
+        end
+        if self._T.clientWatchdogId then
+            _TimerService:ClearTimer(self._T.clientWatchdogId)
+            self._T.clientWatchdogId = nil
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ServerWatchdogTick()
+        -- 무적이 비정상적으로 오래 지속되면(= 해제 타이머 유실) 강제로 되돌린다.
+        if not isvalid(self.Entity) then return end
+        if not self.IsInvincible then
+            self._T.invincibleFor = 0
+            return
+        end
+        self._T.invincibleFor = (self._T.invincibleFor or 0) + 0.25
+        if self._T.invincibleFor > self.ImmuneCooldown + 2.0 then
+            log_warning("[PlayerHit] 무적이 비정상적으로 오래 유지됨 - 강제 해제 (피격/사망 불가 버그 자가복구)")
+            self.Enable = true
+            self._T.invincible = false
+            self.IsInvincible = false
+            self._T.invincibleFor = 0
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClientWatchdogTick()
+        -- 내 캐릭터에 대해서만 동작해야 한다 - 다른 플레이어의 상태를 내 클라이언트에서 바꾸려 하면
+        -- 권한이 없어 [LEA-3022]가 다시 발생한다.
+        local localPlayer = _UserService.LocalPlayer
+        if not isvalid(localPlayer) or localPlayer ~= self.Entity then return end
+        local sc = self.Entity.StateComponent
+        if not isvalid(sc) then return end
+
+        if sc.CurrentStateName ~= "HIT" then
+            self._T.hitFor = 0
+            return
+        end
+
+        -- HIT에 머문 시간이 경직 단축 기준(0.15초)을 넘으면 IDLE로 되돌린다.
+        -- 이 한 줄이 (1) 원래 의도했던 경직 1/4 단축과 (2) HIT 상태에 영구히 갇히는 이동불가 버그의
+        -- 자가복구를 동시에 담당한다.
+        self._T.hitFor = (self._T.hitFor or 0) + 0.1
+        if self._T.hitFor >= 0.15 then
+            sc:ChangeState("IDLE")
+            self._T.hitFor = 0
+        end
     end
 
     method boolean IsHitTarget(string attackInfo)
@@ -35,24 +112,19 @@ script PlayerHit extends HitComponent
         self._T.invincible = true
         self.IsInvincible = true
         self.Enable = false
+        self._T.invincibleFor = 0
 
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
-        -- Reduce stagger (경직) to 1/4 of default: force IDLE after ~0.1s
-        local entity = self.Entity
-        _TimerService:SetTimerOnce(function()
-            if isvalid(entity) then
-                local sc = entity.StateComponent
-                if isvalid(sc) and sc.CurrentStateName == "HIT" then
-                    sc:ChangeState("IDLE")
-                end
-            end
-        end, 0.1)
+
+        -- (기능 이동) 경직(HIT) 단축은 클라이언트 워치독(ClientWatchdogTick)이 담당한다 - 여기서
+        -- 서버가 ChangeState("IDLE")를 호출하면 플레이어 상태 권한이 없어 [LEA-3022]로 항상 실패한다.
 
         _TimerService:SetTimerOnce(function()
             if isvalid(self.Entity) then
                 self.Enable = true
                 self._T.invincible = false
                 self.IsInvincible = false
+                self._T.invincibleFor = 0
             end
         end, self.ImmuneCooldown)
     end
