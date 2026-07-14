@@ -439,6 +439,57 @@ script CharacterPersistence extends Logic
 		sv.lastMeso[id] = meso
 		sv.saves[id] = saveStr
 		sv.dirtySaves[id] = true
+		-- 캐릭터 목록의 외형 필드도 최신 장비로 맞춘다 (선택창 슬롯 아바타가 지금 입은 장비를 보여주도록)
+		self:SyncCharDataFromSave(sv, id, saveStr)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SyncCharDataFromSave(table sv, string id, string saveStr)
+		-- 세이브의 장비 슬롯(E 라인: "E\t<슬롯>\t<아이템문자열>")에서 RUID를 뽑아 캐릭터 목록 data를 갱신한다.
+		-- data 포맷: 이름|얼굴|머리|상의|하의|신발|무기|직업|모자 (미착용은 "NONE", 9번째는 구버전에 없을 수 있음)
+		local ch = nil
+		for _, c in ipairs(sv.list) do
+			if c.id == id then
+				ch = c
+				break
+			end
+		end
+		if ch == nil then return end
+		local parts = {}
+		for part in string.gmatch(ch.data, "([^|]+)") do
+			table.insert(parts, part)
+		end
+		if #parts < 8 then return end
+
+		local ruids = {}
+		local found = 0
+		for _, line in ipairs(self:SplitLines(saveStr)) do
+			local slotStr = string.match(line, "^E\t(%d+)\t")
+			local itemStr = string.match(line, "^E\t%d+\t(.+)$")
+			if slotStr ~= nil and itemStr ~= nil then
+				local r = string.match(itemStr, "[^|]+|([^|]+)")
+				local n = math.floor(tonumber(slotStr) or 0)
+				if n >= 1 and n <= 7 and r ~= nil and r ~= "" then
+					ruids[n] = r
+					found = found + 1
+				end
+			end
+		end
+		if found == 0 then return end   -- 장비 정보가 없는 스냅샷이면 건드리지 않는다
+
+		local newData = parts[1]
+		for i = 1, 6 do
+			local r = ruids[i]
+			if r == nil then r = "NONE" end
+			newData = newData .. "|" .. r
+		end
+		local capR = ruids[7]
+		if capR == nil then capR = "NONE" end
+		newData = newData .. "|" .. parts[8] .. "|" .. capR
+		if newData ~= ch.data then
+			ch.data = newData
+			sv.charsDirty = true
+		end
 	end
 
 	-- ══════════════════════════ 클라이언트: 서버 응답 ══════════════════════════
@@ -666,6 +717,44 @@ script CharacterPersistence extends Logic
 				table.insert(lines, "H\t" .. key .. "\t" .. slot.ruid .. "\t" .. nm)
 			end
 		end
+		-- 퀵슬롯 위치→키 매핑 (기본값과 다른 것만 기록)
+		local barKeys = _SkillManager:ExportBarKeys()
+		for pos, keyName in pairs(barKeys) do
+			if keyName ~= pos then
+				table.insert(lines, "B\t" .. tostring(pos) .. "\t" .. tostring(keyName))
+			end
+		end
+		-- 기능(창 열기/공격/점프) → 키 매핑
+		local funcKeys = _KeySettingManager:ExportFuncKeys()
+		for funcId, keyName in pairs(funcKeys) do
+			if keyName ~= nil and keyName ~= "" then
+				table.insert(lines, "F\t" .. tostring(funcId) .. "\t" .. tostring(keyName))
+			end
+		end
+		-- 키세팅 프리셋 1~3 (PA=활성 번호, PH=프리셋 단축키, PB=프리셋 퀵슬롯 키 매핑, PF=프리셋 기능 키)
+		local pd = _KeySettingManager:ExportPresets()
+		table.insert(lines, "PA\t" .. tostring(pd.active))
+		for n = 1, 3 do
+			local p = pd.presets[n]
+			if p ~= nil then
+				for key, slot in pairs(p.hotkeys or {}) do
+					if slot ~= nil and slot.ruid ~= nil and slot.ruid ~= "" then
+						local nm = (slot.name ~= nil and slot.name ~= "") and slot.name or "-"
+						table.insert(lines, "PH\t" .. tostring(n) .. "\t" .. tostring(key) .. "\t" .. tostring(slot.ruid) .. "\t" .. nm)
+					end
+				end
+				for pos, keyName in pairs(p.barKeys or {}) do
+					if keyName ~= pos then
+						table.insert(lines, "PB\t" .. tostring(n) .. "\t" .. tostring(pos) .. "\t" .. tostring(keyName))
+					end
+				end
+				for funcId, keyName in pairs(p.funcKeys or {}) do
+					if keyName ~= nil and keyName ~= "" then
+						table.insert(lines, "PF\t" .. tostring(n) .. "\t" .. tostring(funcId) .. "\t" .. tostring(keyName))
+					end
+				end
+			end
+		end
 		-- 치장 장착 상태 (부위키 → 치장 아이템 문자열)
 		local deco = _DecoWindowManager:ExportDeco()
 		for slotKey, s in pairs(deco) do
@@ -684,6 +773,10 @@ script CharacterPersistence extends Logic
 		local deco = {}
 		local atkSpeed = 5
 		local potionAtk = 0
+		local barMap = {}
+		local funcMap = {}
+		local presetActive = 1
+		local presetTables = {}
 		for _, line in ipairs(self:SplitLines(saveStr)) do
 			local kind = string.sub(line, 1, 1)
 			if kind == "M" then
@@ -721,6 +814,56 @@ script CharacterPersistence extends Logic
 				if slotKey ~= nil and itemStr ~= nil then
 					deco[slotKey] = itemStr
 				end
+			elseif kind == "B" then
+				-- "B\t<퀵슬롯 위치>\t<키 이름>"
+				local pos = string.match(line, "^B\t([^\t]+)\t")
+				local keyName = string.match(line, "^B\t[^\t]+\t(.+)$")
+				if pos ~= nil and keyName ~= nil then
+					barMap[pos] = keyName
+				end
+			elseif kind == "F" then
+				-- "F\t<기능 id>\t<키 이름>" (장비/인벤/강화/스킬/캐릭터/월드맵/키설정/공격/점프)
+				local funcId = string.match(line, "^F\t([^\t]+)\t")
+				local keyName = string.match(line, "^F\t[^\t]+\t(.+)$")
+				if funcId ~= nil and keyName ~= nil then
+					funcMap[funcId] = keyName
+				end
+			elseif kind == "P" then
+				-- 키세팅 프리셋: "PA\t<활성>" / "PH\t<n>\t<키>\t<ruid>\t<이름>" / "PB\t<n>\t<위치>\t<키>"
+				if string.sub(line, 1, 3) == "PA\t" then
+					presetActive = math.floor(tonumber(string.sub(line, 4)) or 1)
+				elseif string.sub(line, 1, 3) == "PH\t" then
+					local nStr = string.match(line, "^PH\t(%d)\t")
+					local key = string.match(line, "^PH\t%d\t([^\t]+)\t")
+					local ruid = string.match(line, "^PH\t%d\t[^\t]+\t([^\t]+)\t")
+					local nm = string.match(line, "^PH\t%d\t[^\t]+\t[^\t]+\t(.+)$")
+					local n = math.floor(tonumber(nStr) or 0)
+					if n >= 1 and n <= 3 and key ~= nil and ruid ~= nil and nm ~= nil then
+						if presetTables[n] == nil then presetTables[n] = { hotkeys = {}, barKeys = {} } end
+						presetTables[n].hotkeys[key] = { ruid = ruid, name = nm == "-" and "" or nm }
+					end
+				elseif string.sub(line, 1, 3) == "PB\t" then
+					local nStr = string.match(line, "^PB\t(%d)\t")
+					local pos = string.match(line, "^PB\t%d\t([^\t]+)\t")
+					local keyName = string.match(line, "^PB\t%d\t[^\t]+\t(.+)$")
+					local n = math.floor(tonumber(nStr) or 0)
+					if n >= 1 and n <= 3 and pos ~= nil and keyName ~= nil then
+						if presetTables[n] == nil then presetTables[n] = { hotkeys = {}, barKeys = {}, funcKeys = {} } end
+						if presetTables[n].funcKeys == nil then presetTables[n].funcKeys = {} end
+						presetTables[n].barKeys[pos] = keyName
+					end
+				elseif string.sub(line, 1, 3) == "PF\t" then
+					-- "PF\t<프리셋 번호>\t<기능 id>\t<키 이름>"
+					local nStr = string.match(line, "^PF\t(%d)\t")
+					local funcId = string.match(line, "^PF\t%d\t([^\t]+)\t")
+					local keyName = string.match(line, "^PF\t%d\t[^\t]+\t(.+)$")
+					local n = math.floor(tonumber(nStr) or 0)
+					if n >= 1 and n <= 3 and funcId ~= nil and keyName ~= nil then
+						if presetTables[n] == nil then presetTables[n] = { hotkeys = {}, barKeys = {}, funcKeys = {} } end
+						if presetTables[n].funcKeys == nil then presetTables[n].funcKeys = {} end
+						presetTables[n].funcKeys[funcId] = keyName
+					end
+				end
 			end
 		end
 		_UIEquipInventoryManager:ImportSaveTable(t)
@@ -740,7 +883,12 @@ script CharacterPersistence extends Logic
 		-- (요청) 테스트용 소모품(드롭 아이템 / 공격 속도의 비약 / 연두색주문서)을 999개로 채워준다.
 		_UIEquipInventoryManager:SeedTestConsumables()
 		self:ApplyCostumeFromEquips()
+		-- 기능(창 열기/공격/점프) 키 매핑을 먼저 복원해야 단축키 복원 시 기능 키 판정이 올바르다
+		_KeySettingManager:ImportFuncKeys(funcMap)
+		-- 퀵슬롯 위치→키 매핑을 먼저 복원해야 단축키 아이콘이 올바른 칸에 그려진다
+		_SkillManager:ImportBarKeys(barMap)
 		_SkillManager:ImportHotkeys(hotkeys)
+		_KeySettingManager:ImportPresets(presetActive, presetTables)
 		log("[Persist] 캐릭터 데이터 복원 완료 (메소=" .. tostring(t.meso) .. ")")
 	end
 

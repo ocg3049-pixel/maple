@@ -1,0 +1,1218 @@
+@Logic
+script KeySettingManager extends Logic
+
+	property any keyDownHandler = nil
+	property any screenTouchHandler = nil
+	property integer movementFixTimerId = 0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- 단축키 세팅 창(] 키) 전체 관리: 키보드 렌더링, 클릭-클릭 배정, 프리셋 1~3, 저장/복귀, 퀵슬롯 리매핑.
+		self._T.spare = {}            -- 여분 슬롯 (키에서 제거된 스킬 보관) - {ruid, name} 배열
+		self._T.presets = {}          -- 프리셋 1~3: {hotkeys=..., barKeys=...}
+		self._T.activePreset = 1
+		self._T.snapshot = nil        -- 창 열 때의 상태 (저장 안 하고 닫으면 복귀)
+		self._T.remapMode = false     -- 퀵슬롯 버튼 → 슬롯 클릭 대기
+		self._T.remapPos = ""         -- 슬롯 선택됨 → 키 입력 대기
+		self._T.dialogOpen = false
+		self._T.movementKeysLogged = false
+		self._T.funcKeys = self:DefaultFuncKeys()  -- 기능 id → 키 이름 (장비=E, 점프=Alt ...)
+		self._T.carryFunc = ""        -- 클릭-클릭으로 집고 있는 기능 id
+		self._T.carryFromKey = ""     -- 그 기능이 원래 있던 키
+
+		self._T.barSnapshot = nil     -- 퀵슬롯 설정 창을 열기 전의 퀵슬롯 키 매핑 (취소용)
+
+		-- 창/다이얼로그/딤 숨김 (.ui에서는 enable=true로 시작 - 비활성 부모의 자식 컴포넌트 미생성 문제 회피)
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if isvalid(w) then w.Enable = false end
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDialog")
+		if isvalid(dlg) then dlg.Enable = false end
+		local dim = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDim")
+		if isvalid(dim) then dim.Enable = false end
+
+		self.keyDownHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+		self.screenTouchHandler = _InputService:ConnectEvent(ScreenTouchEvent, self.OnScreenTouch)
+
+		-- 공격/점프 액션 키를 기능 매핑대로 적용 (리스폰/맵 이동 후 재적용 대비 1초 주기 자가치유)
+		self.movementFixTimerId = _TimerService:SetTimerRepeat(self.EnsureMovementKeys, 1.0)
+
+		log("[KeySetting] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 이벤트/타이머 해제
+		if self.keyDownHandler then _InputService:DisconnectEvent(KeyDownEvent, self.keyDownHandler) end
+		if self.screenTouchHandler then _InputService:DisconnectEvent(ScreenTouchEvent, self.screenTouchHandler) end
+		if self.movementFixTimerId ~= 0 then _TimerService:ClearTimer(self.movementFixTimerId) end
+	end
+
+	-- ── 이동/공격/점프 액션 키 적용 ───────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void EnsureMovementKeys()
+		-- 1초 주기 자가치유 타이머가 호출한다 (리스폰/맵 이동 후 컨트롤러 매핑이 되살아나는 것을 덮어씀).
+		self:ApplyPlayerActionKeys()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyPlayerActionKeys()
+		-- 현재 기능 매핑(공격/점프)을 PlayerControllerComponent의 액션 키에 반영한다.
+		-- 배정 가능 키 중 공격/점프로 지정되지 않은 키의 기본 액션(WASD 이동 등)은 모두 제거한다.
+		local p = _UserService.LocalPlayer
+		if not isvalid(p) then return end
+		local pc = p.PlayerControllerComponent
+		if not isvalid(pc) then return end
+		local jumpKey   = self:GetKeyForFunc("jump")
+		local attackKey = self:GetKeyForFunc("attack")
+		local changed = false
+		for _, kd in ipairs(self:GetBindKeyDefs()) do
+			local desired = ""
+			if kd.name == jumpKey then
+				desired = "Jump"
+			elseif kd.name == attackKey then
+				desired = "Attack"
+			end
+			local cur = pc:GetActionName(kd.keyEnum)
+			if cur == nil then cur = "" end
+			if desired ~= "" then
+				if cur ~= desired then
+					pc:SetActionKey(kd.keyEnum, desired)
+					changed = true
+				end
+			elseif cur ~= "" then
+				pc:RemoveActionKey(kd.keyEnum)
+				changed = true
+			end
+		end
+		-- Space는 배정 가능 키가 아니지만 기본 점프 매핑이 살아있으므로 항상 제거한다.
+		local spaceAction = pc:GetActionName(KeyboardKey.Space)
+		if spaceAction ~= nil and spaceAction ~= "" then
+			pc:RemoveActionKey(KeyboardKey.Space)
+			changed = true
+		end
+		if changed or not self._T.movementKeysLogged then
+			self._T.movementKeysLogged = true
+			log("[KeySetting] 액션 키 적용 (공격=" .. tostring(attackKey) .. ", 점프=" .. tostring(jumpKey) .. ")")
+		end
+	end
+
+	-- ── 키 목록 (UI 빌드 스크립트와 동일해야 함) ─────────────────────
+
+	@ExecSpace("ClientOnly")
+	method table GetBindKeyDefs()
+		-- 배정 가능 키(스킬·기능 공용 풀): {id=엔티티 접미사, name=표시/저장 키 이름, keyEnum=KeyboardKey}
+		-- 한 키에는 스킬 또는 기능 중 하나만 올 수 있다. Ctrl/Alt는 좌/우 두 타일이 같은 이름을 쓴다.
+		if self._T.bindKeyDefs ~= nil then return self._T.bindKeyDefs end
+		local defs = {
+			{ id = "E", name = "E", keyEnum = KeyboardKey.E },
+			{ id = "I", name = "I", keyEnum = KeyboardKey.I },
+			{ id = "O", name = "O", keyEnum = KeyboardKey.O },
+			{ id = "K", name = "K", keyEnum = KeyboardKey.K },
+			{ id = "C", name = "C", keyEnum = KeyboardKey.C },
+			{ id = "M", name = "M", keyEnum = KeyboardKey.M },
+			{ id = "RightBracket", name = "]", keyEnum = KeyboardKey.RightBracket },
+			{ id = "LCtrl", name = "Ctrl", keyEnum = KeyboardKey.LeftControl },
+			{ id = "RCtrl", name = "Ctrl", keyEnum = KeyboardKey.RightControl },
+			{ id = "LAlt",  name = "Alt",  keyEnum = KeyboardKey.LeftAlt },
+			{ id = "RAlt",  name = "Alt",  keyEnum = KeyboardKey.RightAlt },
+			{ id = "F1",  name = "F1",  keyEnum = KeyboardKey.F1 },
+			{ id = "F2",  name = "F2",  keyEnum = KeyboardKey.F2 },
+			{ id = "F3",  name = "F3",  keyEnum = KeyboardKey.F3 },
+			{ id = "F4",  name = "F4",  keyEnum = KeyboardKey.F4 },
+			{ id = "F5",  name = "F5",  keyEnum = KeyboardKey.F5 },
+			{ id = "F6",  name = "F6",  keyEnum = KeyboardKey.F6 },
+			{ id = "F7",  name = "F7",  keyEnum = KeyboardKey.F7 },
+			{ id = "F8",  name = "F8",  keyEnum = KeyboardKey.F8 },
+			{ id = "F9",  name = "F9",  keyEnum = KeyboardKey.F9 },
+			{ id = "F10", name = "F10", keyEnum = KeyboardKey.F10 },
+			{ id = "F11", name = "F11", keyEnum = KeyboardKey.F11 },
+			{ id = "F12", name = "F12", keyEnum = KeyboardKey.F12 },
+			{ id = "BackQuote", name = "`", keyEnum = KeyboardKey.BackQuote },
+			{ id = "Alpha1", name = "1", keyEnum = KeyboardKey.Alpha1 },
+			{ id = "Alpha2", name = "2", keyEnum = KeyboardKey.Alpha2 },
+			{ id = "Alpha3", name = "3", keyEnum = KeyboardKey.Alpha3 },
+			{ id = "Alpha4", name = "4", keyEnum = KeyboardKey.Alpha4 },
+			{ id = "Alpha5", name = "5", keyEnum = KeyboardKey.Alpha5 },
+			{ id = "Alpha6", name = "6", keyEnum = KeyboardKey.Alpha6 },
+			{ id = "Alpha7", name = "7", keyEnum = KeyboardKey.Alpha7 },
+			{ id = "Alpha8", name = "8", keyEnum = KeyboardKey.Alpha8 },
+			{ id = "Alpha9", name = "9", keyEnum = KeyboardKey.Alpha9 },
+			{ id = "Alpha0", name = "0", keyEnum = KeyboardKey.Alpha0 },
+			{ id = "Minus",  name = "-", keyEnum = KeyboardKey.Minus },
+			{ id = "Equals", name = "=", keyEnum = KeyboardKey.Equals },
+			{ id = "Insert", name = "Ins", keyEnum = KeyboardKey.Insert },
+			{ id = "Home",   name = "Hm",  keyEnum = KeyboardKey.Home },
+			{ id = "PageUp", name = "PUp", keyEnum = KeyboardKey.PageUp },
+			{ id = "Q", name = "Q", keyEnum = KeyboardKey.Q },
+			{ id = "W", name = "W", keyEnum = KeyboardKey.W },
+			{ id = "R", name = "R", keyEnum = KeyboardKey.R },
+			{ id = "T", name = "T", keyEnum = KeyboardKey.T },
+			{ id = "Y", name = "Y", keyEnum = KeyboardKey.Y },
+			{ id = "U", name = "U", keyEnum = KeyboardKey.U },
+			{ id = "P", name = "P", keyEnum = KeyboardKey.P },
+			{ id = "LeftBracket", name = "[",  keyEnum = KeyboardKey.LeftBracket },
+			{ id = "Backslash",   name = "\\", keyEnum = KeyboardKey.Backslash },
+			{ id = "Delete",   name = "Del", keyEnum = KeyboardKey.Delete },
+			{ id = "End",      name = "End", keyEnum = KeyboardKey.End },
+			{ id = "PageDown", name = "PDn", keyEnum = KeyboardKey.PageDown },
+			{ id = "A", name = "A", keyEnum = KeyboardKey.A },
+			{ id = "S", name = "S", keyEnum = KeyboardKey.S },
+			{ id = "D", name = "D", keyEnum = KeyboardKey.D },
+			{ id = "F", name = "F", keyEnum = KeyboardKey.F },
+			{ id = "G", name = "G", keyEnum = KeyboardKey.G },
+			{ id = "H", name = "H", keyEnum = KeyboardKey.H },
+			{ id = "J", name = "J", keyEnum = KeyboardKey.J },
+			{ id = "L", name = "L", keyEnum = KeyboardKey.L },
+			{ id = "Semicolon", name = ";", keyEnum = KeyboardKey.Semicolon },
+			{ id = "Quote",     name = "'", keyEnum = KeyboardKey.Quote },
+			{ id = "Z", name = "Z", keyEnum = KeyboardKey.Z },
+			{ id = "X", name = "X", keyEnum = KeyboardKey.X },
+			{ id = "V", name = "V", keyEnum = KeyboardKey.V },
+			{ id = "B", name = "B", keyEnum = KeyboardKey.B },
+			{ id = "N", name = "N", keyEnum = KeyboardKey.N },
+			{ id = "Comma",  name = ",", keyEnum = KeyboardKey.Comma },
+			{ id = "Period", name = ".", keyEnum = KeyboardKey.Period },
+			{ id = "Slash",  name = "/", keyEnum = KeyboardKey.Slash },
+		}
+		self._T.bindKeyDefs = defs
+		return defs
+	end
+
+	-- ── 기능(창 열기/공격/점프) ↔ 키 매핑 ────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method table GetFuncDefs()
+		-- 키에 배정할 수 있는 기능 목록: {id=기능 id, label=표시 라벨, defaultKey=기본 키 이름}
+		if self._T.funcDefs ~= nil then return self._T.funcDefs end
+		local defs = {
+			{ id = "equip",      label = "장비",   defaultKey = "E" },
+			{ id = "inven",      label = "인벤",   defaultKey = "I" },
+			{ id = "enhance",    label = "강화",   defaultKey = "O" },
+			{ id = "skill",      label = "스킬",   defaultKey = "K" },
+			{ id = "character",  label = "캐릭터", defaultKey = "C" },
+			{ id = "worldmap",   label = "월드맵", defaultKey = "M" },
+			{ id = "keysetting", label = "키설정", defaultKey = "]" },
+			{ id = "attack",     label = "공격",   defaultKey = "Ctrl" },
+			{ id = "jump",       label = "점프",   defaultKey = "Alt" },
+		}
+		self._T.funcDefs = defs
+		return defs
+	end
+
+	@ExecSpace("ClientOnly")
+	method table DefaultFuncKeys()
+		-- 기본 기능 매핑 (기능 id → 키 이름)
+		local t = {}
+		for _, fd in ipairs(self:GetFuncDefs()) do
+			t[fd.id] = fd.defaultKey
+		end
+		return t
+	end
+
+	@ExecSpace("ClientOnly")
+	method table EnsureFuncKeys()
+		-- 다른 Logic이 OnBeginPlay보다 먼저 물어볼 수 있으므로 기본 매핑을 지연 초기화한다
+		if self._T.funcKeys == nil then
+			self._T.funcKeys = self:DefaultFuncKeys()
+		end
+		return self._T.funcKeys
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetFuncOnKey(string keyName)
+		-- 이 키에 배정된 기능 id (없으면 "")
+		if keyName == nil or keyName == "" then return "" end
+		local fk = self:EnsureFuncKeys()
+		for _, fd in ipairs(self:GetFuncDefs()) do
+			if fk[fd.id] == keyName then return fd.id end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetKeyForFunc(string funcId)
+		-- 기능이 배정된 키 이름 (없으면 "")
+		return self:EnsureFuncKeys()[funcId] or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetFuncIdLabel(string funcId)
+		-- 기능 id의 표시 라벨
+		for _, fd in ipairs(self:GetFuncDefs()) do
+			if fd.id == funcId then return fd.label end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetFuncLabel(string keyName)
+		-- 이 키에 배정된 기능의 표시 라벨. 기능 키가 아니면 "" (퀵슬롯/키보드 타일 표시 공용).
+		return self:GetFuncIdLabel(self:GetFuncOnKey(keyName))
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetKeyNameForEnum(any keyEnum)
+		-- KeyboardKey → 배정 가능 키 이름 (지원하지 않는 키면 "")
+		for _, kd in ipairs(self:GetBindKeyDefs()) do
+			if keyEnum == kd.keyEnum then return kd.name end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetFuncForKeyEnum(any keyEnum)
+		-- 눌린 키에 배정된 기능 id (없으면 ""). 각 매니저의 단축키 판정에서 사용한다.
+		return self:GetFuncOnKey(self:GetKeyNameForEnum(keyEnum))
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsFuncKeyPressed(string funcId)
+		-- 기능이 배정된 키가 지금 눌려있는지 (폴링 방식 매니저용 - WorldMapManager)
+		local keyName = self:GetKeyForFunc(funcId)
+		if keyName == "" then return false end
+		for _, kd in ipairs(self:GetBindKeyDefs()) do
+			if kd.name == keyName and _InputService:IsKeyPressed(kd.keyEnum) then return true end
+		end
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ExportFuncKeys()
+		-- 기능 매핑 내보내기 (영속 저장/프리셋용). 여분 슬롯에 보관 중인 기능은 "-"(키 없음)로 나간다.
+		local out = {}
+		for _, fd in ipairs(self:GetFuncDefs()) do
+			local k = self:GetKeyForFunc(fd.id)
+			out[fd.id] = (k ~= "") and k or "-"
+		end
+		return out
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ImportFuncKeys(table t)
+		-- 기능 매핑 복원. 항목이 없으면 기본 키, "-"면 키 없음(여분 슬롯 보관)이다.
+		self._T.funcKeys = self:DefaultFuncKeys()
+		if t ~= nil then
+			for _, fd in ipairs(self:GetFuncDefs()) do
+				local v = t[fd.id]
+				if v ~= nil then
+					local s = tostring(v)
+					if s == "-" then
+						self._T.funcKeys[fd.id] = ""
+					elseif s ~= "" then
+						self._T.funcKeys[fd.id] = s
+					end
+				end
+			end
+		end
+		self:SyncSpareFuncs()
+		self:ApplyPlayerActionKeys()
+		_SkillManager:InitBarIcons()
+		if self:IsWindowOpen() then self:RenderAll() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SyncSpareFuncs()
+		-- 키가 없는 기능은 여분 슬롯에 정확히 하나씩 존재하도록 맞춘다 (프리셋 전환/복원 후 정리)
+		if self._T.spare == nil then self._T.spare = {} end
+		-- 1) 키가 생긴 기능은 여분 슬롯에서 제거
+		local kept = {}
+		for _, s in ipairs(self._T.spare) do
+			local fid = s.funcId or ""
+			if fid == "" or self:GetKeyForFunc(fid) == "" then
+				table.insert(kept, s)
+			end
+		end
+		self._T.spare = kept
+		-- 2) 키가 없는 기능이 여분 슬롯에 없으면 넣어준다
+		for _, fd in ipairs(self:GetFuncDefs()) do
+			if self:GetKeyForFunc(fd.id) == "" then
+				local found = false
+				for _, s in ipairs(self._T.spare) do
+					if s.funcId == fd.id then found = true break end
+				end
+				if not found and #self._T.spare < 16 then
+					table.insert(self._T.spare, { ruid = "", name = fd.label, funcId = fd.id })
+				end
+			end
+		end
+	end
+
+	-- ── 상태 조회 (다른 매니저에서 사용) ──────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method boolean IsWindowOpen()
+		-- 단축키 세팅 창이 열려있는지
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		return isvalid(w) and w.Enable
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsCapturingKey()
+		-- 퀵슬롯 설정 중(다이얼로그가 떠 있거나 키 입력 대기)인지 - true면 다른 매니저는 키 입력을 무시해야 한다.
+		return self._T.dialogOpen == true or (self._T.remapPos ~= nil and self._T.remapPos ~= "")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsRemapMode()
+		-- 퀵슬롯 리매핑에서 "슬롯 클릭 대기" 상태인지 (SkillBar 슬롯 클릭을 가로챈다)
+		return self._T.remapMode == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsPointInWindow(number ux, number uy)
+		-- UI 좌표(중앙 원점)가 창 사각형 안에 있는지 (SkillManager 클릭 배정 취소 판단용)
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if not isvalid(w) or not w.Enable then return false end
+		local p = w.UITransformComponent.anchoredPosition
+		local s = w.UITransformComponent.RectSize
+		return math.abs(ux - p.x) <= s.x / 2 and math.abs(uy - p.y) <= s.y / 2
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FindBindKeyAt(number ux, number uy)
+		-- UI 좌표가 배정 가능 키 타일 위면 그 키 이름을 반환 (드래그 릴리즈 배정용)
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if not isvalid(w) or not w.Enable then return "" end
+		local wp = w.UITransformComponent.anchoredPosition
+		local lx = ux - wp.x
+		local ly = uy - wp.y
+		for _, kd in ipairs(self:GetBindKeyDefs()) do
+			local ent = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Key_" .. kd.id)
+			if self:HitRect(lx, ly, ent) then return kd.name end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HitRect(number lx, number ly, Entity ent)
+		-- 창 로컬 좌표(lx,ly)가 창 직계 자식 엔티티의 사각 영역 안인지
+		if not isvalid(ent) then return false end
+		local p = ent.UITransformComponent.anchoredPosition
+		local s = ent.UITransformComponent.RectSize
+		return math.abs(lx - p.x) <= s.x / 2 and math.abs(ly - p.y) <= s.y / 2
+	end
+
+	-- ── 창 열기/닫기/저장/복귀 ────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void ToggleWindow()
+		-- ] 키: 열려있으면 (저장 안 된 변경 복귀 후) 닫고, 닫혀있으면 연다
+		if self:IsWindowOpen() then
+			self:CloseWindow()
+		else
+			self:OpenWindow()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenWindow()
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if not isvalid(w) then return end
+		-- 활성 프리셋이 아직 저장된 적 없으면 현재 상태로 초기화
+		if self._T.presets[self._T.activePreset] == nil then
+			self._T.presets[self._T.activePreset] = self:CurrentPreset()
+		end
+		-- 열기 전 상태 스냅샷 (저장 안 하고 닫으면 여기로 복귀)
+		self._T.snapshot = self:BuildSnapshot()
+		w.Enable = true
+		self:RenderAll()
+		log("[KeySetting] 창 열림")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseWindow()
+		-- 저장하기를 누르지 않았다면 열기 전 세팅으로 복귀 후 닫는다
+		self._T.carryFunc = ""
+		self._T.carryFromKey = ""
+		self:HideFuncGhost()
+		self:RevertToSnapshot()
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if isvalid(w) then w.Enable = false end
+		self:HideQuickSlotDialog()
+		self:CancelRemap()
+		log("[KeySetting] 창 닫힘")
+	end
+
+	@ExecSpace("ClientOnly")
+	method table CurrentPreset()
+		-- 현재 라이브 상태를 프리셋 한 벌로 담는다 (단축키 / 퀵슬롯 키 매핑 / 기능 키 매핑)
+		return {
+			hotkeys  = _SkillManager:ExportHotkeys(),
+			barKeys  = _SkillManager:ExportBarKeys(),
+			funcKeys = self:ExportFuncKeys(),
+		}
+	end
+
+	@ExecSpace("ClientOnly")
+	method table BuildSnapshot()
+		-- 현재 상태(단축키/퀵슬롯 키 배열/기능 키/프리셋/여분 슬롯) 전체를 깊은 복사한 스냅샷
+		local snap = {
+			hotkeys = _SkillManager:ExportHotkeys(),
+			barKeys = _SkillManager:ExportBarKeys(),
+			funcKeys = self:ExportFuncKeys(),
+			activePreset = self._T.activePreset,
+			presets = {},
+			spare = {},
+		}
+		for n = 1, 3 do
+			local p = self._T.presets[n]
+			if p ~= nil then
+				snap.presets[n] = { hotkeys = self:CopyHotkeys(p.hotkeys), barKeys = self:CopyStrMap(p.barKeys), funcKeys = self:CopyStrMap(p.funcKeys) }
+			end
+		end
+		for i, s in ipairs(self._T.spare) do
+			snap.spare[i] = { ruid = s.ruid, name = s.name, funcId = s.funcId or "" }
+		end
+		return snap
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RevertToSnapshot()
+		-- 창 열 때(또는 마지막 저장 시점) 상태로 되돌린다
+		local snap = self._T.snapshot
+		if snap == nil then return end
+		self:ImportFuncKeys(snap.funcKeys)
+		_SkillManager:ImportBarKeys(snap.barKeys)
+		_SkillManager:ImportHotkeys(snap.hotkeys)
+		self._T.activePreset = snap.activePreset
+		self._T.presets = {}
+		for n = 1, 3 do
+			local p = snap.presets[n]
+			if p ~= nil then
+				self._T.presets[n] = { hotkeys = self:CopyHotkeys(p.hotkeys), barKeys = self:CopyStrMap(p.barKeys), funcKeys = self:CopyStrMap(p.funcKeys) }
+			end
+		end
+		self._T.carryFunc = ""
+		self._T.carryFromKey = ""
+		self:HideFuncGhost()
+		self._T.spare = {}
+		for i, s in ipairs(snap.spare) do
+			self._T.spare[i] = { ruid = s.ruid, name = s.name, funcId = s.funcId or "" }
+		end
+		_SkillManager:ClearSkillSelection()
+		if self:IsWindowOpen() then self:RenderAll() end
+		_CharacterPersistence:MarkDirty("hotkey")
+		log("[KeySetting] 원래대로 복귀")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SaveSettings()
+		-- 저장하기: 현재 상태를 활성 프리셋에 반영하고 스냅샷을 갱신한다 (이후 닫아도 유지됨)
+		self._T.presets[self._T.activePreset] = self:CurrentPreset()
+		self._T.snapshot = self:BuildSnapshot()
+		_CharacterPersistence:MarkDirty("hotkey")
+		log("[KeySetting] 저장 완료 (프리셋 " .. tostring(self._T.activePreset) .. ")")
+	end
+
+	-- ── 프리셋 ────────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void SwitchPreset(integer n)
+		-- 프리셋 1~3 즉시 전환: 현재 상태를 기존 프리셋에 담아두고 대상 프리셋을 적용한다
+		if n < 1 or n > 3 then return end
+		if n == self._T.activePreset then return end
+		self._T.presets[self._T.activePreset] = self:CurrentPreset()
+		if self._T.presets[n] == nil then
+			-- 처음 쓰는 프리셋은 현재 세팅의 복사본으로 시작
+			self._T.presets[n] = self:CurrentPreset()
+		end
+		self._T.activePreset = n
+		local p = self._T.presets[n]
+		self:ImportFuncKeys(p.funcKeys)
+		_SkillManager:ImportBarKeys(p.barKeys)
+		_SkillManager:ImportHotkeys(p.hotkeys)
+		self:RenderAll()
+		_CharacterPersistence:MarkDirty("hotkey")
+		log("[KeySetting] 프리셋 전환: " .. tostring(n))
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ExportPresets()
+		-- 영속 저장용: 활성 프리셋에 현재 상태를 반영한 뒤 전체 프리셋을 내보낸다
+		self._T.presets[self._T.activePreset] = self:CurrentPreset()
+		return { active = self._T.activePreset, presets = self._T.presets }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ImportPresets(integer active, table presetTables)
+		-- 영속 복원용 (라이브 단축키/barKeys/기능 키는 CharacterPersistence가 별도로 복원한다)
+		if active >= 1 and active <= 3 then
+			self._T.activePreset = active
+		end
+		if presetTables ~= nil then
+			for n = 1, 3 do
+				local p = presetTables[n]
+				if p ~= nil then
+					self._T.presets[n] = {
+						hotkeys  = self:CopyHotkeys(p.hotkeys or {}),
+						barKeys  = self:CopyStrMap(p.barKeys or {}),
+						funcKeys = self:CopyStrMap(p.funcKeys or self:DefaultFuncKeys()),
+					}
+				end
+			end
+		end
+	end
+
+	-- ── 렌더링 ────────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void RenderAll()
+		self:RenderKeys()
+		self:RenderSpare()
+		self:RenderPresets()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderKeys()
+		-- 키 타일 갱신: 한 키에는 스킬 아이콘 또는 기능 라벨 중 하나만 표시된다.
+		-- 기능이 있는 타일은 진한 색 + 밝은 키 이름, 스킬 키는 밝은 색 + 진한 키 이름.
+		local funcTile   = Color(0.502, 0.545, 0.611, 1)
+		local skillTile  = Color(0.965, 0.973, 0.984, 1)
+		local carryTile  = Color(0.20, 0.62, 0.83, 1)
+		local lightLabel = Color(0.910, 0.925, 0.953, 1)
+		local darkLabel  = Color(0.247, 0.282, 0.349, 1)
+		for _, kd in ipairs(self:GetBindKeyDefs()) do
+			local base = "/ui/DefaultGroup/KeySettingWindow/Key_" .. kd.id
+			local fid = self:GetFuncOnKey(kd.name)
+			local carrying = (self._T.carryFunc ~= "" and self._T.carryFromKey == kd.name)
+
+			local icon = _EntityService:GetEntityByPath(base .. "/Icon")
+			if isvalid(icon) then
+				local spr = icon.SpriteGUIRendererComponent
+				local sk = _SkillManager:GetSkillOnKey(kd.name)
+				if fid == "" and sk ~= nil and sk.ruid ~= "" then
+					spr.ImageRUID = sk.ruid
+					spr.Color = Color(1, 1, 1, 1)
+				else
+					spr.Color = Color(1, 1, 1, 0)
+				end
+			end
+
+			local funcEnt = _EntityService:GetEntityByPath(base .. "/Func")
+			if isvalid(funcEnt) then
+				-- 집어든 기능은 원래 타일에서 잠시 비워 "들고 있는" 상태를 보여준다
+				if fid ~= "" and not carrying then
+					funcEnt.TextComponent.Text = self:GetFuncIdLabel(fid)
+				else
+					funcEnt.TextComponent.Text = ""
+				end
+			end
+
+			local tile = _EntityService:GetEntityByPath(base)
+			if isvalid(tile) then
+				if carrying then
+					tile.SpriteGUIRendererComponent.Color = carryTile
+				elseif fid ~= "" then
+					tile.SpriteGUIRendererComponent.Color = funcTile
+				else
+					tile.SpriteGUIRendererComponent.Color = skillTile
+				end
+			end
+
+			local nameEnt = _EntityService:GetEntityByPath(base .. "/KeyName")
+			if isvalid(nameEnt) then
+				if fid ~= "" or carrying then
+					nameEnt.TextComponent.FontColor = lightLabel
+				else
+					nameEnt.TextComponent.FontColor = darkLabel
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderSpare()
+		-- 여분 슬롯 갱신: 스킬은 아이콘, 기능은 라벨(장비/점프 ...)로 표시된다
+		for i = 1, 16 do
+			local base = "/ui/DefaultGroup/KeySettingWindow/Spare_" .. tostring(i)
+			local s = self._T.spare[i]
+			local icon = _EntityService:GetEntityByPath(base .. "/Icon")
+			if isvalid(icon) then
+				local spr = icon.SpriteGUIRendererComponent
+				if s ~= nil and s.ruid ~= nil and s.ruid ~= "" then
+					spr.ImageRUID = s.ruid
+					spr.Color = Color(1, 1, 1, 1)
+				else
+					spr.Color = Color(1, 1, 1, 0)
+				end
+			end
+			local labelEnt = _EntityService:GetEntityByPath(base .. "/Label")
+			if isvalid(labelEnt) then
+				if s ~= nil and s.funcId ~= nil and s.funcId ~= "" then
+					labelEnt.TextComponent.Text = self:GetFuncIdLabel(s.funcId)
+				else
+					labelEnt.TextComponent.Text = ""
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderPresets()
+		-- 활성 프리셋 버튼 하이라이트
+		for n = 1, 3 do
+			local bg = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Preset_" .. tostring(n))
+			if isvalid(bg) then
+				if n == self._T.activePreset then
+					bg.SpriteGUIRendererComponent.Color = Color(0.20, 0.62, 0.83, 1)
+				else
+					bg.SpriteGUIRendererComponent.Color = Color(0.141, 0.165, 0.22, 0.95)
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void NotifyHotkeysChanged()
+		-- SkillManager에서 단축키 배정이 바뀌었을 때 호출 - 창이 열려있으면 키보드를 다시 그린다
+		if self:IsWindowOpen() then self:RenderKeys() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetHint(string msg)
+		local e = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/HintText")
+		if isvalid(e) then e.TextComponent.Text = msg end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreHint()
+		self:SetHint("스킬/기능(장비·인벤·강화·스킬·캐릭터·월드맵·키설정·공격·점프)을 클릭한 뒤 키나 퀵슬롯을 클릭해 배정합니다. 빈 곳에 놓으면 여분 슬롯으로 이동합니다.")
+	end
+
+	-- ── 기능 키 클릭-클릭 이동 ────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method boolean IsCarryingFunc()
+		-- 기능을 클릭으로 집고 있는 상태인지 (SkillManager의 퀵슬롯 클릭 처리에서 사용)
+		return self._T.carryFunc ~= nil and self._T.carryFunc ~= ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PickUpFunc(string funcId, string fromKey)
+		-- 기능을 "집은" 상태로 만든다. fromKey가 ""이면 여분 슬롯에서 집은 것.
+		_SkillManager:ClearSkillSelection()
+		self._T.carryFunc = funcId
+		self._T.carryFromKey = fromKey
+		self:ShowFuncGhost(funcId)
+		self:SetHint("[" .. self:GetFuncIdLabel(funcId) .. "] 기능을 집었습니다 - 키/퀵슬롯을 클릭해 배정하거나 빈 곳을 클릭해 여분 슬롯에 보관하세요 (Esc 취소)")
+		self:RenderAll()
+		log("[KeySetting] 기능 집음: " .. funcId .. " (키 " .. tostring(fromKey) .. ")")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowFuncGhost(string funcId)
+		-- 커서를 따라다니는 고스트에 기능 라벨을 띄운다 (스킬 고스트와 같은 엔티티를 공유)
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+		if not isvalid(ghost) then return end
+		local spr = ghost.SpriteGUIRendererComponent
+		spr.ImageRUID = "4fea64a3307cda641809ad8be0d4890b"
+		spr.Color = Color(0.20, 0.62, 0.83, 1)
+		local labelEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost/Label")
+		if isvalid(labelEnt) then labelEnt.TextComponent.Text = self:GetFuncIdLabel(funcId) end
+		local cursor = _InputService:GetCursorPosition()
+		ghost.UITransformComponent.anchoredPosition = Vector2(cursor.x - 960, cursor.y - 540)
+		ghost.Enable = true
+		_SkillManager:BringGhostToFront()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideFuncGhost()
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+		if isvalid(ghost) then
+			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+			ghost.Enable = false
+		end
+		local labelEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost/Label")
+		if isvalid(labelEnt) then labelEnt.TextComponent.Text = "" end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 기능을 집고 있는 동안 고스트가 커서를 따라다닌다 (스킬 고스트는 SkillManager가 담당)
+		if not self:IsCarryingFunc() then return end
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+		if not isvalid(ghost) then return end
+		local cursor = _InputService:GetCursorPosition()
+		ghost.UITransformComponent.anchoredPosition = Vector2(cursor.x - 960, cursor.y - 540)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelFuncCarry()
+		-- 집은 기능을 원래 키에 그대로 두고 취소한다 (실제 매핑은 놓을 때만 바뀌므로 상태만 비운다)
+		if self._T.carryFunc == "" then return end
+		local fid = self._T.carryFunc
+		local fromKey = self._T.carryFromKey
+		self._T.carryFunc = ""
+		self._T.carryFromKey = ""
+		self:HideFuncGhost()
+		-- 여분 슬롯에서 집었던 기능은 다시 여분 슬롯으로 돌려놓는다
+		if fromKey == "" then self:AddFuncToSpare(fid) end
+		if self:IsWindowOpen() then
+			self:RenderAll()
+			self:RestoreHint()
+		end
+		log("[KeySetting] 기능 이동 취소")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DropFuncOnKey(string targetKey)
+		-- 집은 기능을 targetKey에 놓는다. 그 키에 다른 기능이 있으면 서로 교환하고,
+		-- 스킬이 있으면 그 스킬이 기능이 있던 키로 옮겨간다 (한 키 = 스킬 또는 기능 하나).
+		-- 여분 슬롯에서 집어온 기능(fromKey == "")이면 밀려난 쪽이 여분 슬롯으로 간다.
+		local fid = self._T.carryFunc
+		local fromKey = self._T.carryFromKey
+		if fid == "" or targetKey == "" then return end
+		if targetKey == fromKey then
+			self:CancelFuncCarry()
+			return
+		end
+		local otherFunc = self:GetFuncOnKey(targetKey)
+		local sk = _SkillManager:GetSkillOnKey(targetKey)
+		local fk = self:EnsureFuncKeys()
+		self._T.carryFunc = ""
+		self._T.carryFromKey = ""
+		self:HideFuncGhost()
+		fk[fid] = targetKey
+		if otherFunc ~= "" then
+			if fromKey ~= "" then
+				fk[otherFunc] = fromKey
+				log("[KeySetting] 기능 교환: [" .. fromKey .. "] ↔ [" .. targetKey .. "]")
+			else
+				fk[otherFunc] = ""
+				self:AddFuncToSpare(otherFunc)
+				log("[KeySetting] 기능 밀림 → 여분 슬롯: " .. otherFunc)
+			end
+		elseif sk ~= nil and sk.ruid ~= "" then
+			_SkillManager:RemoveSkillFromKey(targetKey)
+			if fromKey ~= "" then
+				_SkillManager:AssignSkillToSlot(fromKey, sk.ruid, sk.name)
+				log("[KeySetting] 기능 ↔ 스킬 교환: [" .. targetKey .. "] " .. tostring(sk.name) .. " → [" .. fromKey .. "]")
+			else
+				self:AddToSpare(sk.ruid, sk.name)
+				log("[KeySetting] 스킬 밀림 → 여분 슬롯: " .. tostring(sk.name))
+			end
+		else
+			log("[KeySetting] 기능 이동: " .. fid .. " [" .. tostring(fromKey) .. "] → [" .. targetKey .. "]")
+		end
+		self:ApplyPlayerActionKeys()
+		_SkillManager:InitBarIcons()
+		_CharacterPersistence:MarkDirty("hotkey")
+		self:RenderAll()
+		self:RestoreHint()
+	end
+
+	-- ── 여분 슬롯 ─────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void AddToSpare(string ruid, string name)
+		-- 키에서 제거된 스킬을 여분 슬롯에 보관한다 (가득 차면 버려진다)
+		if ruid == nil or ruid == "" then return end
+		if #self._T.spare >= 16 then
+			log("[KeySetting] 여분 슬롯이 가득 참 - 스킬 버려짐: " .. tostring(name))
+			return
+		end
+		table.insert(self._T.spare, { ruid = ruid, name = name, funcId = "" })
+		self:RenderSpare()
+		log("[KeySetting] 여분 슬롯에 보관: " .. tostring(name))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AddFuncToSpare(string funcId)
+		-- 기능을 어떤 키에도 배정하지 않은 채 여분 슬롯에 보관한다 (그 기능은 단축키가 없어진다)
+		if funcId == nil or funcId == "" then return end
+		local fk = self:EnsureFuncKeys()
+		fk[funcId] = ""
+		if #self._T.spare >= 16 then
+			log("[KeySetting] 여분 슬롯이 가득 참 - 기능이 키 없이 남음: " .. funcId)
+			return
+		end
+		table.insert(self._T.spare, { ruid = "", name = self:GetFuncIdLabel(funcId), funcId = funcId })
+		self:ApplyPlayerActionKeys()
+		_SkillManager:InitBarIcons()
+		_CharacterPersistence:MarkDirty("hotkey")
+		self:RenderAll()
+		log("[KeySetting] 기능을 여분 슬롯에 보관: " .. funcId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DropCarryToSpare()
+		-- 집고 있던 기능을 여분 슬롯으로 보낸다 (빈 곳 클릭 / 여분 슬롯 클릭)
+		local fid = self._T.carryFunc
+		if fid == "" then return end
+		self._T.carryFunc = ""
+		self._T.carryFromKey = ""
+		self:HideFuncGhost()
+		self:AddFuncToSpare(fid)
+		self:RestoreHint()
+	end
+
+	-- ── 퀵슬롯 리매핑 (딤 + 저장/취소 다이얼로그, 여러 슬롯 연속 변경) ──
+
+	@ExecSpace("ClientOnly")
+	method void ShowQuickSlotDialog()
+		-- 퀵슬롯 설정 모드 시작: 화면을 어둡게 하고(퀵슬롯/다이얼로그는 그 위) 저장/취소를 누를 때까지
+		-- 슬롯 클릭 → 키 입력을 몇 번이든 반복할 수 있다.
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDialog")
+		if not isvalid(dlg) then return end
+		-- 취소를 누르면 돌아갈 시점의 퀵슬롯 키 매핑
+		self._T.barSnapshot = _SkillManager:ExportBarKeys()
+		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDialog/DlgText")
+		if isvalid(txt) then
+			txt.TextComponent.Text = "[퀵슬롯 설정]\n\n오른쪽 아래 퀵슬롯에서 바꾸고 싶은 슬롯을\n클릭하고, 그 슬롯에 연결할 키를 누르세요.\n원하는 만큼 여러 슬롯을 바꿀 수 있습니다.\n\n저장을 누르면 지금 상태로 적용되고,\n취소를 누르면 열기 전 상태로 되돌아갑니다."
+		end
+		self._T.dialogOpen = true
+		self._T.remapMode = true
+		self._T.remapPos = ""
+		dlg.Enable = true
+		self:SetQuickSlotDim(true)
+		self:SetHint("퀵슬롯 설정 중 - 슬롯을 클릭한 뒤 키를 누르세요 (여러 개 가능, 저장/취소로 종료)")
+		log("[KeySetting] 퀵슬롯 설정 모드 시작")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetQuickSlotDim(boolean on)
+		-- 화면 딤. 켤 때는 딤 → 퀵슬롯 → 다이얼로그 순으로 형제 순서를 올려
+		-- 퀵슬롯과 다이얼로그만 밝게 보이도록 한다.
+		local dim = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDim")
+		if not isvalid(dim) then return end
+		if not on then
+			dim.Enable = false
+			return
+		end
+		dim.Enable = true
+		local dg = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if not isvalid(dg) then return end
+		local maxIdx = 0
+		for _, child in ipairs(dg.Children:ToTable()) do
+			if isvalid(child) then
+				local idx = _UILogic:GetSiblingIndex(child.UITransformComponent)
+				if idx > maxIdx then maxIdx = idx end
+			end
+		end
+		_UILogic:SetSiblingIndex(dim.UITransformComponent, maxIdx)
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar")
+		if isvalid(bar) then _UILogic:SetSiblingIndex(bar.UITransformComponent, maxIdx) end
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDialog")
+		if isvalid(dlg) then _UILogic:SetSiblingIndex(dlg.UITransformComponent, maxIdx) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideQuickSlotDialog()
+		-- 다이얼로그/딤을 내리고 퀵슬롯 설정 모드를 종료한다 (매핑 자체는 건드리지 않는다)
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/QuickSlotDialog")
+		if isvalid(dlg) then dlg.Enable = false end
+		self:SetQuickSlotDim(false)
+		self._T.dialogOpen = false
+		self._T.remapMode = false
+		self._T.remapPos = ""
+		if self:IsWindowOpen() then self:RestoreHint() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SaveQuickSlot()
+		-- 저장: 지금까지 바꾼 퀵슬롯 키 매핑을 그대로 확정한다 (창을 저장 없이 닫아도 유지되도록
+		-- 창 스냅샷의 퀵슬롯 매핑도 갱신한다)
+		if self._T.snapshot ~= nil then
+			self._T.snapshot.barKeys = _SkillManager:ExportBarKeys()
+		end
+		self._T.presets[self._T.activePreset] = self:CurrentPreset()
+		_CharacterPersistence:MarkDirty("hotkey")
+		self:HideQuickSlotDialog()
+		log("[KeySetting] 퀵슬롯 설정 저장")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelQuickSlot()
+		-- 취소: 퀵슬롯 설정을 열기 전 매핑으로 되돌린다
+		if self._T.barSnapshot ~= nil then
+			_SkillManager:ImportBarKeys(self._T.barSnapshot)
+		end
+		self:HideQuickSlotDialog()
+		log("[KeySetting] 퀵슬롯 설정 취소 - 열기 전 상태로 복귀")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelRemap()
+		-- 키 입력 대기만 취소한다 (퀵슬롯 설정 모드는 유지 - 다른 슬롯을 계속 고를 수 있다)
+		self._T.remapPos = ""
+		if self._T.dialogOpen then
+			self._T.remapMode = true
+			self:SetHint("퀵슬롯 설정 중 - 슬롯을 클릭한 뒤 키를 누르세요 (여러 개 가능, 저장/취소로 종료)")
+		else
+			self._T.remapMode = false
+			if self:IsWindowOpen() then self:RestoreHint() end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBarSlotPicked(string pos)
+		-- 퀵슬롯 리매핑: SkillBar 슬롯이 선택됨 → 키 입력 대기 (SkillManager의 슬롯 터치 핸들러가 호출)
+		if not self._T.remapMode then return end
+		self._T.remapPos = pos
+		self:SetHint("슬롯 [" .. _SkillManager:GetKeyForBarPos(pos) .. "] 선택됨 - 이 슬롯에 연결할 키를 누르세요 (Esc 취소)")
+		log("[KeySetting] 리매핑 슬롯 선택: " .. pos)
+	end
+
+	-- ── 입력 처리 ─────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent e)
+		local k = e.key
+
+		-- 1) 퀵슬롯 설정 중에는 모든 키 입력을 여기서 소비한다 (다른 매니저는 IsCapturingKey 가드로 무시).
+		--    Esc: 슬롯 키 입력 대기 중이면 그 대기만 취소, 아니면 퀵슬롯 설정 자체를 취소한다.
+		if self._T.dialogOpen then
+			if k == KeyboardKey.Escape then
+				if self._T.remapPos ~= "" then
+					self:CancelRemap()
+				else
+					self:CancelQuickSlot()
+				end
+			elseif self._T.remapPos ~= "" then
+				self:HandleCaptureKey(k)
+			end
+			return
+		end
+		if self:IsCapturingKey() then
+			self:HandleCaptureKey(k)
+			return
+		end
+
+		-- 2) 로그인/캐릭터 선택/생성 화면에서는 무시
+		local lg = _EntityService:GetEntityByPath("/ui/DefaultGroup/LoginGroup")
+		local cs = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup")
+		local cc = _EntityService:GetEntityByPath("/ui/DefaultGroup/CreateCharacter")
+		if (isvalid(lg) and lg.Enable) or (isvalid(cs) and cs.Enable) or (isvalid(cc) and cc.Enable) then return end
+
+		-- 3) 키설정 창 토글 (기본 ] - 다른 키로 옮겨졌으면 그 키)
+		if self:GetFuncForKeyEnum(k) == "keysetting" then
+			self:ToggleWindow()
+			return
+		end
+
+		-- 4) 창 열림 중 Esc: 다이얼로그 → 리매핑 → 기능 이동 → 창 순으로 닫기
+		if k == KeyboardKey.Escape and self:IsWindowOpen() then
+			if self._T.dialogOpen then
+				self:CancelQuickSlot()
+			elseif self._T.remapMode then
+				self:CancelRemap()
+			elseif self._T.carryFunc ~= "" then
+				self:CancelFuncCarry()
+			else
+				self:CloseWindow()
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleCaptureKey(any keyEnum)
+		-- 퀵슬롯 리매핑 키 캡처 처리 본체 (OnKeyDown이 위임)
+		if keyEnum == KeyboardKey.Escape then
+			self:CancelRemap()
+			log("[KeySetting] 리매핑 취소")
+			return
+		end
+		local capturedName = self:GetKeyNameForEnum(keyEnum)
+		if capturedName == "" then
+			log("[KeySetting] 지원하지 않는 키 - 다시 누르세요")
+			return
+		end
+		local pos = self._T.remapPos
+		self._T.remapPos = ""
+		_SkillManager:SetBarKey(pos, capturedName)
+		-- 퀵슬롯 설정 모드는 저장/취소를 누를 때까지 유지된다 (여러 슬롯 연속 변경)
+		if self._T.dialogOpen then
+			self._T.remapMode = true
+			self:SetHint("슬롯 [" .. capturedName .. "] 연결됨 - 다른 슬롯을 계속 바꾸거나 저장/취소를 누르세요")
+		else
+			self:RestoreHint()
+		end
+		log("[KeySetting] 슬롯 " .. pos .. " → 키 [" .. capturedName .. "] 연결")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnScreenTouch(ScreenTouchEvent e)
+		if e.TouchId ~= 1 then return end
+		local ux = e.TouchPoint.x - 960
+		local uy = e.TouchPoint.y - 540
+
+		-- 퀵슬롯 설정 다이얼로그(화면 최상위)가 떠 있으면 저장/취소 버튼 + 퀵슬롯 슬롯 선택만 처리한다
+		-- (슬롯 선택은 SkillManager의 슬롯 터치 핸들러와 중복되지만 OnBarSlotPicked는 멱등하다)
+		if self._T.dialogOpen then
+			if math.abs(ux - (-64)) <= 55 and math.abs(uy - (-89)) <= 19 then
+				self:SaveQuickSlot()
+				return
+			end
+			if math.abs(ux - 64) <= 55 and math.abs(uy - (-89)) <= 19 then
+				self:CancelQuickSlot()
+				return
+			end
+			local barPos = _SkillManager:FindSkillBarSlot(ux, uy)
+			if barPos ~= "" then self:OnBarSlotPicked(barPos) end
+			return
+		end
+
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if not isvalid(w) or not w.Enable then return end
+		local wp = w.UITransformComponent.anchoredPosition
+		self:HandleWindowClick(ux - wp.x, uy - wp.y)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleWindowClick(number lx, number ly)
+		-- 창 로컬 좌표(lx,ly) 기준 클릭 처리 본체 (OnScreenTouch가 위임)
+		if not self:IsWindowOpen() then return end
+
+		-- 닫기 ×
+		local closeEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/CloseKeySetting")
+		if self:HitRect(lx, ly, closeEnt) then
+			self:CloseWindow()
+			return
+		end
+
+		-- 프리셋 1~3
+		for n = 1, 3 do
+			local pEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Preset_" .. tostring(n))
+			if self:HitRect(lx, ly, pEnt) then
+				self:SwitchPreset(n)
+				return
+			end
+		end
+
+		-- 하단 버튼
+		local btnQuick = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/BtnQuickSlot")
+		if self:HitRect(lx, ly, btnQuick) then
+			self:ShowQuickSlotDialog()
+			return
+		end
+		local btnRevert = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/BtnRevert")
+		if self:HitRect(lx, ly, btnRevert) then
+			self:RevertToSnapshot()
+			return
+		end
+		local btnSave = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/BtnSave")
+		if self:HitRect(lx, ly, btnSave) then
+			self:SaveSettings()
+			return
+		end
+
+		-- 기능을 집고 있는 중: 키 타일/퀵슬롯 → 배정, 여분 슬롯/빈 곳 → 여분 슬롯 보관
+		if self:IsCarryingFunc() then
+			for _, kd in ipairs(self:GetBindKeyDefs()) do
+				local kEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Key_" .. kd.id)
+				if self:HitRect(lx, ly, kEnt) then
+					self:DropFuncOnKey(kd.name)
+					return
+				end
+			end
+			for i = 1, 16 do
+				local sEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Spare_" .. tostring(i))
+				if self:HitRect(lx, ly, sEnt) then
+					self:DropCarryToSpare()
+					return
+				end
+			end
+			-- 퀵슬롯 바 위에 놓으면 그 칸에 연결된 키에 배정한다 (SkillManager의 슬롯 터치 핸들러와
+			-- 중복 처리돼도 먼저 처리한 쪽이 carry를 비우므로 나중 쪽은 그냥 지나간다)
+			local wEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+			if isvalid(wEnt) then
+				local wp = wEnt.UITransformComponent.anchoredPosition
+				local barPos = _SkillManager:FindSkillBarSlot(lx + wp.x, ly + wp.y)
+				if barPos ~= "" then
+					self:DropFuncOnKey(_SkillManager:GetKeyForBarPos(barPos))
+					return
+				end
+			end
+			self:DropCarryToSpare()
+			return
+		end
+
+		-- 키 타일: 스킬을 들고 있으면 배정/스왑, 아무것도 안 들었으면 그 키의 스킬 또는 기능을 집는다
+		for _, kd in ipairs(self:GetBindKeyDefs()) do
+			local ent = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Key_" .. kd.id)
+			if self:HitRect(lx, ly, ent) then
+				local fid = self:GetFuncOnKey(kd.name)
+				if _SkillManager:IsClickMode() then
+					if fid ~= "" then
+						-- 기능이 있는 키에는 스킬을 놓을 수 없다 (기능을 먼저 옮겨야 한다)
+						self:SetHint("[" .. kd.name .. "] 키에는 [" .. self:GetFuncIdLabel(fid) .. "] 기능이 있습니다 - 기능을 먼저 다른 키로 옮기세요")
+						return
+					end
+					local payload = _SkillManager:GetClickPayload()
+					local old = _SkillManager:GetSkillOnKey(kd.name)
+					_SkillManager:AssignSkillToSlot(kd.name, payload.ruid, payload.name)
+					if old ~= nil and old.ruid ~= "" and old.ruid ~= payload.ruid then
+						-- 스왑: 원래 있던 스킬을 곧바로 집은 상태로 만든다
+						_SkillManager:EnterClickMode(old.ruid, old.name, "keysetting")
+						log("[KeySetting] 키 [" .. kd.name .. "] 스왑 - " .. tostring(old.name) .. " 집음")
+					else
+						_SkillManager:ClearSkillSelection()
+					end
+				elseif fid ~= "" then
+					-- 기능 키 클릭 → 기능을 집는다 (다음 키 클릭에서 그 키로 이동)
+					self:PickUpFunc(fid, kd.name)
+					return
+				else
+					local sk = _SkillManager:GetSkillOnKey(kd.name)
+					if sk ~= nil and sk.ruid ~= "" then
+						_SkillManager:RemoveSkillFromKey(kd.name)
+						_SkillManager:EnterClickMode(sk.ruid, sk.name, "keysetting")
+						log("[KeySetting] 키 [" .. kd.name .. "] 에서 " .. tostring(sk.name) .. " 집음")
+					end
+				end
+				self:RenderKeys()
+				return
+			end
+		end
+
+		-- 여분 슬롯: 클릭 배정 모드면 보관, 아니면 집기
+		for i = 1, 16 do
+			local ent = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Spare_" .. tostring(i))
+			if self:HitRect(lx, ly, ent) then
+				if _SkillManager:IsClickMode() then
+					local payload = _SkillManager:GetClickPayload()
+					self:AddToSpare(payload.ruid, payload.name)
+					_SkillManager:ClearSkillSelection()
+				else
+					local s = self._T.spare[i]
+					if s ~= nil and s.funcId ~= nil and s.funcId ~= "" then
+						-- 여분 슬롯의 기능을 다시 집는다 (키 없음 상태에서 꺼내오는 것)
+						local fid = s.funcId
+						table.remove(self._T.spare, i)
+						self:PickUpFunc(fid, "")
+					elseif s ~= nil and s.ruid ~= "" then
+						_SkillManager:EnterClickMode(s.ruid, s.name, "spare")
+						table.remove(self._T.spare, i)
+						self:RenderSpare()
+						log("[KeySetting] 여분 슬롯에서 " .. tostring(s.name) .. " 집음")
+					end
+				end
+				return
+			end
+		end
+	end
+
+	-- ── 유틸 ──────────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method table CopyHotkeys(table src)
+		-- {key → {ruid, name}} 테이블 깊은 복사
+		local out = {}
+		if src == nil then return out end
+		for k, v in pairs(src) do
+			if v ~= nil then out[k] = { ruid = tostring(v.ruid or ""), name = tostring(v.name or "") } end
+		end
+		return out
+	end
+
+	@ExecSpace("ClientOnly")
+	method table CopyStrMap(table src)
+		-- {string → string} 테이블 복사
+		local out = {}
+		if src == nil then return out end
+		for k, v in pairs(src) do out[k] = v end
+		return out
+	end
+
+end

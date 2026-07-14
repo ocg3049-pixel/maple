@@ -41,13 +41,19 @@ script SkillManager extends Logic
 		self._T.skillClickMode = false
 		self._T.clickModeRUID  = ""
 		self._T.clickModeName  = ""
+		self._T.clickModeOrigin = ""   -- "window"(스킬창) | "keysetting"(키세팅 키) | "spare"(여분 슬롯)
 
-		-- 슬롯 데이터 초기화
-		self._T.slotData = {}
-		local allKeys = {"Q","W","E","R","1","2","3","4","T","U","V","X","A","S","D","F","5","6","7","8","G","H","J","L"}
-		for _, k in ipairs(allKeys) do
-			self._T.slotData[k] = { ruid = "", name = "" }
+		-- 퀵슬롯 위치(엔티티 접미사, 고정) 목록. 각 위치는 barKeys를 통해 임의의 키에 연결된다.
+		self._T.barPositions = {"Q","W","E","R","1","2","3","4","T","U","V","X","A","S","D","F","5","6","7","8","G","H","J","L"}
+		-- 위치 → 연결된 키 이름 (기본값: 위치 접미사와 동일). 퀵슬롯 리매핑(키세팅 창)으로 변경 가능.
+		self._T.barKeys = {}
+		for _, p in ipairs(self._T.barPositions) do
+			self._T.barKeys[p] = p
 		end
+
+		-- 슬롯 데이터: 키 이름 → {ruid, name}. 임의 키를 허용하므로 비어있는 키는 nil일 수 있다.
+		self._T.slotData = {}
+		local allKeys = self._T.barPositions
 
 		-- 탭/스크롤 상태
 		self._T.activeSkillTab        = "0"
@@ -204,19 +210,31 @@ script SkillManager extends Logic
 			trackTouch:ConnectEvent(UITouchDownEvent, self.OnSkillTrackDown)
 		end
 
-		-- SkillBar 슬롯 클릭/드래그
+		-- SkillBar 슬롯 클릭/드래그 (slotPos = 고정 위치 접미사, 실제 키는 barKeys로 조회)
 		for _, k in ipairs(allKeys) do
 			local slotTouch = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. k .. "/Touch")
-			local slotKey = k
+			local slotPos = k
 			if isvalid(slotTouch) then
 				slotTouch:ConnectEvent(UITouchDownEvent, function(e)
 					if e.TouchId == -1 then
-						if self._T.skillClickMode then
-							-- 클릭 배정 모드: 스킬창에서 클릭 후 슬롯 클릭
-							self:AssignSkillToSlot(slotKey, self._T.clickModeRUID, self._T.clickModeName)
-							self:ClearSkillSelection()
+						if _KeySettingManager:IsCarryingFunc() then
+							-- 기능을 집은 상태로 퀵슬롯 클릭 → 그 슬롯에 연결된 키로 기능을 옮긴다
+							_KeySettingManager:DropFuncOnKey(self:GetKeyForBarPos(slotPos))
+						elseif _KeySettingManager:IsRemapMode() then
+							-- 퀵슬롯 리매핑 모드: 이 슬롯에 연결할 키 입력을 대기시킨다
+							_KeySettingManager:OnBarSlotPicked(slotPos)
+						elseif self._T.skillClickMode then
+							-- 클릭 배정 모드: 스킬창/키세팅에서 클릭 후 슬롯 클릭
+							-- (기능 키에 연결된 슬롯이면 배정하지 않고 계속 들고 있는다)
+							local barKey = self:GetKeyForBarPos(slotPos)
+							if _KeySettingManager:GetFuncOnKey(barKey) == "" then
+								self:AssignSkillToSlot(barKey, self._T.clickModeRUID, self._T.clickModeName)
+								self:ClearSkillSelection()
+							else
+								log("[SkillManager] 기능 키 [" .. barKey .. "] 슬롯 — 스킬 배정 불가")
+							end
 						else
-							self:OnBarSlotDragStart(slotKey)
+							self:OnBarSlotDragStart(slotPos)
 						end
 					end
 				end)
@@ -549,21 +567,155 @@ script SkillManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void InitBarIcons()
-		local keys = {"Q","W","E","R","1","2","3","4","T","U","V","X","A","S","D","F","5","6","7","8","G","H","J","L"}
-		for _, k in ipairs(keys) do
-			local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. k .. "/Icon")
-			if isvalid(iconEnt) then
-				iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
-			end
+		-- 퀵슬롯 24칸 전체를 barKeys/slotData 기준으로 다시 그린다 (키 라벨/아이콘/기능 라벨)
+		for _, p in ipairs(self._T.barPositions) do
+			self:UpdateBarSlotVisual(p)
 		end
+	end
+
+	-- ── 퀵슬롯 위치 ↔ 키 매핑 ──────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method string GetKeyForBarPos(string pos)
+		-- 퀵슬롯 위치(엔티티 접미사)에 연결된 키 이름
+		return self._T.barKeys[pos] or pos
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetBarPosForKey(string key)
+		-- 해당 키가 연결된 퀵슬롯 위치 (없으면 "")
+		for _, p in ipairs(self._T.barPositions) do
+			if self._T.barKeys[p] == key then return p end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetBarKey(string pos, string keyName)
+		-- 퀵슬롯 리매핑: 위치 pos를 keyName 키에 연결한다. 다른 위치가 이미 그 키면 서로 교환한다.
+		local prevKey = self._T.barKeys[pos]
+		if prevKey == keyName then return end
+		local other = self:GetBarPosForKey(keyName)
+		if other ~= "" and other ~= pos then
+			self._T.barKeys[other] = prevKey
+			self:UpdateBarSlotVisual(other)
+		end
+		self._T.barKeys[pos] = keyName
+		self:UpdateBarSlotVisual(pos)
+		self:UpdateAssaulterStackUI()
+		_CharacterPersistence:MarkDirty("hotkey")
+		log("[SkillManager] 퀵슬롯 키 변경: 위치 " .. pos .. " → [" .. keyName .. "]")
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ExportBarKeys()
+		-- 위치 → 키 매핑 내보내기 (영속 저장/프리셋용)
+		local out = {}
+		for _, p in ipairs(self._T.barPositions) do
+			out[p] = self._T.barKeys[p] or p
+		end
+		return out
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ImportBarKeys(table t)
+		-- 위치 → 키 매핑 복원. 항목이 없는 위치는 기본값(위치 접미사)으로 돌아간다.
+		for _, p in ipairs(self._T.barPositions) do
+			local v = (t ~= nil) and t[p] or nil
+			self._T.barKeys[p] = (v ~= nil and v ~= "") and tostring(v) or p
+			self:UpdateBarSlotVisual(p)
+		end
+		self:UpdateAssaulterStackUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateBarSlotVisual(string pos)
+		-- 퀵슬롯 한 칸을 다시 그린다: 키 라벨 + (스킬 아이콘 | 기능 라벨 | 빈 칸)
+		local base = "/ui/DefaultGroup/SkillBar/Slot_" .. pos
+		local key = self:GetKeyForBarPos(pos)
+		local labelEnt = _EntityService:GetEntityByPath(base .. "/KeyLabel")
+		if isvalid(labelEnt) then labelEnt.TextComponent.Text = key end
+		local iconEnt = _EntityService:GetEntityByPath(base .. "/Icon")
+		local funcEnt = _EntityService:GetEntityByPath(base .. "/FuncLabel")
+		local slot = self._T.slotData[key]
+		if slot ~= nil and slot.ruid ~= "" then
+			if isvalid(iconEnt) then
+				local spr = iconEnt.SpriteGUIRendererComponent
+				spr.ImageRUID = slot.ruid
+				spr.Color = Color(1, 1, 1, 1)
+			end
+			if isvalid(funcEnt) then funcEnt.TextComponent.Text = "" end
+		else
+			if isvalid(iconEnt) then iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0) end
+			if isvalid(funcEnt) then funcEnt.TextComponent.Text = _KeySettingManager:GetFuncLabel(key) end
+		end
+	end
+
+	-- ── 클릭 배정 모드 접근자 (KeySettingManager 연동) ────────────────
+
+	@ExecSpace("ClientOnly")
+	method boolean IsClickMode()
+		-- 클릭 배정 모드(스킬을 집은 상태) 여부
+		return self._T.skillClickMode == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetClickPayload()
+		-- 클릭 배정 모드에서 집고 있는 스킬 정보
+		return { ruid = self._T.clickModeRUID or "", name = self._T.clickModeName or "" }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnterClickMode(string ruid, string name, string origin)
+		-- 스킬을 집은 상태(클릭 배정 모드)로 전환한다. origin: "window" | "keysetting" | "spare"
+		self._T.skillClickMode = true
+		self._T.clickModeRUID  = ruid
+		self._T.clickModeName  = name
+		self._T.clickModeOrigin = origin
+		self:ShowDragGhost(ruid)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetSkillOnKey(string key)
+		-- 해당 키에 배정된 스킬 정보 (없으면 빈 문자열)
+		local slot = self._T.slotData[key]
+		if slot == nil then return { ruid = "", name = "" } end
+		return { ruid = slot.ruid or "", name = slot.name or "" }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RemoveSkillFromKey(string key)
+		-- 키에서 스킬을 제거한다 (키세팅 창에서 집기/삭제용)
+		self._T.slotData[key] = { ruid = "", name = "" }
+		local pos = self:GetBarPosForKey(key)
+		if pos ~= "" then self:UpdateBarSlotVisual(pos) end
+		_CharacterPersistence:MarkDirty("hotkey")
+		self:UpdateAssaulterStackUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetSkillKeyName(any keyEnum)
+		-- KeyboardKey → 스킬 배정 가능 키 이름 (지원하지 않는 키면 ""). 키 목록은 KeySettingManager가 단일 관리.
+		if self._T.keyDefs == nil then
+			self._T.keyDefs = _KeySettingManager:GetBindKeyDefs()
+		end
+		for _, kd in ipairs(self._T.keyDefs) do
+			if keyEnum == kd.keyEnum then return kd.name end
+		end
+		return ""
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyDown(KeyDownEvent e)
+		-- 퀵슬롯 리매핑 키 캡처 중에는 스킬/창 단축키를 모두 무시한다 (KeySettingManager가 처리)
+		if _KeySettingManager:IsCapturingKey() then return end
 		local k = e.key
-		if k == KeyboardKey.K then
+		-- 스킬창 열기 키 (기본 K - 키설정에서 다른 키로 옮겼으면 그 키)
+		if _KeySettingManager:GetFuncForKeyEnum(k) == "skill" then
 			self:ToggleWindow()
-		elseif k == KeyboardKey.Tab then
+			return
+		end
+		if k == KeyboardKey.Tab then
 			local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
 			if isvalid(w) and w.Enable then
 				local tabOrder = {"0", "1", "2", "3", "4", "5", "6", "7"}
@@ -576,61 +728,23 @@ script SkillManager extends Logic
 				end
 				self:SwitchSkillTab(tabOrder[nextIdx])
 			end
-		elseif k == KeyboardKey.Q      then self._T.heldSkillKeys["Q"] = true; self:UseSkillInSlot("Q")
-		elseif k == KeyboardKey.W      then self._T.heldSkillKeys["W"] = true; self:UseSkillInSlot("W")
-		elseif k == KeyboardKey.E      then self._T.heldSkillKeys["E"] = true; self:UseSkillInSlot("E")
-		elseif k == KeyboardKey.R      then self._T.heldSkillKeys["R"] = true; self:UseSkillInSlot("R")
-		elseif k == KeyboardKey.Alpha1 then self._T.heldSkillKeys["1"] = true; self:UseSkillInSlot("1")
-		elseif k == KeyboardKey.Alpha2 then self._T.heldSkillKeys["2"] = true; self:UseSkillInSlot("2")
-		elseif k == KeyboardKey.Alpha3 then self._T.heldSkillKeys["3"] = true; self:UseSkillInSlot("3")
-		elseif k == KeyboardKey.Alpha4 then self._T.heldSkillKeys["4"] = true; self:UseSkillInSlot("4")
-		elseif k == KeyboardKey.T      then self._T.heldSkillKeys["T"] = true; self:UseSkillInSlot("T")
-		elseif k == KeyboardKey.U      then self._T.heldSkillKeys["U"] = true; self:UseSkillInSlot("U")
-		elseif k == KeyboardKey.V      then self._T.heldSkillKeys["V"] = true; self:UseSkillInSlot("V")
-		elseif k == KeyboardKey.X      then self._T.heldSkillKeys["X"] = true; self:UseSkillInSlot("X")
-		elseif k == KeyboardKey.A      then self._T.heldSkillKeys["A"] = true; self:UseSkillInSlot("A")
-		elseif k == KeyboardKey.S      then self._T.heldSkillKeys["S"] = true; self:UseSkillInSlot("S")
-		elseif k == KeyboardKey.D      then self._T.heldSkillKeys["D"] = true; self:UseSkillInSlot("D")
-		elseif k == KeyboardKey.F      then self._T.heldSkillKeys["F"] = true; self:UseSkillInSlot("F")
-		elseif k == KeyboardKey.Alpha5 then self._T.heldSkillKeys["5"] = true; self:UseSkillInSlot("5")
-		elseif k == KeyboardKey.Alpha6 then self._T.heldSkillKeys["6"] = true; self:UseSkillInSlot("6")
-		elseif k == KeyboardKey.Alpha7 then self._T.heldSkillKeys["7"] = true; self:UseSkillInSlot("7")
-		elseif k == KeyboardKey.Alpha8 then self._T.heldSkillKeys["8"] = true; self:UseSkillInSlot("8")
-		elseif k == KeyboardKey.G      then self._T.heldSkillKeys["G"] = true; self:UseSkillInSlot("G")
-		elseif k == KeyboardKey.H      then self._T.heldSkillKeys["H"] = true; self:UseSkillInSlot("H")
-		elseif k == KeyboardKey.J      then self._T.heldSkillKeys["J"] = true; self:UseSkillInSlot("J")
-		elseif k == KeyboardKey.L      then self._T.heldSkillKeys["L"] = true; self:UseSkillInSlot("L")
+			return
+		end
+		-- 단축키 세팅 창이 열려있는 동안에는 스킬 오발동을 막는다 (편집 중 보호)
+		if _KeySettingManager:IsWindowOpen() then return end
+		local keyName = self:GetSkillKeyName(k)
+		if keyName ~= "" then
+			self._T.heldSkillKeys[keyName] = true
+			self:UseSkillInSlot(keyName)
 		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyUp(KeyUpEvent e)
 		-- 스킬키를 뗀 순간 홀드 상태를 해제한다 (OnUpdate의 홀드 지속 발동 루프가 멈추도록)
-		local k = e.key
-		if k == KeyboardKey.Q      then self._T.heldSkillKeys["Q"] = false
-		elseif k == KeyboardKey.W      then self._T.heldSkillKeys["W"] = false
-		elseif k == KeyboardKey.E      then self._T.heldSkillKeys["E"] = false
-		elseif k == KeyboardKey.R      then self._T.heldSkillKeys["R"] = false
-		elseif k == KeyboardKey.Alpha1 then self._T.heldSkillKeys["1"] = false
-		elseif k == KeyboardKey.Alpha2 then self._T.heldSkillKeys["2"] = false
-		elseif k == KeyboardKey.Alpha3 then self._T.heldSkillKeys["3"] = false
-		elseif k == KeyboardKey.Alpha4 then self._T.heldSkillKeys["4"] = false
-		elseif k == KeyboardKey.T      then self._T.heldSkillKeys["T"] = false
-		elseif k == KeyboardKey.U      then self._T.heldSkillKeys["U"] = false
-		elseif k == KeyboardKey.V      then self._T.heldSkillKeys["V"] = false
-		elseif k == KeyboardKey.X      then self._T.heldSkillKeys["X"] = false
-		elseif k == KeyboardKey.A      then self._T.heldSkillKeys["A"] = false
-		elseif k == KeyboardKey.S      then self._T.heldSkillKeys["S"] = false
-		elseif k == KeyboardKey.D      then self._T.heldSkillKeys["D"] = false
-		elseif k == KeyboardKey.F      then self._T.heldSkillKeys["F"] = false
-		elseif k == KeyboardKey.Alpha5 then self._T.heldSkillKeys["5"] = false
-		elseif k == KeyboardKey.Alpha6 then self._T.heldSkillKeys["6"] = false
-		elseif k == KeyboardKey.Alpha7 then self._T.heldSkillKeys["7"] = false
-		elseif k == KeyboardKey.Alpha8 then self._T.heldSkillKeys["8"] = false
-		elseif k == KeyboardKey.G      then self._T.heldSkillKeys["G"] = false
-		elseif k == KeyboardKey.H      then self._T.heldSkillKeys["H"] = false
-		elseif k == KeyboardKey.J      then self._T.heldSkillKeys["J"] = false
-		elseif k == KeyboardKey.L      then self._T.heldSkillKeys["L"] = false
+		local keyName = self:GetSkillKeyName(e.key)
+		if keyName ~= "" then
+			self._T.heldSkillKeys[keyName] = false
 		end
 	end
 
@@ -659,10 +773,9 @@ script SkillManager extends Logic
 		if slot.name == "HP포션" then
 			_PotionShopManager:RequestUsePotion()
 			self._T.slotData[key] = { ruid = "", name = "" }
-			local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
-			if isvalid(iconEnt) then
-				iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
-			end
+			local potPos = self:GetBarPosForKey(key)
+			if potPos ~= "" then self:UpdateBarSlotVisual(potPos) end
+			_KeySettingManager:NotifyHotkeysChanged()
 			log("[SkillManager] HP포션 사용 키=" .. key)
 			-- 포션 사용으로 슬롯이 비워지는 것도 단축키 변경이므로 저장 예약
 			_CharacterPersistence:MarkDirty("hotkey")
@@ -1504,6 +1617,8 @@ script SkillManager extends Logic
 		local tp = e.TouchPoint
 		local tux = tp.x - 960
 		local tuy = tp.y - 540
+		-- 단축키 세팅 창이 위에 겹쳐 있으면 그 영역의 클릭은 키세팅이 전담한다
+		if _KeySettingManager:IsPointInWindow(tux, tuy) then return end
 		local wp = win.UITransformComponent.anchoredPosition
 		local lx = tux - wp.x
 		local ly = tuy - wp.y
@@ -1587,7 +1702,9 @@ script SkillManager extends Logic
 	-- ── SkillBar 드래그 ────────────────────────────────────────────────
 
 	@ExecSpace("ClientOnly")
-	method void OnBarSlotDragStart(string key)
+	method void OnBarSlotDragStart(string pos)
+		-- pos = 퀵슬롯 위치 접미사. 실제 키는 barKeys로 조회한다.
+		local key = self:GetKeyForBarPos(pos)
 		local slot = self._T.slotData[key]
 		if slot == nil or slot.ruid == "" then return end
 		self._T.isDraggingSkill = true
@@ -1596,10 +1713,8 @@ script SkillManager extends Logic
 		self._T.dragSource      = "bar"
 		self._T.dragFromKey     = key
 		self._T.slotData[key] = { ruid = "", name = "" }
-		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
-		if isvalid(iconEnt) then
-			iconEnt.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
-		end
+		self:UpdateBarSlotVisual(pos)
+		_KeySettingManager:NotifyHotkeysChanged()
 		self:ShowDragGhost(self._T.dragSkillRUID)
 		log("[SkillManager] SkillBar 드래그 시작: [" .. key .. "] " .. slot.name)
 		-- 슬롯에서 스킬을 떼어내는 것도 단축키 변경이므로 저장 예약
@@ -1615,9 +1730,32 @@ script SkillManager extends Logic
 		local spr = ghost.SpriteGUIRendererComponent
 		spr.ImageRUID = ruid
 		spr.Color = Color(1, 1, 1, 1)
+		-- 기능 고스트(KeySettingManager)와 엔티티를 공유하므로 기능 라벨을 지운다
+		local labelEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost/Label")
+		if isvalid(labelEnt) then labelEnt.TextComponent.Text = "" end
 		local cursor = _InputService:GetCursorPosition()
 		ghost.UITransformComponent.anchoredPosition = Vector2(cursor.x - 960, cursor.y - 540)
 		ghost.Enable = true
+		self:BringGhostToFront()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BringGhostToFront()
+		-- 고스트는 항상 최상단에 - 키세팅 창 등 나중에 만들어진 창이 고스트를 가리지 않게 한다.
+		-- (BringWindowToFront와 동일하게 형제들 중 최대 인덱스로 이동)
+		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+		if not isvalid(ghost) then return end
+		local dg = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(dg) then
+			local maxIdx = 0
+			for _, child in ipairs(dg.Children:ToTable()) do
+				if isvalid(child) then
+					local idx = _UILogic:GetSiblingIndex(child.UITransformComponent)
+					if idx > maxIdx then maxIdx = idx end
+				end
+			end
+			_UILogic:SetSiblingIndex(ghost.UITransformComponent, maxIdx)
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1631,6 +1769,7 @@ script SkillManager extends Logic
 		self._T.skillClickMode = false
 		self._T.clickModeRUID  = ""
 		self._T.clickModeName  = ""
+		self._T.clickModeOrigin = ""
 		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
 		if isvalid(ghost) then ghost.Enable = false end
 		log("[SkillManager] 클릭 배정 모드 해제")
@@ -1743,8 +1882,9 @@ script SkillManager extends Logic
 		if self._T.assaulterRechargeTimerId ~= nil then return end
 		if self._T.assaulterStacks >= self._T.assaulterMaxStacks then return end
 		local key = self:FindAssaulterSlotKey()
-		if key ~= "" then
-			_AssaulterCooldownUI:ShowCooldownV2(3.0, key)
+		local barPos = key ~= "" and self:GetBarPosForKey(key) or ""
+		if barPos ~= "" then
+			_AssaulterCooldownUI:ShowCooldownV2(3.0, barPos)
 		end
 		self._T.assaulterRechargeTimerId = _TimerService:SetTimerOnce(function()
 			self._T.assaulterRechargeTimerId = nil
@@ -1758,18 +1898,24 @@ script SkillManager extends Logic
 	@ExecSpace("ClientOnly")
 	method void UpdateAssaulterStackUI()
 		-- 스택 수 표시(단축키 아이콘 우측 아래)를 최신 상태로 갱신한다.
-		_AssaulterCooldownUI:UpdateStackDisplay(self._T.assaulterStacks, self._T.assaulterMaxStacks, self:FindAssaulterSlotKey())
+		-- AssaulterCooldownUI는 Slot_<위치> 경로를 쓰므로 키 이름을 퀵슬롯 위치로 변환해 넘긴다.
+		local key = self:FindAssaulterSlotKey()
+		local barPos = key ~= "" and self:GetBarPosForKey(key) or ""
+		_AssaulterCooldownUI:UpdateStackDisplay(self._T.assaulterStacks, self._T.assaulterMaxStacks, barPos)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void AssignSkillToSlot(string key, string ruid, string name)
-		self._T.slotData[key] = { ruid = ruid, name = name }
-		local iconEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. key .. "/Icon")
-		if isvalid(iconEnt) then
-			local spr = iconEnt.SpriteGUIRendererComponent
-			spr.ImageRUID = ruid
-			spr.Color = Color(1, 1, 1, 1)
+		-- key = 키 이름 (퀵슬롯 위치가 아님). 해당 키가 퀵슬롯에 연결되어 있으면 그 칸도 갱신된다.
+		-- 한 키에는 스킬 또는 기능(장비/인벤/공격/점프...) 중 하나만 올 수 있다 - 기능 키는 거부한다.
+		if _KeySettingManager:GetFuncOnKey(key) ~= "" then
+			log("[SkillManager] 기능 키 [" .. key .. "] 에는 스킬을 배정할 수 없음: " .. tostring(name))
+			return
 		end
+		self._T.slotData[key] = { ruid = ruid, name = name }
+		local pos = self:GetBarPosForKey(key)
+		if pos ~= "" then self:UpdateBarSlotVisual(pos) end
+		_KeySettingManager:NotifyHotkeysChanged()
 		log("[SkillManager] 슬롯 배정: [" .. key .. "] = " .. name)
 		-- 단축키 배정 변경 영속 저장 예약 (캐릭터별로 저장되어 재접속 시 복원됨)
 		_CharacterPersistence:MarkDirty("hotkey")
@@ -1789,18 +1935,33 @@ script SkillManager extends Logic
 		return out
 	end
 
-	-- 저장된 단축키 배정을 복원한다 (CharacterPersistence 전용). 전체 초기화 후 저장된 항목만 배정.
+	-- 저장된 단축키 배정을 복원한다 (CharacterPersistence/키세팅 프리셋 전용). 전체 초기화 후 저장된 항목만 배정.
 	@ExecSpace("ClientOnly")
 	method void ImportHotkeys(table hotkeys)
-		local allKeys = {"Q","W","E","R","1","2","3","4","T","U","V","X","A","S","D","F","5","6","7","8","G","H","J","L"}
-		for _, k in ipairs(allKeys) do
-			self._T.slotData[k] = { ruid = "", name = "" }
-		end
+		self._T.slotData = {}
 		self:InitBarIcons()
 		if hotkeys == nil then return end
 		for key, slot in pairs(hotkeys) do
 			if slot ~= nil and slot.ruid ~= nil and slot.ruid ~= "" then
-				self:AssignSkillToSlot(tostring(key), tostring(slot.ruid), tostring(slot.name or ""))
+				local keyName = tostring(key)
+				-- 과거 세이브 호환: 기능 키(E 등)에 배정돼 있던 스킬은 더 이상 발동하지 않으므로
+				-- 첫 번째 빈 퀵슬롯 키로 옮겨준다.
+				if _KeySettingManager:GetFuncLabel(keyName) ~= "" then
+					local moved = ""
+					for _, p in ipairs(self._T.barPositions) do
+						local cand = self:GetKeyForBarPos(p)
+						local existing = self._T.slotData[cand]
+						if _KeySettingManager:GetFuncLabel(cand) == "" and (existing == nil or existing.ruid == "") and (hotkeys[cand] == nil or hotkeys[cand].ruid == nil or hotkeys[cand].ruid == "") then
+							moved = cand
+							break
+						end
+					end
+					if moved ~= "" then
+						log("[SkillManager] 기능 키 [" .. keyName .. "]의 스킬을 [" .. moved .. "]로 이동: " .. tostring(slot.name))
+						keyName = moved
+					end
+				end
+				self:AssignSkillToSlot(keyName, tostring(slot.ruid), tostring(slot.name or ""))
 			end
 		end
 	end
@@ -1881,24 +2042,35 @@ script SkillManager extends Logic
 			if isvalid(ghost) then
 				ghost.UITransformComponent.anchoredPosition = ghostUI
 			end
-			-- 스킬창이 닫히면 배정 모드도 취소
+			-- 스킬창/키세팅 창이 모두 닫히면 배정 모드도 취소
 			local cWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
-			if not isvalid(cWin) or not cWin.Enable then
+			local skillWinOpen = isvalid(cWin) and cWin.Enable
+			local keySettingOpen = _KeySettingManager:IsWindowOpen()
+			if not skillWinOpen and not keySettingOpen then
 				self:ClearSkillSelection()
 			else
-				-- 새 클릭이 스킬바 슬롯도, 스킬창 내부도 아니면(빈 곳 클릭) 배정 취소
+				-- 새 클릭이 스킬바 슬롯/스킬창/키세팅 창 어디에도 해당하지 않으면(빈 곳 클릭) 배정 해제
 				local mouseDown = _InputService:IsKeyPressed(KeyboardKey.Mouse0)
 				if mouseDown and self._T.clickModePrevMouse ~= true then
 					local slotKey = self:FindSkillBarSlot(ghostUI.x, ghostUI.y)
 					local insideWin = false
-					local wp = cWin.UITransformComponent.anchoredPosition
-					local ws = cWin.UITransformComponent.RectSize
-					if math.abs(ghostUI.x - wp.x) <= ws.x / 2 and math.abs(ghostUI.y - wp.y) <= ws.y / 2 then
-						insideWin = true
+					if skillWinOpen then
+						local wp = cWin.UITransformComponent.anchoredPosition
+						local ws = cWin.UITransformComponent.RectSize
+						if math.abs(ghostUI.x - wp.x) <= ws.x / 2 and math.abs(ghostUI.y - wp.y) <= ws.y / 2 then
+							insideWin = true
+						end
 					end
-					if slotKey == "" and not insideWin then
+					local insideKeySetting = _KeySettingManager:IsPointInWindow(ghostUI.x, ghostUI.y)
+					if slotKey == "" and not insideWin and not insideKeySetting then
+						-- 키세팅/여분 슬롯에서 집은 스킬을 바닥에 놓으면 여분 슬롯으로 보관된다
+						if self._T.clickModeOrigin == "keysetting" or self._T.clickModeOrigin == "spare" then
+							_KeySettingManager:AddToSpare(self._T.clickModeRUID, self._T.clickModeName)
+							log("[SkillManager] 빈 곳 클릭 — 여분 슬롯으로 이동")
+						else
+							log("[SkillManager] 빈 곳 클릭 — 클릭 배정 취소")
+						end
 						self:ClearSkillSelection()
-						log("[SkillManager] 빈 곳 클릭 — 클릭 배정 취소")
 					end
 				end
 				self._T.clickModePrevMouse = mouseDown
@@ -1915,11 +2087,33 @@ script SkillManager extends Logic
 			end
 			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
 				self._T.isDraggingSkill = false
-				local key = self:FindSkillBarSlot(ghostUI.x, ghostUI.y)
-				if key ~= "" then
-					-- 슬롯 위에서 릴리즈 → 즉시 배정
+				local dropPos = self:FindSkillBarSlot(ghostUI.x, ghostUI.y)
+				local ksKey = _KeySettingManager:FindBindKeyAt(ghostUI.x, ghostUI.y)
+				local dropKey = ""
+				if dropPos ~= "" then dropKey = self:GetKeyForBarPos(dropPos) elseif ksKey ~= "" then dropKey = ksKey end
+				if dropKey ~= "" and _KeySettingManager:GetFuncOnKey(dropKey) ~= "" then
+					-- 기능이 배정된 키 위에 드랍 → 배정 불가, 원래 자리로 되돌린다 (스킬이 사라지지 않게)
 					if isvalid(ghost) then ghost.Enable = false end
-					self:AssignSkillToSlot(key, self._T.dragSkillRUID, self._T.dragSkillName)
+					if self._T.dragSource == "bar" and self._T.dragFromKey ~= "" then
+						self:AssignSkillToSlot(self._T.dragFromKey, self._T.dragSkillRUID, self._T.dragSkillName)
+					end
+					log("[SkillManager] 기능 키 [" .. dropKey .. "] 에는 스킬을 놓을 수 없음 — 되돌림")
+					self._T.dragSkillRUID = ""
+					self._T.dragSkillName = ""
+					self._T.dragSource    = ""
+					self._T.dragFromKey   = ""
+				elseif dropPos ~= "" then
+					-- 슬롯 위에서 릴리즈 → 그 슬롯에 연결된 키에 즉시 배정
+					if isvalid(ghost) then ghost.Enable = false end
+					self:AssignSkillToSlot(dropKey, self._T.dragSkillRUID, self._T.dragSkillName)
+					self._T.dragSkillRUID = ""
+					self._T.dragSkillName = ""
+					self._T.dragSource    = ""
+					self._T.dragFromKey   = ""
+				elseif ksKey ~= "" then
+					-- 키세팅 창의 키 타일 위에서 릴리즈 → 그 키에 즉시 배정
+					if isvalid(ghost) then ghost.Enable = false end
+					self:AssignSkillToSlot(ksKey, self._T.dragSkillRUID, self._T.dragSkillName)
 					self._T.dragSkillRUID = ""
 					self._T.dragSkillName = ""
 					self._T.dragSource    = ""
@@ -1929,6 +2123,7 @@ script SkillManager extends Logic
 					self._T.skillClickMode = true
 					self._T.clickModeRUID  = self._T.dragSkillRUID
 					self._T.clickModeName  = self._T.dragSkillName
+					self._T.clickModeOrigin = "window"
 					log("[SkillManager] 클릭 배정 모드 진입: " .. self._T.dragSkillName)
 					self._T.dragSkillRUID = ""
 					self._T.dragSkillName = ""
