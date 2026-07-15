@@ -360,28 +360,34 @@ script DecoWindowManager extends Logic
         -- (기본 모자는 캐릭터 생성 시 모자 슬롯에 "아이템"으로 지급되며, 벗으면 맨머리가 된다).
         local capR = pick("cap", eq[7].ruid)
 
+        -- (버그 수정) 카테고리를 "정수"로 담는다 - 아래에서 이 목록을 그대로 서버로 보내 다른 클라이언트에도
+        -- 동기화하는데, 엔진 enum(MapleAvatarItemCategory)은 RPC로 넘길 수 없기 때문이다(넘기면 LEA-3036).
+        -- 로컬 SetEquip 호출은 self:CatEnum(int)로 정수를 enum으로 되돌려 쓴다.
         local finals = {
-            { MapleAvatarItemCategory.Face,             eq[1].ruid },
-            { MapleAvatarItemCategory.Hair,             eq[2].ruid },
-            { MapleAvatarItemCategory.Coat,             pick("coat", eq[3].ruid) },
-            { MapleAvatarItemCategory.Pants,            pick("pants", eq[4].ruid) },
-            { MapleAvatarItemCategory.Shoes,            pick("shoes", eq[5].ruid) },
-            { MapleAvatarItemCategory.Cap,              capR },
-            { MapleAvatarItemCategory.Glove,            self:DecoRuid("glove") },
-            { MapleAvatarItemCategory.Cape,             self:DecoRuid("cape") },
-            { MapleAvatarItemCategory.SubWeapon,        self:DecoRuid("subweapon") },
-            { MapleAvatarItemCategory.FaceAccessory,    self:DecoRuid("faceacc") },
-            { MapleAvatarItemCategory.EyeAccessory,     self:DecoRuid("eyeacc") },
-            { MapleAvatarItemCategory.EarAccessory,     self:DecoRuid("earacc") },
-            { MapleAvatarItemCategory.OneHandedWeapon,  oneHandR },
-            { MapleAvatarItemCategory.TwoHandedWeapon,  twoHandR },
+            { 4,  eq[1].ruid },                        -- Face
+            { 3,  eq[2].ruid },                        -- Hair
+            { 7,  pick("coat", eq[3].ruid) },          -- Coat
+            { 10, pick("pants", eq[4].ruid) },         -- Pants
+            { 12, pick("shoes", eq[5].ruid) },         -- Shoes
+            { 5,  capR },                              -- Cap
+            { 8,  self:DecoRuid("glove") },            -- Glove
+            { 6,  self:DecoRuid("cape") },             -- Cape
+            { 15, self:DecoRuid("subweapon") },        -- SubWeapon
+            { 16, self:DecoRuid("faceacc") },          -- FaceAccessory
+            { 17, self:DecoRuid("eyeacc") },           -- EyeAccessory
+            { 18, self:DecoRuid("earacc") },           -- EarAccessory
+            { 13, oneHandR },                          -- OneHandedWeapon
+            { 14, twoHandR },                          -- TwoHandedWeapon
         }
 
         local player = _UserService.LocalPlayer
         local playerCM = nil
         if isvalid(player) then playerCM = player.CostumeManagerComponent end
 
-        -- 1) 플레이어 본체에 먼저 적용한다 (미리보기가 플레이어의 "최종" 외형을 그대로 따라가야 하므로)
+        -- 1) 플레이어 본체에 먼저 적용한다 (미리보기가 플레이어의 "최종" 외형을 그대로 따라가야 하므로).
+        --    ★ 여기(클라이언트)에서 바꾼 값은 로컬 화면에만 반영된다 - CostumeManager의 Custom*Equip과
+        --    UseCustomEquipOnly는 @Sync(서버→클라 단방향)라 클라에서 바꿔도 다른 사람에겐 전파되지 않는다.
+        --    (그래서 "다른 사람이 보면 맨몸/대머리"였다.) 그래서 아래 3)에서 서버로도 보내 진짜 동기화한다.
         if isvalid(playerCM) then
             -- 계정 기본 아바타는 무시하고 게임에서 지정한 장비만 보이게 한다 (UI 아바타들도 .ui에서 모두 true).
             -- 이래야 모자 아이템을 벗었을 때 계정 아바타의 모자가 비쳐 보이지 않고 맨머리가 된다.
@@ -390,7 +396,7 @@ script DecoWindowManager extends Logic
                 log("[DecoWin] 플레이어 UseCustomEquipOnly 설정")
             end
             for _, f in ipairs(finals) do
-                playerCM:SetEquip(f[1], f[2])
+                playerCM:SetEquip(self:CatEnum(f[1]), f[2])
             end
         end
 
@@ -405,13 +411,56 @@ script DecoWindowManager extends Logic
                     cm:SetEquip(MapleAvatarItemCategory.Body, self:SafeEquip(playerCM, MapleAvatarItemCategory.Body))
                 end
                 for _, f in ipairs(finals) do
-                    cm:SetEquip(f[1], f[2])
+                    cm:SetEquip(self:CatEnum(f[1]), f[2])
                 end
             end
         end
         -- 캐릭터 정보창 아바타도 같은 외형으로 즉시 갱신 (창이 열려있는 동안 장비를 바꿔도 따라오도록)
         _CharInfoManager:UpdateAvatar()
+
+        -- 3) ★ 서버로 보내 실제로 모든 클라이언트에 동기화한다 (다른 사람에게도 장비가 보이게).
+        --    서버가 이 플레이어의 CostumeManager에 같은 값을 넣으면 @Sync가 모든 클라로 퍼진다.
+        self:ApplyAppearanceServer(finals)
         log("[DecoWin] 외형 적용 완료 (모자=" .. tostring(capR) .. ")")
+    end
+
+    method any CatEnum(integer c)
+        -- 정수 카테고리 코드를 MapleAvatarItemCategory enum 멤버로 되돌린다.
+        -- (finals 목록은 RPC 호환을 위해 정수로 담고, SetEquip 호출 직전에만 enum으로 바꾼다.)
+        if c == 1 then return MapleAvatarItemCategory.Body end
+        if c == 3 then return MapleAvatarItemCategory.Hair end
+        if c == 4 then return MapleAvatarItemCategory.Face end
+        if c == 5 then return MapleAvatarItemCategory.Cap end
+        if c == 6 then return MapleAvatarItemCategory.Cape end
+        if c == 7 then return MapleAvatarItemCategory.Coat end
+        if c == 8 then return MapleAvatarItemCategory.Glove end
+        if c == 10 then return MapleAvatarItemCategory.Pants end
+        if c == 12 then return MapleAvatarItemCategory.Shoes end
+        if c == 13 then return MapleAvatarItemCategory.OneHandedWeapon end
+        if c == 14 then return MapleAvatarItemCategory.TwoHandedWeapon end
+        if c == 15 then return MapleAvatarItemCategory.SubWeapon end
+        if c == 16 then return MapleAvatarItemCategory.FaceAccessory end
+        if c == 17 then return MapleAvatarItemCategory.EyeAccessory end
+        if c == 18 then return MapleAvatarItemCategory.EarAccessory end
+        if c == 19 then return MapleAvatarItemCategory.Ear end
+        return MapleAvatarItemCategory.Invalid
+    end
+
+    @ExecSpace("Server")
+    method void ApplyAppearanceServer(table finals)
+        -- (버그 수정) 다른 플레이어에게 장비가 안 보이던 문제의 실제 해결부.
+        -- 서버에서 이 플레이어(요청 보낸 클라)의 CostumeManager에 장비를 넣으면, Custom*Equip/
+        -- UseCustomEquipOnly가 @Sync라 "모든" 클라이언트로 퍼진다 - 즉 다른 사람 화면에도 반영된다.
+        -- (@Logic이라 서버 RPC 호스팅 가능. senderUserId는 요청 보낸 클라의 UserId다.)
+        local player = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) then return end
+        local cm = player.CostumeManagerComponent
+        if not isvalid(cm) then return end
+        cm.UseCustomEquipOnly = true
+        for _, f in ipairs(finals) do
+            cm:SetEquip(self:CatEnum(f[1]), f[2])
+        end
+        log("[DecoWin] (서버) 외형 동기화 완료 user=" .. tostring(senderUserId))
     end
 
     @ExecSpace("ClientOnly")

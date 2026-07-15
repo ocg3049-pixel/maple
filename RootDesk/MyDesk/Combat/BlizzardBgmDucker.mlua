@@ -1,0 +1,81 @@
+@Logic
+@ExecSpace("ClientOnly")
+script BlizzardBgmDucker extends Logic
+
+	-- 블리자드 시전 동안 맵의 메인 BGM(1분 이상짜리 긴 배경음악)을 잠깐 죽였다가 되살리는 연출.
+	--
+	-- 왜 BGM 채널 음량인가:
+	--   맵의 메인 BGM은 map01 루트의 SoundComponent(Bgm=true)로 재생된다. Bgm=true 인 사운드는
+	--   엔진의 BGM 채널로 나가므로, 어떤 맵의 어떤 BGM이든 _SoundService:SetBGMVolume 하나로
+	--   음량을 조절할 수 있다(블리자드 시전 사운드/얼음 효과음 같은 일반 사운드는 영향받지 않는다).
+	--
+	-- 타임라인(StartDuck 호출 시점 기준):
+	--   0 ~ fadeDown          : 원래 음량 → MinVolume(20%)로 서서히 작아짐
+	--   ~ holdSeconds         : 20% 유지
+	--   ~ fadeUp              : 다시 서서히 원래 음량으로 복귀
+	-- 블리자드는 "13초 뒤 다시 커지기 시작" 하도록 PlayerAttack이 (1.5, 11.5, 2.5)로 부른다.
+
+	-- 원래 음량(복귀 목표). 맵 SoundComponent의 Volume과 맞춘다.
+	property number BaseVolume = 1.0
+
+	method void StartDuck(number fadeDownSeconds, number holdSeconds, number fadeUpSeconds, number minVolume)
+		-- 중복 시전 시 진행 중이던 페이드는 새 값으로 갱신된다(타이머를 하나만 유지).
+		if not self:IsClient() then return end
+
+		self._T.fadeDown = math.max(fadeDownSeconds, 0.01)
+		self._T.hold = math.max(holdSeconds, 0.0)
+		self._T.fadeUp = math.max(fadeUpSeconds, 0.01)
+		self._T.minVolume = minVolume
+		self._T.elapsed = 0.0
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self:Tick(delta)
+		end, 1 / 30)
+		log("[BlizzardBgmDucker] BGM 줄이기 시작 min=" .. tostring(minVolume) .. " hold=" .. tostring(holdSeconds))
+	end
+
+	method void Tick(number delta)
+		-- 경과 시간에 따라 BGM 음량을 BaseVolume → MinVolume → BaseVolume 으로 보간한다.
+		self._T.elapsed = self._T.elapsed + delta
+		local e = self._T.elapsed
+		local down = self._T.fadeDown
+		local hold = self._T.hold
+		local up = self._T.fadeUp
+		local minV = self._T.minVolume
+		local baseV = self.BaseVolume
+
+		local vol = baseV
+		if e < down then
+			vol = baseV + (minV - baseV) * (e / down)
+		elseif e < down + hold then
+			vol = minV
+		elseif e < down + hold + up then
+			vol = minV + (baseV - minV) * ((e - down - hold) / up)
+		else
+			-- 끝: 원래 음량으로 정확히 되돌리고 타이머를 정리한다.
+			_SoundService:SetBGMVolume(baseV)
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			log("[BlizzardBgmDucker] BGM 원상복귀 완료")
+			return
+		end
+		_SoundService:SetBGMVolume(vol)
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+		_SoundService:SetBGMVolume(self.BaseVolume)
+	end
+
+end

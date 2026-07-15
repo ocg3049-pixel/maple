@@ -1,0 +1,116 @@
+@Component
+script BlizzardFadingEffect extends Component
+
+	-- 블리자드 연출용 공용 이펙트 엔티티. _EffectService:PlayEffect는 재생 중인 인스턴스의 투명도/위치를
+	-- 실시간으로 바꿀 수 없어(라이브 트윈 불가), "서서히 사라짐 / 위로 떠오름 / 색 보정 / 지형 뒤 렌더링"이
+	-- 필요한 연출은 이 컴포넌트를 붙인 전용 엔티티로 클라이언트가 직접 매 프레임 갱신한다
+	-- (SpearBurstFadingEffect와 같은 이유. 그쪽은 스피어버스터 전용 트윈 규칙이라 건드리지 않고 분리했다).
+	--
+	-- 사용처(PlayerAttack.AttackBlizzard):
+	--  - 바닥 서리 이펙트(a428e9f4 / 1c0dd97b): 15~20초 뒤 1.5초에 걸쳐 서서히 사라짐
+	--  - 시전 시 캐릭터 앞 얼음책(5db17594): 위로 떠오르며 1.5초에 걸쳐 사라짐
+	--  - 배경 이펙트(02ab2921): 지형지물보다 뒤(SortingLayer/OrderInLayer)에서 희미하게 1회 재생
+
+	@Sync property string ClipRUID = ""
+	@Sync property number StartAlpha = 1.0
+	-- 이 시간 동안 그대로 보여준 뒤(HoldSeconds), FadeSeconds 동안 알파를 0까지 낮춘다.
+	@Sync property number HoldSeconds = 1.0
+	@Sync property number FadeSeconds = 1.5
+	-- 0보다 크면 매 프레임 위로 떠오른다(월드 유닛/초).
+	@Sync property number RiseSpeed = 0
+	@Sync property integer OrderInLayerValue = 0
+	-- 빈 문자열이면 모델 기본 SortingLayer를 그대로 쓴다. 지형 뒤로 보내려면 맵 레이어 이름을 넣는다.
+	@Sync property string SortingLayerName = ""
+	@Sync property number ScaleValue = 1.0
+	-- 클립 재생 속도(1.0 = 원본 속도, 0.5 = 절반 속도로 느리게). SpriteRendererComponent.PlayRate에 그대로 넣는다.
+	@Sync property number PlayRateValue = 1.0
+	-- 블리자드 이펙트(푸른 얼음)와 색을 맞추기 위한 색 보정(기본 1,1,1 = 원본 색 그대로).
+	@Sync property number TintR = 1.0
+	@Sync property number TintG = 1.0
+	@Sync property number TintB = 1.0
+	@Sync property boolean IsFlipX = false
+
+	@HideFromInspector property number Elapsed = 0
+	@HideFromInspector property boolean IsDone = false
+
+	method void OnBeginPlay()
+		-- 그림 갱신은 클라이언트에서만 한다(서버는 이 엔티티를 그리지 않는다).
+		if not self:IsClient() then return end
+		-- (버그 수정) "지면에 하얀 네모가 보인다" - 스폰 모델의 기본 SpriteRUID가 엔진 기본
+		-- 플레이스홀더(1705e3c5...)라, @Sync(ClipRUID)가 도착하기 전까지 그 네모가 그려졌다.
+		-- → 값이 오기 전에는 무조건 숨겨둔다.
+		self:HideUntilClipArrives()
+		self:Apply()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideUntilClipArrives()
+		-- 우리 클립이 정해지기 전까지 모델 기본 스프라이트가 보이지 않게 한다.
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		if self.ClipRUID ~= "" then return end
+		spr.SpriteRUID = ""
+		spr.Color = Color(self.TintR, self.TintG, self.TintB, 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- 서버가 스폰 직후 AddComponent → @Sync 설정을 하므로 클라이언트 OnBeginPlay가 값보다 먼저
+		-- 실행되는 경쟁 상태가 있다(SpearBurstFadingEffect에 문서화된 것과 동일). 값 도착 시 다시 적용한다.
+		if name ~= "ClipRUID" and name ~= "OrderInLayerValue" and name ~= "SortingLayerName" and name ~= "ScaleValue" and name ~= "StartAlpha" and name ~= "IsFlipX" and name ~= "PlayRateValue" then return end
+		self:Apply()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Apply()
+		-- 스프라이트/색/레이어/크기를 현재 프로퍼티 값으로 다시 적용한다.
+		if self.ClipRUID == "" then
+			self:HideUntilClipArrives()
+			return
+		end
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		spr.SpriteRUID = self.ClipRUID
+		-- 재생 속도(0.5면 절반 속도로 천천히 재생). 기본 1.0이라 기존 사용처는 그대로다.
+		spr.PlayRate = self.PlayRateValue
+		spr.OrderInLayer = self.OrderInLayerValue
+		spr.FlipX = self.IsFlipX
+		if self.SortingLayerName ~= "" then
+			spr.SortingLayer = self.SortingLayerName
+		end
+		spr.Color = Color(self.TintR, self.TintG, self.TintB, self.StartAlpha)
+		self.Entity.TransformComponent.Scale = Vector3(self.ScaleValue, self.ScaleValue, self.ScaleValue)
+		if self._T.baseY == nil then
+			self._T.baseY = self.Entity.TransformComponent.Position.y
+		end
+	end
+
+	method void OnUpdate(number delta)
+		if not self:IsClient() then return end
+		if self.IsDone then return end
+		if not isvalid(self.Entity) then return end
+		if self.ClipRUID == "" then return end
+
+		self.Elapsed = self.Elapsed + delta
+
+		if self.RiseSpeed > 0 and self._T.baseY ~= nil then
+			local p = self.Entity.TransformComponent.Position
+			self.Entity.TransformComponent.Position = Vector3(p.x, self._T.baseY + self.RiseSpeed * self.Elapsed, p.z)
+		end
+
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+
+		if self.Elapsed < self.HoldSeconds then
+			return
+		end
+
+		local t = (self.Elapsed - self.HoldSeconds) / math.max(self.FadeSeconds, 0.001)
+		if t >= 1.0 then
+			t = 1.0
+			self.IsDone = true
+		end
+		spr.Color = Color(self.TintR, self.TintG, self.TintB, self.StartAlpha * (1.0 - t))
+	end
+
+end

@@ -1,0 +1,93 @@
+@Logic
+@ExecSpace("ClientOnly")
+script BlizzardScreenDim extends Logic
+
+	-- 블리자드 시전 시 "맵 전체가 서서히 조금 어두워졌다가 15초 뒤 서서히 밝아지는" 연출.
+	-- 화면 전체를 덮는 검은 UI 스프라이트의 알파를 직접 트윈한다. UI 그룹의 형제들 중 맨 뒤(sibling 0)로
+	-- 보내두어 HUD/퀵슬롯 같은 UI는 어두워지지 않고 월드(맵)만 어두워 보이게 한다.
+
+	property SpriteGUIRendererComponent dimSprite = "ffdda413-5cf0-4545-8df5-d68661a37939"
+
+	method void OnBeginPlay()
+		if not self:IsClient() then return end
+		local ent = self:GetDimEntity()
+		if not isvalid(ent) then return end
+		-- 다른 UI(HUD/스킬바/창)보다 뒤에 그려지도록 형제들 중 맨 앞 인덱스로 보낸다.
+		_UILogic:SetSiblingIndex(ent.UITransformComponent, 0)
+		self.dimSprite.Color = Color(0, 0, 0, 0)
+		ent.Enable = false
+	end
+
+	method Entity GetDimEntity()
+		if not isvalid(self.dimSprite) then return nil end
+		return self.dimSprite.Entity
+	end
+
+	method void StartDim(number fadeInSeconds, number holdSeconds, number fadeOutSeconds, number maxAlpha)
+		-- 어두워짐(fadeIn) → 유지(hold) → 밝아짐(fadeOut). 중복 시전 시 진행 중이던 트윈은 새 값으로 갱신된다.
+		if not self:IsClient() then return end
+		local ent = self:GetDimEntity()
+		if not isvalid(ent) then return end
+
+		self._T.fadeIn = math.max(fadeInSeconds, 0.01)
+		self._T.hold = math.max(holdSeconds, 0.0)
+		self._T.fadeOut = math.max(fadeOutSeconds, 0.01)
+		self._T.maxAlpha = maxAlpha
+		self._T.elapsed = 0.0
+
+		ent.Enable = true
+		_UILogic:SetSiblingIndex(ent.UITransformComponent, 0)
+		self.dimSprite.Color = Color(0, 0, 0, 0)
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self:Tick(delta)
+		end, 1 / 60)
+		log("[BlizzardScreenDim] 어두워짐 시작 hold=" .. tostring(holdSeconds) .. " maxAlpha=" .. tostring(maxAlpha))
+	end
+
+	method void Tick(number delta)
+		-- 경과 시간에 따라 알파를 0 → maxAlpha → 0 으로 보간한다.
+		local ent = self:GetDimEntity()
+		if not isvalid(ent) then return end
+		self._T.elapsed = self._T.elapsed + delta
+		local e = self._T.elapsed
+		local fadeIn = self._T.fadeIn
+		local hold = self._T.hold
+		local fadeOut = self._T.fadeOut
+		local maxA = self._T.maxAlpha
+
+		local alpha = 0.0
+		if e < fadeIn then
+			alpha = maxA * (e / fadeIn)
+		elseif e < fadeIn + hold then
+			alpha = maxA
+		elseif e < fadeIn + hold + fadeOut then
+			alpha = maxA * (1.0 - (e - fadeIn - hold) / fadeOut)
+		else
+			-- 끝: 타이머 정리 후 완전히 끈다.
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			self.dimSprite.Color = Color(0, 0, 0, 0)
+			ent.Enable = false
+			log("[BlizzardScreenDim] 밝아짐 완료")
+			return
+		end
+		self.dimSprite.Color = Color(0, 0, 0, alpha)
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+	end
+
+end

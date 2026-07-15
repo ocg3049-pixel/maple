@@ -1,0 +1,197 @@
+@Logic
+@ExecSpace("ClientOnly")
+script BlizzardSnowfall extends Logic
+
+	-- 블리자드 시전 시 "화면 오른쪽 위 → 왼쪽 아래로 눈이 빠르게 쏟아지는 폭설" 연출.
+	--
+	-- 왜 UI 오버레이인가:
+	-- (1) 월드 엔티티로 눈송이 수십 개를 스폰하면 서버-클라 동기화 비용이 크고, 카메라가 움직이면
+	--     화면 밖에 눈이 없는 구간이 생긴다.
+	-- (2) _EffectService:PlayEffect는 재생 위치를 매 프레임 옮길 수 없어 "흘러내리는" 연출이 안 된다.
+	-- → 전용 UI 그룹 ui/BlizzardSnowGroup.ui(눈송이 스프라이트 88개)를 클라이언트가 직접
+	--    매 프레임 이동시킨다. 화면 밖으로 나가면 오른쪽/위쪽 가장자리에서 다시 등장한다(무한 순환).
+	--    (70개 → 안 보여서 350개 → 많아서 175개 → 다시 절반인 88개. 투명도 80%, 각도는 좌측으로 눕힘.)
+	--
+	-- 왜 DefaultGroup.ui가 아니라 별도 파일인가(중요):
+	--   DefaultGroup.ui는 이미 엔티티가 2300개가 넘어, 뒤에 덧붙인 엔티티가 런타임에 통째로
+	--   누락된다(실측 - 70개는 올라왔지만 350개로 늘리자 자식이 0개가 됐다. 5묶음으로 나눠도 동일).
+	--   .ui 파일마다 예산이 따로라 전용 그룹 파일로 빼면 정상적으로 올라온다.
+	--   ⚠ 그룹의 displayOrder/GroupOrder에 음수(-1)를 주면 엔티티/알파/좌표가 다 정상인데도
+	--     화면에 아무것도 안 그려진다(실측). 그래서 양수 6을 쓴다.
+	--
+	-- 눈송이 스프라이트는 원본 시트(2d507f2d)를 조각내어 업로드한 3종:
+	--   8b2d0a29(육각 결정) / 78a18913(길게 늘어진 눈발) / bd783daa(작은 알갱이)
+	--   → msw-dev-tools/resources/블리자드눈/RUID.md
+
+	property Entity snowGroup = "4667ab97-cd24-44c2-aa53-ebf023cfe3ad"
+
+	-- 낙하 방향(오른쪽 위 → 왼쪽 아래). 화면 좌표계라 x-가 왼쪽, y-가 아래.
+	-- (기능 수정) 좀 더 좌측으로 날아가는 느낌 - 기울기를 눕혔다(-0.45,-0.89 → -0.80,-0.60).
+	property number DirX = -0.80
+	property number DirY = -0.60
+
+	-- 전체 투명도 80%(요청). 눈송이마다 진하기가 다르되 이 값을 넘지 않는다.
+	property number MaxAlpha = 0.8
+
+	-- 화면(1920x1080) 바깥까지 넉넉히 잡은 순환 경계.
+	property number BoundL = -1150
+	property number BoundR = 1150
+	property number BoundT = 660
+	property number BoundB = -660
+
+	method void OnBeginPlay()
+		-- 시작할 땐 꺼둔다(블리자드를 쓸 때만 StartSnow로 켠다).
+		if not self:IsClient() then return end
+		if not isvalid(self.snowGroup) then
+			log_warning("[BlizzardSnowfall] snowGroup 엔티티를 찾지 못했습니다")
+			return
+		end
+		self.snowGroup.Enable = false
+	end
+
+	method void StartSnow(number phase1Seconds, number phase2Seconds)
+		-- 폭설 타임라인(호출 시점 기준):
+		--   0s              ~ FADE_IN : 눈이 스르륵 짙어지며 내리기 시작(전량)
+		--   ~ phase1Seconds           : 전량이 계속 내림 (요청: 7초)
+		--   phase1 시점               : 눈송이의 "절반"이 먼저 스르륵 사라짐(HALF_FADE)
+		--   ~ phase2Seconds 추가      : 남은 절반이 계속 내림 (요청: 4초)
+		--   그 뒤 FADE_OUT            : 나머지도 스르륵 사라지고 그룹이 꺼진다
+		if not self:IsClient() then return end
+		if not isvalid(self.snowGroup) then return end
+
+		self._T.fadeIn = 1.0
+		self._T.phase1 = math.max(phase1Seconds, 0.1)
+		self._T.halfFade = 1.0
+		self._T.phase2 = math.max(phase2Seconds, 0.1)
+		self._T.fadeOut = 1.5
+		self._T.elapsed = 0.0
+
+		self.snowGroup.Enable = true
+
+		self:InitFlakes()
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self:Tick(delta)
+		end, 1 / 60)
+		log("[BlizzardSnowfall] 폭설 시작 flakes=" .. tostring(#self._T.flakes))
+	end
+
+	method void InitFlakes()
+		-- 눈송이 하나하나의 초기 위치/속도/투명도를 정한다. 속도를 제각각 줘야 "쏟아지는" 느낌이 난다.
+		-- 눈송이는 Batch 패널 아래에 최대 70개씩 나뉘어 있다(그룹 → 배치 → 눈송이). 그래서 손자까지 훑는다.
+		local flakes = {}
+		local n = 0
+		for _, batch in ipairs(self.snowGroup.Children:ToTable()) do
+			for _, child in ipairs(batch.Children:ToTable()) do
+				local spr = child.SpriteGUIRendererComponent
+				local tr = child.UITransformComponent
+				if isvalid(spr) and isvalid(tr) then
+					local f = {}
+					f.entity = child
+					f.spr = spr
+					f.tr = tr
+					-- 절반(홀수 번째)은 1단계가 끝나면 먼저 사라지고, 나머지 절반이 4초 더 내린다.
+					n = n + 1
+					f.isEarly = (n % 2 == 1)
+					f.x = self.BoundL + _UtilLogic:RandomDouble() * (self.BoundR - self.BoundL)
+					f.y = self.BoundB + _UtilLogic:RandomDouble() * (self.BoundT - self.BoundB)
+					-- 1400~2600 px/s. 폭설이라 아주 빠르게 흐른다.
+					f.speed = 1400 + _UtilLogic:RandomDouble() * 1200
+					-- 눈송이마다 진하기가 달라야 앞/뒤 거리감이 생긴다. 최대치는 MaxAlpha(80%).
+					f.alpha = self.MaxAlpha * (0.65 + _UtilLogic:RandomDouble() * 0.35)
+					table.insert(flakes, f)
+				end
+			end
+		end
+		self._T.flakes = flakes
+	end
+
+	method void Respawn(any f)
+		-- 화면 왼쪽/아래로 빠져나간 눈송이를 위쪽 또는 오른쪽 가장자리에 다시 넣는다.
+		-- 각도를 좌측으로 눕히면서 대부분 왼쪽 벽으로 빠져나가므로, 오른쪽 가장자리에서 더 많이
+		-- 다시 넣어야 화면이 고르게 채워진다(위쪽에서만 넣으면 오른쪽이 휑해진다).
+		if _UtilLogic:RandomDouble() < 0.35 then
+			f.x = -960 + _UtilLogic:RandomDouble() * (self.BoundR + 960)
+			f.y = self.BoundT
+		else
+			f.x = self.BoundR
+			f.y = -540 + _UtilLogic:RandomDouble() * (self.BoundT + 540)
+		end
+	end
+
+	method number EnvelopeAt(number e, number outStart, number outLength)
+		-- 등장(fadeIn) → 유지 → outStart부터 outLength 동안 퇴장. 0~1 사이 배율을 돌려준다.
+		local fadeIn = self._T.fadeIn
+		if e < fadeIn then
+			return e / fadeIn
+		end
+		if e < outStart then
+			return 1.0
+		end
+		if e < outStart + outLength then
+			return 1.0 - (e - outStart) / outLength
+		end
+		return 0.0
+	end
+
+	method void Tick(number delta)
+		-- 매 프레임 눈송이를 대각선으로 이동시키고, 절반/나머지 각각의 투명도를 갱신한다.
+		if not isvalid(self.snowGroup) then return end
+		if self._T.flakes == nil then return end
+
+		self._T.elapsed = self._T.elapsed + delta
+		local e = self._T.elapsed
+
+		-- 절반(isEarly)은 phase1이 끝나면 바로 퇴장, 나머지는 phase2까지 더 내린 뒤 퇴장.
+		local earlyOut = self._T.phase1
+		local lateOut = self._T.phase1 + self._T.phase2
+		local envEarly = self:EnvelopeAt(e, earlyOut, self._T.halfFade)
+		local envLate = self:EnvelopeAt(e, lateOut, self._T.fadeOut)
+
+		if e >= lateOut + self._T.fadeOut then
+			-- 끝: 타이머를 정리하고 그룹을 끈다.
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			self.snowGroup.Enable = false
+			log("[BlizzardSnowfall] 폭설 종료")
+			return
+		end
+
+		for _, f in ipairs(self._T.flakes) do
+			local env = envLate
+			if f.isEarly then
+				env = envEarly
+			end
+			-- 이미 사라진 눈송이는 움직일 필요가 없다.
+			if env > 0 then
+				f.x = f.x + self.DirX * f.speed * delta
+				f.y = f.y + self.DirY * f.speed * delta
+				if f.x < self.BoundL or f.y < self.BoundB then
+					self:Respawn(f)
+				end
+				if isvalid(f.tr) then
+					f.tr.anchoredPosition = Vector2(f.x, f.y)
+				end
+			end
+			if isvalid(f.spr) then
+				f.spr.Color = Color(1, 1, 1, f.alpha * env)
+			end
+		end
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+	end
+
+end
