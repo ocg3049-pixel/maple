@@ -74,7 +74,9 @@ script SkillManager extends Logic
 			},
 			["1"] = {
 				{ ruid = "5c61ff8df1544c05a200e598ea9164ce", name = "파워스트라이크", level = 1, desc = "무기로 적을 강하게 내려친다." },
-				{ ruid = "42e8d60e495a41bc94d4b3ac7ec022dc", name = "슬래쉬블래스트", level = 1, desc = "검을 휘둘러 전방의 적들을 베어낸다." },
+				{ ruid = "362ae7fa63104016a89c5172d6c76efd", name = "러시",           level = 1, desc = "방향키를 누른 채 사용하거나 방향키를 두 번 눌러 질주한다.\n질주 자세로 이동속도가 2배가 되며,\n방향키를 떼거나 공격하면 풀린다.\n(아이콘은 임시 - 교체 가능)" },
+			{ ruid = "2ba15e204ac64214a8144b0b2deeaf79", name = "가드",           level = 1, desc = "1초간 공격을 받아넘길 자세를 취한다.\n그 사이 공격을 받으면 피해를 무시하고\n2초간 무적이 된다.\n재사용 대기시간 20초(가드 성공 시 5초).\n(아이콘은 임시 - 교체 가능)" },
+				{ ruid = "42e8d60e495a41bc94d4b3ac7ec022dc", name = "슬래시블러스트", level = 1, desc = "검을 휘둘러 전방의 적들을 베어낸다." },
 				{ ruid = "56144f55ece34e13b1aeeb6c102eb8b1", name = "더블샷",         level = 1, desc = "화살 두 발을 동시에 발사한다." },
 				{ ruid = "4e76419dd50a4ca99103118dd05e4628", name = "매직클로",       level = 1, desc = "마법의 힘을 담은 손톱으로 적을 할퀸다." },
 				{ ruid = "92a5020c978c46bdabab910598118b86", name = "더블스탭",       level = 1, desc = "단검으로 적을 두 번 빠르게 찌른다." },
@@ -712,6 +714,25 @@ script SkillManager extends Logic
 		-- 퀵슬롯 리매핑 키 캡처 중에는 스킬/창 단축키를 모두 무시한다 (KeySettingManager가 처리)
 		if _KeySettingManager:IsCapturingKey() then return end
 		local k = e.key
+		-- (질주) 좌/우 방향키 "더블탭"(0.5초 내 두 번) → 그 방향으로 질주 진입. 공격키(Ctrl) → 질주 해제.
+		if k == KeyboardKey.LeftArrow or k == KeyboardKey.RightArrow then
+			local dir = (k == KeyboardKey.LeftArrow) and "left" or "right"
+			local now = _UtilLogic.ElapsedSeconds
+			-- 이미 그 방향으로 질주 중이면 더블탭을 다시 잡지 않는다(홀드 중 반복 KeyDown으로 재발동 방지).
+			if not (self._T.sprintActive == true and self._T.sprintDir == dir) then
+				local lastT = (dir == "left") and (self._T.sprintLastLeft or -99.0) or (self._T.sprintLastRight or -99.0)
+				if lastT + 0.5 >= now then
+					self:EnterSprint(dir)
+					-- 트리거 후 타이머를 비워 홀드 중 반복 입력이 좌/우를 번갈아 재발동시키지 않게 한다.
+					self._T.sprintLastLeft = -99.0
+					self._T.sprintLastRight = -99.0
+				else
+					if dir == "left" then self._T.sprintLastLeft = now else self._T.sprintLastRight = now end
+				end
+			end
+		elseif k == KeyboardKey.LeftControl or k == KeyboardKey.RightControl then
+			if self._T.sprintActive == true then self:EndSprint() end
+		end
 		-- 스킬창 열기 키 (기본 K - 키설정에서 다른 키로 옮겼으면 그 키)
 		if _KeySettingManager:GetFuncForKeyEnum(k) == "skill" then
 			self:ToggleWindow()
@@ -743,11 +764,182 @@ script SkillManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyUp(KeyUpEvent e)
+		-- (질주) 진행 방향 방향키를 떼면 질주 해제.
+		if e.key == KeyboardKey.LeftArrow or e.key == KeyboardKey.RightArrow then
+			if self._T.sprintActive == true then
+				local upDir = (e.key == KeyboardKey.LeftArrow) and "left" or "right"
+				if self._T.sprintDir == upDir then self:EndSprint() end
+			end
+		end
 		-- 스킬키를 뗀 순간 홀드 상태를 해제한다 (OnUpdate의 홀드 지속 발동 루프가 멈추도록)
 		local keyName = self:GetSkillKeyName(e.key)
 		if keyName ~= "" then
 			self._T.heldSkillKeys[keyName] = false
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BlinkSlotReady(string slotPos)
+		-- 쿨타임이 다 돌아 다시 사용할 수 있게 되면 그 슬롯 아이콘을 2번 깜빡여 알린다(모든 쿨타임 스킬 공통).
+		-- 어둡게(알파 0.25) → 밝게 → 어둡게 → 밝게 순서로 0.15초 간격 토글 = 깜빡임 2회.
+		if slotPos == nil or slotPos == "" then return end
+		local icon = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. tostring(slotPos) .. "/Icon")
+		if not isvalid(icon) then return end
+		local spr = icon.SpriteGUIRendererComponent
+		if not isvalid(spr) then return end
+		local c = spr.Color
+		local bright = Color(c.r, c.g, c.b, 1)
+		local dim = Color(c.r, c.g, c.b, 0.25)
+		spr.Color = dim
+		_TimerService:SetTimerOnce(function() if isvalid(spr) then spr.Color = bright end end, 0.15)
+		_TimerService:SetTimerOnce(function() if isvalid(spr) then spr.Color = dim end end, 0.3)
+		_TimerService:SetTimerOnce(function() if isvalid(spr) then spr.Color = bright end end, 0.45)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetWeaponMotionClass()
+		-- 파워스트라이크/슬래쉬블래스트 모션 분기용 무기 분류를 돌려준다.
+		--   "spear"   = 창/폴암 (장비 이름에 "창" 또는 "폴암" 포함)
+		--   "twohand" = 두손검 등 TwoHandedWeapon 슬롯 장착 무기
+		--   "onehand" = 한손검 등 그 외
+		-- 인벤토리/장비는 클라이언트 전용 상태라 여기(클라이언트)서만 판정할 수 있다.
+		local weaponStr = _UIEquipInventoryManager:GetEquip(6)
+		local wname = (weaponStr ~= "") and _UIEquipInventoryManager:ParseName(weaponStr) or ""
+		if string.find(wname, "창") ~= nil or string.find(wname, "폴암") ~= nil then
+			return "spear"
+		end
+		-- (버그 수정) "카알대검(한손검)을 끼었는데 두손검 모션이 나온다" - 아바타 TwoHandedWeapon 슬롯
+		-- 점유 여부로 판정했더니, 무기를 한손검으로 바꿔도 두손 슬롯에 이전 무기 값이 남아 있어 twohand로
+		-- 오판했다. 장착 슬롯 결정(DecoWindowManager)과 동일한 "장비창 무기 이름" 기반 판정으로 통일한다.
+		if wname ~= "" and _UIEquipInventoryManager:IsOneHandedJobWeapon(wname) then
+			return "onehand"
+		end
+		return "twohand"
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FindBarPosForSkillName(string skillName)
+		-- 지정한 스킬이 배정된 퀵슬롯 위치 접미사(Slot_<위치>)를 돌려준다(없으면 "").
+		-- slotData는 "실제 키 → 슬롯" 매핑이라, 키를 찾은 뒤 GetBarPosForKey로 위치를 역조회한다.
+		for key, slot in pairs(self._T.slotData or {}) do
+			if slot ~= nil and slot.name == skillName then
+				return self:GetBarPosForKey(key)
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void TryEnterSprintFromSkill()
+		-- 러시 스킬 발동 시: 좌/우 방향키를 누르고 있으면 그 방향으로 질주 진입(안 누르고 있으면 무반응).
+		if _InputService:IsKeyPressed(KeyboardKey.LeftArrow) then
+			self:EnterSprint("left")
+		elseif _InputService:IsKeyPressed(KeyboardKey.RightArrow) then
+			self:EnterSprint("right")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnterSprint(string dir)
+		-- swingT3 대시 자세로 이동속도 2배 질주. 방향키를 떼거나 공격/스킬 시 해제(SprintTick/OnKeyUp/UseSkillInSlot).
+		-- (요청) 쿨타임 3초 - 발동한 순간부터 3초 동안 재발동 불가, 퀵슬롯에 블리자드 방식으로 표시된다.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		if self._T.sprintActive == true and self._T.sprintDir == dir then return end
+		if (self._T.dashCooldownUntil or 0) >= _UtilLogic.ElapsedSeconds then return end
+		if self._T.sprintActive == true then self:EndSprint() end
+		self._T.dashCooldownUntil = _UtilLogic.ElapsedSeconds + 3.0
+		-- 러시가 배정된 퀵슬롯 위치를 찾아 쿨타임 오버레이/카운트다운을 띄운다(블리자드와 동일한 표시).
+		local dashBarPos = self:FindBarPosForSkillName("러시")
+		if dashBarPos ~= "" then
+			_DashCooldownUI:ShowCooldown(3.0, dashBarPos)
+		end
+		self._T.sprintActive = true
+		self._T.sprintDir = dir
+		self._T.sprintKeyEnum = (dir == "left") and KeyboardKey.LeftArrow or KeyboardKey.RightArrow
+		-- 이동속도 2배는 서버에서 설정한다(클라이언트에서 InputSpeed를 직접 바꾸면 서버가 덮어써 무효).
+		self:RequestSetSprintSpeed(true)
+		if self._T.sprintTimerId ~= nil then _TimerService:ClearTimer(self._T.sprintTimerId) end
+		self._T.sprintTimerId = _TimerService:SetTimerRepeat(function()
+			self:SprintTick()
+		end, 0.08)
+		-- (요청) 질주 지속시간 0.4초 - 방향키를 계속 눌러도 0.4초 뒤 자동 해제된다.
+		if self._T.sprintDurTimerId ~= nil then _TimerService:ClearTimer(self._T.sprintDurTimerId) end
+		self._T.sprintDurTimerId = _TimerService:SetTimerOnce(function()
+			self:EndSprint()
+		end, 0.4)
+		self:PlaySprintPose()
+		log("[SkillManager] 질주 시작 dir=" .. dir)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SprintTick()
+		-- 질주 자세만 유지한다. 해제는 OnKeyUp(방향키 릴리즈)/공격/스킬이 담당한다
+		-- (IsKeyPressed 폴링은 홀드 중에도 false로 읽혀 질주가 깜빡거리는 문제가 있어 사용하지 않는다).
+		if self._T.sprintActive ~= true then return end
+		self:PlaySprintPose()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlaySprintPose()
+		-- 걷기 애니메이션에 덮이지 않게 swingT3 대시 자세(프레임 0~1)를 계속 재전송한다.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		local ar = player.AvatarRendererComponent
+		if not isvalid(ar) then return end
+		local body = ar:GetBodyEntity()
+		if not isvalid(body) then return end
+		local ev = ActionStateChangedEvent("swingT3", "swingT3", 1.0, SpriteAnimClipPlayType.Loop, 0, 1)
+		body:SendEvent(ev)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EndSprint()
+		if self._T.sprintActive ~= true then return end
+		self._T.sprintActive = false
+		if self._T.sprintTimerId ~= nil then
+			_TimerService:ClearTimer(self._T.sprintTimerId)
+			self._T.sprintTimerId = nil
+		end
+		if self._T.sprintDurTimerId ~= nil then
+			_TimerService:ClearTimer(self._T.sprintDurTimerId)
+			self._T.sprintDurTimerId = nil
+		end
+		self:RequestSetSprintSpeed(false)   -- 서버에서 원래 이동속도로 복구
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			-- 남은 질주 자세 클립을 걷기/서기로 되돌린다(StateChangeEvent 유발).
+			local sc = player.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+				sc:ChangeState("MOVE")
+				sc:ChangeState("IDLE")
+			end
+		end
+		log("[SkillManager] 질주 해제")
+	end
+
+	@ExecSpace("Server")
+	method void RequestSetSprintSpeed(boolean active)
+		-- 질주 이동속도(2배) 적용/해제를 서버에서 처리한다. 유저별 원래 InputSpeed를 저장해 정확히 복구한다.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then return end
+		local mv = player.MovementComponent
+		if not isvalid(mv) then return end
+		if self._T.sprintOrigByUser == nil then self._T.sprintOrigByUser = {} end
+		if active then
+			if self._T.sprintOrigByUser[senderUserId] == nil then
+				self._T.sprintOrigByUser[senderUserId] = mv.InputSpeed
+			end
+			mv.InputSpeed = self._T.sprintOrigByUser[senderUserId] * 2.0
+		else
+			local orig = self._T.sprintOrigByUser[senderUserId]
+			if orig ~= nil then
+				mv.InputSpeed = orig
+				self._T.sprintOrigByUser[senderUserId] = nil
+			end
+		end
+		log("[SkillManager] RequestSetSprintSpeed active=" .. tostring(active) .. " InputSpeed=" .. tostring(mv.InputSpeed))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -762,6 +954,15 @@ script SkillManager extends Logic
 		if isvalid(deathState) and deathState.CurrentStateName == "DEAD" then
 			log("[SkillManager] 사망 상태 - 스킬 사용 불가 (부활 후 사용 가능)")
 			return
+		end
+		-- (새 대쉬=질주) 러시 스킬: 방향키(좌/우)를 누르고 있으면 질주 진입, 아니면 아무 일도 안 함. 쿨다운/RPC 없음.
+		if slot.name == "러시" then
+			self:TryEnterSprintFromSkill()
+			return
+		end
+		-- (요청) 질주 중 다른 스킬을 누르면 제자리로 돌아가지 않고 즉시 그 스킬을 발동한다 - 먼저 질주만 해제한다.
+		if self._T.sprintActive == true then
+			self:EndSprint()
 		end
 		-- 캐릭터 정보창의 실제 크리티컬 확률(장비 잠재능력 반영)을 스킬 사용 시마다 서버로 동기화한다 -
 		-- CalcCritical은 서버에서만 실행되고 장비/인벤토리는 클라이언트 전용 상태라, combatPower와
@@ -833,6 +1034,20 @@ script SkillManager extends Logic
 			self:RequestFireAssaulter(combatPower)
 			return
 		end
+		if slot.name == "가드" then
+			-- 가드(패링): 공용 쿨다운과 무관한 독립 쿨타임 20초(패링 성공 시 5초로 단축 - NotifyGuardParrySuccess).
+			-- 이펙트/모션 없이 서버에 1초 패링 창만 연다.
+			if (self._T.guardCooldownUntil or 0) >= _UtilLogic.ElapsedSeconds then return end
+			self._T.guardUseAt = _UtilLogic.ElapsedSeconds
+			self._T.guardCooldownUntil = self._T.guardUseAt + 20.0
+			self._T.guardBarPos = self:GetBarPosForKey(key)
+			if self._T.guardBarPos ~= "" then
+				_GuardCooldownUI:ShowCooldown(20.0, self._T.guardBarPos)
+			end
+			self:RequestFireGuard()
+			log("[SkillManager] 가드 사용(패링 1초, 쿨타임 20초)")
+			return
+		end
 		if self._T.skillOnCooldown then return end
 		log("[SkillManager] 스킬 사용: " .. slot.name .. " (단축키: " .. key .. ")")
 		if slot.name == "달팽이 세마리" then
@@ -850,11 +1065,10 @@ script SkillManager extends Logic
 				self._T.skillOnCooldown = false
 			end, 0.75 * atkMult)
 			local combatPower = _CharInfoManager:CalcCombatPower()
-			-- 파이널어택(2차 패시브)의 창/비창 모션 분기용 - 인벤토리/장비는 클라이언트 전용 상태라 여기서 확인해 전달한다.
-			local weaponStr = _UIEquipInventoryManager:GetEquip(6)
-			local isSpear = weaponStr ~= "" and string.find(_UIEquipInventoryManager:ParseName(weaponStr), "창") ~= nil
-			self:RequestFirePowerStrike(combatPower, atkMult, isSpear)
-		elseif slot.name == "슬래쉬블래스트" then
+			-- 무기 분류(창·폴암/두손검/한손검) 모션 분기용 - 인벤토리/장비는 클라이언트 전용 상태라 여기서 확인해 전달한다.
+			self:RequestFirePowerStrike(combatPower, atkMult, self:GetWeaponMotionClass())
+		elseif slot.name == "슬래시블러스트" or slot.name == "슬래쉬블래스트" then
+			-- (이름 변경) 새 이름 "슬래시블러스트" + 이미 퀵슬롯에 저장된 옛 이름("슬래쉬블래스트")도 호환.
 			-- 파워스트라이크와 동일하게 공격속도 배율을 쿨다운(재사용 대기시간)에 함께 적용한다.
 			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
 			self._T.skillOnCooldown = true
@@ -862,9 +1076,7 @@ script SkillManager extends Logic
 				self._T.skillOnCooldown = false
 			end, 0.75 * atkMult)
 			local combatPower = _CharInfoManager:CalcCombatPower()
-			local weaponStr = _UIEquipInventoryManager:GetEquip(6)
-			local isSpear = weaponStr ~= "" and string.find(_UIEquipInventoryManager:ParseName(weaponStr), "창") ~= nil
-			self:RequestFireSlashBlast(combatPower, atkMult, isSpear)
+			self:RequestFireSlashBlast(combatPower, atkMult, self:GetWeaponMotionClass())
 		elseif slot.name == "럭키세븐" then
 			-- 럭키세븐은 가니어를 장착한 상태에서만 사용 가능하다. 인벤토리/장비 상태는 클라이언트에만 존재하므로
 			-- (서버는 CostumeManagerComponent의 실제 장착값을 알 수 없음) 여기 클라이언트 측에서 확인한다.
@@ -1205,7 +1417,7 @@ script SkillManager extends Logic
 	end
 
 	@ExecSpace("Server")
-	method void RequestFirePowerStrike(number combatPower, number atkMultiplier, boolean isSpear)
+	method void RequestFirePowerStrike(number combatPower, number atkMultiplier, string weaponClass)
 		local player = _UserService:GetUserEntityByUserId(senderUserId)
 		if not isvalid(player) then
 			log_warning("[SkillManager] RequestFirePowerStrike: player not found")
@@ -1217,12 +1429,41 @@ script SkillManager extends Logic
 			log_warning("[SkillManager] RequestFirePowerStrike: PlayerAttack component not found")
 			return
 		end
-		pa:AttackPowerStrike(combatPower, atkMultiplier, isSpear)
+		pa:AttackPowerStrike(combatPower, atkMultiplier, weaponClass)
 		log("[SkillManager] 파워스트라이크 발동! combatPower=" .. tostring(combatPower) .. " atkMultiplier=" .. tostring(atkMultiplier))
 	end
 
 	@ExecSpace("Server")
-	method void RequestFireSlashBlast(number combatPower, number atkMultiplier, boolean isSpear)
+	method void RequestFireGuard()
+		-- 가드(패링) 사용: 서버의 PlayerHit에 1초 패링 창을 연다. 실제 판정/무적/성공 통지는
+		-- PlayerHit.CheckGuardBlock(공격자 MonsterAttack.IsAttackTarget에서 호출)이 처리한다.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then return end
+		local hit = player.PlayerHit
+		if isvalid(hit) then
+			hit:StartGuardParry()
+		end
+	end
+
+	@ExecSpace("Client")
+	method void NotifyGuardParrySuccess()
+		-- 가드 패링 성공(서버 PlayerHit.CheckGuardBlock에서 호출): 쿨타임을 5초로 단축하고
+		-- 우측 상단에 무적(2초) 버프 아이콘을 띄운다.
+		local now = _UtilLogic.ElapsedSeconds
+		local shortened = (self._T.guardUseAt or now) + 5.0
+		if shortened < (self._T.guardCooldownUntil or 0) then
+			self._T.guardCooldownUntil = shortened
+			local remaining = math.max(shortened - now, 0.1)
+			if (self._T.guardBarPos or "") ~= "" then
+				_GuardCooldownUI:ShowCooldown(remaining, self._T.guardBarPos)
+			end
+		end
+		_GuardBuffUI:ShowBuff(2.0)
+		log("[SkillManager] 가드 성공! 쿨타임 5초로 단축 + 2초 무적 버프")
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireSlashBlast(number combatPower, number atkMultiplier, string weaponClass)
 		local player = _UserService:GetUserEntityByUserId(senderUserId)
 		if not isvalid(player) then
 			log_warning("[SkillManager] RequestFireSlashBlast: player not found")
@@ -1234,8 +1475,8 @@ script SkillManager extends Logic
 			log_warning("[SkillManager] RequestFireSlashBlast: PlayerAttack component not found")
 			return
 		end
-		pa:AttackSlashBlast(combatPower, atkMultiplier, isSpear)
-		log("[SkillManager] 슬래쉬블래스트 발동! combatPower=" .. tostring(combatPower) .. " atkMultiplier=" .. tostring(atkMultiplier))
+		pa:AttackSlashBlast(combatPower, atkMultiplier, weaponClass)
+		log("[SkillManager] 슬래시블러스트 발동! combatPower=" .. tostring(combatPower) .. " atkMultiplier=" .. tostring(atkMultiplier))
 	end
 
 	@ExecSpace("Server")
@@ -2193,7 +2434,7 @@ script SkillManager extends Logic
 			for key, held in pairs(self._T.heldSkillKeys) do
 				if held and not self._T.skillOnCooldown then
 					local slot = self._T.slotData[key]
-					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터" or slot.name == "어벤져" or slot.name == "드래곤 로어" or slot.name == "새비지블로우") then
+					if slot ~= nil and (slot.name == "달팽이 세마리" or slot.name == "파워스트라이크" or slot.name == "슬래시블러스트" or slot.name == "슬래쉬블래스트" or slot.name == "럭키세븐" or slot.name == "더블스탭" or slot.name == "매직클로" or slot.name == "썬더볼트" or slot.name == "힐" or slot.name == "파이어에로우" or slot.name == "아이언 에로우" or slot.name == "헤이스트" or slot.name == "스피어 버스터" or slot.name == "어벤져" or slot.name == "드래곤 로어" or slot.name == "새비지블로우") then
 						self:UseSkillInSlot(key)
 					end
 				end

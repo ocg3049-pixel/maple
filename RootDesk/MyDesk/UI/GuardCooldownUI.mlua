@@ -1,0 +1,101 @@
+@Logic
+@ExecSpace("ClientOnly")
+script GuardCooldownUI extends Logic
+
+	-- 가드(패링) 쿨타임(기본 20초, 패링 성공 시 5초로 단축) 표시. 대시(DashCooldownUI)와 동일한 표현 방식 -
+	-- 스킬이 배정된 퀵슬롯 아이콘 위에 검은 오버레이가 덮이고, 시간이 지날수록 위에서부터 밝아지면서
+	-- 남은 초가 숫자로 뜬다. 쿨타임이 다 돌면 슬롯 아이콘이 2번 깜빡여 재사용 가능을 알린다.
+	-- 다른 쿨타임 UI(대시/블리자드)와 엔티티를 공유하지 않는 이유: 동시에 돌면 서로를 덮어쓰기 때문.
+
+	property SpriteGUIRendererComponent grayOverlay = "3f5b64fe-d09b-4e2c-a765-04e604f58a92"
+	property TextComponent countdownText = "79c48a5d-eb18-4b1e-958c-c4307cd8ec14"
+
+	method void ShowCooldown(number duration, string slotKey)
+		-- slotKey = 퀵슬롯 위치 접미사(Slot_<위치>). 오버레이/텍스트를 그 슬롯 위로 옮긴 뒤 카운트다운을 시작한다.
+		-- 패링 성공 시 남은 시간으로 다시 호출되면 기존 타이머를 교체해 표시만 갱신된다.
+		if not self:IsClient() then return end
+		if duration <= 0 then return end
+		self._T.totalDuration = duration
+		self._T.remaining = duration
+		self._T.slotKey = slotKey
+
+		-- (Dash/BlizzardCooldownUI와 동일) 오버레이를 .ui에 Filled로 저장하면 렌더링되지 않는 문제가 있어,
+		-- 저장은 Simple로 하고 런타임에 매번 Filled/Vertical로 바꿔준다.
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Type = ImageType.Filled
+			self.grayOverlay.FillMethod = FillMethodType.Vertical
+		end
+
+		local slotEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. tostring(slotKey))
+		if isvalid(slotEnt) then
+			local slotPos = slotEnt.UITransformComponent.anchoredPosition
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Entity.Enable = true
+		end
+		if isvalid(self.countdownText) then
+			self.countdownText.Entity.Enable = true
+		end
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self._T.remaining = self._T.remaining - delta
+			self:UpdateCooldownDisplay()
+		end, 1 / 60)
+
+		self:UpdateCooldownDisplay()
+		log("[GuardCooldownUI] 쿨타임 표시 시작 duration=" .. tostring(duration) .. " slot=" .. tostring(slotKey))
+	end
+
+	method void UpdateCooldownDisplay()
+		-- 매 프레임 남은 시간에 따라 오버레이(FillAmount)/카운트다운 텍스트를 갱신한다.
+		local remaining = self._T.remaining
+		local total = self._T.totalDuration
+
+		if remaining <= 0 then
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.Enable = false
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.Enable = false
+			end
+			-- 쿨타임 완료: 슬롯 아이콘 2번 깜빡임으로 재사용 가능 알림.
+			_SkillManager:BlinkSlotReady(self._T.slotKey or "")
+			return
+		end
+
+		-- 남은 비율을 그대로 FillAmount로 준다 - 검은 영역이 아래쪽에 고정된 채 위에서부터 줄어든다(밝아진다).
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.FillAmount = math.max(0, math.min(1, remaining / total))
+		end
+		if isvalid(self.countdownText) then
+			self.countdownText.FontColor = Color(1, 1, 1, 1)
+			self.countdownText.Text = tostring(math.ceil(remaining))
+		end
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+	end
+
+end
