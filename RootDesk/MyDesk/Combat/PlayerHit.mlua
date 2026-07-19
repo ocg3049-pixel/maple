@@ -81,6 +81,15 @@ script PlayerHit extends HitComponent
         local sc = self.Entity.StateComponent
         if not isvalid(sc) then return end
 
+        -- (요청) 브랜디쉬 시전 중에는 HIT -> IDLE 복귀를 미룬다 - 여기서 IDLE로 되돌리면 IDLE에 매핑된
+        -- 기본 자세(stand)가 몸에 내려가 브랜디쉬 모션을 끊는다("모션은 그대로 두고 표정만" 요청).
+        -- 시전 중 피격의 표시는 표정(PlayerAttack.OnHitDuringSkill의 PlayEmotion)이 담당한다.
+        -- 이 워치독은 0.1초마다 계속 돌고 있으므로, 시전이 끝나 가드가 풀리면 곧바로 IDLE로 복구된다
+        -- - HIT에 영구히 갇히는 이동불가 버그로 돌아가지 않는다.
+        ---@type PlayerAttack
+        local pa = self.Entity:GetComponent("script.PlayerAttack")
+        if isvalid(pa) and pa:IsBrandishMotionGuardOn() then return end
+
         if sc.CurrentStateName ~= "HIT" then
             self._T.hitFor = 0
             return
@@ -102,6 +111,15 @@ script PlayerHit extends HitComponent
         -- CheckGuardBlock(공격자 쪽 IsAttackTarget에서 호출)이 무시시키고 2초 무적으로 전환한다.
         self._T.guardParryUntil = _UtilLogic.ElapsedSeconds + 1.2
         log("[PlayerHit] 가드 패링 창 오픈(1.2초)")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StartPowerGuard(number duration)
+        -- 파워가드(2차 버프) 사용: 지금부터 duration초간 "받는 피해 30% 회복" 창이 열린다.
+        -- 스탯 버프(공격력 +10)는 CharInfoManager가 클라에서 처리하지만, 피해 회복은 서버 피격
+        -- 파이프라인(OnHit)에서 일어나야 하므로 서버에 별도 타임스탬프를 둔다(가드 패링과 같은 방식).
+        self._T.powerGuardUntil = _UtilLogic.ElapsedSeconds + duration
+        log("[PlayerHit] 파워가드 창 오픈(" .. tostring(duration) .. "초) - 받는 피해 30% 회복")
     end
 
     @ExecSpace("ServerOnly")
@@ -159,6 +177,29 @@ script PlayerHit extends HitComponent
         self._T.invincibleFor = 0
 
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
+
+        -- (요청) 파워가드 버프 중이면 받은 피해의 30%를 회복한다. __base:OnHit이 이미 Hp를 깎았으므로
+        -- 그 뒤에 회복분을 되돌린다. 표시는 힐 스킬과 동일한 데미지 스킨(ShowHealDamageSkin, 힐 RUID).
+        if (self._T.powerGuardUntil or 0) >= _UtilLogic.ElapsedSeconds and damage > 0 then
+            local pc = self.Entity.PlayerComponent
+            if isvalid(pc) then
+                local heal = math.floor(damage * 0.3)
+                if heal > 0 then
+                    pc.Hp = math.min(pc.Hp + heal, pc.MaxHp)
+                    ---@type PlayerAttack
+                    local pa = self.Entity:GetComponent("script.PlayerAttack")
+                    if isvalid(pa) then pa:ShowHealDamageSkin(self.Entity, heal) end
+                    log("[PlayerHit] 파워가드 피해 회복: 받은 피해 " .. tostring(damage) .. " -> +" .. tostring(heal) .. " HP")
+                end
+            end
+        end
+
+        -- (요청) 스킬 시전 중 피격이면 몸동작은 그대로 두고 표정만 피격 표정으로 바꾼다.
+        -- 시전 중인지 판단과 표정 재생은 그 상태를 들고 있는 PlayerAttack이 담당한다(시전 중이 아니면
+        -- 아무것도 하지 않으므로 평소 피격 동작은 그대로다).
+        ---@type PlayerAttack
+        local pa = self.Entity:GetComponent("script.PlayerAttack")
+        if isvalid(pa) then pa:OnHitDuringSkill() end
 
         -- (기능 이동) 경직(HIT) 단축은 클라이언트 워치독(ClientWatchdogTick)이 담당한다 - 여기서
         -- 서버가 ChangeState("IDLE")를 호출하면 플레이어 상태 권한이 없어 [LEA-3022]로 항상 실패한다.

@@ -13,6 +13,13 @@ script SpearBurstFadingEffect extends Component
 	-- 이 이펙트가 캐릭터보다 확실히 뒤로 가지 않았다 - OrderInLayer(우선순위가 Z보다 높음)를 캐릭터
 	-- 기준(0)보다 작은 값(-1)으로 직접 지정해야 확실하게 뒤에 그려진다.
 	@Sync property integer OrderInLayerValue = 0
+	-- (버그 수정) OrderInLayerValue만으로는 캐릭터보다 확실히 뒤로 못 보낸다. 캐릭터 아바타 바디는
+	-- SortingLayer="MapLayer0" / OrderInLayer=4 로 그려지는데(실측), 이 이펙트는 기본 SortingLayer라
+	-- 레이어 자체가 아바타보다 앞이라 OrderInLayer를 -100으로 내려도 소용이 없다(파워가드 13~16이
+	-- 캐릭터를 가리던 원인). 빈 문자열이면 모델 기본 SortingLayer를 그대로 쓰고, "MapLayer0"처럼
+	-- 아바타와 같은 레이어 이름을 넣고 OrderInLayer를 4보다 작게 주면 확실히 캐릭터 뒤로 간다.
+	-- (BlizzardFadingEffect와 동일한 처리)
+	@Sync property string SortingLayerName = ""
 	-- true면 아래 OnUpdate가 기존 Hold+단일 Tween 대신, TweenDuration을 반으로 나눠 "StartScale→EndScale로
 	-- 서서히 커짐 → 중간지점에서 SecondClipRUID로 스프라이트 교체 + StartScale로 순간 리셋 → 다시
 	-- StartScale→EndScale로 서서히 커짐" 2단 성장 패턴을 재생한다(마법진 전용 - 날개 이펙트 등 기존
@@ -35,6 +42,14 @@ script SpearBurstFadingEffect extends Component
 	@Sync property number SecondPivotOffsetX = 0
 	@Sync property number SecondPivotOffsetY = 0
 
+	-- (버프 이펙트 전용) 서버가 매 프레임 갱신하는 로컬 위치. 서버가 TransformComponent.Position을
+	-- 직접 @Sync로 옮기면 트랜스폼 보간이 걸려 이펙트가 "지진"처럼 떨렸다(실측). 대신 이 Vector2를
+	-- @Sync로 받아 클라이언트가 OnUpdate에서 직접(보간 없이) Position에 적용한다(위 PivotOffset을 클라에서
+	-- 적용하는 것과 같은 방식). 프레임별 스프라이트 크기가 달라도 이 값으로 이미지의 "눈에 보이는 하단"을
+	-- 한 지점에 고정하면서 위로만 자라게 할 수 있다.
+	@Sync property boolean UseFrameLocalPos = false
+	@Sync property Vector2 FrameLocalPos = Vector2(0, 0)
+
 	@HideFromInspector property number ElapsedTime = 0
 	@HideFromInspector property boolean IsTweenDone = false
 	@HideFromInspector property number BaseLocalX = 0
@@ -54,14 +69,29 @@ script SpearBurstFadingEffect extends Component
 		if not self:IsClient() then return end
 		local spr = self.Entity.SpriteRendererComponent
 		if not isvalid(spr) then return end
-		spr.SpriteRUID = self.ClipRUID
 		spr.FlipX = self.IsFlipX
 		spr.OrderInLayer = self.OrderInLayerValue
-		spr.Color = Color(1, 1, 1, self.StartAlpha)
+		if self.SortingLayerName ~= "" then
+			spr.SortingLayer = self.SortingLayerName
+		end
+		-- (버그 수정) ClipRUID @Sync가 아직 도착 안 한 경쟁 상태(위 주석)에서는 SpriteRUID=""로 덮어도
+		-- 모델 기본 플레이스홀더(로딩 스피너)가 안 지워져 캐릭터 발밑에 1~2프레임 깜빡였다 - 파워가드처럼
+		-- 3번 스폰하면 특히 눈에 띈다. BlizzardFadingEffect.HideUntilClipArrives처럼 클립 도착 전엔
+		-- 알파 0으로 숨기고, 아래 OnSyncProperty가 클립 도착 시 알파를 StartAlpha로 복구한다.
+		if self.ClipRUID == "" then
+			spr.SpriteRUID = ""
+			spr.Color = Color(1, 1, 1, 0)
+		else
+			spr.SpriteRUID = self.ClipRUID
+			spr.Color = Color(1, 1, 1, self.StartAlpha)
+		end
 		self.Entity.TransformComponent.Scale = Vector3(self.StartScale, self.StartScale, self.StartScale)
 		self.BaseLocalX = self.Entity.TransformComponent.Position.x
 		self.BaseLocalY = self.Entity.TransformComponent.Position.y
 		self.ElapsedTime = 0
+		if self.UseFrameLocalPos then
+			self.Entity.TransformComponent.Position = Vector3(self.FrameLocalPos.x, self.FrameLocalPos.y, 0)
+		end
 		log("[SpearBurstFadingEffect] OnBeginPlay applied SpriteRUID=" .. tostring(spr.SpriteRUID))
 	end
 
@@ -69,12 +99,20 @@ script SpearBurstFadingEffect extends Component
 	method void OnSyncProperty(string name, any value)
 		-- OnBeginPlay가 @Sync 프로퍼티 도착보다 먼저 실행되는 경쟁 상태에 대비한다 - 초기값이
 		-- 늦게 도착해도 실제로 반영된 시점에 다시 한번 SpriteRUID/Flip/Layer를 적용한다.
-		if name ~= "ClipRUID" and name ~= "IsFlipX" and name ~= "OrderInLayerValue" then return end
+		if name ~= "ClipRUID" and name ~= "IsFlipX" and name ~= "OrderInLayerValue" and name ~= "SortingLayerName" then return end
 		local spr = self.Entity.SpriteRendererComponent
 		if not isvalid(spr) then return end
 		spr.SpriteRUID = self.ClipRUID
 		spr.FlipX = self.IsFlipX
 		spr.OrderInLayer = self.OrderInLayerValue
+		if self.SortingLayerName ~= "" then
+			spr.SortingLayer = self.SortingLayerName
+		end
+		-- (버그 수정) OnBeginPlay에서 클립 미도착으로 알파 0으로 숨겼던 경우, 클립이 도착하면 다시
+		-- 보이도록 알파를 StartAlpha로 복구한다(페이드 시작 전일 때만 - 페이드 중엔 OnUpdate가 관리).
+		if self.ClipRUID ~= "" and not self.IsTweenDone then
+			spr.Color = Color(1, 1, 1, self.StartAlpha)
+		end
 		log("[SpearBurstFadingEffect] OnSyncProperty " .. tostring(name) .. " -> SpriteRUID=" .. tostring(spr.SpriteRUID))
 	end
 
@@ -82,6 +120,11 @@ script SpearBurstFadingEffect extends Component
 		if not self:IsClient() then return end
 		if self.IsTweenDone then return end
 		if not isvalid(self.Entity) then return end
+		-- (버프 이펙트) 매 프레임 서버가 갱신한 FrameLocalPos를 직접 적용(보간 없음 → 떨림 없음).
+		-- 아래 페이드/스케일 로직보다 먼저 두어, HoldDuration 대기 중에도 위치는 계속 반영되게 한다.
+		if self.UseFrameLocalPos then
+			self.Entity.TransformComponent.Position = Vector3(self.FrameLocalPos.x, self.FrameLocalPos.y, 0)
+		end
 		self.ElapsedTime = self.ElapsedTime + delta
 
 		if self.UseSplitGrowth then

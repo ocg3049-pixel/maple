@@ -12,6 +12,13 @@ script CharInfoManager extends Logic
 	-- (CalcCombatPower/UpdateStats의 "공격력" 또는 "마력" 옵션 분기 참고), 공격력 +1000·마력 +1000을 합쳐 2000으로 반영한다.
 	property integer potionAttackBonus = 0
 
+	-- (신규) 2차 버프 스킬(분노/메디테이션/파워가드)이 주는 공마(공격력·마력) 보너스의 합.
+	-- 이 스탯 시스템은 공격력/마력을 하나의 flatATK로 합쳐 계산하므로(위 potionAttackBonus 참고)
+	-- "공마 +30"은 여기에 30을 더하는 것으로 반영된다. 각 버프는 서로 독립적으로 켜지고, 이 값은
+	-- 활성 버프들의 보너스 합이다. 전투력은 스킬 시전 시 RPC 인자로 서버에 전달되므로(SkillManager
+	-- 참고) 이 보너스가 스킬 데미지에도 자동으로 반영된다.
+	property integer buffAttackBonus = 0
+
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		local detailBtn = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow/DetailToggleBtn")
@@ -238,6 +245,7 @@ script CharInfoManager extends Logic
 
 		-- Final stat values
 		flatATK += self.potionAttackBonus
+		flatATK += self.buffAttackBonus
 		local baseVal  = 4 + level * 5
 		local strFinal = math.floor((baseVal + flatSTR) * (1 + pctSTR / 100))
 		local dexFinal = math.floor((baseVal + flatDEX) * (1 + pctDEX / 100))
@@ -372,6 +380,56 @@ script CharInfoManager extends Logic
 		end, duration)
 
 		_BoosterBuffUI:ShowBuff(duration)
+	end
+
+	-- (신규) 2차 버프 스킬의 공마 보너스 적용 공통 코어. UseBooster와 동일한 토큰 패턴으로,
+	-- 재사용 시 중첩 없이 지속시간만 갱신한다. key는 버프별 상태를 _T에 분리 저장하는 접두사.
+	-- 각 버프는 서로 독립적이라(분노+메디테이션+파워가드 동시 활성 가능) buffAttackBonus는 합산된다.
+	@ExecSpace("ClientOnly")
+	method void ApplyAttackBuff(string key, integer atkBonus, number duration)
+		local activeKey = "buff_" .. key .. "_active"
+		local bonusKey = "buff_" .. key .. "_bonus"
+		local tokenKey = "buff_" .. key .. "_token"
+		if not self._T[activeKey] then
+			self.buffAttackBonus = self.buffAttackBonus + atkBonus
+			self._T[activeKey] = true
+			self._T[bonusKey] = atkBonus
+			log("[CharInfo] 버프 발동(" .. key .. ") 공마 +" .. tostring(atkBonus) .. " (합계 buffAttackBonus=" .. tostring(self.buffAttackBonus) .. ")")
+			local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+			if isvalid(cw) and cw.Enable then self:UpdateStats() end
+		end
+		self._T[tokenKey] = (self._T[tokenKey] or 0) + 1
+		local myToken = self._T[tokenKey]
+		_TimerService:SetTimerOnce(function()
+			if self._T[tokenKey] ~= myToken then return end
+			self.buffAttackBonus = self.buffAttackBonus - (self._T[bonusKey] or 0)
+			self._T[activeKey] = false
+			log("[CharInfo] 버프 종료(" .. key .. ") 공마 원복 (합계 buffAttackBonus=" .. tostring(self.buffAttackBonus) .. ")")
+			local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+			if isvalid(cw) and cw.Enable then self:UpdateStats() end
+		end, duration)
+	end
+
+	-- 분노(2차 버프): 5분간 공마 +30.
+	@ExecSpace("ClientOnly")
+	method void UseRage()
+		self:ApplyAttackBuff("rage", 30, 300)
+		_RageBuffUI:ShowBuff(300)
+	end
+
+	-- 메디테이션(2차 버프): 5분간 공마 +30.
+	@ExecSpace("ClientOnly")
+	method void UseMeditation()
+		self:ApplyAttackBuff("meditation", 30, 300)
+		_MeditationBuffUI:ShowBuff(300)
+	end
+
+	-- 파워가드(2차 버프): 5분간 공격력 +10. 받는 피해 30% 회복은 서버(PlayerHit)에서 별도로 처리한다
+	-- (스탯 버프는 클라 전용이지만 피해 회복은 서버 피격 파이프라인에서 일어나므로).
+	@ExecSpace("ClientOnly")
+	method void UsePowerGuard()
+		self:ApplyAttackBuff("powerguard", 10, 300)
+		_PowerGuardBuffUI:ShowBuff(300)
 	end
 
 	-- "공격력 물약" 사용 시 호출 - 공격력 +500. potionAttackBonus는 세션 전용 스탯이라
@@ -516,6 +574,7 @@ script CharInfoManager extends Logic
 		end
 
 		flatATK += self.potionAttackBonus
+		flatATK += self.buffAttackBonus
 		local baseVal  = 4 + level * 5
 		local strFinal = math.floor((baseVal + flatSTR) * (1 + pctSTR / 100))
 		local dexFinal = math.floor((baseVal + flatDEX) * (1 + pctDEX / 100))

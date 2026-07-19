@@ -216,6 +216,14 @@ script PlayerAttack extends AttackComponent
 			                return false
 			            end
 		        end
+		        -- 브랜디쉬 - 이번 호출 전용 단일 대상만 통과시킨다(밀집 지역에서 이웃까지 겹쳐맞는 것 방지).
+		        -- 마무리 2줄(skill.brandish.finish)도 같은 _T.brandishCurrentTarget을 쓴다 - 1타에서 잡아둔
+		        -- 대상 목록을 그대로 순회하므로 "1타와 2타가 같은 대상만 때린다"는 요청이 여기서 보장된다.
+		        if attackInfo == "skill.brandish" or attackInfo == "skill.brandish.finish" then
+			            if not isvalid(self._T.brandishCurrentTarget) or defender ~= self._T.brandishCurrentTarget then
+			                return false
+			            end
+		        end
 		        -- 돌진 - 이번 호출 전용 단일 대상만 통과시킨다(밀집 지역에서 이웃까지 겹쳐맞는 것 방지).
 		        if attackInfo == "skill.rush" then
 			            if not isvalid(self._T.rushCurrentTarget) or defender ~= self._T.rushCurrentTarget then
@@ -298,7 +306,7 @@ script PlayerAttack extends AttackComponent
 		-- Base 안에서 보너스 미반영 값으로 먼저 채워지므로, 여기서 보너스 반영값으로 재갱신해
 		-- 화면 표시와 실제 적용량을 일치시킨다.
 		local dmg = self:ApplyComboAttackBonus(self:CalcDamageBase(attacker, defender, attackInfo))
-		local isManualSkin = (attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst" or attackInfo == "skill.savageblow")
+		local isManualSkin = (attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst" or attackInfo == "skill.savageblow" or attackInfo == "skill.brandish.finish")
 		local critRate = (self._T.currentCritRatePercent or 50) / 100
 		-- 크리티컬 데미지 배율: 기본 125%(1.25배) + 장비 잠재능력의 "크리티컬 데미지" 옵션. SyncCritDamage로
 		-- 동기화된 값을 쓴다(GetCriticalDamageRate와 동일 소스) - 이 아래의 수동 다중 표시 분기들은 엔진
@@ -333,6 +341,9 @@ script PlayerAttack extends AttackComponent
 		elseif attackInfo == "skill.savageblow" then
 			self._T.lastSavageBlowDamage = dmg
 			self._T.lastSavageBlowIsCritical = baseIsCritical
+		elseif attackInfo == "skill.brandish.finish" then
+			self._T.lastBrandishFinishDamage = dmg
+			self._T.lastBrandishFinishIsCritical = baseIsCritical
 		end
 		-- (기능 변경) 쉐도우 파트너 - "타수 2배"를 별도의 진짜 히트(재진입 Attack() 호출)로 처리하던
 		-- 기존 방식은 (1) 죽는 순간의 히트에서 대상이 이미 죽어 [LEA-3002]로 실패하거나 그 경우 통째로
@@ -371,11 +382,45 @@ script PlayerAttack extends AttackComponent
 			self._T.shadowEchoBonusIsCritical = bonusIsCritical
 			dmg = dmg + bonus
 		end
+		-- (요청) 브랜디쉬 1타(skill.brandish)는 대상을 죽이지 않는다 - HP를 1만 남기고 2타(swingTF
+		-- 마지막의 2줄)에서 죽게 한다. Monster.HandleHitEvent가 Hp - TotalDamage로 깎으므로, 여기서
+		-- 반환값을 "지금 HP - 1"로 잘라두면 HitEvent 파이프라인은 그대로 태운 채(데미지 스킨/히트
+		-- 이펙트/피격음 전부 정상) HP만 1로 남는다. Hp에 직접 대입하는 방식은 HitEvent를 우회해
+		-- 그 연출들이 통째로 조용히 생략되므로 쓰지 않는다.
+		-- 잘라내기는 반드시 이 위치(쉐도우 파트너 보너스까지 합산된 최종값)에서 해야 한다 - 위쪽에서
+		-- 자르면 그 뒤에 보너스가 더해져 다시 치명타가 된다.
+		-- 2타(skill.brandish.finish)는 이 분기를 타지 않으므로 그대로 죽일 수 있다.
+		if attackInfo == "skill.brandish" and isvalid(defender) then
+			---@type Monster
+			local monsterComp = defender:GetComponent("script.Monster")
+			if isvalid(monsterComp) and not monsterComp.IsDead and dmg >= monsterComp.Hp then
+				local capped = monsterComp.Hp - 1
+				if capped < 0 then capped = 0 end
+				-- 쉐도우 파트너가 켜져 있으면 이 히트를 원본/보너스 2줄로 나눠 표시하는데
+				-- (ShowShadowEchoDamageSkin), 잘라낸 총량에 맞춰 두 줄도 같은 비율로 다시 나눠
+				-- 표시 합이 실제 적용량과 어긋나지 않게 한다.
+				if self._T.shadowEchoOriginal ~= nil and dmg > 0 then
+					local newBonus = math.floor(capped * (self._T.shadowEchoBonus or 0) / dmg)
+					self._T.shadowEchoBonus = newBonus
+					self._T.shadowEchoOriginal = capped - newBonus
+				end
+				log("[Brandish] 1타 마무리 방지: HP 1 남김 target=" .. tostring(defender.Name) .. " hp=" .. tostring(monsterComp.Hp) .. " dmg=" .. tostring(dmg) .. " -> " .. tostring(capped))
+				dmg = capped
+			end
+		end
 		return dmg
 	end
 
 	method integer CalcDamageBase(Entity attacker, Entity defender, string attackInfo)
-		        if attackInfo == "skill.rush" then
+		        if attackInfo == "skill.brandish" or attackInfo == "skill.brandish.finish" then
+		            -- (요청) 브랜디쉬: 전투력의 400%~700%. swingT3 마지막의 1줄과 swingTF 마지막의 2줄이
+		            -- 모두 같은 공식을 쓴다(줄당 400~700%, 한 시전에 총 3줄).
+		            -- math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 마무리 2줄은 같은 틱에 잇따라
+		            -- 굴리므로 이 파일에 문서화된 math.random() 반복 소비 편향(더블스탭에서 실측)에 그대로 걸린다.
+		            local combatPower = self._T.pendingBrandishCombatPower or 0
+		            local mult = 4.0 + _UtilLogic:RandomDouble() * 3.0
+		            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.rush" then
 		            -- (요청) 돌진: 전투력의 300%~400%
 		            local combatPower = self._T.pendingRushCombatPower or 0
 		            local mult = 3.0 + math.random() * 1.0
@@ -545,7 +590,10 @@ script PlayerAttack extends AttackComponent
 		        -- 버스터는 "3번 찌르기" 타격감을 위해 대상 하나당 실제 판정을 3회 진행하도록 재설계돼
 		        -- 이 목록에 추가한다. 다른 스킬(파워스트라이크/슬래쉬블래스트/기본공격)은 부모 기본값(1) 유지.
 		        -- 새비지블로우도 동일하게 6타를 수동으로 6줄 표시(ShowSavageBlowDamageSkin)하므로 자동표시를 끈다.
-		        if attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst" or attackInfo == "skill.savageblow" then
+		        -- 브랜디쉬 마무리(swingTF 마지막의 2줄)도 같은 대상을 연속 2번 때리므로 자동표시를 끄고
+		        -- ShowBrandishFinishDamageSkin에서 2줄을 직접 띄운다. 1타(skill.brandish)는 대상당 판정이
+		        -- 한 번뿐이라 부모 기본값(1) 그대로 엔진 자동표시로 1줄을 띄운다.
+		        if attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst" or attackInfo == "skill.savageblow" or attackInfo == "skill.brandish.finish" then
 		            return 0
 		        end
 		        -- (버그 수정) 쉐도우 파트너 활성 중에는 항상 엔진 자동 표시를 끈다. 이전에는
@@ -2320,6 +2368,15 @@ script PlayerAttack extends AttackComponent
 		        -- "방향을 바꾸면 모션이 한 번 더 재생된다"는 문제가 있었다. 대신 IDLE이 아닌 상태로 전환되려는 시도만
 		        -- 즉시 IDLE로 되돌려서, 이동 봉인이 완전히 풀릴 때까지(RestoreControl) 겉보기에도 계속 서 있게 만든다.
 		        if event.CurrentStateName == "DEAD" then return end
+		        -- (요청) 브랜디쉬 시전 중에는 상태 전환이 몸동작을 건드리지 못하게 전부 건너뛴다.
+		        -- 시전 중 피격 시 HIT로 상태가 바뀌는데, 아래 두 경로가 모두 새 클립을 내려보내 브랜디쉬
+		        -- 자세를 끊는다: (1) isMotionPlaying 구간의 모션 재적용(= 스윙이 처음부터 다시 재생됨),
+		        -- (2) isDirectionLocked 구간의 강제 IDLE 복귀(= IDLE에 매핑된 stand가 내려감).
+		        -- HIT 몸동작 매핑은 AttackBrandish가 이미 빼뒀으므로, 여기서 아무것도 안 하면 상태만
+		        -- 조용히 HIT에 머물고 화면에는 브랜디쉬 자세가 그대로 이어진다. 시전이 끝나 가드가 풀리면
+		        -- PlayerHit의 클라이언트 워치독(0.1초마다 계속 돌고 있다)이 곧바로 IDLE로 되돌리므로
+		        -- HIT 상태에 갇히지 않는다.
+		        if self._T.brandishMotionGuard then return end
 		        -- (기능 추가) "가만히 있을 때 기본모션으로 돌아갔다가 다시 숨고르기로 가서 불안정해 보인다 -
 		        -- 기본모션으로 바뀌는 바로 그 타이밍에 숨고르기를 넣어달라"는 요청 - 각 스킬 정리용
 		        -- IDLE→MOVE→IDLE 토글이 실제로 "IDLE"(기본 모션)로 전환되는 이 이벤트를 감지해, 그 순간
@@ -2444,6 +2501,26 @@ script PlayerAttack extends AttackComponent
 		        end
 
 		        -- 새비지블로우 전용 처리 (더블스탭과 동일한 패턴이지만 별도의 플래그를 사용 - 서로 간섭하지 않는다)
+		        -- 돌진 - 이동 중 시전하면 MOVE 상태 전환이 걷기 모션을 내보내 돌진 자세를 덮어쓴다.
+		        -- 파워스트라이크/새비지블로우와 같은 패턴으로, 상태가 바뀔 때마다 잡고 있어야 할 포즈를
+		        -- (같은 프레임으로) 다시 적용해 자세를 유지한다.
+		        if self._T.isRushMotionPlaying then
+		            local playerCtrl = self.Entity.PlayerControllerComponent
+		            if isvalid(playerCtrl) then
+		                playerCtrl.LookDirectionX = self._T.lockedRushDirX
+		            end
+		            local motionName = self._T.lockedRushMotionName
+		            if not motionName then return end
+		            local avatarRenderer = self.Entity.AvatarRendererComponent
+		            if not isvalid(avatarRenderer) then return end
+		            local body = avatarRenderer:GetBodyEntity()
+		            if not isvalid(body) then return end
+		            local frameIdx = self._T.lockedRushFrame or 1
+		            body:SendEvent(ActionStateChangedEvent(motionName, motionName, 1.0, SpriteAnimClipPlayType.Onetime, frameIdx, frameIdx))
+		            log("[Rush] HandleStateChangeEvent re-applied pose over " .. tostring(event.CurrentStateName) .. ": " .. tostring(motionName) .. " frame=" .. tostring(frameIdx))
+		            return
+		        end
+
 		        if self._T.isSavageBlowMotionPlaying then
 		            local playerCtrl = self.Entity.PlayerControllerComponent
 		            if isvalid(playerCtrl) then
@@ -3981,7 +4058,15 @@ script PlayerAttack extends AttackComponent
 		local actualHealed = newHp - pc.Hp
 		if actualHealed <= 0 then return end
 		pc.Hp = newHp
-		self:PlayHealTargetEffect(target)
+		-- (버그 수정) "피를 채울 때만 머리 위에 이펙트가 하나 더 뜬다" - 시전자 본인은 시전과 동시에
+		-- PlayHealStartEffect가 **같은 RUID**의 이펙트를 몸(0,0,0)에서 이미 재생하는데, 여기서 머리
+		-- 위(0,0.6)에 한 번 더 재생해 두 개가 겹쳤다. HP가 꽉 차 있으면 위의 actualHealed <= 0에서
+		-- 일찍 빠져나가 이 줄을 타지 않으므로 "피가 안 찰 때만 정상"으로 보였던 것.
+		-- 본인은 시작 이펙트로 충분하니 머리 위 이펙트는 다른 대상에게만 재생한다(회복 숫자 표시는
+		-- 본인도 그대로 - 그건 겹치는 게 아니다).
+		if target ~= self.Entity then
+			self:PlayHealTargetEffect(target)
+		end
 		self:ShowHealDamageSkin(target, actualHealed)
 	end
 
@@ -5330,52 +5415,304 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackBooster(boolean isMage, number atkMultiplier)
-		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
-		self:StopBreather()
-		-- 부스터: 실제 공격속도 상승 효과는 CharInfoManager가 클라이언트에서 이미 즉시 적용했다(서버에
-		-- 대응 데이터가 없는 클라이언트 전용 스탯이라). 여기서는 다른 플레이어에게 보이는 시전
-		-- 이펙트/사운드만 재생한다.
-		local currentState = self.Entity.StateComponent.CurrentStateName
-		if currentState == "DEAD" then
-			return
-		end
+		-- 부스터(2차 버프): 실제 공격속도 상승 효과는 CharInfoManager가 클라에서 이미 적용했다.
+		-- (요청) 모션 alert2 + 구버전 WZ 프레임 이펙트. isMage는 더 이상 쓰지 않는다.
+		-- RUID 대응표: msw-dev-tools/resources/부스터/RUID.md
+		-- (요청) 각 프레임의 눈에 보이는 바닥을 발과 네임태그 사이(BUFF_ANCHOR_Y)에 고정.
+		self:CastBuffMotion("a83d56a314fd449cad236fd7d9b2fa63", atkMultiplier)
+		local dirX = self._T.pendingBoosterDirX or 1
+		local ruids = {
+			"42514aa334774d0bb0fade61945e5970", "9d4e8b3b2eab441a8aa42ef883531704",
+			"b7b99713c5ba4a55948ee31c7e213820", "c94fc0ca497c4ee2b2496bae4ded3259",
+			"d5f5ceb4d0a04e25b3b978755d7a2f85", "3d84f51e0bc84c99b90e1e299338401f",
+			"ea23c07eb82742709a0cad07d9614954", "c112602d64c84307b0438420d8d8a394",
+			"85ed511773ff4ba1be37b92190c0cd50",
+		}
+		-- (요청) 코드 보정(무게중심/x=0)이 아니라 원본 WZ origin(ox,oy)에 따라 각 프레임을 배치한다.
+		-- 각 프레임의 origin 점을 캐릭터 부착점(발끝)에 맞춘다: xs=-(ox-W/2)/100, ys=(oy-H/2)/100.
+		-- (centerX가 좌우반전 시 origin이 계속 부착점에 오도록 처리.) ox={25,20,20,20,25,25,25,15,12},
+		-- oy={12,15,33,34,34,33,33,32,32}, W={44,45,48,62,79,79,56,51,48}, H={12,15,33,34,34,26,21,20,20}.
+		local xs = { -0.03, 0.025, 0.04, 0.11, 0.145, 0.145, 0.03, 0.105, 0.12 }
+		local ys = { 0.06, 0.075, 0.165, 0.17, 0.17, 0.20, 0.225, 0.22, 0.22 }
+		-- 부스터: 9프레임 90ms 재생 후 0.2s 페이드아웃(영상은 작은 발끝 반짝임이 흩어지며 사라짐).
+		self:SpawnBuffFrameEffect(self:MakeOriginFrames(ruids, xs, ys, 5), dirX, 0.1, 0.2)
+	end
 
-		-- 힐과 동일한 모션(alert)을 재생하고, 그동안 다른 행동을 제한한다.
+	@ExecSpace("ServerOnly")
+	method void AttackRage(number atkMultiplier)
+		-- 분노(2차 버프): 모션 alert2 + 이펙트/사운드. RUID: msw-dev-tools/resources/분노/RUID.md
+		-- (요청) 각 프레임의 눈에 보이는 바닥을 발과 네임태그 사이(0.1)에 고정, 위로만 성장.
+		-- (요청) 이펙트가 다 끝나기 전에 움직여지지 않도록 분노는 조작잠금을 이펙트 길이에 맞게 길게(1.2s).
+		self:CastBuffMotion("267c7840593c419098060eb07e2b4dbb", atkMultiplier, 1.2)
+		local dirX = self._T.pendingBoosterDirX or 1
+		-- (요청) 1~6번(흰 스파클 상승)은 빼고 7~19번만 이어서 재생한다(7_ 보라/흰 폭발 → 파란 오라 → 스파크).
+		-- (강제이동 근본 수정 + 원작 정합) 프레임마다 크기가 달라 하단 고정 시 매 프레임 y를 바꿔 순간이동처럼
+		-- 보였고, 하단 정렬은 원작의 스파크 분출 방향/높이도 없앴다. 그래서 7~19를 동일 캔버스(130×182)로
+		-- 패딩하되 각 프레임의 원본 WZ origin(ox,oy)을 한 점(canvas 65,124)에 정렬해 재업로드했다
+		-- (msw-dev-tools/resources/분노/padded_origin). 이제 모든 프레임 origin이 같은 캔버스 위치라 단일 고정
+		-- 위치로 놓아도 강제이동이 없고, 폭발·오라·스파크가 원작처럼 각자 위치에 배치된다(스파크는 위/옆으로
+		-- 분출). origin이 canvas y=124(center 91 기준 +33px)이므로 y=0.33에서 origin이 world 0(발끝)에 온다.
+		-- (요청/영상 정합) 7~12번(폭발+오라 빌드업)은 캐릭터에 고정돼야 하는데, origin 정렬본은 프레임마다
+		-- origin이 내용 중심과 달라(cx 58~65 들쭉날쭉) 가로로 밀려 보였다. 원작 영상은 7~12가 "가로 중심 +
+		-- 내용 하단이 발끝"으로 캐릭터에 고정이라, 7~12를 내용중심(col65)·내용하단(row124) 기준으로 재패딩해
+		-- 재업로드했다(padded_fix78). 13~19(스파크 분출)는 밖으로 퍼지는 게 의도라 origin 정렬본 유지.
+		-- 전부 같은 130×182 캔버스라 단일 위치(y=0.33)에서 정렬된다.
+		local ruids = {
+			"c2a6680d91c84a98a42151cc5b47299a", "451ad9c3daf242c2bcc0ca704c171231",   -- 7,8 (내용정렬)
+			"1b63db8e85e543738c3172c669651a62", "a02b80f5599f481f9818166f4e3abe9d",   -- 9,10 (내용정렬)
+			"36faa085b70f4dceb681b13c5e507aec", "b0eac942e50d42e58cf37ba082fb7a6e",   -- 11,12 (내용정렬)
+			"efad481e5db5447bbcff52debe1c15e3", "e6828bdf4c8147739b60285a680558a4",   -- 13,14
+			"526568bad72b4dd4a516415c26d1110c", "d54c705fb1dc4a0ca06efa00d4148d0d",   -- 15,16
+			"3f38641f56ab4c988966952ed951f723", "1c44ed375d9d477bb12dc29fdbbe2880",   -- 17,18
+			"bbc5c210f9ef4fb6b83fccf2a9e41d4b",                                       -- 19
+		}
+		-- (요청) 전체 높이: 단일 y=0.33(origin=발끝). 이 값 하나만 올리고/내리면 전체가 동일 이동.
+		-- (요청) 프레임당 기본 100ms, 단 12→13, 13→14 구간(프레임12·13)만 80ms로 빠르게.
+		local rageFrames = self:MakeConstantFrames(ruids, 0, 0.33, 5)
+		rageFrames[6].interval = 0.08   -- 프레임12(12→13)
+		rageFrames[7].interval = 0.08   -- 프레임13(13→14)
+		self:SpawnBuffFrameEffect(rageFrames, dirX, 0.1, 0.25)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackMeditation(number atkMultiplier)
+		-- 메디테이션(2차 버프): 모션 alert2 + 이펙트/사운드. RUID: msw-dev-tools/resources/메디테이션/RUID.md
+		-- (요청) 각 프레임의 눈에 보이는 바닥을 발과 네임태그 사이(0.1)에 고정, 위로만 성장(분노와 동일).
+		self:CastBuffMotion("3fa020cfd70f495c89c39fd3a3dd480a", atkMultiplier)
+		local dirX = self._T.pendingBoosterDirX or 1
+		-- (요청/영상 실측) 메디테이션 이펙트는 "나무가 발밑에서 위로 자라남" 시퀀스(프레임 1~9)뿐이다.
+		-- 원본 팩의 _10~_17은 나무가 아니라 별도의 작은 "나뭇잎+반짝임" 표식(버프 지속 표시)이라
+		-- 시전 이펙트로 붙이면 큰 나무가 갑자기 작은 잎으로 튀어 부자연스러웠다 - 1~9만 사용한다.
+		-- 영상 길이 0.76s / 9프레임 ≈ 45ms(기존 90ms는 2배 느렸음). 다 자란 뒤 0.3s 페이드아웃.
+		-- (강제이동 근본 수정) 기존 소스 PNG는 프레임마다 크기가 달라(H 15~156), 중앙 피벗 특성상 밑동을
+		-- 발끝에 고정하려면 코드가 매 프레임 위치(FrameLocalPos)를 다시 세팅해야 했다 - 이 프레임별 강제이동이
+		-- 느린 재생에서 "튐"으로 보였다. 그래서 9장을 동일 캔버스(158×156)로 패딩하고 각 프레임의 밑동
+		-- (가로=하단밴드 중심, 세로=origin oy)을 같은 캔버스 위치에 정렬해 재업로드했다(msw-dev-tools/
+		-- resources/메디테이션/padded). 이제 모든 프레임이 같은 크기·같은 밑동위치라 단일 고정 위치로 놓으면
+		-- 프레임별 이동이 전혀 없다. 위치: 밑동이 canvas y=147(center 78 기준 +69px)이므로 y=0.69에서 밑동이
+		-- world 0(발끝)에 온다. x=0(캔버스 중심=밑동). RUID: msw-dev-tools/resources/메디테이션/RUID.md
+		local ruids = {
+			"fbf3efdbb65a471296d3b6932faaaccb", "b36a872cc61f401fa248d9483c7baa48",
+			"587f1c0fdc254cabad1701395814498c", "1b78e68cd9c14ddfb8b5b1dd5ef51f30",
+			"e868faf607ce4698a538053515026e2d", "5b4258569fd447ba952faf18383a7e49",
+			"d790809da58249a9bffe6fec4c684587", "8ddd66f6b9844b23aa789859bcac064b",
+			"03128f23618849e98d401d05b944bd28",
+		}
+		-- (끝프레임 미세 이동 보정) 패딩 정렬 잔차로 후반 프레임(7~9)의 밑동이 캔버스 중심에서 좌측으로
+		-- ~0.6~1.9px 치우쳐(캔버스 고정밴드 y130-150 실측) 끝쪽에서 캐릭터 앞으로 살짝 이동해 보였다.
+		-- 각 프레임 밑동을 정확히 world 0(중심=캐릭터)에 오도록 미세 x보정: xs=-(밑동offset px)/100
+		-- (centerX로 좌우반전 대응). 대부분 0에 가깝고 7~9만 유효 보정. ys는 0.69 고정(밑동=발끝).
+		-- baseXs = 밑동을 캐릭터 중심에 정렬하는 보정값(끝프레임 미세 이동 방지).
+		local baseXs = { -0.003, -0.002, -0.001, -0.001, -0.005, -0.002, 0.006, 0.014, 0.019 }
+		local ys = { 0.69, 0.69, 0.69, 0.69, 0.69, 0.69, 0.69, 0.69, 0.69 }
+		-- (요청) 다시 캐릭터를 가리도록 앞에 그린다(order 5, 기본 SortingLayer) - 뒤로보내기(MapLayer0) 제거.
+		-- (요청) 이펙트 전체를 바라보는 방향(앞)으로 당긴다. centerX는 FrameLocalPos.x=-xs*dirX라, 앞으로
+		-- +forwardX*dirX 만큼 옮기려면 각 xs에서 forwardX를 빼면 된다(더/덜 당기려면 forwardX만 조정).
+		local forwardX = 0.1
+		local xs = {}
+		for i, v in ipairs(baseXs) do xs[i] = v - forwardX end
+		self:SpawnBuffFrameEffect(self:MakeOriginFrames(ruids, xs, ys, 5), dirX, 0.1, 0.3)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackPowerGuard(number atkMultiplier)
+		-- 파워가드(2차 버프): 모션 alert2 + 이펙트/사운드. 30% 회복은 PlayerHit(서버) 담당.
+		-- 파워가드 팩엔 사운드가 없어 기존 버프음 재사용. RUID: msw-dev-tools/resources/파워가드/RUID.md
+		-- (요청/WZ origin 실측) 업로드 PNG는 중앙 피벗이므로, 각 프레임을 원본 origin(ox,oy)이 한 점
+		-- (캐릭터 부착점)에 오도록 중앙 오프셋 dx=-(ox-W/2)/100, dy=(oy-H/2)/100 만큼 옮겨 배치한다.
+		-- 그러면 프레임 안에 그려진 "좌/우에서 합쳐짐" 모션이 그대로 살아난다(별도 슬라이드 불필요).
+		-- 구성(요청): 좌측 절반 1~4 + 우측 절반 13~16 이 동시에 좌우에서 생성돼 합쳐지고(각 100ms),
+		-- 그 뒤 본체 실드 5~12 가 캐릭터에서 1회 재생(100ms). 부착점 세로 = anchorY.
+		-- dx,dy 는 PIL 실측(각 PNG 크기 + 사용자가 준 origin). y = anchorY + dy.
+		self:CastBuffMotion("a83d56a314fd449cad236fd7d9b2fa63", atkMultiplier)
+		local dirX = self._T.pendingBoosterDirX or 1
+		local anchorY = 0
+		-- (요청) 파워가드 이펙트 전체를 캐릭터 정면 쪽으로 이동하는 공통 오프셋. build에서 모든 프레임
+		-- x에 더한다(dirX가 곱해지므로 +면 항상 바라보는 정면 쪽). 더 앞/뒤로는 이 값만 조정.
+		local forwardX = 0.0
+		-- { ruid, dx, dy }
+		-- (요청) 앞/뒤 order는 그대로 두고 1~4와 13~16의 가로 위치만 맞바꿈(dx 스왑).
+		local leftHalf = {   -- 1~4 (앞, order 6): 위치를 우측(+0.185)으로 스왑
+			{ "3697356e16ba486cb9069c432d976235", 0.185, 0.385 },
+			{ "d3c16c82974b4933b03eeba3c2ec644c", 0.185, 0.385 },
+			{ "88b7df45f13e43f5acdb374b9d5286a8", 0.185, 0.385 },
+			{ "f12bdb312e404be5a58e7fb157ee9b8f", 0.185, 0.385 },
+		}
+		local rightHalf = {  -- 13~16 (뒤): 위치는 -0.245 그대로, 가려짐은 z-order(캐릭터보다 뒤)로 처리
+			{ "6fcc6e7183704cff9ec8a356ff477c64", -0.245, 0.385 },
+			{ "a49bed1bd7f04571b78a6507bcc5f2b2", -0.245, 0.385 },
+			{ "88175dd62ea3411faffee0446b5716f6", -0.245, 0.385 },
+			{ "5e9e7bdbc0624cd8b9aac4698f3ade58", -0.245, 0.385 },
+		}
+		-- 본체 실드 5~12: 한 덩어리 실드가 제자리에 서 있어야 하므로 전 프레임 위치를 (0.00, 0.425)로
+		-- 통일한다(프레임별 크기/origin 차이로 인한 8~9번 근처 미세 떨림 제거).
+		local mainShield = {
+			{ "b68ea6ee3e0445a0898f02da53070dab", 0.00, 0.395 },
+			{ "8bac5a8b9fe04382a50afac0bc65a994", 0.00, 0.395 },
+			{ "04ab10c58c174b27b11be0beaf30f1b9", 0.00, 0.395 },
+			{ "23a03201d15f46dc8b7d34d9af562c04", 0.00, 0.395 },
+			{ "14d58140ffe94bb383d8ce4fb7fef2d5", 0.00, 0.395 },
+			{ "b3199ee4a4ec48fc84a6aab4a824cd74", 0.00, 0.395 },
+			{ "b1585d55ff8f4bb2af9e23d0fc4abe72", 0.00, 0.395 },
+			{ "a52d7487325540fea53e92d14b4e023f", 0.00, 0.395 },
+		}
+		local function build(list, order, sortingLayer)
+			local frames = {}
+			for _, e in ipairs(list) do
+				table.insert(frames, { ruid = e[1], x = e[2] + forwardX, y = anchorY + e[3], order = order, sortingLayer = sortingLayer })
+			end
+			return frames
+		end
+		-- 좌/우 절반 동시 생성 → 합쳐짐(각 4프레임 × 100ms = 0.4s, 페이드 없이 본체로 전환).
+		-- 좌측 1~4/본체 실드는 캐릭터 앞(order 10, 기본 SortingLayer).
+		-- (요청) 우측 13~16만 캐릭터 뒤로: OrderInLayer는 같은 SortingLayer 안에서만 비교되는데 이 이펙트의
+		-- 기본 SortingLayer가 아바타(MapLayer0)보다 통째로 앞이라 order를 아무리 내려도 소용없다 - 아바타와
+		-- 같은 SortingLayer("MapLayer0")로 올리고 OrderInLayer를 아바타(4)보다 작게(3, 지형 타일 1보다는 앞) 준다.
+		self:SpawnBuffFrameEffect(build(leftHalf, 10, ""), dirX, 0.1, 0)
+		self:SpawnBuffFrameEffect(build(rightHalf, 3, "MapLayer0"), dirX, 0.1, 0)
+		-- 본체 실드는 합쳐짐이 끝난 뒤(0.4s) 캐릭터에서 1회 재생 + 0.2s 페이드아웃(앞, order 10)
+		_TimerService:SetTimerOnce(function()
+			self:SpawnBuffFrameEffect(build(mainShield, 10, ""), dirX, 0.1, 0.2)
+		end, 0.4)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastBuffMotion(string soundRuid, number atkMultiplier, number lockDuration)
+		-- 4종 버프 공용 시전의 모션/조작잠금/사운드 부분(이펙트는 각 Attack* 메서드가 직접 스폰).
+		-- (요청) 사용 즉시 "숨고르기"(breather = alert 루프) 모션을 재생한다. 예전엔 PlayBoosterMotion에
+		-- "alert2"를 넘겼는데 유효 클립이 아니라 아무 모션도 안 나왔다 - PlayBreatherImmediate로 즉시 재생.
+		-- 스탯 효과는 CharInfoManager가 클라에서 이미 적용했다.
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" then return end
 		local mult = math.max(atkMultiplier or 1.0, 0.001)
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		local dirX = isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1
 		self._T.pendingBoosterDirX = dirX
 		self._T.pendingBoosterWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
-		if isvalid(playerCtrl) then
-			playerCtrl.Enable = false
-		end
-		if isvalid(self.Entity.MovementComponent) then
-			self.Entity.MovementComponent:Stop()
-		end
-		self:PlayBoosterMotion(self.Entity, "alert", dirX, mult)
+		if isvalid(playerCtrl) then playerCtrl.Enable = false end
+		if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+		-- 즉시 숨고르기(alert 루프) 재생. 컨트롤 복구(RestoreBoosterControl) 시점의 PlayBreather가
+		-- 복구 직후 컨트롤러의 IDLE 스냅을 잡아 숨고르기를 이어가므로 끊기지 않는다.
+		self:PlayBreatherImmediate(self.Entity, dirX)
+		-- (요청) 조작잠금 시간: lockDuration이 주어지면 그 절대값(초), 없으면 기존 0.6*mult. 분노는 이펙트가
+		-- 끝나기 전에 못 움직이도록 길게(1.2s) 넘긴다. 나머지 버프는 nil로 넘겨 기존 동작 유지.
+		local lock = lockDuration or (0.6 * mult)
 		_TimerService:SetTimerOnce(function()
 			self:RestoreBoosterControl()
-		end, 0.6 * mult)
+		end, lock)
+		self:PlayBuffSound(soundRuid)
+	end
 
-		self:PlayBoosterCastEffect(self.Entity, isMage)
+	method table MakeConstantFrames(table ruids, number x, number y, integer order)
+		-- 모든 프레임을 같은 x/y/order에 두는 디스크립터 목록을 만든다(부스터/파워가드 B레이어용).
+		local out = {}
+		for _, ruid in ipairs(ruids) do
+			table.insert(out, { ruid = ruid, x = x, y = y, order = order })
+		end
+		return out
+	end
+
+	method table MakeOriginFrames(table ruids, table xs, table ys, integer order)
+		-- (요청/원본 origin 실측) 각 프레임의 WZ origin(ox,oy)을 캐릭터 부착점에 맞추기 위한 중앙피벗
+		-- 오프셋을 미리 계산해 넘긴다: x=dx=-(ox-W/2)/100, y=dy=(oy-H/2)/100 (world 단위, 100px=1unit).
+		-- SpawnBuffFrameEffect에서 x는 dirX가 곱해져 좌우 반전되고, y는 그대로 적용된다.
+		-- centerX=true: x는 origin 중앙피벗 보정값이라 좌우반전(IsFlipX) 시 부호가 뒤집혀야 origin이
+		-- 한 점에 고정된다(SpawnBuffFrameEffect에서 -x*dirX로 적용). 프레임마다 dx가 달라도 안 밀린다.
+		local out = {}
+		for i, ruid in ipairs(ruids) do
+			table.insert(out, { ruid = ruid, x = xs[i] or 0, y = ys[i] or 0, order = order, centerX = true })
+		end
+		return out
+	end
+
+	method table MakeAnchoredFrames(table ruids, table offsets, number anchorY, integer order)
+		-- (요청) 각 프레임의 "눈에 보이는 실제 바닥"(투명 여백 제외 마지막 불투명 픽셀)을 anchorY 한
+		-- 지점(발과 네임태그 사이)에 고정하고 위로만 자라게 한다. offsets[i] = 스프라이트 중심에서
+		-- 내용 하단까지의 거리(px, 아래로 +, PIL로 실측). 중앙 피벗이라 내용 하단 world = Position.y -
+		-- offset/100 이므로, y = anchorY + offset/100 로 주면 크기가 달라도 모든 프레임의 내용 하단이
+		-- anchorY에 정렬된다. 위치는 FrameLocalPos로 클라가 직접 적용해 프레임마다 y가 바뀌어도
+		-- 떨리지 않는다(SpawnBuffFrameEffect 참고). (100px = 1 world unit)
+		local out = {}
+		for i, ruid in ipairs(ruids) do
+			table.insert(out, { ruid = ruid, x = 0, y = anchorY + (offsets[i] or 0) / 100, order = order })
+		end
+		return out
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnBuffFrameEffect(table frames, number dirX, number frameInterval, number fadeDuration)
+		-- 프레임 교체 방식 이펙트. 각 프레임 디스크립터 { ruid, x, y, order }를 frameInterval 간격으로 재생.
+		-- (요청 - 영상 매칭) frameInterval을 스킬별로 받아 재생속도를 영상에 맞춘다(메디테이션 45ms 등).
+		-- 재생 동안 solid(alpha 1)로 유지하고, 다 재생한 뒤 fadeDuration>0이면 마지막 프레임에서 알파를
+		-- 1→0으로 페이드아웃한다(영상처럼 "다 자란 뒤 사라짐"). fadeDuration=0이면 그냥 컷.
+		-- (요청 - 지진 제거) 위치는 서버가 TransformComponent.Position을 옮기지 않고 FrameLocalPos(@Sync)만
+		-- 갱신 - 클라가 OnUpdate에서 보간 없이 직접 적용해 프레임마다 위치가 바뀌어도 떨리지 않는다.
+		self._T.buffFxSeq = (self._T.buffFxSeq or 0) + 1
+		local f0 = frames[1]
+		if f0 == nil then return end
+		-- (요청) 프레임별 개별 딜레이 지원: 각 프레임에 interval 필드가 있으면 그 값을, 없으면 기본
+		-- frameInterval을 그 프레임의 표시 시간으로 쓴다(분노 8·9번만 80ms). 시작 시각을 누적 계산한다.
+		-- interval 필드가 하나도 없으면 결과는 기존 (#frames * frameInterval)과 동일하다(하위호환).
+		local starts = {}
+		local acc = 0
+		for i = 1, #frames do
+			starts[i] = acc
+			acc = acc + (frames[i].interval or frameInterval)
+		end
+		local playTime = acc
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", "BuffFx" .. tostring(self._T.buffFxSeq), Vector3(0, 0, 0), self.Entity)
+		if not isvalid(fx) then return end
+		fx:AddComponent("script.SpearBurstFadingEffect")
+		local comp = fx:GetComponent("script.SpearBurstFadingEffect")
+		if isvalid(comp) then
+			comp.IsFlipX = dirX > 0
+			comp.StartScale = 1.0
+			comp.EndScale = 1.0
+			comp.StartAlpha = 1.0
+			if fadeDuration > 0 then
+				comp.EndAlpha = 0.0
+				comp.HoldDuration = playTime           -- 재생 동안 solid
+				comp.TweenDuration = fadeDuration       -- 재생 후 페이드아웃
+			else
+				comp.EndAlpha = 1.0
+				comp.HoldDuration = 5.0
+				comp.TweenDuration = 0.0
+			end
+			comp.OrderInLayerValue = f0.order or 5
+			-- (버그 수정) 캐릭터 뒤로 보내려면 OrderInLayer만으론 부족하고 SortingLayer를 아바타와 같은
+			-- 레이어("MapLayer0")로 맞춰야 한다(파워가드 13~16 가림 원인). 프레임 디스크립터에 sortingLayer가
+			-- 있으면 적용, 없으면 기본 SortingLayer 그대로(부스터/분노/메디테이션 등 기존 사용처 영향 없음).
+			comp.SortingLayerName = f0.sortingLayer or ""
+			comp.UseFrameLocalPos = true
+			-- centerX 프레임(origin 중앙보정)은 반전 시 부호 반전(-x*dirX), 그 외(위치성 offset)는 x*dirX.
+			local f0x = f0.centerX and (-(f0.x or 0) * dirX) or ((f0.x or 0) * dirX)
+			comp.FrameLocalPos = Vector2(f0x, f0.y or 0)
+			comp.ClipRUID = f0.ruid
+		end
+		for i = 2, #frames do
+			local fr = frames[i]
+			local prev = frames[i - 1]
+			local orderChanged = (fr.order ~= prev.order)
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(comp) then return end
+				comp.ClipRUID = fr.ruid
+				if orderChanged then comp.OrderInLayerValue = fr.order or 5 end
+				local frx = fr.centerX and (-(fr.x or 0) * dirX) or ((fr.x or 0) * dirX)
+				comp.FrameLocalPos = Vector2(frx, fr.y or 0)
+			end, starts[i])
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(fx) then fx:Destroy() end
+		end, playTime + fadeDuration + 0.05)
 	end
 
 	@ExecSpace("Multicast")
-	method void PlayBoosterCastEffect(Entity attacker, boolean isMage)
-		-- 마법사 계열(썬콜/불독 아크메이지, 비숍)과 나머지 직업 모두 캐릭터 몸쪽에서 1회 재생(사용 리소스만 다름).
+	method void PlayBuffSound(string soundRuid)
+		-- 버프 사용음(클라이언트에서만 재생).
 		if not self:IsClient() then return end
-		if not isvalid(attacker) then return end
-		local ruid = isMage and "b65a4879ddf44d2a9fcdc09fa00c610c" or "c960275509274d72b540f18f5f53f01f"
-		local serial = _EffectService:PlayEffectAttached(ruid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
-		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
-		local echoSerial = self:EchoShadowSkillEffectAttached(ruid, attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
-		_SoundService:PlaySound("a83d56a314fd449cad236fd7d9b2fa63", 1.0)
-		_TimerService:SetTimerOnce(function()
-			_EffectService:RemoveEffect(serial)
-			if echoSerial ~= 0 then
-				_EffectService:RemoveEffect(echoSerial)
-			end
-		end, 1.5)
+		if soundRuid == nil or soundRuid == "" then return end
+		_SoundService:PlaySound(soundRuid, 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -9075,9 +9412,14 @@ script PlayerAttack extends AttackComponent
 		local RUSH_PUSH_FRONT = 1.0
 		-- (요청) 이동 시간 0.25초 / 딜레이(컨트롤 복귀) 0.27초 / 모션 지속시간 0.4초.
 		-- 모션은 딜레이보다 길게 유지해 딜레이가 끝날 때까지 자세가 바뀌지 않게 한다(요청).
-		local RUSH_MOVE_DURATION = 0.25
-		local RUSH_DELAY = 0.27
-		local RUSH_MOTION_DURATION = 0.4
+		-- (요청) 공속이 오르면 모션이 빨라지고 딜레이도 그만큼 줄어야 한다 - 세 값에 모두 같은 배율을
+		-- 곱해 "이동 종료 < 딜레이 종료 < 모션 종료" 순서를 그대로 유지한다(하나만 줄이면 딜레이가
+		-- 이동보다 먼저 끝나 컨트롤러가 돌진 자세를 덮어쓴다). 돌진 거리(RUSH_MAX_DISTANCE)는 그대로라
+		-- 공속이 오르면 같은 거리를 더 빨리 주파한다.
+		local mult = math.max(0.1, math.min(atkMultiplier or 1.0, 3.0))
+		local RUSH_MOVE_DURATION = 0.25 * mult
+		local RUSH_DELAY = 0.27 * mult
+		local RUSH_MOTION_DURATION = 0.4 * mult
 
 		-- 밀어낼 대상(전방 최대 10명)
 		-- 판정 범위 = 돌진 사거리 + 몸 앞 여유(밀어내는 폭). 사거리를 바꾸면 판정도 같이 따라온다.
@@ -9283,11 +9625,16 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void RestoreRushControl()
+		-- (버그 수정) RestoreBrandishControl과 동일한 이유로 무조건 복구한다 - 이미 컨트롤러가 꺼져 있는
+		-- 동안 돌진이 시작하면 pendingRushWasControllerEnabled가 false로 찍혀 영영 복구되지 않았다.
+		-- 클라이언트 쪽(RunRushMove)은 같은 원인으로 이미 무조건 복구로 고쳐져 있었는데 서버 쪽인
+		-- 여기만 남아 있었다.
 		self._T.isRushing = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
-		if isvalid(playerCtrl) and self._T.pendingRushWasControllerEnabled then
+		if isvalid(playerCtrl) then
 			playerCtrl.Enable = true
 		end
+		log("[Rush] RestoreRushControl 컨트롤 복구 wasCtrl=" .. tostring(self._T.pendingRushWasControllerEnabled))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -9343,6 +9690,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isRushMotionPlaying = true
 		self._T.lockedRushDirX = dirX
 		self._T.lockedRushMotionName = motionName
+		self._T.lockedRushFrame = frameIndex
 
 		body:SendEvent(ActionStateChangedEvent(motionName, motionName, 1.0, SpriteAnimClipPlayType.Onetime, frameIndex, frameIndex))
 		log("[Rush] PlayRushMotion sent: " .. tostring(motionName) .. " frame=" .. tostring(frameIndex))
@@ -9421,6 +9769,379 @@ script PlayerAttack extends AttackComponent
 		_TimerService:SetTimerOnce(function()
 			if isvalid(fx) then fx:Destroy() end
 		end, #frames * frameInterval + 0.05)
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method void AttackBrandish(number combatPower, number atkMultiplier, string weaponClass)
+		-- 브랜디쉬(4차): 검을 크게 휘둘러 전방의 적을 벤다. 한 번 시전에 총 3줄 -
+		-- swingT3 마지막에 1줄, 이어지는 swingTF 마지막에 2줄이 들어간다(요청). 줄당 전투력의 400~700% 피해.
+		-- 모션은 무기 분류와 무관하게 swingT3 -> swingTF 연속 재생(요청) - weaponClass는 쓰지 않는다.
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then return end
+		if self._T.isBrandishing then
+			log("PlayerAttack: AttackBrandish 요청 차단됨(이미 진행 중)")
+			return
+		end
+		self._T.isBrandishing = true
+
+		local mult = math.max(0.1, math.min(atkMultiplier or 1.0, 3.0))
+		self._T.pendingBrandishCombatPower = combatPower
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local dirX = playerCtrl.LookDirectionX
+		self._T.pendingBrandishDirX = dirX
+		self._T.pendingBrandishWasCtrl = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then playerCtrl.Enable = false end
+		if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+
+		-- 시전 중 몸동작이 브랜디쉬 자세를 덮어쓰는 경로를 이번 시전 동안만 전부 막는다.
+		-- (요청 ①) "맞으면 피격 모션 때문에 모션이 끊긴다" (요청 ②) "점프 브랜디쉬 중 착지하면 모션이 멈춘다"
+		-- 원인은 같다 - 상태가 바뀌면 엔진(AvatarStateAnimationComponent)이 그 상태에 매핑된 몸동작을
+		-- 자동으로 내려보내 진행 중인 raw 클립을 덮어쓴다. 매핑 자체를 빼두면(msw-avatar Strategy A)
+		-- 상태만 조용히 바뀌고 몸에는 아무 클립도 안 내려가 브랜디쉬 자세가 그대로 이어진다.
+		-- RestoreBrandishControl에서 기본값으로 되돌린다. StateToAvatarBodyActionSheet는 @Sync라
+		-- 반드시 서버에서 바꿔야 모든 클라이언트에 전파된다(이 메서드는 ServerOnly).
+		self:SuppressBrandishStateMotions()
+		self:SetBrandishMotionGuard(true)
+
+		-- (요청) 모션 속도 2배 + 그만큼 못 움직이는 기간도 짧게. PlayAttackMotion은 재생속도를 1/배율로
+		-- 잡으므로, 배율을 절반으로 넘기면 재생속도가 2배가 되고 아래 타이머들도 전부 같은 배율을 쓰므로
+		-- 모션/판정/조작복구가 통째로 정확히 절반 시간에 끝난다(싱크 유지). 데미지 공식은 mult가 아니라
+		-- pendingBrandishCombatPower를 쓰므로 이 변경에 영향받지 않는다.
+		-- (요청) 그 2배에서 다시 20% 느리게 -> 재생속도 2.0배 -> 1.6배. 배율은 재생속도의 역수라
+		-- 0.5 / 0.8 = 0.625를 곱한다.
+		local motionMult = mult * 0.625
+		-- (요청) 마지막 모션(swingTF)만 0.2초 더 길게. raw 클립 길이가 0.65*배율이므로, 배율에
+		-- 0.2/0.65를 더하면 그 클립만 정확히 0.2초 길어진다(= 그만큼 더 천천히 재생된다).
+		-- 아래 2타 판정/조작복구도 이 배율을 쓰므로 늘어난 길이에 그대로 따라붙는다.
+		local finishMult = motionMult + 0.2 / 0.65
+		-- swingTF 시작 시각(= swingT3 클립이 끝나는 시각). 아래 2타/조작복구의 기준점.
+		local finishStart = 0.65 * motionMult
+		-- (요청) 2타의 2줄 사이 텀 - 같은 틱에 몰아 넣으면 숫자가 한꺼번에 툭 튀어나와 뻣뻣하다.
+		-- 이 스킬의 다른 시간값과 동일하게 공속 배율을 태운다(공속이 오르면 텀도 같이 좁아진다) -
+		-- 고정값으로 두면 공속이 아주 빠를 때 둘째 줄이 조작 복구 뒤로 밀려난다.
+		self._T.brandishFinishGap = 0.1 * mult
+
+		-- 모션은 파워스트라이크와 같은 재생기(PlayAttackMotion)를 쓴다 - 상태 변경 시 자세를 다시
+		-- 덧씌우는 기존 핸들러(HandleStateChangeEvent)가 그대로 적용돼 이동 중에도 모션이 살아남는다.
+		-- raw 모션 한 클립의 길이는 0.65초 * 배율이다(PlayAttackMotion에 실측 문서화됨) - 두 모션을
+		-- 그 길이만큼 띄워 연달아 재생하고, 각 타격을 클립이 끝나기 직전(0.55*배율, 약 85% 지점)에 맞춘다.
+		self:PlayAttackMotion(self.Entity, "swingT3", dirX, motionMult)
+		self:PlayBrandishCastEffect(self.Entity, dirX)
+		self:PlayBrandishUseSound(self.Entity)
+
+		-- 1타: swingT3의 마지막 모션에서 1줄(요청).
+		_TimerService:SetTimerOnce(function()
+			self:DealBrandishFirstHits()
+		end, 0.55 * motionMult)
+		-- swingT3가 끝나는 시점에 swingTF를 이어서 재생한다(요청). 이 클립만 0.2초 긴 배율을 쓴다.
+		_TimerService:SetTimerOnce(function()
+			self:PlayAttackMotion(self.Entity, "swingTF", self._T.pendingBrandishDirX or 1, finishMult)
+		end, finishStart)
+		-- 2타: swingTF의 마지막 동작에서 2줄(요청). 1타에서 잡아둔 그 대상들만 때린다.
+		-- 길어진 swingTF 클립의 같은 지점(85%)이라 판정도 그만큼 뒤로 밀린다.
+		_TimerService:SetTimerOnce(function()
+			self:DealBrandishFinishHits()
+		end, finishStart + 0.55 * finishMult)
+
+		-- 조작 복구(못 움직이는 기간의 끝) - swingTF 배율을 따라가므로 마지막 모션이 길어진 만큼 같이 밀린다.
+		-- ⚠ SkillManager의 브랜디쉬 공용 쿨다운이 이 시각과 반드시 같아야 한다(어긋나면 홀드 연속 시전이
+		-- "이미 진행 중"으로 차단되거나, 모션이 끝났는데도 다음 시전이 안 나간다) - 그 쪽 주석 참고.
+		_TimerService:SetTimerOnce(function()
+			self:RestoreBrandishControl()
+		end, finishStart + 0.75 * finishMult)
+		log("PlayerAttack: AttackBrandish 시전 dir=" .. tostring(dirX) .. " motionMult=" .. tostring(motionMult) .. " finishMult=" .. tostring(finishMult))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealBrandishFirstHits()
+		-- 1타(swingT3 마지막) - 전방 박스 안의 적을 최대 6명까지 한 번에 타격한다(슬래시블러스트와 같은
+		-- 탐색 방식). 여기서 찾은 대상 목록을 그대로 저장해 2타(swingTF 마지막)가 재탐색 없이 같은
+		-- 대상만 때리게 한다("첫번째 공격과 2번째 공격은 같은 대상만 공격한다"는 요청) - 2타 때 다시
+		-- 탐색하면 그 사이 다가온 다른 몬스터까지 맞는다.
+		local worldPos = self.Entity.TransformComponent.WorldPosition
+		local dirX = self._T.pendingBrandishDirX or 1
+		local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 6, 2.5, 1.0)
+		self._T.brandishTargets = targets
+		for _, t in ipairs(targets) do
+			if isvalid(t) then
+				self._T.brandishCurrentTarget = t
+				local pos = t.TransformComponent.WorldPosition
+				local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+				self:AttackShadowSafe(shape, "skill.brandish", t)
+				self:PlayBrandishHitEffect(t)
+			end
+		end
+		log("[Brandish] DealBrandishFirstHits targets=" .. tostring(#targets))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealBrandishFinishHits()
+		-- 2타(swingTF 마지막) - 1타에서 저장해둔 대상만 순회하며 대상마다 2줄을 넣는다.
+		-- (요청) 두 줄을 같은 틱에 몰아 넣으면 숫자 2개가 한꺼번에 툭 튀어나와 뻣뻣하다 - 둘째 줄만
+		-- 짧은 텀(brandishFinishGap) 뒤에 넣어 아래 줄 -> 윗 줄로 이어져 뜨게 한다
+		-- (ShowBrandishFinishDamageSkin이 hitIndex별로 offsetY를 0.0 / 0.3으로 쌓아 올린다).
+		-- targets는 지역변수로 잡아 클로저에 담는다 - 아래에서 _T.brandishTargets를 비워도 둘째 줄이
+		-- 같은 대상 목록을 그대로 쓴다(1타/2타가 같은 대상만 때린다는 요청 유지).
+		local targets = self._T.brandishTargets
+		if targets == nil then return end
+		local gap = self._T.brandishFinishGap or 0.1
+		for _, t in ipairs(targets) do
+			if isvalid(t) then
+				self:DealBrandishFinishHit(t, 1)
+			end
+		end
+		_TimerService:SetTimerOnce(function()
+			for _, t in ipairs(targets) do
+				if isvalid(t) then
+					self:DealBrandishFinishHit(t, 2)
+				end
+			end
+		end, gap)
+		self._T.brandishTargets = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealBrandishFinishHit(Entity target, integer hitIndex)
+		-- 2타의 2줄 중 hitIndex번째. 새비지블로우(DealSavageBlowHit)와 완전히 동일한 구조다:
+		--  · 같은 AttackComponent 인스턴스로 같은 대상을 짧은 간격으로 두 번 때리면 GetDisplayHitCount=0이어도
+		--    엔진이 자동 데미지 숫자를 추가로 띄워, 판정 직전에 대상의 DamageSkinSpawnerComponent를 잠깐 뗀다.
+		--  · 1타에 대상이 이미 죽어 판정 자체가 실패해도(콜라이더가 더 이상 걸리지 않음) 2줄이 항상 뜨도록
+		--    표시 전용 데미지를 새로 굴린다("첫번째 공격으로 적이 죽었어도 데미지를 준다"는 요청).
+		if not isvalid(target) then return end
+		self._T.brandishCurrentTarget = target
+
+		---@type Monster
+		local monsterComp = target:GetComponent("script.Monster")
+		-- Attack() 호출 전에 미리 확인한다 - Monster.HandleHitEvent는 이미 죽어있으면(IsDead) 자기 히트음을
+		-- 건너뛰므로, "네이티브가 이 타격의 히트음을 이미 냈는지" 판단 기준으로 쓴다.
+		local wasAlreadyDead = isvalid(monsterComp) and monsterComp.IsDead
+
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		local targetSkinSpawner = target:GetComponent("MOD.Core.DamageSkinSpawnerComponent")
+		if isvalid(targetSkinSpawner) then target:RemoveComponent("MOD.Core.DamageSkinSpawnerComponent") end
+		local hitComps = self:Attack(shape, "skill.brandish.finish", CollisionGroups.HitBox)
+		if isvalid(target) and not isvalid(target:GetComponent("MOD.Core.DamageSkinSpawnerComponent")) then
+			target:AddComponent("MOD.Core.DamageSkinSpawnerComponent")
+		end
+
+		local actuallyHit = false
+		for _, hc in ipairs(hitComps) do
+			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
+				actuallyHit = true
+				break
+			end
+		end
+
+		local damage = self._T.lastBrandishFinishDamage or 0
+		local baseCrit = self._T.lastBrandishFinishIsCritical or false
+		local bonus = self._T.shadowEchoBonus or 0
+		local bonusCrit = self._T.shadowEchoBonusIsCritical or false
+
+		if not actuallyHit then
+			-- CalcDamageBase의 skill.brandish.finish 분기와 동일한 공식(400%~700%)으로 표시 전용 데미지를
+			-- 새로 굴린다(실제 Hp에는 영향 없음). 크리티컬/쉐도우 파트너 보너스도 stale 값 대신 새로 굴린다.
+			local critRate = (self._T.currentCritRatePercent or 50) / 100
+			local critMult = (self._T.currentCritDamagePercent or 125) / 100
+			local combatPower = self._T.pendingBrandishCombatPower or 0
+			local mult = 4.0 + _UtilLogic:RandomDouble() * 3.0
+			damage = self:ApplyComboAttackBonus(math.floor(combatPower * mult))
+			baseCrit = _UtilLogic:RandomDouble() < critRate
+			if baseCrit then damage = math.floor(damage * critMult) end
+			bonus = 0
+			bonusCrit = false
+			if self._T.shadowPartnerActive then
+				bonus = math.floor(damage * (0.55 + _UtilLogic:RandomDouble() * 0.10))
+				bonusCrit = _UtilLogic:RandomDouble() < critRate
+				if bonusCrit then bonus = math.floor(bonus * critMult) end
+			end
+		end
+
+		self:ShowBrandishFinishDamageSkin(target, damage, hitIndex, bonus, baseCrit, bonusCrit)
+		if bonus > 0 then
+			self:PlayShadowEchoHitSound(target)
+		end
+		-- 히트 이펙트는 실제 판정 성공 여부와 무관하게 매번 재생한다(대상이 죽어도 2줄 모두 터져야 한다).
+		self:PlayBrandishHitEffect(target)
+
+		-- 실제로 명중했고 대상이 이번 타격 전까지 살아있었다면 Monster.HandleHitEvent가 이미 히트음을 냈다 -
+		-- 여기서 또 내면 같은 타격에 소리가 2번 겹친다(스피어 버스터/새비지블로우에서 실측). 이미 죽어있었거나
+		-- 판정이 실패한 경우에만 보충 재생한다("해당 몬스터의 타격소리를 들려준다"는 요청).
+		if isvalid(monsterComp) and (not actuallyHit or wasAlreadyDead) then
+			monsterComp:PlayHitSound()
+		end
+
+		log("[Brandish] DealBrandishFinishHit hitIndex=" .. tostring(hitIndex) .. " actuallyHit=" .. tostring(actuallyHit) .. " wasAlreadyDead=" .. tostring(wasAlreadyDead) .. " damage=" .. tostring(damage))
+	end
+
+	@ExecSpace("Client")
+	method void ShowBrandishFinishDamageSkin(Entity target, integer damage, integer hitIndex, integer bonus, boolean baseIsCritical, boolean bonusIsCritical)
+		-- 2타의 2줄을 세로로 쌓아 보여준다(새비지블로우의 6줄 배치와 동일한 방식, 줄 수만 2개).
+		-- (2줄: 0.0 / 0.3, 쉐도우 파트너로 4줄이 되면 0.0, 0.25 / 0.5, 0.75)
+		if not isvalid(target) then return end
+		local offsetY = (hitIndex - 1) * 0.3
+		local bonusGap = 0.15
+		if bonus > 0 then
+			offsetY = (hitIndex - 1) * 0.5
+			bonusGap = 0.25
+		end
+		local skinRuid = self:GetHitDamageSkinId()
+		_DamageSkinService:Play(
+			target, skinRuid, 0,
+			{ damage }, DamageSkinTweenType.Default, baseIsCritical,
+			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+		if bonus > 0 then
+			_DamageSkinService:Play(
+				target, skinRuid, 0,
+				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+			)
+		end
+		log("[Brandish] ShowBrandishFinishDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(baseIsCritical))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreBrandishControl()
+		-- (버그 수정) "점프하고 어느 순간 다음 모션이 안 나간다" - 예전엔 시전 시작 시점에 찍어둔
+		-- "원래 컨트롤러가 켜져 있었나"(pendingBrandishWasCtrl)가 true일 때만 복구했는데, 이미 컨트롤러가
+		-- 꺼져 있는 동안(다른 스킬의 잠금 구간, 홀드 연속 시전 중 이전 시전의 잔여 잠금 등) 브랜디쉬가
+		-- 시작하면 그 값이 false로 찍힌다. 그런데 AttackBrandish는 그와 무관하게 컨트롤러를 끄므로,
+		-- 복구 시점에 false를 보고 그냥 넘어가 컨트롤러가 영영 꺼진 채로 남는다 -> 이동도 안 되고
+		-- 다음 스킬 모션도 안 나간다. RunRushMove가 같은 원인으로 이미 한 번 고쳐진 것과 동일한 버그다
+		-- (그 쪽 주석 참고). 시전 자체가 DEAD/사다리 상태를 막고 들어오므로 무조건 복구한다.
+		self._T.isBrandishing = false
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = true
+		end
+		-- 시전 중 빼뒀던 몸동작 매핑을 기본값 그대로 되돌린다(AttackBrandish 참고).
+		self:RestoreBrandishStateMotions()
+		self:SetBrandishMotionGuard(false)
+		local sc = self.Entity.StateComponent
+		log("[Brandish] RestoreBrandishControl 컨트롤 복구 wasCtrl=" .. tostring(self._T.pendingBrandishWasCtrl) .. " state=" .. tostring(isvalid(sc) and sc.CurrentStateName or "nil"))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SuppressBrandishStateMotions()
+		-- 브랜디쉬 시전 중 브랜디쉬 자세를 덮어쓸 수 있는 상태들의 몸동작 매핑을 전부 빼둔다.
+		-- 대상 4종과 그 이유:
+		--   IDLE - 착지(FALL -> IDLE)나 피격 복귀 때 stand가 내려와 모션을 끊는다("점프 브랜디쉬 착지 시
+		--          모션 중지"의 직접 원인).
+		--   FALL - 점프 브랜디쉬에서 상승(JUMP) -> 하강 전환 시 fall이 내려와 공중에서 끊긴다.
+		--   JUMP - 시전 도중 점프 상태로 바뀌는 경우(기본 매핑이 fall).
+		--   HIT  - 시전 중 피격(몸동작 대신 표정만 바꾸는 요청 - OnHitDuringSkill 참고).
+		-- MOVE는 시전 중 컨트롤러가 꺼져 있어 발생하지 않으므로 건드리지 않는다(걷기 애니메이션 보존).
+		-- DEAD도 남겨둔다 - 시전 중 죽으면 사망 모션은 정상적으로 나와야 한다.
+		local asac = self.Entity.AvatarStateAnimationComponent
+		if not isvalid(asac) then return end
+		asac:RemoveActionSheet("IDLE")
+		asac:RemoveActionSheet("FALL")
+		asac:RemoveActionSheet("JUMP")
+		asac:RemoveActionSheet("HIT")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreBrandishStateMotions()
+		-- SuppressBrandishStateMotions가 빼둔 4종을 StateToAvatarBodyActionSheet 기본값 그대로 되돌린다
+		-- (IDLE=stand / FALL=fall / JUMP=fall / HIT=hit, 모두 PlayRate 1.0).
+		-- SetActionSheet은 두 번째 인자가 RUID인지 몸동작 이름인지 정의가 모호해, 요소를 직접 넣어
+		-- 기본값을 정확히 재현한다. 시전 중 사망 등으로 빠져나가도 RestoreBrandishControl은 타이머로
+		-- 항상 실행되므로 매핑이 빠진 채로 남지 않는다.
+		local asac = self.Entity.AvatarStateAnimationComponent
+		if not isvalid(asac) then return end
+		asac.StateToAvatarBodyActionSheet["IDLE"] = AvatarBodyActionElement("stand", 1.0)
+		asac.StateToAvatarBodyActionSheet["FALL"] = AvatarBodyActionElement("fall", 1.0)
+		asac.StateToAvatarBodyActionSheet["JUMP"] = AvatarBodyActionElement("fall", 1.0)
+		asac.StateToAvatarBodyActionSheet["HIT"] = AvatarBodyActionElement("hit", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void SetBrandishMotionGuard(boolean on)
+		-- 브랜디쉬 시전 중 "상태 전환이 몸동작을 건드리지 못하게" 막는 클라이언트 플래그를 켜고 끈다.
+		-- 상태 전환/모션 재적용을 판단하는 코드(HandleStateChangeEvent, PlayerHit.ClientWatchdogTick)가
+		-- 전부 클라이언트에서 돌기 때문에, 서버 전용인 _T.isBrandishing으로는 판단할 수 없어 별도로 둔다.
+		self._T.brandishMotionGuard = on
+		if on then return end
+		if not self:IsClient() then return end
+		-- 시전이 끝나는 시점의 자세 정리 안전망.
+		-- PlayAttackMotion이 모션 끝에 도는 정리 토글(IDLE->MOVE->IDLE)은 IDLE 매핑이 있어야 stand를
+		-- 내려보내 브랜디쉬 자세를 지운다. 그런데 매핑 복구(@Sync, 서버)가 그 토글보다 늦게 도착하면
+		-- 토글이 헛돌아 브랜디쉬 자세로 굳은 채 남는다(움직이기 전까지). 매핑 복구와 같은 호출에서
+		-- 출발한 이 RPC 뒤에 여유를 두고 한 번 더 토글해 확실히 되돌린다.
+		-- 상태 전이 권한은 본인 클라이언트에만 있다 - 남의 화면(Multicast라 모두 실행된다)에서 부르면
+		-- [LEA-3022]로 실패한다(PlayerHit.ClientWatchdogTick과 같은 이유).
+		if _UserService.LocalPlayer ~= self.Entity then return end
+		_TimerService:SetTimerOnce(function()
+			-- 그 사이 새 시전이 시작됐으면(홀드 연속 시전) 새 모션을 건드리면 안 되므로 건너뛴다.
+			if self._T.brandishMotionGuard then return end
+			local sc = self.Entity.StateComponent
+			if not isvalid(sc) or sc.CurrentStateName == "DEAD" then return end
+			sc:ChangeState("IDLE")
+			sc:ChangeState("MOVE")
+			sc:ChangeState("IDLE")
+			log("[Brandish] 시전 종료 자세 정리 토글 완료")
+		end, 0.1)
+	end
+
+	method boolean IsBrandishMotionGuardOn()
+		-- PlayerHit의 클라이언트 워치독이 참조한다 - 다른 스크립트가 _T를 직접 읽지 않도록 메서드로 노출한다.
+		return self._T.brandishMotionGuard == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnHitDuringSkill()
+		-- PlayerHit.OnHit(서버)이 피격 때마다 호출한다. 브랜디쉬 시전 중이면 피격 몸동작을 막아둔 상태라
+		-- (AttackBrandish 참고) 그대로 두면 맞은 티가 전혀 안 난다 - 몸동작 대신 표정만 피격 표정으로
+		-- 바꿔준다(요청). PlayEmotion은 표정 전용이라 진행 중인 몸 클립에 영향을 주지 않는다.
+		if not self._T.isBrandishing then return end
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		-- PlayEmotion은 @ExecSpace("Client") - 서버에서 호출하면 엔진이 클라이언트로 전달한다.
+		avatarRenderer:PlayEmotion(EmotionalType.Hit, 1.0)
+		log("[Brandish] 시전 중 피격 - 몸동작 유지, 표정만 피격 표정으로 변경")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayBrandishUseSound(Entity attacker)
+		-- 브랜디쉬 사용음. MSW 라이브러리의 구버전 원본 팩(skill/112.img/skill/1121008)에 그대로 살아있다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		_SoundService:PlaySound("6c06fe8ab27b469eb61f466ea7f7e182", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayBrandishCastEffect(Entity attacker, number dirX)
+		-- 시전 이펙트(주황 아크 9프레임) - skill/800033.img/skill/80003319의 effect(요청).
+		-- animationclip이라 EffectService로 바로 재생한다(스프라이트 프레임 교체 방식 불필요).
+		-- (요청) 좌우를 반대로 뒤집고(FlipX 조건 반전) 높이를 0.4 내렸다(y 0.4 -> 0.0, 40픽셀).
+		-- (요청) 이펙트를 몸쪽으로 - x 0.6 -> 0.3 -> -0.45 -> -0.2 -> 0. 이제 앞뒤 치우침 없이
+		-- 캐릭터 몸 중앙에 붙는다(x가 0이라 dirX를 곱해도 그대로 0 - 방향과 무관하게 항상 중앙).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local options = { ["FlipX"] = dirX > 0, ["Alpha"] = 1.0, ["OrderInLayer"] = 5 }
+		local serial = _EffectService:PlayEffectAttached("1c29e2f0793a48eb8aa40f697b93963d", attacker, Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), false, options)
+		-- (버그 수정) "8번째 9번째 프레임이 보이지 않아 부자연스럽다" - 이 클립은 정확히 9프레임인데
+		-- (리소스 조회로 확인: index 0~8), 아래 정리용 타이머가 1.0초에 이펙트를 지워버려 재생이 끝나기
+		-- 전에 잘려나갔다(메이플 스킬 이펙트는 프레임당 100~120ms라 9프레임이면 약 0.9~1.1초).
+		-- 이 타이머는 클립이 끝나도 남는 경우를 대비한 안전망일 뿐이므로, 클립 길이보다 확실히 뒤인
+		-- 2.0초로 미뤄 9프레임이 전부 나오게 한다(isLoop=false라 재생이 끝나면 더 진행되지 않는다).
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayBrandishHitEffect(Entity target)
+		-- 타격 이펙트(흰 폭발) - 같은 팩의 hit/0.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached("ee451f0e79a944b7b5546636a674005a", target, Vector3(0, 0.4, 0), 0, Vector3(1, 1, 1), false, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.0)
 	end
 
 end
