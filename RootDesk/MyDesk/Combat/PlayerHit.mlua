@@ -114,6 +114,18 @@ script PlayerHit extends HitComponent
     end
 
     @ExecSpace("ServerOnly")
+    method void StartParryStance(number combatPower)
+        -- 패링(1차 스킬) 사용: 가드와 완전히 동일한 창(1.2초)/무적(2초) 규격으로 패링 자세를 취한다.
+        -- 가드와 다른 점은 성공했을 때 (1) 주변이 일렁이는 이펙트가 한 번 터지고 (2) 가드 표시 0.5초 뒤
+        -- 주변 최대 6명에게 전투력의 500~700% 반격 피해가 들어간다는 것뿐이다.
+        -- combatPower는 반격 데미지 계산에 쓰려고 시전 시점의 값을 서버에 넘겨받아 보관한다
+        -- (전투력은 장비 잠재능력 등 클라이언트 전용 상태에 의존하므로 서버가 직접 계산할 수 없다).
+        self._T.parryUntil = _UtilLogic.ElapsedSeconds + 1.2
+        self._T.parryCombatPower = combatPower
+        log("[PlayerHit] 패링 창 오픈(1.2초) combatPower=" .. tostring(combatPower))
+    end
+
+    @ExecSpace("ServerOnly")
     method void StartPowerGuard(number duration)
         -- 파워가드(2차 버프) 사용: 지금부터 duration초간 "받는 피해 30% 회복" 창이 열린다.
         -- 스탯 버프(공격력 +10)는 CharInfoManager가 클라에서 처리하지만, 피해 회복은 서버 피격
@@ -156,6 +168,86 @@ script PlayerHit extends HitComponent
         _EffectService:PlayEffectAttached("d7852ad775ea4db8ac46a11c3735b9e1", self.Entity, Vector3(0, 0.2, 0), 0, Vector3(2 / 3, 2 / 3, 1), false, { ["Alpha"] = 0.7 })
         -- 엔진 데미지 스킨의 "Guard" 텍스트(피격 스킨 RUID 기반) - 데미지 숫자 대신 Guard가 뜬다.
         _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean CheckParryBlock()
+        -- 패링 판정. CheckGuardBlock과 완전히 동일한 구조로 MonsterAttack.IsAttackTarget에서 호출된다
+        -- (IsHitTarget은 이 프로젝트의 몬스터 공격 경로에서 호출되지 않는 것으로 실측됨 - 무적/가드와
+        -- 같은 이유로 공격자 쪽에서 걸러야 실제로 동작한다). true면 이번 공격이 통째로 무시된다.
+        local now = _UtilLogic.ElapsedSeconds
+        -- ② 패링 성공 후 2초 무적 중이면 계속 무시(가드와 동일한 무적 시간).
+        if (self._T.parryInvulnUntil or 0) >= now then return true end
+        -- ① 패링 창(1.2초) 안에 공격이 들어오면: 그 공격을 무시하고 2초 무적 시작 + 연출/반격 예약.
+        if (self._T.parryUntil or 0) >= now then
+            self._T.parryUntil = 0            -- 패링은 1회 소모
+            self._T.parryInvulnUntil = now + 2.0
+            local pc = self.Entity.PlayerComponent
+            if isvalid(pc) then
+                _SkillManager:NotifyParrySuccess(pc.UserId)
+            end
+            self:PlayParrySuccessEffects()
+            -- (요청) 가드 표시 0.5초 뒤 주변 최대 6명에게 전투력의 500~700% 반격 피해.
+            local combatPower = self._T.parryCombatPower or 0
+            _TimerService:SetTimerOnce(function()
+                self:FireParryCounter(combatPower)
+            end, 0.5)
+            log("[PlayerHit] 패링 성공! 2초 무적 + 0.5초 뒤 반격 예약")
+            return true
+        end
+        return false
+    end
+
+    @ExecSpace("ServerOnly")
+    method void FireParryCounter(number combatPower)
+        -- 패링 성공 0.5초 뒤 실제 반격 판정. 판정/데미지 공식은 다른 스킬과 동일하게 PlayerAttack이 담당한다.
+        if not isvalid(self.Entity) then return end
+        ---@type PlayerAttack
+        local pa = self.Entity:GetComponent("script.PlayerAttack")
+        if not isvalid(pa) then
+            log_warning("[PlayerHit] FireParryCounter: PlayerAttack 컴포넌트를 찾지 못했다")
+            return
+        end
+        pa:AttackParryCounter(combatPower)
+    end
+
+    @ExecSpace("Multicast")
+    method void PlayParrySuccessEffects()
+        -- 패링 성공 연출. (요청 이력)
+        --  · 가드의 몸통 이펙트(d7852ad7) 제거 - "가드와 같은 이펙트는 없앤다".
+        --  · 크게 퍼지던 Nova 파티클 제거 - "이펙트가 너무 크다".
+        --  · 카메라 줌 감쇠진동(화면 이동) 제거 - "화면 이동은 일단 없앤다".
+        --  · 퍼져나가는 링 클립 제거 - "이펙트 없앤다. 일렁거림만 있고 따로 이미지는 없을 예정".
+        -- (최종 지정) 이펙트/사운드를 사용자가 직접 지정한 리소스로 교체:
+        --  · 이펙트 7344e618 - 옅은 빛 알갱이가 흩어지는 클립(14프레임, 원본 약 13x7.7 유닛).
+        --    형체가 뚜렷한 그림이 아니라 화면 전체가 일렁이듯 반짝이는 연출이다.
+        --  · 사운드 dca3f8aa - 검과 검이 부딪히는 날카로운 금속성 타격음(패링 막아냄 표현).
+        -- Multicast는 서버도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
+        if not self:IsClient() then return end
+        if not isvalid(self.Entity) then return end
+        _SoundService:PlaySound("dca3f8aa0f524bf59e85ff44792b1860", 1.0)
+        _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        self:PlayParryShimmer()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlayParryShimmer()
+        -- 패링 일렁임 연출.
+        --  ① 노란 빛 - 이 클립의 원본 알갱이는 분홍빛이다(프레임 평균 RGB 실측 (1.00, 0.70, 0.83)).
+        --    Color는 **곱연산**이라 채널별 계수로 색을 바꾼다: g x1.7로 분홍의 부족한 초록을 채우고(넘치는
+        --    만큼은 1.0으로 잘림), b x0.55로 파랑을 깎아 (1.0, 1.0, ~0.46) = 따뜻한 노란 빛을 만든다.
+        --    (흰색이 필요하면 b를 1.45로 - 분홍 제거 원리는 동일하다.)
+        --  ② 투명도 70% - Alpha 옵션 0.7.
+        --  ③ 캐릭터를 따라다니면 안 됨 - PlayEffectAttached(부착)가 아니라 PlayEffect(월드 고정)를 쓴다.
+        --    시전 순간의 위치에 깔리고, 이후 캐릭터가 움직여도 그 자리에 남는다.
+        --  ④ 알갱이 크기 절반 - scale 2.0 -> 1.0. 대신 한 장으로는 화면이 안 차므로 좌/우 두 장을
+        --    x -3.2 / +3.2로 나란히 깔아 화면 전체를 덮는다(클립 1장이 약 13x7.7 유닛, PC 화면은 12.8x7.2).
+        if not isvalid(self.Entity) then return end
+        local wp = self.Entity.TransformComponent.WorldPosition
+        local shimmerColor = Color(1.0, 1.7, 0.55, 1)
+        local shimmerOpts = { ["Color"] = shimmerColor, ["Alpha"] = 0.7 }
+        _EffectService:PlayEffect("7344e61864444842b917cb4be91e548e", self.Entity, Vector3(wp.x - 3.2, wp.y + 0.5, 0), 0, Vector3(1.0, 1.0, 1), false, shimmerOpts)
+        _EffectService:PlayEffect("7344e61864444842b917cb4be91e548e", self.Entity, Vector3(wp.x + 3.2, wp.y + 0.5, 0), 0, Vector3(1.0, 1.0, 1), false, shimmerOpts)
     end
 
     method boolean IsHitTarget(string attackInfo)

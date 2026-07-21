@@ -1,0 +1,311 @@
+@Component
+script DarkDragon extends Component
+
+	-- 서먼 다크드래곤(2차 버프, 10분) 소환수. spearburstfadingeffect 모델(Sprite+Transform, 기본 RUID "")을
+	-- 플레이어의 자식으로 스폰한 뒤 이 컴포넌트를 붙인다. 위치는 부모(플레이어) 기준 로컬 궤도 공식으로
+	-- 각 클라이언트가 매 프레임 직접 계산해 움직인다(위치 동기화 트래픽 0, 떨림 없음). 애니메이션은
+	-- @Sync AnimState(idle/buf/stand)만 동기화하고 프레임 교체는 클라 로컬로 돌린다(프레임 RUID 동기화 불필요).
+	-- 소환 시 알파 0→1 페이드인. 서버 타이머: 2~4초 공격 / 20~30초 랜덤 버프 / 600초 수명.
+	-- RUID 대응표: msw-dev-tools/resources/다크드래곤/RUID.md
+
+	property Entity OwnerEntity = nil            -- 서버 전용(공격/버프 대상 주인). 클라는 부모로 충분.
+	property number Lifetime = 600               -- 서버 전용 수명(초). 플레이어 시전=600, 드래곤 버프 소환=90.
+	@Sync property string AnimState = "idle"     -- idle / buf / stand
+	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
+	@Sync property number PhaseSeed = 0          -- 궤도 위상(드래곤마다 달라 겹치지 않게)
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- 서버: 수명/공격/버프 타이머 예약. PhaseSeed는 스폰 시각 기반으로 흩뿌린다.
+		self.PhaseSeed = _UtilLogic.ElapsedSeconds % 100
+		self._T.spawnAt = _UtilLogic.ElapsedSeconds
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then self.Entity:Destroy() end
+		end, self.Lifetime)
+		self:ScheduleAttack()
+		self:ScheduleBuff(true)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleAttack()
+		-- 공격 주기. stand 자세(1.0~1.5초 대기 + 0.6초 유지, 최대 ~2.1초)와 겹치지 않게 2.5~4.5초 간격.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:TryAttack()
+			self:ScheduleAttack()
+		end, 2.5 + _UtilLogic:RandomDouble() * 2.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleBuff(boolean isFirst)
+		-- (요청) 최초 소환 시 3~15초 사이에 1회 버프, 이후 40~60초 간격.
+		local delay = 40.0 + _UtilLogic:RandomDouble() * 20.0
+		if isFirst then delay = 3.0 + _UtilLogic:RandomDouble() * 12.0 end
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:CastRandomBuff()
+			self:ScheduleBuff(false)
+		end, delay)
+	end
+
+	@ExecSpace("Server")
+	method void ReportDragonPos(number x, number y)
+		-- 소유 클라가 계산한 실제 드래곤 월드좌표를 서버에 저장(공격 targeting 기준). 0.15초마다 갱신.
+		self._T.serverWorldPos = Vector2(x, y)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryAttack()
+		-- 근처 몬스터를 찾아 stand 자세로 전환 + 드래곤→몬스터 각도의 궤적 이펙트 + 데미지(전투력 200~300%).
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		-- (버그 수정) 드래곤 이동은 클라에서 계산돼 서버 Transform은 스폰 위치(플레이어 근처)에 머문다.
+		-- 그래서 서버 기준 위치로 적을 찾으면 "드래곤은 멀리 있는데 플레이어 주변 적이 죽는" 문제가 생긴다.
+		-- 소유 클라가 매 0.15초 보고한 실제 드래곤 월드좌표(serverWorldPos)를 targeting에 쓴다(없으면 Transform).
+		local wp = self._T.serverWorldPos
+		local mx = (wp ~= nil) and wp.x or self.Entity.TransformComponent.WorldPosition.x
+		local my = (wp ~= nil) and wp.y or self.Entity.TransformComponent.WorldPosition.y
+		local myPos = Vector2(mx, my)
+		-- (버그 수정) 이전엔 좌·우 전방박스(각 7)를 합쳐 가로 14유닛(거의 화면 전체)을 스캔해서 드래곤 위치와
+		-- 무관한 적까지 죽었다. 이제 드래곤 주변 반경(3.5유닛) 안의 몬스터만 가까운 순으로 최대 10마리 고른다.
+		local targets = pa:FindMonstersInRadius(myPos, 3.5, 10)
+		if #targets == 0 then return end
+		local tp = targets[1].TransformComponent.WorldPosition
+		-- 첫 대상 방향으로 몸을 돌리고 stand(공격 자세)로 전환한다(공격 대상 쪽을 바라봄).
+		self.FacingX = (tp.x >= myPos.x) and 1 or -1
+		self.AnimState = "stand"
+		-- 궤적: 요청 RUID 5종 중 랜덤. 시작점/방향은 각 클라이언트가 자기 화면의 실제 드래곤 위치에서 계산.
+		local clips = {
+			"f9b7dfc6f8964ce4864ccfdb2a83ac0c", "3ea00516cb29440a9ee3c4aa84b7b02d",
+			"9fad89441feb4cdfa11fbf0e908392ed", "f7d1f362ef9549b883b2b11df1f75194",
+			"3d12372b1af64ca6a5d99f9c62e72375",
+		}
+		-- (요청) stand 자세로 바뀐 뒤 1.0~1.5초 뒤에 공격(궤적+타격)한다. 그동안 stand 자세를 유지한다.
+		local atkDelay = 1.0 + _UtilLogic:RandomDouble() * 0.5
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			for i, t in ipairs(targets) do
+				if isvalid(t) then
+					local clip = clips[math.floor(_UtilLogic:RandomDouble() * #clips) + 1]
+					local p = t.TransformComponent.WorldPosition
+					self:PlayAttackTrail(clip, Vector3(p.x, p.y + 0.3, 0), 0)
+					local tt = t
+					_TimerService:SetTimerOnce(function()
+						if isvalid(tt) then pa:DealDarkDragonHit(tt) end
+					end, (i - 1) * 0.08)
+				end
+			end
+		end, atkDelay)
+		-- stand 자세는 공격 시점 + 0.6초 뒤 idle 복귀(그만큼 오래 유지).
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self.AnimState == "stand" then self.AnimState = "idle" end
+		end, atkDelay + 0.6)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAttackTrail(string clipRuid, Vector3 targetPos, number unused)
+		-- 공격 궤적: 이 클라이언트 화면의 실제 드래곤 입 앞에서 시작해 몬스터 쪽으로 날아가게 재생.
+		-- (방향 최종 수정) 통제 테스트(같은 클립을 0°/45°/90°로 재생)에서 zRotation이 실제로 회전함을 실측 확인.
+		-- 클립 기본 진행방향은 오른쪽(+x). 대상 방향 각도 zRot=deg(atan2(dy,dx))로 회전만 하면 상하/좌우 어느
+		-- 방향이든 대상을 정확히 향한다(FlipX 사용 안 함 - FlipX가 오히려 각도를 어긋나게 했음).
+		if not self:IsClient() then return end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local dx = targetPos.x - myPos.x
+		local dy = targetPos.y - myPos.y
+		local len = math.sqrt(dx * dx + dy * dy)
+		if len < 0.0001 then len = 0.0001 end
+		local ux, uy = dx / len, dy / len
+		-- 시작점: 드래곤 입에서 대상 방향으로 0.4유닛 앞(드래곤에서 뻗어나가는 모양).
+		local startX = myPos.x + ux * 0.4
+		local startY = myPos.y + uy * 0.4
+		-- (방향 최종 확정) 표식 테스트 실측: 이 클립의 기본(회전 0°) 진행방향/밝은 머리는 -x(왼쪽)이다.
+		-- 따라서 대상 각도 atan2(dy,dx)에 +180°를 더해야 머리가 대상을 향한다.
+		local zRot = math.deg(math.atan(dy, dx)) + 180   -- 대상을 향하는 각도(도 단위)
+		-- (요청) 블랙&화이트: GrayScale 셰이더 머티리얼. EntryId는 이름으로 조회해 캐시(bare uuid).
+		if self._T.grayMatId == nil then
+			self._T.grayMatId = _EntryService:GetMaterialIdByName("DarkDragonTrailGray")
+		end
+		local options = { ["OrderInLayer"] = 6 }
+		if self._T.grayMatId ~= nil and self._T.grayMatId ~= "" then
+			options["MaterialID"] = self._T.grayMatId
+		end
+		local serial = _EffectService:PlayEffect(clipRuid, self.Entity, Vector3(startX, startY, 0), zRot, Vector3(1, 1, 1), false, options)
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastRandomBuff()
+		-- buf 자세 1.2초 + 6종 중 랜덤. 시전 이펙트는 "드래곤 위치"에서 발동한다(요청). 단, 쉐도우파트너의
+		-- 그림자·콤보어택의 구슬(원) 회전 같은 "버프 지속 표현"은 기존대로 캐릭터에게 나타난다.
+		-- 버프별 지속시간(요청): 쉐도우파트너 20s / 콤보어택 20s / 서먼드래곤 90s / 메디테이션 30s / 분노 30s.
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		self.AnimState = "buf"
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self.AnimState == "buf" then self.AnimState = "idle" end
+		end, 1.2)
+		local dirX = (self.FacingX >= 0) and 1 or -1
+		local pc = self.OwnerEntity.PlayerComponent
+		local userId = isvalid(pc) and pc.UserId or ""
+		local roll = math.floor(_UtilLogic:RandomDouble() * 6) + 1
+		if roll == 1 then
+			-- 쿨타임 초기화: 요청 이펙트(드래곤 머리 위) + 사운드, 주인 클라의 스킬 쿨다운 전부 리셋.
+			self:PlayHeadBuffEffect("280d255d900646b180a302ed10979568", "c454d99778eb4838ad367d434a3aad20")
+			if isvalid(pc) then _SkillManager:ResetAllCooldowns(userId) end
+			log("[DarkDragon] 버프: 쿨타임 전체 초기화")
+		elseif roll == 2 then
+			-- 서먼블랙드래곤: 주인 주변에 드래곤 한 마리 추가 소환(수명 90초). 드래곤은 계속 소환 가능.
+			self:PlayHeadBuffEffect("", "")
+			pa:SummonDarkDragonLife(pa:GetDarkDragonCombatPower(), 90)
+			log("[DarkDragon] 버프: 서먼블랙드래곤(추가 소환, 90초)")
+		elseif roll == 3 then
+			-- 콤보어택(20초): 구슬 회전은 캐릭터에게, 시전 마법진 버스트는 드래곤 위치에서.
+			pa:ActivateComboAttackSilent(20)
+			self:PlayComboCastAtDragon()
+			log("[DarkDragon] 버프: 콤보 어택(20초)")
+		elseif roll == 4 then
+			-- 쉐도우파트너(20초): 그림자는 캐릭터에게, 시전 버스트는 드래곤 위치에서.
+			pa:ActivateShadowPartnerSilent(20)
+			self:PlayShadowCastAtDragon()
+			log("[DarkDragon] 버프: 쉐도우 파트너(20초)")
+		elseif roll == 5 then
+			-- 메디테이션(30초): 공마 스탯은 주인 클라에, 검은색 이펙트는 드래곤 위치에서.
+			if isvalid(pc) then _CharInfoManager:ApplyDragonStatBuff("meditation", 30, 30, userId) end
+			pa:CastDragonMeditationEffect(self.Entity, dirX)
+			log("[DarkDragon] 버프: 메디테이션(30초, 검은색)")
+		else
+			-- 분노(30초): 공마 스탯은 주인 클라에, 검은색 이펙트는 드래곤 위치에서.
+			if isvalid(pc) then _CharInfoManager:ApplyDragonStatBuff("rage", 30, 30, userId) end
+			pa:CastDragonRageEffect(self.Entity, dirX)
+			log("[DarkDragon] 버프: 분노(30초, 검은색)")
+		end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComboCastAtDragon()
+		-- 콤보어택 시전 마법진 버스트 + 사용음을 드래곤 위치에서 재생(캐릭터가 아님).
+		if not self:IsClient() then return end
+		_EffectService:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
+		_SoundService:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayShadowCastAtDragon()
+		-- 쉐도우파트너 시전 버스트(앞/뒤 2종) + 사용음을 드래곤 위치에서 재생.
+		if not self:IsClient() then return end
+		_EffectService:PlayEffectAttached("6db426f91ed54b83beddb7837d96fb4c", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 6 })
+		_EffectService:PlayEffectAttached("8ef08d990aeb452bad114479f6bc76fd", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 9 })
+		_SoundService:PlaySound("6c7c28167b9049419435cc53001cef0c", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHeadBuffEffect(string clipRuid, string soundRuid)
+		-- 드래곤 머리 위 버프 이펙트/사운드. clipRuid가 비면 이펙트 생략(buf 자세 애니가 시전 표현을 겸한다).
+		if not self:IsClient() then return end
+		if clipRuid ~= nil and clipRuid ~= "" then
+			local serial = _EffectService:PlayEffectAttached(clipRuid, self.Entity, Vector3(0, 0.9, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
+			_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.5)
+		end
+		if soundRuid ~= nil and soundRuid ~= "" then
+			_SoundService:PlaySound(soundRuid, 1.0)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 클라: 궤도 이동(부모=플레이어 기준 로컬 좌표) + 페이드인 + 프레임 교체 애니메이션.
+		local tr = self.Entity.TransformComponent
+		if not isvalid(tr) then return end
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+
+		-- 궤도 + 지연 추적(요청):
+		-- ① 플레이어 주변을 넓게 배회(반경 5배). ② 플레이어가 움직여도 바로 붙지 않고 부드럽게 뒤따른다 -
+		--    child 로컬 고정(즉시 추적) 대신, 목표 월드좌표(플레이어월드+배회오프셋)로 현재 월드좌표를 매 프레임
+		--    조금씩 보간(지연)해서 자연스럽게 배회/추적하게 한다. ③ 공격(stand) 중엔 배회 시간축을 멈춘다.
+		local parent = self.Entity.Parent
+		local pw = (isvalid(parent) and isvalid(parent.TransformComponent)) and parent.TransformComponent.WorldPosition or self.Entity.TransformComponent.WorldPosition
+		if self.AnimState ~= "stand" then
+			self._T.orbitT = (self._T.orbitT or (self.PhaseSeed or 0)) + delta * 1.3
+		end
+		local t = self._T.orbitT or (self.PhaseSeed or 0)
+		-- (요청) 활동 반경 크게(원래 1.5 → 약 3배). 화면 안에 대체로 머물도록 가로 ±4.5, 세로 위아래로 넓게.
+		-- (더 넓히려면 아래 4.5/1.0/1.5 값을 키우면 됨 - 너무 크면 화면 밖으로 나감.)
+		local ox = math.sin(t * 0.45) * 4.5 + math.sin(t * 0.17) * 1.0
+		local oy = 2.0 + math.sin(t * 0.6) * 1.5 + math.sin(t * 0.23) * 0.5
+		local targetWorld = Vector3(pw.x + ox, pw.y + oy, 0)
+		-- 현재 드래곤 월드좌표를 목표로 부드럽게 보간(지연 추적). 초기엔 플레이어 위치에서 시작해 서서히 퍼진다.
+		if self._T.worldPos == nil then self._T.worldPos = Vector3(pw.x, pw.y + 1.0, 0) end
+		local cur = self._T.worldPos
+		local k = math.min(1.0, 1.6 * delta)   -- 추적 지연 강도(작을수록 더 느긋하게 따라옴)
+		self._T.worldPos = Vector3(cur.x + (targetWorld.x - cur.x) * k, cur.y + (targetWorld.y - cur.y) * k, 0)
+		-- child라 Position은 로컬 - 스무딩된 월드좌표를 부모 기준 로컬로 환산해 넣는다.
+		tr.Position = Vector3(self._T.worldPos.x - pw.x, self._T.worldPos.y - pw.y, 0)
+
+		-- (버그 수정) 서버는 이 드래곤의 실제 이동 위치를 모른다(이동이 클라 전용). 소유 클라가 실제 월드좌표를
+		-- 0.15초마다 서버에 보고해, 서버 TryAttack이 "드래곤 위치 기준"으로 적을 찾고 그 방향을 바라보게 한다.
+		if isvalid(parent) and _UserService.LocalPlayer == parent then
+			self._T.reportTimer = (self._T.reportTimer or 0) + delta
+			if self._T.reportTimer >= 0.15 then
+				self._T.reportTimer = 0
+				self:ReportDragonPos(self._T.worldPos.x, self._T.worldPos.y)
+			end
+		end
+
+		-- (요청) 전체 크기를 이전의 70%로 축소: idle/buf 0.8→0.56, stand(공격) 0.7→0.49.
+		local scale = 0.56
+		if self.AnimState == "stand" then scale = 0.49 end
+		tr.Scale = Vector3(scale, scale, 1)
+
+		-- 바라보는 방향: 공격 중(stand)엔 서버가 준 FacingX, 평소엔 실제 배회 이동 방향(스무딩된 x 변화량 부호).
+		local face = self.FacingX
+		if self.AnimState ~= "stand" then
+			local moved = self._T.worldPos.x - (self._T.prevWorldX or self._T.worldPos.x)
+			if math.abs(moved) > 0.0006 then
+				self._T.faceRoam = (moved > 0) and 1 or -1
+			end
+			face = self._T.faceRoam or 1
+		end
+		self._T.prevWorldX = self._T.worldPos.x
+		sr.FlipX = (face > 0)   -- 시트 원본이 왼쪽을 봄 → 오른쪽 볼 때만 Flip
+
+		-- 페이드인: 처음 1.2초 알파 0→1.
+		if self._T.fadeStart == nil then self._T.fadeStart = _UtilLogic.ElapsedSeconds end
+		local ft = (_UtilLogic.ElapsedSeconds - self._T.fadeStart) / 1.2
+		local alpha = math.min(1.0, math.max(0.0, ft))
+		sr.Color = Color(1, 1, 1, alpha)
+
+		-- 프레임 교체: AnimState별 5~6프레임을 0.16초 간격 루프.
+		local idleF = {
+			"7ac2730a18ac47e083a46dc5e879deac", "fa619b956fad497ca2f3a686985a2319",
+			"4f30d3c01e424ed6a0752a8236a9bb1f", "cfb1fcf539844ada8ac200500ee0fb39",
+			"43f7075f03254c3c94a5b98c635d1a98",
+		}
+		local bufF = {
+			"953bb7366eef4ad79524a050a9f2aa8c", "54ff71063a2f4e09a287668b80a1c493",
+			"036e6b099704491daf4f3fd24c4c059e", "7b3d8b3a1c984894bbf509177de98f47",
+			"b80ee5241abd46ac930cacfc6f77b74c", "2d38445668b54dfd946da682d5db517e",
+		}
+		local standF = {
+			"87672a20076545599a3db8f49cab3004", "72f34a0b01494325bd89343292d83619",
+			"bf23099d75e94310bed5429863c830c5", "c16ddf9d7cf04223bc9d44111de8e8ee",
+			"6e919b4a2a854e0f9bbedc4e6851a53e",
+		}
+		local frames = idleF
+		if self.AnimState == "buf" then frames = bufF
+		elseif self.AnimState == "stand" then frames = standF end
+		self._T.animTimer = (self._T.animTimer or 0) + delta
+		if self._T.animTimer >= 0.16 then
+			self._T.animTimer = 0
+			self._T.frameIdx = ((self._T.frameIdx or 0) % #frames) + 1
+		end
+		local idx = math.min(self._T.frameIdx or 1, #frames)
+		local want = frames[idx]
+		if sr.SpriteRUID ~= want then sr.SpriteRUID = want end
+	end
+
+end
