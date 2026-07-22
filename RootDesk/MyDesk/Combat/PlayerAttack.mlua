@@ -8921,6 +8921,132 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
+	method void AttackRapidFire(number combatPower, number atkMultiplier, number rawDirX, number rawDirY)
+		-- 속사(2차) 한 발. 연사 간격(0.5초)과 조준 각도 보간은 시전한 클라이언트
+		-- (SkillManager.RapidFireTick)이 담당하고, 서버는 넘겨받은 각도로 화살 한 발을 쏘는 것만 맡는다.
+		-- 이동 잠금도 클라이언트가 연사가 끝날 때까지 통째로 들고 있으므로 여기서는 건드리지 않는다
+		-- (다른 화살 스킬처럼 시전마다 잠갔다 푸는 방식은 0.5초 간격 연사에서 잠금/해제가 엇갈린다).
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+
+		local dirX, dirY = rawDirX, rawDirY
+		local mag = math.sqrt(dirX * dirX + dirY * dirY)
+		if mag > 0.0001 then
+			dirX = dirX / mag
+			dirY = dirY / mag
+		else
+			local ctrlForDir = self.Entity.PlayerControllerComponent
+			dirX = (isvalid(ctrlForDir) and ctrlForDir.LookDirectionX >= 0) and 1 or -1
+			dirY = 0
+		end
+
+		-- 순수 상하 조준(dirX가 0에 가까움)일 때는 캐릭터가 보던 좌우 방향을 그대로 유지한다.
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local horizDirX
+		if math.abs(dirX) > 0.0001 then
+			horizDirX = (dirX > 0) and 1 or -1
+		else
+			horizDirX = (isvalid(playerCtrl) and playerCtrl.LookDirectionX >= 0) and 1 or -1
+		end
+
+		-- (버그 수정) 연사 중 이동 잠금은 **서버에서** 걸어야 한다. PlayerControllerComponent.Enable은
+		-- 서버가 들고 있는 @Sync 프로퍼티라 클라이언트에서 false를 넣어도 곧 되돌려지고(실측), 그 결과
+		-- ↓키가 엔진의 앉기/눕기(ActionCrouch)로 흘러들어가 "아래로 조준하면 캐릭터가 눕는" 문제가 있었다.
+		-- 매 발마다 다시 잠그고(이미 false면 그대로), 마지막 발사 1초 뒤에는 토큰 가드로 자동 복구한다 -
+		-- 클라이언트의 종료 요청(RequestEndRapidFire)이 유실돼도 조작이 영영 잠기지 않게 하는 안전장치다.
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		self._T.rapidFireCtrlToken = (self._T.rapidFireCtrlToken or 0) + 1
+		local myCtrlToken = self._T.rapidFireCtrlToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.rapidFireCtrlToken ~= myCtrlToken then return end
+			self:RestoreRapidFireControl()
+		end, 1.0)
+
+		-- (요청) 공격속도 2배 - 발사 간격이 0.25초로 줄었으므로 활 쏘는 모션도 2배 빠르게 재생해야
+		-- 한 발 주기 안에 동작이 끝난다. PlayRapidFireMotion은 재생속도를 1/배율로 잡으므로
+		-- 배율을 절반으로 넘기면 재생속도가 2배가 된다(브랜디쉬 motionMult와 같은 방식).
+		self:PlayRapidFireMotion(self.Entity, "shoot1", horizDirX, atkMultiplier * 0.5)
+		self:SpawnRapidFireProjectile(combatPower, dirX, dirY)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreRapidFireControl()
+		-- 연사가 끝나 이동 잠금을 되돌린다. 키를 뗀 즉시(SkillManager.RequestEndRapidFire)와
+		-- 마지막 발사 1초 뒤 안전장치, 두 경로에서 호출되므로 여러 번 불려도 안전해야 한다.
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = true
+		end
+		log("[RapidFire] 이동 잠금 해제")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayRapidFireMotion(Entity attacker, string motionName, number dirX, number atkMultiplier)
+		-- 속사 전용 활 쏘는 모션. 더블샷과 동일한 방식이되, 0.5초마다 다시 호출되므로 모션이 끝난 뒤
+		-- IDLE로 되돌리는 처리는 넣지 않는다(연사 중에는 다음 발 모션이 곧바로 이어진다).
+		-- 연사가 끝난 뒤의 자세 복구는 SkillManager가 EndRapidFire에서 한 번만 처리한다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		local body = avatarRenderer:GetBodyEntity()
+		if not isvalid(body) then return end
+
+		avatarRenderer.ShowDefaultWeaponEffects = false
+
+		local playerCtrl = attacker.PlayerControllerComponent
+		if isvalid(attacker.MovementComponent) then
+			attacker.MovementComponent:Stop()
+		end
+		if isvalid(playerCtrl) then
+			playerCtrl.LookDirectionX = dirX
+		end
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local playRate = 1.0 / mult
+		local motionEvent = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
+		body:SendEvent(motionEvent)
+
+		_TimerService:SetTimerOnce(function()
+			if isvalid(avatarRenderer) then
+				avatarRenderer.ShowDefaultWeaponEffects = true
+			end
+		end, 0.2 * mult)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnRapidFireProjectile(number combatPower, number dirX, number dirY)
+		-- 속사 화살 한 발을 맵에 스폰하고 조준 방향으로 발사한다.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		self._T.rapidFireCount = (self._T.rapidFireCount or 0) + 1
+		local name = "rapidfire_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.rapidFireCount)
+		-- 발쪽(원점)이 아니라 몸통 중심 높이에서 날아가도록 y를 올린다(다른 화살 스킬과 동일한 0.35).
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local proj = _SpawnService:SpawnByModelId("rapidfireprojectile", name, Vector3(myPos.x, myPos.y + 0.35, myPos.z), map)
+		if not isvalid(proj) then
+			log_warning("[PlayerAttack] RapidFire 발사체 스폰 실패")
+			return
+		end
+
+		---@type RapidFireProjectile
+		local projComp = proj:GetComponent("script.RapidFireProjectile")
+		if isvalid(projComp) then
+			projComp.CombatPower = combatPower
+			projComp.CritRate = self._T.currentCritRatePercent or 50
+			-- 지금 적용 중인 데미지 스킨(블리자드 중이면 얼음 스킨)을 발사체에 새겨준다 - 수동 표시에 쓰인다.
+			projComp.DamageSkinRUID = self:GetHitDamageSkinId()
+			projComp:Fire(dirX, dirY)
+		end
+		log("[RapidFire] 화살 발사 dir=(" .. string.format("%.2f", dirX) .. "," .. string.format("%.2f", dirY) .. ") combatPower=" .. tostring(combatPower))
+	end
+
+	@ExecSpace("ServerOnly")
 	method void AttackAvenger(number combatPower, number atkMultiplier, number rawDirX, number rawDirY)
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		self:StopBreather()

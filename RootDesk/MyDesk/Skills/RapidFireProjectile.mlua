@@ -1,0 +1,89 @@
+@Component
+script RapidFireProjectile extends Component
+
+	-- 속사(2차) 화살. 더블샷 화살(DoubleShotProjectile)과 같은 아트/구조를 쓰되, 두 발이 벌어지는
+	-- 로직 없이 발사된 조준 각도 그대로 직선으로 날아가는 단발 화살이다.
+	-- 화살 하나는 적 한 명을 맞히면 사라진다.
+
+	property number Speed = 8
+
+	property number MaxLifetime = 1.5
+
+	property number CombatPower = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcDamage는 서버에서
+	-- 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 서버가 직접 읽을 수 없어, 발사한 플레이어가
+	-- 동기화해둔 값을 그대로 넘겨받는다(더블샷/아이언 에로우와 동일한 방식).
+	property number CritRate = 50
+
+	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID. 비어 있으면 공용 기본 히트 스킨으로 폴백한다.
+	property string DamageSkinRUID = ""
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화(서버 전용 필드).
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hit = false
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 조준 방향으로 발사 시작. 속사는 더블샷과 같은 화살 그림(ball1/ball2)을 쓰는데
+		-- 이 그림은 머리가 +x(오른쪽)를 향하고 있어 에로우 블로우/아이언 에로우와 달리
+		-- 회전각에 180도 보정을 하지 않는다(msw-dev-tools/resources/더블샷/RUID.md 실측 메모).
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(dirY, dirX))
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHit()
+		-- 이 화살이 이미 한 명을 맞혔는지. 명중 후에는 판정도 막고 다음 프레임에 스스로 사라진다.
+		return self._T.hit == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkHit()
+		-- 명중 확정(RapidFireProjectileAttack.CalcDamage가 호출).
+		self._T.hit = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		-- 이미 한 명을 맞혔으면 사라진다. 판정 처리와 같은 프레임에 자기 자신을 파괴하면 재진입 문제가
+		-- 생길 수 있어 다음 프레임에 파괴한다(다른 화살 스킬과 동일).
+		if self._T.hit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self._T.lifetime = self._T.lifetime + delta
+		if self._T.lifetime >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self.Entity.TransformComponent:Translate(
+			self._T.dirX * self.Speed * delta,
+			self._T.dirY * self.Speed * delta
+		)
+
+		-- 매 프레임 화살 위치에서 작은 원형 판정을 낸다(더블샷 화살과 동일한 반경 0.3).
+		---@type RapidFireProjectileAttack
+		local ac = self.Entity:GetComponent("script.RapidFireProjectileAttack")
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			ac:AttackFast(CircleShape(Vector2(pos.x, pos.y), 0.3), "skill.rapidfire", CollisionGroups.HitBox)
+		end
+	end
+
+end

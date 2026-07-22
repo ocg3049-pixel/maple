@@ -102,6 +102,12 @@ script SkillManager extends Logic
 				{ ruid = "44b70137422f425eb486eb7cc5a92aec", name = "힐",             level = 1, desc = "대상의 HP를 회복시킨다." },
 				{ ruid = "5dc96ca0e6674dc1b301965cfed9f168", name = "에로우 봄",      level = 1, desc = "폭발하는 화살로 주변 적을 공격한다." },
 				{ ruid = "0cfe777a9cd04df9bbb22a18a598e9b7", name = "아이언 에로우",  level = 1, desc = "강한 관통력을 가진 화살을 발사한다." },
+				-- 속사(2차): 키를 누르고 있는 동안 0.25초마다 화살이 계속 나간다(요청으로 공격속도 2배).
+				-- 방향키로 조준 각도를 바꾸면 각도가 곧바로 튀지 않고 초당 90도씩 서서히 회전해,
+				-- 3시와 12시 사이의 중간 각도로도 발사된다.
+				-- 화살/적중 이펙트는 더블샷과 같은 아트를 쓰고, 아이콘은 임시로 MSW 라이브러리의
+				-- "해달 궁술: 속사" 아이콘을 쓴다(교체 가능).
+				{ ruid = "98e897de7be7419d947521aa8b800b59", name = "속사",           level = 1, desc = "키를 누르고 있는 동안 0.25초마다\n화살을 한 발씩 계속 발사한다.\n한 발당 전투력의 100%~150% 피해.\n쏘는 도중 방향키로 조준 방향을 바꾸면\n각도가 서서히 돌아간다(연사 중 이동 불가)." },
 				{ ruid = "e223bdc2a6cd46f98639e00b34083332", name = "헤이스트",       level = 1, desc = "5분간 이동 속도 40%, 점프력 20%를 증가시킨다." },
 				{ ruid = "03b1da381bf046c68488fae4690e4f6f", name = "부스터",         level = 1, desc = "5분간 공격 속도가 1단계 상승한다." },
 				-- 새비지블로우: MSW 기본 리소스에 없어 직접 구해와 업로드한 아이콘이다
@@ -1137,6 +1143,192 @@ script SkillManager extends Logic
 		end, 1 / 60)
 	end
 
+	-- ── 속사(2차) ────────────────────────────────────────────────────
+	-- 키를 누르고 있는 동안 0.5초마다 화살 한 발. 방향키로 조준 각도를 바꾸면 곧바로 튀지 않고
+	-- 초당 RAPIDFIRE_TURN_SPEED(90도)씩 최단 방향으로 돌아가므로, 3시 → 12시로 바꾸면 그 사이 각도로도
+	-- 화살이 나간다(요청). 각도 보간/발사 간격은 전부 시전한 클라이언트가 관리하고, 서버에는 한 발씩
+	-- "이 각도로 쏴라"만 요청한다.
+
+	@ExecSpace("ClientOnly")
+	method void StartRapidFire(string key)
+		-- 연사 시작. 이미 연사 중이면 무시한다(KeyDown 자동 반복/홀드 루프가 매 프레임 들어온다).
+		if self._T.rapidFireActive == true then return end
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		local sc = player.StateComponent
+		if isvalid(sc) and (sc.CurrentStateName == "DEAD" or sc.CurrentStateName == "CLIMB" or sc.CurrentStateName == "LADDER") then return end
+
+		self._T.rapidFireActive = true
+		self._T.rapidFireKey = key
+		-- 시작 각도는 지금 바라보는 방향 - 오른쪽이면 3시(0도), 왼쪽이면 9시(180도).
+		local ctrl = player.PlayerControllerComponent
+		local facingRight = (not isvalid(ctrl)) or ctrl.LookDirectionX >= 0
+		self._T.rapidFireAngle = facingRight and 0.0 or 180.0
+		self._T.rapidFireNextShotAt = 0    -- 첫 발은 즉시
+
+		-- (요청) 연사 중에는 방향키가 조준 전용이 되도록 제자리에 고정한다.
+		-- (버그 수정) 예전엔 여기 클라이언트에서만 ctrl.Enable=false를 했는데, PlayerControllerComponent의
+		-- Enable은 서버가 들고 있는 @Sync 프로퍼티라 클라 쪽 대입이 곧바로 되돌려진다(실측: 연사 중
+		-- ctrlEnable=true). 그래서 ↓키가 그대로 엔진의 앉기/눕기(ActionCrouch)로 흘러들어가
+		-- "아래로 조준하면 캐릭터가 눕는" 문제가 생겼다. 실제 잠금은 서버(PlayerAttack.AttackRapidFire)가
+		-- 매 발마다 걸고, 연사가 끝나면 RequestEndRapidFire로 되돌린다. 여기서는 즉시 반응을 위해
+		-- 이동만 멈춘다.
+		if isvalid(player.MovementComponent) then player.MovementComponent:Stop() end
+		log("[SkillManager] 속사 시작 key=" .. tostring(key) .. " 시작각도=" .. tostring(self._T.rapidFireAngle))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EndRapidFire()
+		-- 연사 종료: 이동 잠금을 풀고 남아있는 활 쏘기 자세를 서기/걷기로 되돌린다(질주 해제와 동일).
+		if self._T.rapidFireActive ~= true then return end
+		self._T.rapidFireActive = false
+		self._T.rapidFireKey = ""
+		-- 이동 잠금은 서버가 걸어둔 것이라 서버에서 풀어야 한다(클라에서 Enable=true를 대입해도 @Sync가 덮는다).
+		self:RequestEndRapidFire()
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			local sc = player.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+				sc:ChangeState("MOVE")
+				sc:ChangeState("IDLE")
+			end
+		end
+		log("[SkillManager] 속사 종료")
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetRapidFireTargetAngle()
+		-- 지금 눌린 방향키 조합이 가리키는 목표 각도(도). 아무 방향키도 안 눌렸으면 9999를 돌려주고,
+		-- 호출부는 그때 현재 각도를 그대로 유지한다(= 마지막 조준 각도로 계속 쏜다).
+		-- 부수적으로 self._T.rapidFireAimInstant에 "이번 입력이 좌/우 전용인지"를 함께 기록한다 -
+		-- (요청) 좌/우 전환은 서서히 돌지 않고 즉시 그 방향을 봐야 하는데, 호출부에서 입력을 또 읽으면
+		-- 같은 프레임에 두 번 읽게 되어 판정이 갈릴 수 있어 여기서 한 번에 정한다.
+		local left  = _InputService:IsKeyPressed(KeyboardKey.LeftArrow)
+		local right = _InputService:IsKeyPressed(KeyboardKey.RightArrow)
+		local up    = _InputService:IsKeyPressed(KeyboardKey.UpArrow)
+		local down  = _InputService:IsKeyPressed(KeyboardKey.DownArrow)
+		local dx = 0
+		local dy = 0
+		if left  then dx = dx - 1 end
+		if right then dx = dx + 1 end
+		if up    then dy = dy + 1 end
+		if down  then dy = dy - 1 end
+		self._T.rapidFireAimInstant = (dy == 0)
+		if dx == 0 and dy == 0 then return 9999 end
+		if dx == 0 then
+			-- 순수 위/아래 입력: 12시(90도) / 6시(-90도)를 목표로 한다. 최단 경로로 도는 아래 보간과
+			-- 맞물려, 3시에서 누르면 각도가 올라가고 9시에서 누르면 반대쪽으로 올라간다.
+			if dy > 0 then return 90.0 end
+			return -90.0
+		end
+		return math.deg(math.atan(dy, dx))
+	end
+
+	@ExecSpace("ClientOnly")
+	method number StepAngleToward(number current, number target, number maxStep)
+		-- current를 target 쪽으로 최대 maxStep(도)만큼 최단 방향으로 돌린 각도를 돌려준다.
+		local diff = target - current
+		while diff > 180 do diff = diff - 360 end
+		while diff < -180 do diff = diff + 360 end
+		if math.abs(diff) <= maxStep then return target end
+		if diff > 0 then return current + maxStep end
+		return current - maxStep
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RapidFireTick(number delta)
+		-- 연사 유지: 매 프레임 조준 각도를 목표로 조금씩 돌리고, 0.5초마다 한 발씩 쏜다.
+		if self._T.rapidFireActive ~= true then return end
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then
+			self:EndRapidFire()
+			return
+		end
+		local sc = player.StateComponent
+		if isvalid(sc) and (sc.CurrentStateName == "DEAD" or sc.CurrentStateName == "CLIMB" or sc.CurrentStateName == "LADDER") then
+			self:EndRapidFire()
+			return
+		end
+		-- 키를 떼면 종료(OnKeyUp이 heldSkillKeys를 false로 내린다).
+		local key = self._T.rapidFireKey or ""
+		if key == "" or self._T.heldSkillKeys[key] ~= true then
+			self:EndRapidFire()
+			return
+		end
+
+		-- 조준 각도 갱신.
+		--  · 좌/우 입력(위아래가 섞이지 않은 순수 좌우) → (요청) 즉시 그 방향으로 꺾는다. 반대쪽을
+		--    볼 때 각도가 천천히 넘어가면 그 사이에 엉뚱한 방향으로 화살이 나가기 때문.
+		--  · 위/아래가 섞인 입력 → (요청) 초당 135도(기존 90도의 1.5배)로 서서히 돌린다.
+		--    12시(90도) 전환이 약 0.67초 걸리므로 그 사이 중간 각도로도 화살이 나간다.
+		local RAPIDFIRE_TURN_SPEED = 135.0
+		local targetAngle = self:GetRapidFireTargetAngle()
+		if targetAngle < 9000 then
+			if self._T.rapidFireAimInstant == true then
+				self._T.rapidFireAngle = targetAngle
+			else
+				self._T.rapidFireAngle = self:StepAngleToward(self._T.rapidFireAngle or 0, targetAngle, RAPIDFIRE_TURN_SPEED * delta)
+			end
+		end
+
+		-- (요청) 공격속도 2배 - 발사 간격 0.5초 → 0.25초(초당 4발).
+		local RAPIDFIRE_SHOT_INTERVAL = 0.25
+		local now = _UtilLogic.ElapsedSeconds
+		if now >= (self._T.rapidFireNextShotAt or 0) then
+			self._T.rapidFireNextShotAt = now + RAPIDFIRE_SHOT_INTERVAL
+			self:FireRapidFireShot()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FireRapidFireShot()
+		-- 지금 조준 각도로 화살 한 발을 서버에 요청한다.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		-- 크리티컬 확률/데미지는 장비 잠재능력까지 반영된 클라이언트 전용 값이라 발사 직전에 동기화한다
+		-- (다른 스킬이 UseSkillInSlot 초반에 하는 것과 같은 처리 - 속사는 그 경로를 타지 않는다).
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if pa ~= nil then
+			pa:SyncCritRate(_CharInfoManager:CalcCritRate())
+			pa:SyncCritDamage(_CharInfoManager:CalcCritDamage())
+		end
+		local rad = math.rad(self._T.rapidFireAngle or 0)
+		local combatPower = _CharInfoManager:CalcCombatPower()
+		local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
+		self:RequestFireRapidFire(combatPower, atkMult, math.cos(rad), math.sin(rad))
+		log("[SkillManager] 속사 발사 각도=" .. string.format("%.1f", self._T.rapidFireAngle or 0))
+	end
+
+	@ExecSpace("Server")
+	method void RequestFireRapidFire(number combatPower, number atkMultiplier, number dirX, number dirY)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then
+			log_warning("[SkillManager] RequestFireRapidFire: player not found")
+			return
+		end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then
+			log_warning("[SkillManager] RequestFireRapidFire: PlayerAttack component not found")
+			return
+		end
+		pa:AttackRapidFire(combatPower, atkMultiplier, dirX, dirY)
+	end
+
+	@ExecSpace("Server")
+	method void RequestEndRapidFire()
+		-- 연사 종료를 서버에 알려 이동 잠금(PlayerControllerComponent.Enable)을 즉시 되돌린다.
+		-- 이 요청이 유실돼도 서버가 마지막 발사 1초 뒤에 스스로 복구한다(AttackRapidFire의 토큰 가드).
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then return end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then return end
+		pa:RestoreRapidFireControl()
+	end
+
 	@ExecSpace("Server")
 	method void RequestFireDoubleJump(number dirX)
 		-- 더블 점프의 이펙트/사용음만 서버에 요청한다(이동은 위 RunDoubleJumpMove가 클라에서 처리).
@@ -1202,6 +1394,17 @@ script SkillManager extends Logic
 		if slot.name == "더블 점프" then
 			self:TryDoubleJump()
 			return
+		end
+		-- (속사) 키를 누르고 있는 동안 계속 발사되는 지속 스킬. 여기서는 연사를 "시작"만 하고,
+		-- 실제 발사 간격(0.5초)·조준 각도 보간·종료 판정은 OnUpdate의 RapidFireTick이 담당한다.
+		-- 이미 연사 중이면 StartRapidFire가 그냥 무시하므로 KeyDown 반복이 들어와도 안전하다.
+		if slot.name == "속사" then
+			self:StartRapidFire(key)
+			return
+		end
+		-- 속사 중에 다른 스킬을 누르면 연사를 먼저 끝낸다(질주와 같은 처리 - 이동 잠금이 남지 않게).
+		if self._T.rapidFireActive == true then
+			self:EndRapidFire()
 		end
 		-- (요청) 질주 중 다른 스킬을 누르면 제자리로 돌아가지 않고 즉시 그 스킬을 발동한다 - 먼저 질주만 해제한다.
 		if self._T.sprintActive == true then
@@ -3315,6 +3518,9 @@ script SkillManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		-- 속사 연사 유지(조준 각도 보간 + 0.5초 간격 발사). 연사 중이 아니면 즉시 반환한다.
+		self:RapidFireTick(delta)
+
 		local cursor  = _InputService:GetCursorPosition()
 		local ghostUI = Vector2(cursor.x - 960, cursor.y - 540)
 
