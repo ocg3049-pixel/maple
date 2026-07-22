@@ -1,0 +1,106 @@
+@Logic
+@ExecSpace("ClientOnly")
+script DragonRidingCooldownUI extends Logic
+
+	-- 드래곤 라이딩(3차) 쿨타임(10분) 표시. 블리자드(BlizzardCooldownUI)와 동일한 표현 방식 -
+	-- 스킬이 배정된 퀵슬롯 아이콘 위에 검은 오버레이가 덮이고, 시간이 지날수록 위에서부터 밝아지면서
+	-- 남은 시간이 숫자로 뜬다. 다른 쿨타임 스킬과 동시에 돌 수 있으므로 전용 오버레이 엔티티를 쓴다.
+	-- 10분짜리라 남은 시간이 60초 이상이면 "분" 단위(노란색)로, 60초 미만이면 초 단위로 표시한다.
+
+	property SpriteGUIRendererComponent grayOverlay = "a7a279bc-70d9-42e1-94db-1f843e8fe9dc"
+	property TextComponent countdownText = "c3e84cc1-692a-47c6-8399-ed17cd4c1493"
+
+	method void ShowCooldown(number duration, string slotKey)
+		-- slotKey = 퀵슬롯 위치 접미사(Slot_<위치>). 오버레이/텍스트를 그 슬롯 위로 옮긴 뒤 카운트다운 시작.
+		if not self:IsClient() then return end
+		if duration <= 0 then return end
+		self._T.totalDuration = duration
+		self._T.remaining = duration
+		self._T.slotKey = slotKey   -- 쿨타임 완료 시 깜빡임 대상 슬롯
+
+		-- (AssaulterCooldownUI/BlizzardCooldownUI와 동일) 오버레이 스프라이트를 .ui에 Filled로 저장하면
+		-- 렌더링되지 않는 문제가 있어, 저장은 Simple로 하고 런타임에 매번 Filled/Vertical로 바꿔준다.
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Type = ImageType.Filled
+			self.grayOverlay.FillMethod = FillMethodType.Vertical
+		end
+
+		local slotEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. tostring(slotKey))
+		if isvalid(slotEnt) then
+			local slotPos = slotEnt.UITransformComponent.anchoredPosition
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Entity.Enable = true
+		end
+		if isvalid(self.countdownText) then
+			self.countdownText.Entity.Enable = true
+		end
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self._T.remaining = self._T.remaining - delta
+			self:UpdateCooldownDisplay()
+		end, 1 / 60)
+
+		self:UpdateCooldownDisplay()
+		log("[DragonRidingCooldownUI] 쿨타임 표시 시작 duration=" .. tostring(duration) .. " slot=" .. tostring(slotKey))
+	end
+
+	method void UpdateCooldownDisplay()
+		-- 매 프레임 남은 시간에 따라 오버레이(FillAmount)/카운트다운 텍스트를 갱신한다.
+		local remaining = self._T.remaining
+		local total = self._T.totalDuration
+
+		if remaining <= 0 then
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.Enable = false
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.Enable = false
+			end
+			-- 쿨타임 완료: 슬롯 아이콘 2번 깜빡임으로 재사용 가능 알림(모든 쿨타임 스킬 공통).
+			_SkillManager:BlinkSlotReady(self._T.slotKey or "")
+			return
+		end
+
+		-- 남은 비율을 그대로 FillAmount로 준다 - 검은 영역이 아래쪽에 고정된 채 위에서부터 줄어든다.
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.FillAmount = math.max(0, math.min(1, remaining / total))
+		end
+		if isvalid(self.countdownText) then
+			if remaining < 60 then
+				self.countdownText.FontColor = Color(1, 1, 1, 1)
+				self.countdownText.Text = tostring(math.ceil(remaining))
+			else
+				-- 10분 쿨타임이라 대부분의 시간은 분 단위로 보여준다(버프바 표기와 같은 규칙).
+				self.countdownText.FontColor = Color(1, 1, 0, 1)
+				self.countdownText.Text = tostring(math.floor(remaining / 60))
+			end
+		end
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+	end
+
+end

@@ -1,0 +1,71 @@
+# 차지 블로우 속성 궤적 - 업로드 RUID 대응표
+
+원본 시트: /Users/florence/Desktop/속성궤적/{얼음,전기,불,성}.png (1280x1280, 320px 셀 4행x4열)
+frames/ 는 행 단위로 4원소·4프레임 공통 대칭 박스로 잘라 0.55배 축소한 것(같은 행끼리 정렬 보장).
+
+| 파일 | RUID |
+|---|---|
+| ice_r1_f1.png | 256ed90a49b54a17a4be2280e49009ce |
+| ice_r1_f2.png | 919aec05616b464aba949064c65499b4 |
+| ice_r1_f3.png | 435ac3806a924dc9b4239cb8c1c86243 |
+| ice_r1_f4.png | 3f97672a96fa4dcdb9e274ea39673b09 |
+| ice_r2_f1.png | 9ee1ca6818a04ac6aa6270e2123b0bbe |
+| ice_r2_f2.png | e7cba842c3f048e29ea8816b798f1a64 |
+| ice_r2_f3.png | 8454baceedfa4c1a9c2edab4741cd552 |
+| ice_r2_f4.png | 451d3672aa8d4b2e9fc93bddbc2d2a95 |
+| ice_r3_f1.png | 4cce0f1075a843858a72f1c3934179df |
+| ice_r3_f2.png | 433bf9eb0b884b57bf2e379b75f0c9a8 |
+| ice_r3_f3.png | 99acf5028d394e898cfcc780893578b3 |
+| ice_r3_f4.png | 50a36c1b7d44453fbcbb8c518fd525ea |
+| ice_r4_f1.png | e34c657a37934280a2828c935ad90714 |
+| ice_r4_f2.png | 8b3d8c43db4b4aabb93c194dc13062a2 |
+| ice_r4_f3.png | d39424cc827e4bbc9c62269a44ea97be |
+| ice_r4_f4.png | 22eed4ca45d241558dfd1cd41f802220 |
+| elec_r1_f1.png | 0b0d53c99e514b21b1f3b94bf91c4410 |
+| elec_r1_f2.png | 6e766ce2b33845c49e7a7a35ad0ea567 |
+| elec_r1_f3.png | 0325c34e91a3425ca8d847bbdafe4c2b |
+| elec_r1_f4.png | f9172c536716419e9096774d27594efe |
+| elec_r2_f1.png | e8ba7382f2784e44902adefd65b6dbd2 |
+| elec_r2_f2.png | 47143ec91a58468691a172e3a7b05c85 |
+| elec_r2_f3.png | 82f668b2579f41cc91b15a4d5fd4b281 |
+| elec_r2_f4.png | 82913fa6cd124ca0ba157d18f6a9aff8 |
+| elec_r3_f1.png | f9c5606515d84a2ca5615ee3ef42efe0 |
+| elec_r3_f2.png | a1574059f19a4cc2837d8f2c47532665 |
+| elec_r3_f3.png | 93012b7ce08240e79659e3d886591c72 |
+| elec_r3_f4.png | 5d818f4df3714acfb97f4816027f928d |
+| elec_r4_f1.png | 9979fce5082d47dd87c002c0bbd8ba87 |
+| elec_r4_f2.png | 16b87869ef1e4b40955eebbb63b2e41c |
+| elec_r4_f3.png | 3031de3aad7d4736a6bd37b63dc72c84 |
+| elec_r4_f4.png | 2fb4759ebfe5485bbb4eed246de191dd |
+| fire_r1_f1.png | 8ed34627d76d4500907a123ec4817242 |
+| fire_r1_f2.png | c446252cdb9c4d9e936755e1b9138ac1 |
+| fire_r1_f3.png | 20006015b5484621bade91e2afd63a6e |
+| fire_r1_f4.png | 5df7aba02f834818a92b07340736b0ef |
+| fire_r2_f1.png | 603a1c408eb5410e9ec7a40ac26f9267 |
+| fire_r2_f2.png | 6039ca86fe81406a95cb9ca0c2402924 |
+| fire_r2_f3.png | fee55936696c4b0e8035fe1cf2652e9d |
+| fire_r2_f4.png | 2d88266d3901442f983cadc5a172cda4 |
+| fire_r3_f1.png | 507d9c37ad214dd09a7123716eece5d3 |
+| fire_r3_f2.png | 0916e5711ae04feb9265fc8db4dbc405 |
+| fire_r3_f3.png | ee8f14cd11c943e89c370352303eb8f5 |
+| fire_r3_f4.png | 79e0485dea9a4bea85e09f70461cb9bb |
+| fire_r4_f1.png | 475a253a7a0942918fa279f611577fa4 |
+| fire_r4_f2.png | f5d2a9d46cea47b7837c21d8c7647c73 |
+| fire_r4_f3.png | b4f5d7c8f21240d6b1cc2d2b8500b09b |
+| fire_r4_f4.png | 5bce29112dbf4393a30e59e852f94c52 |
+| holy_r1_f1.png | fc48f9ad06294b5dad48b846418363cd |
+| holy_r1_f2.png | 9e67fec6094445bfac073ca3769d4ccb |
+| holy_r1_f3.png | 7628999206e04ef8b3ed093d5827f9de |
+| holy_r1_f4.png | ff3182dea66642348e77436ff63a36d0 |
+| holy_r2_f1.png | 8b7bf6badd434cbd99b46ac280c4e5c6 |
+| holy_r2_f2.png | 3bd2b0d3d50a4ef79edd3ca995cd99ba |
+| holy_r2_f3.png | de58f59fe8d64c4e87199b323f94fe0b |
+| holy_r2_f4.png | 9b74f35a880b4b9e9090f743d332841c |
+| holy_r3_f1.png | ef846906c4b54786b3017245a1fcb084 |
+| holy_r3_f2.png | 4fd0804986e543688e875a59b446f744 |
+| holy_r3_f3.png | 82c64a31f984418ba0a16592a556bbb4 |
+| holy_r3_f4.png | a1d1c7ecda334e7bb664e7bfff99f816 |
+| holy_r4_f1.png | 3b6e2f19df8e486dbad3cd6abf5d836d |
+| holy_r4_f2.png | ade08cff629644f8817990e780523a66 |
+| holy_r4_f3.png | 1f642456eb344ff980d13626861e4716 |
+| holy_r4_f4.png | 5ba8a9e73caa44ab83fe4aef6d836410 |

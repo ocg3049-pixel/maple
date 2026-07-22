@@ -1,0 +1,331 @@
+@Component
+script RidingDragon extends Component
+
+	-- 드래곤 라이딩(3차 스킬) 소환수. 서먼 다크드래곤(DarkDragon.mlua)과 같은 구조로,
+	-- spearburstfadingeffect 모델(Transform+Sprite, 기본 RUID "")을 플레이어의 자식으로 스폰한 뒤
+	-- 이 컴포넌트를 붙인다. 위치는 각 클라이언트가 매 프레임 직접 계산해 움직이고(동기화 트래픽 0),
+	-- 애니메이션은 @Sync 상태값(AtkState/Riding)만 동기화한 뒤 클립 교체는 클라 로컬로 처리한다.
+	--
+	-- 다크드래곤과 다른 점 2가지:
+	--  1) 프레임 RUID를 하나씩 갈아끼우지 않고, animationclip RUID를 SpriteRUID에 그대로 넣어
+	--     엔진 루프 재생에 맡긴다(SpriteRUID는 animationclip을 직접 받는다 - platform.md §7).
+	--  2) Riding=true면 소환수가 아니라 "탈것"이 된다 - 플레이어 발밑에 딱 붙어 같이 날아다닌다.
+	--
+	-- 리소스(요청 RUID): 이동/비행 af21747f · 제자리 2d932a6e · 공격1 0314573e(히트 b5798210) ·
+	--                    공격2 22c654ad(히트 f0f7c7dd) · 소멸 1b59436e
+
+	property Entity OwnerEntity = nil            -- 서버 전용(공격 대상 탐색/데미지 주체). 클라는 부모로 충분.
+	property number Lifetime = 300               -- 서버 전용 수명(초). 요청 스펙 = 5분.
+	@Sync property string AtkState = ""          -- "" (평상시) | "atk1" | "atk2"
+	@Sync property boolean Riding = false        -- true면 플레이어가 탑승 중
+	@Sync property boolean Warping = false       -- 탑승 연출: 제자리에서 이펙트 재생하며 잠시 사라진 상태
+	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- 서버: 수명(5분) / 공격(5~7초) 타이머 예약.
+		self._T.spawnAt = _UtilLogic.ElapsedSeconds
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			-- 소멸 이펙트를 먼저 각 클라에서 재생하고, 0.2초 뒤에 실제로 엔티티를 지운다.
+			self:PlayVanishEffect()
+			_TimerService:SetTimerOnce(function()
+				if isvalid(self.Entity) then self.Entity:Destroy() end
+			end, 0.2)
+		end, self.Lifetime)
+		self:ScheduleAttack()
+		log("[RidingDragon] 소환 - 수명 " .. tostring(self.Lifetime) .. "초")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleAttack()
+		-- (요청) 5~7초에 한 번 사거리 내에 적이 있으면 공격한다.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:TryAttack()
+			self:ScheduleAttack()
+		end, 5.0 + _UtilLogic:RandomDouble() * 2.0)
+	end
+
+	@ExecSpace("Server")
+	method void ReportDragonPos(number x, number y)
+		-- 소유 클라가 계산한 실제 드래곤 월드좌표를 서버에 저장(공격 targeting 기준). 0.15초마다 갱신.
+		-- 드래곤 이동은 클라 전용 계산이라 서버 Transform은 스폰 위치에 머문다(DarkDragon과 동일한 이유).
+		self._T.serverWorldPos = Vector2(x, y)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryAttack()
+		-- 드래곤 주변 반경 안의 몬스터를 찾아 공격 모션 2종 중 하나를 재생하고 히트 이펙트 + 데미지를 넣는다.
+		if self.Riding then return end             -- 탑승 중에는 탈것이므로 공격하지 않는다.
+		if self.AtkState ~= "" then return end     -- 이미 공격 모션 재생 중
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+
+		local wp = self._T.serverWorldPos
+		local mx = (wp ~= nil) and wp.x or self.Entity.TransformComponent.WorldPosition.x
+		local my = (wp ~= nil) and wp.y or self.Entity.TransformComponent.WorldPosition.y
+		local targets = pa:FindMonstersInRadius(Vector2(mx, my), 4.0, 3)
+		if #targets == 0 then return end
+
+		local tp = targets[1].TransformComponent.WorldPosition
+		self.FacingX = (tp.x >= mx) and 1 or -1
+		-- 공격 모션 2종 중 랜덤. 히트 이펙트도 모션에 맞는 것으로 짝지어 재생한다.
+		local useFirst = _UtilLogic:RandomDouble() < 0.5
+		self.AtkState = useFirst and "atk1" or "atk2"
+		local hitRuid = useFirst and "b57982104fc24997900fcdd693be1f77" or "f0f7c7dd4d72494d91f145d07dc170e3"
+
+		-- 모션 중반(0.7초)에 타격 판정 + 히트 이펙트. 대상별로 0.08초씩 어긋나게 넣는다.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			if self.Warping or self.Riding then return end   -- 탑승으로 중단된 공격은 타격도 취소
+			for i, t in ipairs(targets) do
+				if isvalid(t) then
+					local tt = t
+					_TimerService:SetTimerOnce(function()
+						if not isvalid(tt) then return end
+						if self.Warping or self.Riding then return end
+						self:PlayHitEffect(tt, hitRuid)
+						if isvalid(pa) then pa:DealRidingDragonHit(tt) end
+					end, (i - 1) * 0.08)
+				end
+			end
+		end, 0.7)
+
+		-- 공격 모션 종료 → 평상시 상태로 복귀.
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then self.AtkState = "" end
+		end, 1.6)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHitEffect(Entity target, string clipRuid)
+		-- 공격 모션별 히트 이펙트를 맞은 몬스터 몸에서 1회 재생한다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached(clipRuid, target, Vector3(0, 0.3, 0), 0, Vector3(1.1, 1.1, 1), false, { ["OrderInLayer"] = 7 })
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 1.5)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginMountWarp()
+		-- (요청) 탑승은 "드래곤이 플레이어에게 날아와서 타는" 게 아니라,
+		-- ① 드래곤이 있던 자리에서 워프 이펙트를 1회 재생하며 사라지고
+		-- ② 잠시 뒤 플레이어가 원래 있던 자리에 드래곤을 탄 채로 나타난다.
+		-- 여기서는 ①을 띄우고 0.5초 뒤 Riding을 켠다(클라가 그 순간 위치를 플레이어에게 스냅한다).
+		-- (요청) 공격 모션 도중에 탑승키를 누르면 모션을 즉시 중지하고 탑승한다.
+		-- AtkState를 비우면 클라의 클립 선택이 바로 비행/제자리로 돌아가고, 아래 공격 타이머들도
+		-- Warping/Riding 가드에 걸려 남은 타격이 나가지 않는다.
+		self.AtkState = ""
+		self.Warping = true
+		self:PlayMountWarpEffect()
+		log("[RidingDragon] 탑승 워프 시작(제자리 이펙트 후 사라짐)")
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self.Warping = false
+			self.Riding = true
+			log("[RidingDragon] 탑승 워프 완료 - 플레이어 자리에 등장")
+		end, 0.5)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMountWarpEffect()
+		-- 탑승 워프 이펙트(요청 RUID). 드래곤이 곧 숨겨지므로 부착이 아니라 그 자리에 1회 재생한다.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local wp = self.Entity.TransformComponent.WorldPosition
+		local serial = _EffectService:PlayEffect("86500681cfad4e8488cf4ba9376fe801", self.Entity, Vector3(wp.x, wp.y, 0), 0, Vector3(1.1, 1.1, 1), false, { ["OrderInLayer"] = 7 })
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayVanishEffect()
+		-- (요청) 소환이 끝나 사라질 때의 이펙트. 엔티티가 곧 삭제되므로 부착이 아니라 그 자리에 재생한다.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local wp = self.Entity.TransformComponent.WorldPosition
+		local serial = _EffectService:PlayEffect("1b59436ee8a34893be13d1ed75104cb1", self.Entity, Vector3(wp.x, wp.y, 0), 0, Vector3(1.1, 1.1, 1), false, { ["OrderInLayer"] = 6 })
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 탑승 중에 드래곤이 사라지면(5분 만료 등) 흔들림 오프셋이 남지 않게 아바타 위치를 되돌린다.
+		if self._T.rideBobApplied ~= true then return end
+		self._T.rideBobApplied = false
+		local parent = self.Entity.Parent
+		if not isvalid(parent) then return end
+		local ar = parent.AvatarRendererComponent
+		if not isvalid(ar) then return end
+		local avatarRoot = ar:GetAvatarRootEntity()
+		if isvalid(avatarRoot) and isvalid(avatarRoot.TransformComponent) then
+			local atr = avatarRoot.TransformComponent
+			atr.Position = Vector3(atr.Position.x, 0, atr.Position.z)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 클라: 위치(따라다니기 / 탑승) + 클립 교체 + 페이드인.
+		local tr = self.Entity.TransformComponent
+		if not isvalid(tr) then return end
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+
+		-- 탑승 워프 중에는 완전히 감춘 채 위치 계산도 멈춘다(이 자리에서 이펙트만 터지고 사라진 것처럼 보인다).
+		if self.Warping then
+			sr.Color = Color(1, 1, 1, 0)
+			self._T.warpedOut = true
+			return
+		end
+
+		local parent = self.Entity.Parent
+		local pw = (isvalid(parent) and isvalid(parent.TransformComponent))
+			and parent.TransformComponent.WorldPosition or tr.WorldPosition
+
+		-- 플레이어가 바라보는 방향(탑승 중 드래곤 방향 / 따라다닐 때 뒤쪽 위치 계산에 쓴다).
+		local look = 1
+		if isvalid(parent) then
+			local ctrl = parent.PlayerControllerComponent
+			if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
+		end
+
+		local targetWorld = nil
+		local follow = 0.0
+		if self.Riding then
+			-- 탑승: 캐릭터가 드래곤 "등"에 앉은 것처럼 보이게 맞춘다.
+			-- 이 클립은 그림 내용이 피벗 기준으로 한쪽(왼쪽 볼 때 기준 오른쪽)으로 치우쳐 있어서,
+			-- FlipX로 좌우를 뒤집으면 몸통이 통째로 반대편으로 밀린다. 그래서 보정값도 방향에 따라
+			-- 부호를 뒤집어야 한다(offset = -0.35 * look). 실측: 오른쪽을 볼 때 +0.45를 주면 캐릭터가
+			-- 꼬리 뒤로 빠져버렸다.
+			-- (요청) 캐릭터가 좀 더 위에 앉아 보이도록 드래곤을 계속 내렸다
+			-- (-0.18 → -0.38 → -0.58 → -0.75 → -0.9). 이 값이 "캐릭터와 드래곤 사이의 dy"다.
+			targetWorld = Vector3(pw.x - look * 0.35, pw.y - 0.9, 0)
+			-- (요청) 탑승 중에는 보간 없이 100% 따라붙는다. 18/초 보간으로도 캐릭터가 먼저 가고 드래곤이
+			-- 반 박자 늦게 따라오는 이질감이 남아서, 탈것인 만큼 아예 같은 프레임에 딱 붙게 했다.
+			follow = 1.0
+			-- 워프로 사라졌다가 탑승 상태로 돌아오는 첫 프레임에는 보간하지 않고 플레이어 위치로 즉시 스냅한다
+			-- (날아오는 게 아니라 "플레이어 자리에 이미 탑승한 채로 나타나야" 하므로).
+			if self._T.warpedOut == true then
+				self._T.warpedOut = false
+				self._T.worldPos = targetWorld
+				self._T.fadeStart = _UtilLogic.ElapsedSeconds   -- 다시 알파 0→1로 부드럽게 등장
+				-- 이 프레임에 비행 클립도 처음부터 재생되므로(SpriteRUID 교체) 흔들림 위상도 0에서 시작해
+				-- 클립 루프와 위아래 타이밍이 어긋나지 않게 맞춘다.
+				self._T.rideBobT = 0
+			end
+		else
+			-- 평상시: 플레이어 위를 아주 천천히 따라다닌다(위아래로 완만하게 흔들린다).
+			-- (요청) 유저가 방향을 바꿔도 드래곤이 확 움직이면 안 된다 - 목표 지점에서 바라보는 방향
+			-- 성분을 아예 빼서(예전엔 pw.x - look*1.4) 방향 전환 순간 목표가 2.8유닛 순간이동하던 것을
+			-- 없애고, 추적 계수도 2.6 → 1.0으로 낮춰 천천히 따라오게 한다.
+			-- (요청) 평상시 소환 높이를 낮춘다(머리 위 1.1 → 0.55).
+			self._T.bobT = (self._T.bobT or 0) + delta
+			local bob = math.sin(self._T.bobT * 1.6) * 0.18
+			targetWorld = Vector3(pw.x, pw.y + 0.55 + bob, 0)
+			follow = math.min(1.0, 1.0 * delta)
+			self._T.warpedOut = false
+		end
+
+		if self._T.worldPos == nil then self._T.worldPos = Vector3(pw.x, pw.y + 1.0, 0) end
+		local cur = self._T.worldPos
+		local nx = cur.x + (targetWorld.x - cur.x) * follow
+		local ny = cur.y + (targetWorld.y - cur.y) * follow
+		-- 이번 프레임 실제 이동 속도(유닛/초) - 이동 모션 / 제자리 모션 판정에 쓴다.
+		local moveDist = math.sqrt((nx - cur.x) * (nx - cur.x) + (ny - cur.y) * (ny - cur.y))
+		local speed = (delta > 0) and (moveDist / delta) or 0
+		self._T.worldPos = Vector3(nx, ny, 0)
+		-- child라 Position은 부모(플레이어) 기준 로컬 좌표다.
+		tr.Position = Vector3(nx - pw.x, ny - pw.y, 0)
+
+		-- (요청) 탑승 중에는 드래곤의 비행 모션이 위아래로 살짝 출렁이므로, 캐릭터도 그 리듬에 맞춰
+		-- 조금씩 같이 흔들려야 자연스럽다. 단 "이미지만" 움직여야 하고 네임태그는 고정돼야 하므로,
+		-- 플레이어 엔티티가 아니라 아바타 루트 자식 엔티티의 로컬 y만 흔든다
+		-- (네임태그는 플레이어 엔티티에 붙어 있어 영향을 받지 않는다).
+		if isvalid(parent) then
+			local ar = parent.AvatarRendererComponent
+			if isvalid(ar) then
+				local avatarRoot = ar:GetAvatarRootEntity()
+				if isvalid(avatarRoot) and isvalid(avatarRoot.TransformComponent) then
+					local atr = avatarRoot.TransformComponent
+					if self.Riding then
+						-- (요청) 흔들림을 클립 프레임에 정확히 맞춘다.
+						-- 실측: move(af21747f)/stand(2d932a6e) 둘 다 6프레임 × 150ms = 0.9초 루프
+						-- (썸네일 GIF의 프레임 딜레이를 그대로 읽어 확인).
+						--   · 1~2프레임(0.00~0.30초) → 정지
+						--   · 3~4프레임(0.30~0.60초) → 위로 올라감
+						--   · 5~6프레임(0.60~0.90초) → 다시 내려옴
+						-- 반주기 사인(sin(π·q))이면 시작/끝이 정확히 0이고 한가운데(4→5프레임 경계)가 최고점이라,
+						-- 정지 구간과 이어져도 안 튀면서 "올라갔다 내려오는" 모양이 그대로 나온다.
+						self._T.rideBobT = (self._T.rideBobT or 0) + delta
+						local loopT = self._T.rideBobT % 0.9
+						local rideBob = 0
+						if loopT >= 0.3 then
+							local q = (loopT - 0.3) / 0.6   -- 0 → 1 (3프레임 시작 ~ 6프레임 끝)
+							rideBob = math.sin(q * math.pi) * 0.015
+						end
+						atr.Position = Vector3(atr.Position.x, rideBob, atr.Position.z)
+						self._T.rideBobApplied = true
+					elseif self._T.rideBobApplied == true then
+						-- 하차/소멸 시 원래 자리로 복구(한 번만).
+						self._T.rideBobApplied = false
+						self._T.rideBobT = 0
+						atr.Position = Vector3(atr.Position.x, 0, atr.Position.z)
+					end
+				end
+			end
+		end
+
+		-- 소유 클라만 실제 월드좌표를 서버로 보고한다(서버 TryAttack의 타겟팅 기준).
+		if isvalid(parent) and _UserService.LocalPlayer == parent then
+			self._T.reportTimer = (self._T.reportTimer or 0) + delta
+			if self._T.reportTimer >= 0.15 then
+				self._T.reportTimer = 0
+				self:ReportDragonPos(nx, ny)
+			end
+		end
+
+		-- 크기: (요청) 탑승/평상시 구분 없이 스킬 전체를 1.1 배율로 통일한다.
+		-- 예전엔 탑승 1.1 / 평상시 0.88로 달라서 "라이딩할 때만 이펙트가 커 보인다"는 지적이 나왔다.
+		-- 이펙트들도 모두 같은 배율(1.1)로 재생한다.
+		local scale = 1.1
+		tr.Scale = Vector3(scale, scale, 1)
+
+		-- 캐릭터에 가리도록 아바타와 같은 레이어에 두고 OrderInLayer를 4(내 아바타)보다 낮춘다.
+		if sr.SortingLayer ~= "MapLayer0" then sr.SortingLayer = "MapLayer0" end
+		if sr.OrderInLayer ~= 3 then sr.OrderInLayer = 3 end
+
+		-- 바라보는 방향: 공격 중엔 서버가 정한 FacingX, 탑승 중엔 플레이어 방향, 평소엔 이동 방향.
+		local face = look
+		if self.AtkState ~= "" then
+			face = self.FacingX
+		elseif not self.Riding then
+			local moved = nx - (self._T.prevX or nx)
+			if math.abs(moved) > 0.0008 then
+				self._T.faceRoam = (moved > 0) and 1 or -1
+			end
+			face = self._T.faceRoam or look
+		end
+		self._T.prevX = nx
+		sr.FlipX = (face > 0)   -- 시트 원본이 왼쪽을 봄 → 오른쪽 볼 때만 Flip
+
+		-- 클립 선택: 공격 중 > 탑승(항상 비행) > 이동 중이면 비행 / 멈춰 있으면 제자리.
+		local want = "2d932a6e7989426a9856fb5fc2d0e59f"          -- 제자리(스탠드)
+		if self.AtkState == "atk1" then
+			want = "0314573ebc8d43f49e50047bdf28133a"
+		elseif self.AtkState == "atk2" then
+			want = "22c654ad535a48d99be4af99857f1f90"
+		elseif self.Riding or speed > 0.35 then
+			want = "af21747f71154e3392d2669160dceb81"            -- 이동(비행)
+		end
+		if sr.SpriteRUID ~= want then sr.SpriteRUID = want end
+
+		-- 페이드인: 처음 0.8초 동안 알파 0→1.
+		if self._T.fadeStart == nil then self._T.fadeStart = _UtilLogic.ElapsedSeconds end
+		local ft = (_UtilLogic.ElapsedSeconds - self._T.fadeStart) / 0.8
+		sr.Color = Color(1, 1, 1, math.min(1.0, math.max(0.0, ft)))
+	end
+
+end
