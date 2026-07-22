@@ -1,0 +1,118 @@
+@Component
+script DoubleShotProjectileAttack extends AttackComponent
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- 화살 한 발은 적 "한 명"만 맞힌다 - 이미 명중했으면 이후 판정을 전부 막는다.
+		-- (두 발이 각각 독립적으로 한 명씩 맞히므로, 보통은 같은 대상에게 2줄의 데미지가 뜬다.)
+		if isvalid(defender.PlayerComponent) then return false end
+		---@type DoubleShotProjectile
+		local proj = self.Entity:GetComponent("script.DoubleShotProjectile")
+		if proj ~= nil and proj:HasHit() then return false end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 화살 1발당 전투력의 100%~150%(럭키세븐 표창 1개와 동일한 공식). 실제 명중이 확정된 시점(이 훅)에만
+		-- 호출되므로 여기서 명중을 기록해 화살이 다음 프레임에 사라지도록 한다.
+		---@type DoubleShotProjectile
+		local proj = self.Entity:GetComponent("script.DoubleShotProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local hitIndex = 1
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			hitIndex = proj.HitIndex
+			proj:MarkHit()
+		end
+		local mult = 1.0 + _UtilLogic:RandomDouble() * 0.5
+		local dmg = math.floor(combatPower * mult)
+		-- 크리티컬은 화살 한 발마다 캐릭터 정보창의 확률로 독립적으로 굴리고 배율을 반환값에 바로 곱한다
+		-- (아래 CalcCritical은 엔진의 이중 배율 적용을 막기 위해 항상 false를 반환). math.random() 대신
+		-- _UtilLogic:RandomDouble()을 쓰는 이유는 두 발이 짧은 간격으로 잇따라 호출되어 math.random()이
+		-- 같은 시퀀스를 반복 소비할 위험이 크기 때문이다(PlayerAttack.mlua에 문서화된 버그).
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		self:ShowDoubleShotDamageSkin(defender, dmg, hitIndex, isCritical, self:GetProjectileDamageSkinId())
+		self:PlayDoubleShotHitEffect(defender)
+		return dmg
+	end
+
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		-- CalcDamage가 자체적으로 크리티컬을 굴리고 배율을 이미 반환값에 곱했으므로, 엔진이 여기서 또
+		-- true를 반환하면 실제 적용 데미지가 표시값의 2배로 이중 적용된다. 항상 false를 반환한다.
+		return false
+	end
+
+	@ExecSpace("Client")
+	method void ShowDoubleShotDamageSkin(Entity target, integer damage, integer hitIndex, boolean isCritical, string skinRuid)
+		-- 럭키세븐과 동일하게 두 발의 데미지를 서로 겹치지 않는 2줄로 나눠 표시한다(1발째 아래, 2발째 위).
+		if not isvalid(target) then return end
+		local offsetY = -0.2
+		if hitIndex == 2 then offsetY = 0.15 end
+		_DamageSkinService:Play(
+			target, skinRuid, 0,
+			{ damage }, DamageSkinTweenType.Default, isCritical,
+			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+		log("[DoubleShot] ShowDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(isCritical))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayDoubleShotHitEffect(Entity target)
+		-- 업로드한 적중 이펙트 3장(hit1 -> hit2 -> hit3)을 맞은 대상 몸에서 순서대로 보여준다. 정지
+		-- 스프라이트라 EffectService(애니메이션클립 전용)로는 재생할 수 없어, 프로젝트에 이미 있는
+		-- 스프라이트 페이드 엔티티(SpearBurstFadingEffect) 패턴을 그대로 재사용한다.
+		-- (원본/RUID 대응표: msw-dev-tools/resources/더블샷/RUID.md)
+		if not isvalid(target) then return end
+		local offsetY = 0.3
+		local hitComp = target.HitComponent
+		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
+		self._T.hitFxSeq = (self._T.hitFxSeq or 0) + 1
+		local fxName = "DoubleShotHitFx_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.hitFxSeq)
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", fxName, Vector3(0, offsetY, 0), target)
+		if not isvalid(fx) then return end
+		fx:AddComponent("script.SpearBurstFadingEffect")
+		---@type SpearBurstFadingEffect
+		local comp = fx:GetComponent("script.SpearBurstFadingEffect")
+		if isvalid(comp) then
+			comp.IsFlipX = false
+			comp.StartAlpha = 1.0
+			comp.EndAlpha = 0.0
+			-- 세 프레임(0.07초 간격)을 다 보여준 뒤에 페이드가 시작되도록 HoldDuration을 잡는다.
+			comp.HoldDuration = 0.21
+			comp.TweenDuration = 0.15
+			comp.StartScale = 1.0
+			comp.EndScale = 1.0
+			comp.OrderInLayerValue = 5
+			comp.ClipRUID = "26d2d1e5e0e64a3cb3569f45a3a33fad"   -- hit1 (58x57)
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(comp) then
+				comp.ClipRUID = "69c92fcc07f14c22a5c8a457853612c0"  -- hit2 (67x74)
+			end
+		end, 0.07)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(comp) then
+				comp.ClipRUID = "968e33be3ea1417aae71c875cac52a73"  -- hit3 (69x73)
+			end
+		end, 0.14)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(fx) then fx:Destroy() end
+		end, 0.45)
+	end
+
+	method string GetProjectileDamageSkinId()
+		-- 발사한 플레이어의 현재 데미지 스킨(블리자드 중이면 얼음 스킨). 같은 엔티티의 투사체 스크립트가
+		-- 발사 시점에 PlayerAttack으로부터 받아둔 값이다. 비어 있으면 기본 히트 스킨으로 폴백한다.
+		---@type DoubleShotProjectile
+		local proj = self.Entity:GetComponent("script.DoubleShotProjectile")
+		if isvalid(proj) and proj.DamageSkinRUID ~= "" then
+			return proj.DamageSkinRUID
+		end
+		return "3271c3e79bf04ecba9a107d55495970d"
+	end
+
+end

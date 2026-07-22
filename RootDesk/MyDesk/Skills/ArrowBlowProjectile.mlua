@@ -1,0 +1,247 @@
+@Component
+script ArrowBlowProjectile extends Component
+
+	property number Speed = 9
+
+	property number MaxLifetime = 1.5
+
+	property number CombatPower = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcDamage는 서버에서
+	-- 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 서버가 직접 읽을 수 없어, 발사한 플레이어가
+	-- 동기화해둔 값을 그대로 넘겨받는다(아이언 에로우와 동일한 방식).
+	property number CritRate = 50
+
+	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID(PlayerAttack이 발사 시점에 채워준다).
+	-- 비어 있으면 공용 기본 히트 스킨으로 폴백한다.
+	property string DamageSkinRUID = ""
+
+	-- 에로우 블로우 강화(1차 토글 스킬) 적용 여부. true면 첫 명중 지점에서 "폭발"해
+	-- 히트 이펙트 3개를 시간차+거리차로 보여주고, 주변 적을 최대 BlastMaxTargets명까지
+	-- 한 명씩 시간차로 추가 타격한다. false면 기존처럼 한 명만 맞히고 즉시 사라진다.
+	property boolean Enhanced = false
+
+	-- 폭발 지점 기준으로 추가 타격 대상을 찾는 반경(world unit).
+	property number BlastRadius = 1.6
+
+	-- 폭발로 맞힐 수 있는 최대 인원(첫 명중 대상 포함).
+	property integer BlastMaxTargets = 5
+
+	-- 폭발 적중 이펙트 3개가 화살 진행 방향으로 벌어지는 거리 간격(world unit).
+	-- (피드백) 처음 0.55에서 1/3인 0.18로 좁혔다.
+	property number BlastEffectGap = 0.18
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화(서버 전용 필드). 에로우 블로우는 단일 대상 스킬이라 한 명을 맞히면 소멸한다.
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hit = false
+			self._T.frameTime = 0
+			self._T.frameIdx = 1
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 방향 벡터를 받아 발사 시작. 원본 화살 그림은 머리가 -x쪽(왼쪽)을 향하고 꼬리가 오른쪽으로
+		-- 흐른다(실측: 알파 무게중심 x=25/71로 좌측에 몰려 있음) - 그래서 다른 화살 스킬들과 동일하게
+		-- 각도에 180도를 더해 보정한다.
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(dirY, dirX)) + 180
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHit()
+		-- 이 화살이 이미 한 명을 맞혔는지. 명중 후에는 판정도 막고 다음 프레임에 스스로 사라진다.
+		return self._T.hit == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkHit(Entity defender)
+		-- 명중 확정(ArrowBlowProjectileAttack.CalcDamage가 호출). 강화 상태면 이 지점에서 폭발을 시작한다.
+		self._T.hit = true
+		if self.Enhanced then
+			self:StartBlast(defender)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity GetBlastTarget()
+		-- 폭발 추가 타격이 "지금 이 한 번의 판정에서" 통과시킬 단일 대상.
+		-- (밀집 지역에서 '목록 포함' 방식으로 필터링하면 이웃까지 겹쳐 맞으므로 단일 포인터 방식을 쓴다.)
+		return self._T.blastTarget
+	end
+
+	@ExecSpace("ServerOnly")
+	method void StartBlast(Entity firstTarget)
+		-- 강화 에로우 블로우의 폭발 처리. 화살은 이 자리에 멈춰 보이지 않게 되고, 대신
+		-- (1) 적중 이펙트 3개를 0.2~0.4초 간격 + 진행 방향 거리 간격으로 보여주고
+		-- (2) 주변 적을 첫 대상 포함 최대 BlastMaxTargets명까지 0.2~0.5초 간격으로 한 명씩 추가 타격한다.
+		if self._T.blast then return end
+		self._T.blast = true
+		self._T.blastStartTime = _UtilLogic.ElapsedSeconds
+
+		local pos = self.Entity.TransformComponent.WorldPosition
+		local bx, by, bz = pos.x, pos.y, pos.z
+		local spr = self.Entity.SpriteRendererComponent
+		if isvalid(spr) then spr.Enable = false end
+
+		---@type ArrowBlowProjectileAttack
+		local ac = self.Entity:GetComponent("script.ArrowBlowProjectileAttack")
+
+		-- (1) 히트 이펙트 3개.
+		-- (피드백) "퍼지는 속도를 2배로, 간격을 1/3로" - 시간 간격은 절반(0.2~0.4초 -> 0.1~0.2초)으로
+		-- 줄여 두 배 빠르게 퍼지게 하고, 거리 간격은 1/3(0.55 -> 0.18 유닛)로 좁혔다.
+		-- 이 값들은 이펙트 연출 전용이며, 아래 (2)의 추가 타격 간격(0.2~0.5초)과는 무관하다.
+		local effectTime = 0
+		for i = 1, 3 do
+			local ox = self._T.dirX * self.BlastEffectGap * (i - 1)
+			local oy = self._T.dirY * self.BlastEffectGap * (i - 1) + (((i % 2) == 0) and 0.06 or -0.03)
+			local at = effectTime
+			local idx = i
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(self.Entity) then return end
+				if ac ~= nil then ac:SpawnBlastHitEffectAt(bx + ox, by + oy, bz) end
+				log("[ArrowBlow] 폭발 이펙트 #" .. tostring(idx)
+					.. " t=+" .. string.format("%.2f", _UtilLogic.ElapsedSeconds - (self._T.blastStartTime or 0))
+					.. "s pos=(" .. string.format("%.2f", bx + ox) .. "," .. string.format("%.2f", by + oy) .. ")")
+			end, at)
+			effectTime = effectTime + 0.1 + _UtilLogic:RandomDouble() * 0.1
+		end
+
+		-- (2) 추가 타격 대상 선정 - 첫 명중 대상은 이미 데미지를 입었으므로 제외하고, 폭발 반경 안에서
+		--     가까운 순으로 (BlastMaxTargets - 1)명까지 고른다.
+		local extra = {}
+		local map = self.Entity.CurrentMap
+		if isvalid(map) then
+			local comps = map:GetChildComponentsByTypeName("script.Monster", true)
+			local cands = {}
+			for _, c in ipairs(comps) do
+				---@type Monster
+				local mc = c
+				if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead and mc.Entity ~= firstTarget then
+					local mp = mc.Entity.TransformComponent.WorldPosition
+					local dx = mp.x - bx
+					local dy = mp.y - by
+					local d = math.sqrt(dx * dx + dy * dy)
+					if d <= self.BlastRadius then
+						table.insert(cands, { entity = mc.Entity, dist = d })
+					end
+				end
+			end
+			table.sort(cands, function(a, b) return a.dist < b.dist end)
+			local maxExtra = self.BlastMaxTargets - 1
+			for i = 1, math.min(#cands, maxExtra) do
+				table.insert(extra, cands[i].entity)
+			end
+		end
+
+		-- 한 번에 몰아서가 아니라 한 명씩 순차 타격하되, (피드백) "데미지 간격이 너무 길다 - 모든 데미지가
+		-- 합쳐서 0.2~0.3초 안에 끝나야 한다"에 맞춰 전체 소요시간을 0.2~0.3초로 먼저 정하고 그 안에서
+		-- 대상 수만큼 균등하게 나눠 배치한다(마지막 타격이 정확히 전체 소요시간에 떨어진다).
+		-- 대상이 많을수록 간격이 촘촘해지지만 서로 다른 시점이라 "동시 피격"은 여전히 발생하지 않는다.
+		local hitTime = 0
+		if #extra > 0 then
+			local total = 0.2 + _UtilLogic:RandomDouble() * 0.1
+			for i = 1, #extra do
+				local target = extra[i]
+				local at = total * i / #extra
+				_TimerService:SetTimerOnce(function()
+					self:DealBlastHit(target)
+				end, at)
+			end
+			hitTime = total
+		end
+
+		-- 이펙트/추가 타격이 모두 끝난 뒤에 화살 엔티티를 정리한다(예약된 타이머가 이 컴포넌트를 쓰므로
+		-- 그 전에 파괴하면 안 된다).
+		local cleanupAt = math.max(effectTime, hitTime) + 0.7
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then _EntityService:Destroy(self.Entity) end
+		end, cleanupAt)
+
+		log("[ArrowBlow] 폭발 시작 pos=(" .. string.format("%.2f", bx) .. "," .. string.format("%.2f", by)
+			.. ") 추가대상=" .. tostring(#extra) .. "명 (첫 명중 포함 총 " .. tostring(#extra + 1) .. "명) cleanup=" .. string.format("%.2f", cleanupAt))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealBlastHit(Entity target)
+		-- 폭발 추가 타격 1회. 단일 CurrentTarget 포인터를 세운 채로 그 대상 위치에 판정을 한 번 낸다.
+		if not isvalid(self.Entity) then return end
+		if not isvalid(target) then return end
+		---@type ArrowBlowProjectileAttack
+		local ac = self.Entity:GetComponent("script.ArrowBlowProjectileAttack")
+		if ac == nil then return end
+		local tp = target.TransformComponent.WorldPosition
+		local ty = tp.y
+		local thc = target.HitComponent
+		if isvalid(thc) then ty = ty + thc.ColliderOffset.y end
+		self._T.blastTarget = target
+		ac:AttackFrom(Vector2(0.8, 0.8), Vector2(tp.x, ty), "skill.arrowblow.blast", CollisionGroups.HitBox)
+		self._T.blastTarget = nil
+		self._T.blastHitCount = (self._T.blastHitCount or 0) + 1
+		log("[ArrowBlow] 폭발 추가타격 #" .. tostring(self._T.blastHitCount) .. " target=" .. tostring(target.Name)
+			.. " t=+" .. string.format("%.2f", _UtilLogic.ElapsedSeconds - (self._T.blastStartTime or 0)) .. "s")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		-- 이미 한 명을 맞혔으면(직전 프레임에 CalcDamage가 기록) 사라진다. 판정 처리와 같은 프레임에
+		-- 자기 자신을 파괴하면 재진입 문제가 생길 수 있어 다음 프레임에 파괴한다(다른 화살 스킬과 동일).
+		-- 단, 강화 상태에서는 폭발 연출/추가 타격이 끝날 때까지 이 자리에 남아야 하므로(StartBlast가
+		-- 예약한 타이머들이 이 컴포넌트를 쓴다) 파괴하지 않고 이동/판정만 멈춘다.
+		if self._T.hit then
+			if not self.Enhanced then
+				_EntityService:Destroy(self.Entity)
+			end
+			return
+		end
+
+		self._T.lifetime = self._T.lifetime + delta
+		if self._T.lifetime >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self:AdvanceFrame(delta)
+
+		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * delta, self._T.dirY * self.Speed * delta)
+
+		---@type ArrowBlowProjectileAttack
+		local ac = self.Entity:GetComponent("script.ArrowBlowProjectileAttack")
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			ac:AttackFast(CircleShape(Vector2(pos.x, pos.y), 0.3), "skill.arrowblow", CollisionGroups.HitBox)
+		end
+	end
+
+	method void AdvanceFrame(number delta)
+		-- 업로드한 화살 스프라이트 3장(ball1~3)을 순환 재생한다. 애니메이션클립이 아니라 정지 스프라이트라
+		-- SpriteRUID를 직접 갈아끼워야 한다(원본/RUID 대응표: msw-dev-tools/resources/에로우블로우/RUID.md).
+		self._T.frameTime = self._T.frameTime + delta
+		if self._T.frameTime < 0.08 then return end
+		self._T.frameTime = 0
+		self._T.frameIdx = self._T.frameIdx % 3 + 1
+		local spr = self.Entity.SpriteRendererComponent
+		if isvalid(spr) then
+			spr.SpriteRUID = self:GetFrameRUID(self._T.frameIdx)
+		end
+	end
+
+	method string GetFrameRUID(integer idx)
+		-- ball1(71x11) / ball2(73x11) / ball3(70x11)
+		if idx == 2 then return "2c74b4f7878c403ea5cb3b4cb6bf263e" end
+		if idx == 3 then return "1654e29956a544d6913a9f4d788b5981" end
+		return "77840f1324aa47cc80905fbdf259941c"
+	end
+
+end
