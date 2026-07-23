@@ -1,0 +1,88 @@
+@Component
+script IceShotProjectile extends Component
+
+	-- 스트레이프 화살과 같은 속도.
+	property number Speed = 8
+
+	property number MaxLifetime = 1.5
+
+	-- 0보다 크면 이 시간(초)만큼 날아간 뒤 소멸한다(타겟 없는 시전의 시각 전용 화살).
+	property number FlightTime = 0
+
+	-- true면 화살의 x좌표가 TargetX(타겟 몸통 중심 x)를 지나는 순간 확정 히트를 발동하고 소멸한다
+	-- (스트레이프와 동일한 방식). 화살 자체의 물리 판정은 없다 - 데미지/빙결은 전부
+	-- PlayerAttack.DealIceShotHit가 처리한다.
+	property boolean LockHit = false
+
+	property number TargetX = 0
+
+	property Entity TargetEntity = ""
+	property Entity OwnerEntity = ""
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화(서버 전용 필드). 탄환 그림은 파이어 샷과 공용으로 쓰는 ball 애니메이션클립
+		-- (7d360ab4c5ef4690bbebd54ff766cc5b)이라 SpriteRUID에 그대로 넣으면 엔진이 반복 재생한다
+		-- (예전 9프레임 화살 프레임 교체는 필요 없어져 제거 - 그 화살 아트는 이제 도착지점 화살비가 쓴다).
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hit = false
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 방향으로 발사 시작. 공용 ball 클립은 (실측 확인) 다른 화살 아트와 달리 머리가
+		-- +x(오른쪽)를 향하고 꼬리가 왼쪽으로 늘어진 원본이라 회전 보정이 필요 없다.
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(dirY, dirX))
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		-- 확정 히트를 이미 발동했으면 다음 프레임에 파괴한다(스트레이프와 동일한 재진입 방지 패턴).
+		if self._T.hit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self._T.lifetime = self._T.lifetime + delta
+		local limit = self.MaxLifetime
+		if self.FlightTime > 0 and self.FlightTime < limit then limit = self.FlightTime end
+		if self._T.lifetime >= limit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self.Entity.TransformComponent:Translate(
+			self._T.dirX * self.Speed * delta,
+			self._T.dirY * self.Speed * delta
+		)
+
+		-- 타겟 고정: 화살 x가 타겟 몸통 중심 x를 지나는 순간 "맞은 것"으로 확정(스트레이프와 동일).
+		if self.LockHit and not self._T.hit then
+			local x = self.Entity.TransformComponent.Position.x
+			local crossed = (self._T.dirX >= 0 and x >= self.TargetX) or (self._T.dirX < 0 and x <= self.TargetX)
+			if crossed then
+				self._T.hit = true
+				if isvalid(self.OwnerEntity) then
+					---@type PlayerAttack
+					local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+					if isvalid(pa) and isvalid(self.TargetEntity) then
+						pa:DealIceShotHit(self.TargetEntity)
+					end
+				end
+				return
+			end
+		end
+	end
+
+end

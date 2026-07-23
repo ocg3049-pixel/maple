@@ -1,0 +1,61 @@
+@Component
+script ChainShotChain extends Component
+
+	-- 체인샷(2차)의 체인 줄. 플레이어에 자식으로 붙은 채로, 매 프레임 "플레이어 가슴 → 고정점"을
+	-- 잇도록 각도(ZRotation)와 가로 길이(Scale.x)를 스스로 계산한다.
+	-- 서버가 트랜스폼을 직접 @Sync로 밀면 보간이 걸려 줄이 떨리기 때문에(SpearBurstFadingEffect
+	-- 주석과 같은 이유), 서버는 고정점 좌표만 넘기고 실제 계산은 각 클라이언트가 한다.
+	-- 원본 아트는 가로로 누운 체인이고 피벗이 왼쪽 끝(5/476)이라, 이 엔티티 원점을 축으로 회전 +
+	-- 가로 스케일만 주면 그대로 "여기서 저기까지 뻗은 줄"이 된다.
+
+	-- 체인 원본 아트의 가로 길이(월드 유닛). 476px / 100 = 4.76.
+	@Sync property number ArtLength = 4.76
+	-- 줄이 이어질 목표 지점(월드 좌표). 서버가 발사 직후 채워준다.
+	@Sync property Vector2 AnchorPos = Vector2(0, 0)
+	-- 지형에 실제로 박혔는지. false면 최대 사거리까지 뻗기만 하고 사라지는 빗나간 체인이다.
+	@Sync property boolean Anchored = false
+	-- 줄이 0에서 목표 길이까지 뻗어나가는 데 걸리는 시간(초).
+	@Sync property number GrowDuration = 0.12
+
+	method void OnBeginPlay()
+		-- 뻗어나가는 연출용 경과 시간. 클라이언트에서만 쓴다.
+		if self:IsClient() then
+			self._T.elapsed = 0
+			self._T.frozen = false
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 매 프레임 자기 위치(=플레이어 가슴)에서 고정점까지를 잇는다. 플레이어가 움직이면 각도와
+		-- 길이가 따라 변하므로 "캐릭터와 벽이 계속 이어져 있는" 모양이 유지된다(요청).
+		-- (경쟁 상태 방어) 서버가 보낸 AnchorPos가 아직 도착하지 않았으면 원점을 향한 엉뚱한 줄이
+		-- 한 프레임 보일 수 있어, 값이 채워질 때까지 그리지 않는다.
+		if self.AnchorPos.x == 0 and self.AnchorPos.y == 0 then return end
+		local tr = self.Entity.TransformComponent
+		if not isvalid(tr) then return end
+
+		local myPos = tr.WorldPosition
+		local dx = self.AnchorPos.x - myPos.x
+		local dy = self.AnchorPos.y - myPos.y
+		local dist = math.sqrt(dx * dx + dy * dy)
+
+		self._T.elapsed = (self._T.elapsed or 0) + delta
+		local grow = 1.0
+		if self.GrowDuration > 0 and self._T.elapsed < self.GrowDuration then
+			grow = self._T.elapsed / self.GrowDuration
+		end
+
+		tr.ZRotation = math.deg(math.atan(dy, dx))
+		local sx = (dist * grow) / math.max(self.ArtLength, 0.001)
+		tr.Scale = Vector3(sx, 1, 1)
+
+		-- (요청) 지형에 부딪히면 이펙트가 멈춘다 - 다 뻗은 시점에 클립 재생을 정지시켜 박힌 상태로 굳힌다.
+		if self.Anchored and not self._T.frozen and self._T.elapsed >= self.GrowDuration then
+			self._T.frozen = true
+			local spr = self.Entity.SpriteRendererComponent
+			if isvalid(spr) then spr.PlayRate = 0 end
+		end
+	end
+
+end

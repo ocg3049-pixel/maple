@@ -1,0 +1,110 @@
+@Component
+script ArrowRainArrow extends Component
+
+	-- 파이어 샷 / 아이스 샷 탄환이 도착한 지점에 위에서 쏟아지는 화살 한 발(연출 전용 - 데미지 판정 없음).
+	-- 아트는 아이스 샷 원본 리소스의 9프레임 화살(msw-dev-tools/resources/아이스샷/RUID.md)을 그대로 쓰고,
+	-- 파이어 샷은 Tint로 붉게 칠해 불화살로 보이게 한다.
+
+	-- 낙하 속도(월드 유닛/초).
+	property number Speed = 7
+
+	-- 이 거리(월드 유닛)만큼 내려오면 소멸한다. 스폰 높이와 같은 값을 주면 도착지점 바닥에서 사라진다.
+	property number FallDistance = 2.6
+
+	-- 프레임 교체 간격(초). 원본 화살은 9프레임 애니메이션(ori.txt delay100)인데, 낙하 시간이 짧아
+	-- 간격을 줄여 떨어지는 동안 한 바퀴가 다 보이게 한다.
+	property number FrameInterval = 0.05
+
+	-- 화살 크기. 원본 아트가 1.3월드유닛쯤으로 크다(실측). 원본 영상의 화살비도 캐릭터 키의 두 배쯤
+	-- 되는 큰 화살이라 거의 원본 크기로 두되, 6발이 덜 겹치도록 조금만 줄인다.
+	property number ArrowScale = 0.85
+
+	-- 원본 픽셀에 곱해지는 색. 기본 (1,1,1)이면 원본 얼음 화살 그대로, 파이어 샷은 붉은 값을 넣는다.
+	@Sync property number TintR = 1.0
+	@Sync property number TintG = 1.0
+	@Sync property number TintB = 1.0
+
+	@Sync property boolean Fired = false
+
+	method table GetArrowFrames()
+		-- 화살 9프레임 RUID 목록을 돌려준다(아이스 샷 원본 리소스 arrow1~9).
+		return {
+			"2d244b18d5da41fd946220e319e73dce",
+			"c76a4948cd2b479797c816948d4eb632",
+			"55c85742031c4a3eacafc0e64b83e8aa",
+			"3a1249350d2f4e49a7a6f580c9fc04fe",
+			"64ab16e3ec4b4c2bb49ad42bfb79e4e5",
+			"3b2bdef2d73848eb9d50466559fbbd81",
+			"5dd40edc6d764efaac5562db877e878b",
+			"b506c14e7d6740279d4a2a7101fef728",
+			"98ffd0585ec04ec990ab6e76ecd27095",
+		}
+	end
+
+	method void OnBeginPlay()
+		-- 서버는 낙하 상태를, 클라이언트는 틴트를 초기화한다.
+		if self:IsServer() then
+			self._T.fallen = 0
+			self._T.dirX = 0
+			self._T.dirY = -1
+			self._T.frameTimer = 0
+			self._T.frameIndex = 1
+		end
+		if self:IsClient() then
+			self:ApplyTint()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- 스폰 직후 서버가 넣는 Tint @Sync는 클라이언트 OnBeginPlay보다 늦게 도착할 수 있다
+		-- (SpearBurstFadingEffect와 같은 경쟁 상태) - 실제로 도착한 시점에 다시 칠한다.
+		if name ~= "TintR" and name ~= "TintG" and name ~= "TintB" then return end
+		self:ApplyTint()
+	end
+
+	method void ApplyTint()
+		-- 현재 Tint 값을 스프라이트 색에 반영한다(알파는 항상 1).
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		spr.Color = Color(self.TintR, self.TintG, self.TintB, 1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 낙하 방향을 정규화해 잡고 회전을 맞춘 뒤 떨어지기 시작한다. 화살 아트는 머리가 좌하단(-135도)을
+		-- 향해 있어(실측: arrow1.png 화살촉이 좌하단) 진행 방향각 + 135도가 실제 회전값이다.
+		local len = math.sqrt(dirX * dirX + dirY * dirY)
+		if len < 0.0001 then len = 0.0001 end
+		self._T.dirX = dirX / len
+		self._T.dirY = dirY / len
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(self._T.dirY, self._T.dirX)) + 135
+		self.Entity.TransformComponent.Scale = Vector3(self.ArrowScale, self.ArrowScale, 1)
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		local step = self.Speed * delta
+		self.Entity.TransformComponent:Translate(self._T.dirX * step, self._T.dirY * step)
+		self._T.fallen = self._T.fallen + step
+
+		-- 9프레임 화살 애니메이션(끝나면 마지막 프레임 유지).
+		self._T.frameTimer = self._T.frameTimer + delta
+		if self._T.frameTimer >= self.FrameInterval and self._T.frameIndex < 9 then
+			self._T.frameTimer = self._T.frameTimer - self.FrameInterval
+			self._T.frameIndex = self._T.frameIndex + 1
+			local spr = self.Entity.SpriteRendererComponent
+			if isvalid(spr) then
+				spr.SpriteRUID = self:GetArrowFrames()[self._T.frameIndex]
+			end
+		end
+
+		if self._T.fallen >= self.FallDistance then
+			_EntityService:Destroy(self.Entity)
+		end
+	end
+
+end

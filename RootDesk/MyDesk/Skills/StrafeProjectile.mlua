@@ -1,0 +1,137 @@
+@Component
+script StrafeProjectile extends Component
+
+	-- (피드백) 처음 10에서 4/5인 8로 줄임(더블샷 화살과 같은 속도).
+	property number Speed = 8
+
+	-- (피드백) 사거리 1/3(0.5초=5유닛) → 다시 2.5배(1.25초=12.5유닛, 조준 사거리 5.0을 여유있게 커버).
+	property number MaxLifetime = 1.25
+
+	property number CombatPower = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcDamage는 서버에서
+	-- 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 서버가 직접 읽을 수 없어, 발사한 플레이어가
+	-- 동기화해둔 값을 그대로 넘겨받는다(더블샷/럭키세븐과 동일한 방식).
+	property number CritRate = 50
+
+	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID. 비어 있으면 공용 기본 히트 스킨으로 폴백한다.
+	property string DamageSkinRUID = ""
+
+	-- 1~4 = 몇 번째 화살인지. 데미지 숫자가 뜨는 세로 위치를 정한다(영상처럼 4줄로 쌓인다).
+	property integer HitIndex = 1
+
+	-- 0보다 크면 이 시간(초)만큼 날아간 뒤 소멸한다 - 타겟이 고정된 시전에서 "대상까지의 거리/속도"로
+	-- 계산해 넘어온다(화살이 대상 근처에서 사라지는 것처럼 보이게). 0이면 MaxLifetime까지 자유 비행.
+	property number FlightTime = 0
+
+	-- false면 이 화살은 시각 연출 전용이다(충돌 판정 없음). 타겟 고정 시전에서는 데미지가
+	-- PlayerAttack.DealStrafeLockHit(스피어 버스터 패턴의 확정 히트)로 별도 적용되므로, 화살이
+	-- 도중에 다른 몬스터를 스치며 맞히는 일이 없도록 판정을 끈다. 전방에 타겟이 없을 때만 true로
+	-- 스폰되어 기존처럼 지나가는 적 1명을 맞힐 수 있다.
+	property boolean AttackEnabled = true
+
+	-- (요청) "x축이 지정한 몬스터와 맞으면 맞은 걸로" - 타겟 고정 시전에서 true가 되고, 화살의
+	-- x좌표가 TargetX(타겟 몸통 중심 x)를 지나는 순간 확정 히트를 발동시키며 소멸한다.
+	property boolean LockHit = false
+
+	-- 확정 히트 판정 기준이 되는 타겟 몸통 중심의 x좌표(발사 시점에 고정).
+	property number TargetX = 0
+
+	-- 이 화살이 노리는 타겟과, 확정 히트를 실행해 줄 시전자(플레이어) 엔티티.
+	property Entity TargetEntity = ""
+	property Entity OwnerEntity = ""
+
+	-- 이 화살이 타겟 몸통 중심 기준 어느 높이(위/아래)에 꽂히는지 - 히트 이펙트/판정 위치에 쓰인다.
+	property number HitYOffset = 0
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화(서버 전용 필드). 화살 한 발은 적 한 명을 맞히면 소멸한다.
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hit = false
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 조준 방향으로 발사 시작. 스트레이프 화살 그림(원본 팩 ball/0, 68x12 사슬 화살)은
+		-- 머리가 -x(왼쪽)를 향하고 있어 에로우 블로우/아이언 에로우처럼 180도 보정을 더한다.
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(dirY, dirX)) + 180
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHit()
+		-- 이 화살이 이미 한 명을 맞혔는지. 명중 후에는 판정도 막고 다음 프레임에 스스로 사라진다.
+		return self._T.hit == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkHit()
+		-- 명중 확정(StrafeProjectileAttack.CalcDamage가 호출).
+		self._T.hit = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		-- 이미 한 명을 맞혔으면 사라진다. 판정 처리와 같은 프레임에 자기 자신을 파괴하면 재진입 문제가
+		-- 생길 수 있어 다음 프레임에 파괴한다(다른 화살 스킬과 동일).
+		if self._T.hit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self._T.lifetime = self._T.lifetime + delta
+		local limit = self.MaxLifetime
+		if self.FlightTime > 0 and self.FlightTime < limit then limit = self.FlightTime end
+		if self._T.lifetime >= limit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		-- 4발이 각자 자기 각도로 직선 비행한다 - 각도는 발사 시점에 Fire로 확정된다.
+		self.Entity.TransformComponent:Translate(
+			self._T.dirX * self.Speed * delta,
+			self._T.dirY * self.Speed * delta
+		)
+
+		-- (요청) 타겟 고정 시전: 화살의 x가 타겟 몸통 중심 x를 지나는 순간 "맞은 것"으로 확정하고,
+		-- 그 자리에서 히트 이펙트가 터지며 화살은 다음 프레임에 소멸한다(맨 위 self._T.hit 블록 재사용).
+		if self.LockHit and not self._T.hit then
+			local x = self.Entity.TransformComponent.Position.x
+			local crossed = (self._T.dirX >= 0 and x >= self.TargetX) or (self._T.dirX < 0 and x <= self.TargetX)
+			if crossed then
+				self._T.hit = true
+				if isvalid(self.OwnerEntity) then
+					---@type PlayerAttack
+					local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+					if isvalid(pa) and isvalid(self.TargetEntity) then
+						local hitDirX = (self._T.dirX >= 0) and 1 or -1
+						pa:DealStrafeLockHit(self.TargetEntity, hitDirX, self.HitIndex, self.HitYOffset)
+					end
+				end
+				return
+			end
+		end
+
+		-- 타겟 고정 시전(AttackEnabled=false)에서는 시각 전용 - 충돌 판정을 걸지 않는다.
+		if not self.AttackEnabled then return end
+
+		---@type StrafeProjectileAttack
+		local ac = self.Entity:GetComponent("script.StrafeProjectileAttack")
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			ac:AttackFast(CircleShape(Vector2(pos.x, pos.y), 0.3), "skill.strafe", CollisionGroups.HitBox)
+		end
+	end
+
+end

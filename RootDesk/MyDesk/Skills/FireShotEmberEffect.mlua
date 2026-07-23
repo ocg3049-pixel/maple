@@ -1,0 +1,88 @@
+@Component
+script FireShotEmberEffect extends Component
+
+	-- 파이어 샷 히트 지점 위에서 아래로 떨어지는 불꽃 파편(원본 팩 special 애니메이션클립).
+	-- 여러 개가 서로 다른 속도로 내려오다 수명이 다하면 사라진다(연출 전용 - 판정 없음).
+	-- 낙하는 클라이언트에서 결정적으로(같은 FallSpeed+같은 시작좌표) 계산해 서버가 매 프레임
+	-- 위치를 @Sync로 밀지 않는다(트랜스폼 보간 떨림 방지 - SpearBurstFadingEffect와 같은 이유).
+
+	-- 표시할 애니메이션클립 RUID. 월드 SpriteRendererComponent에 그대로 넣으면 엔진이 반복 재생한다.
+	@Sync property string ClipRUID = ""
+
+	-- 초당 낙하 거리(월드 유닛). 인스턴스마다 다르게 준다.
+	@Sync property number FallSpeed = 6
+
+	-- 가로 흐름 비율(낙하 속도 대비). 음수면 왼쪽으로 흐른다. 왼쪽아래 대각선 낙하용으로 -0.8을 준다.
+	@Sync property number DriftX = -0.8
+
+	-- 이 시간(초)이 지나면 파괴된다. 원본 클립 프레임 기준 "12프레임"(약 0.1초×12=1.2초)에 사라지게 잡는다.
+	@Sync property number Lifetime = 1.2
+
+	-- 마지막에 톡 꺼지지 않도록 살짝만 페이드아웃하는 구간(초). 0이면 즉시 사라진다.
+	@Sync property number EndFade = 0.15
+
+	@Sync property integer OrderInLayerValue = 6
+	@Sync property string SortingLayerName = ""
+
+	@HideFromInspector property number Elapsed = 0
+
+	method void OnBeginPlay()
+		-- 클라이언트만 표시/낙하를 담당한다. (스폰 직후 @Sync 도착 전 경쟁 상태 대비: ClipRUID가
+		-- 아직 빈 문자열이면 알파 0으로 숨겼다가 OnSyncProperty에서 실제 클립이 도착하면 보여준다.)
+		if not self:IsClient() then return end
+		self.Elapsed = 0
+		self:ApplyClip()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- @Sync 도착 순서는 보장되지 않으므로 클립/레이어 관련 값이 도착할 때마다 다시 적용한다.
+		if name == "ClipRUID" or name == "OrderInLayerValue" or name == "SortingLayerName" then
+			self:ApplyClip()
+		end
+	end
+
+	method void ApplyClip()
+		-- 현재 프로퍼티 값을 스프라이트에 반영한다.
+		local spr = self.Entity.SpriteRendererComponent
+		if not isvalid(spr) then return end
+		spr.OrderInLayer = self.OrderInLayerValue
+		if self.SortingLayerName ~= "" then
+			spr.SortingLayer = self.SortingLayerName
+		end
+		if self.ClipRUID == "" then
+			spr.SpriteRUID = ""
+			spr.Color = Color(1, 1, 1, 0)
+		else
+			spr.SpriteRUID = self.ClipRUID
+			spr.Color = Color(1, 1, 1, 1)
+		end
+	end
+
+	method void OnUpdate(number delta)
+		if not self:IsClient() then return end
+		if self.ClipRUID == "" then return end
+		self.Elapsed = self.Elapsed + delta
+
+		-- Body 없는 이펙트 엔티티라 Position 직접 조작이 안전하다. 왼쪽아래 대각선으로 내린다
+		-- (아래로 FallSpeed, 옆으로 FallSpeed*DriftX).
+		local t = self.Entity.TransformComponent
+		local p = t.Position
+		local step = self.FallSpeed * delta
+		t.Position = Vector3(p.x + self.DriftX * step, p.y - step, p.z)
+
+		-- 수명 끝 EndFade 구간 동안만 알파를 1->0으로 내려 톡 꺼지지 않게 한다.
+		if self.EndFade > 0 then
+			local fadeStart = self.Lifetime - self.EndFade
+			if self.Elapsed >= fadeStart then
+				local spr = self.Entity.SpriteRendererComponent
+				if isvalid(spr) then
+					local a = 1 - (self.Elapsed - fadeStart) / self.EndFade
+					if a < 0 then a = 0 end
+					spr.Color = Color(1, 1, 1, a)
+				end
+			end
+		end
+	end
+
+end

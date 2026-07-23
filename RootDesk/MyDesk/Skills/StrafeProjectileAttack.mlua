@@ -1,0 +1,88 @@
+@Component
+script StrafeProjectileAttack extends AttackComponent
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- 화살 한 발은 적 "한 명"만 맞힌다 - 이미 명중했으면 이후 판정을 전부 막는다.
+		-- (4발이 같은 직선을 따라 날아가므로, 보통은 맨 앞의 같은 대상에게 4줄의 데미지가 뜬다.)
+		if isvalid(defender.PlayerComponent) then return false end
+		---@type StrafeProjectile
+		local proj = self.Entity:GetComponent("script.StrafeProjectile")
+		if proj ~= nil and proj:HasHit() then return false end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 화살 1발당 전투력의 200%~250%(3차 - 더블샷 1발 100~150%의 2배 규격). 실제 명중이 확정된
+		-- 시점(이 훅)에만 호출되므로 여기서 명중을 기록해 화살이 다음 프레임에 사라지도록 한다.
+		---@type StrafeProjectile
+		local proj = self.Entity:GetComponent("script.StrafeProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local hitIndex = 1
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			hitIndex = proj.HitIndex
+			proj:MarkHit()
+		end
+		local mult = 2.0 + _UtilLogic:RandomDouble() * 0.5
+		local dmg = math.floor(combatPower * mult)
+		-- 크리티컬은 화살 한 발마다 캐릭터 정보창의 확률로 독립적으로 굴리고 배율을 반환값에 바로 곱한다
+		-- (아래 CalcCritical은 엔진의 이중 배율 적용을 막기 위해 항상 false를 반환). math.random() 대신
+		-- _UtilLogic:RandomDouble()을 쓰는 이유는 네 발이 짧은 간격으로 잇따라 호출되어 math.random()이
+		-- 같은 시퀀스를 반복 소비할 위험이 크기 때문이다(PlayerAttack.mlua에 문서화된 버그).
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		self:ShowStrafeDamageSkin(defender, dmg, hitIndex, isCritical, self:GetProjectileDamageSkinId())
+		self:PlayStrafeHitEffect(defender)
+		return dmg
+	end
+
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		-- CalcDamage가 자체적으로 크리티컬을 굴리고 배율을 이미 반환값에 곱했으므로, 엔진이 여기서 또
+		-- true를 반환하면 실제 적용 데미지가 표시값의 2배로 이중 적용된다. 항상 false를 반환한다.
+		return false
+	end
+
+	@ExecSpace("Client")
+	method void ShowStrafeDamageSkin(Entity target, integer damage, integer hitIndex, boolean isCritical, string skinRuid)
+		-- 영상처럼 네 발의 데미지를 서로 겹치지 않는 4줄로 나눠 표시한다(1발째가 맨 아래, 4발째가 맨 위).
+		if not isvalid(target) then return end
+		local offsetY = -0.2 + (hitIndex - 1) * 0.2
+		_DamageSkinService:Play(
+			target, skinRuid, 0,
+			{ damage }, DamageSkinTweenType.Default, isCritical,
+			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+		log("[Strafe] ShowDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(isCritical))
+	end
+
+	@ExecSpace("Client")
+	method void PlayStrafeHitEffect(Entity target)
+		-- 원본 팩(skill/800032.img/skill/80003299)의 hit/0(분홍 별 폭발, 3프레임 애니메이션클립)을
+		-- 맞은 대상 몸에서 1회 재생한다 + 화살 히트 사운드(아이언 에로우와 공용).
+		if not isvalid(target) then return end
+		local offsetY = 0.3
+		local hitComp = target.HitComponent
+		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
+		local serial = _EffectService:PlayEffectAttached("2d66c100851845ec902a98ede7c88b78", target, Vector3(0, offsetY, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 5 })
+		_SoundService:PlaySound("eb49560ca2a84e0585e0e83cd61c9dc6", 1.0)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.0)
+	end
+
+	method string GetProjectileDamageSkinId()
+		-- 발사한 플레이어의 현재 데미지 스킨(블리자드 중이면 얼음 스킨). 같은 엔티티의 투사체 스크립트가
+		-- 발사 시점에 PlayerAttack으로부터 받아둔 값이다. 비어 있으면 기본 히트 스킨으로 폴백한다.
+		---@type StrafeProjectile
+		local proj = self.Entity:GetComponent("script.StrafeProjectile")
+		if isvalid(proj) and proj.DamageSkinRUID ~= "" then
+			return proj.DamageSkinRUID
+		end
+		return "3271c3e79bf04ecba9a107d55495970d"
+	end
+
+end
