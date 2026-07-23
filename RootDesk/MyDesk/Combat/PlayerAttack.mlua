@@ -255,6 +255,24 @@ script PlayerAttack extends AttackComponent
 				                return false
 			            end
 		        end
+		        -- 용사 소환(소환수 공격) - 이번 호출 전용 단일 대상만 통과시킨다(다크드래곤과 동일한 패턴).
+		        if attackInfo == "skill.herosummon" then
+			            if not isvalid(self._T.heroSummonCurrentTarget) or defender ~= self._T.heroSummonCurrentTarget then
+				                return false
+			            end
+		        end
+		        -- 프리져(소환수 공격) - 이번 호출 전용 단일 대상만 통과시킨다(다크드래곤과 동일한 패턴).
+		        if attackInfo == "skill.freezer" then
+			            if not isvalid(self._T.freezerCurrentTarget) or defender ~= self._T.freezerCurrentTarget then
+				                return false
+			            end
+		        end
+		        -- 피닉스(소환수 공격) - 이번 호출 전용 단일 대상만 통과시킨다(프리져와 동일한 패턴).
+		        if attackInfo == "skill.phoenix" then
+			            if not isvalid(self._T.phoenixCurrentTarget) or defender ~= self._T.phoenixCurrentTarget then
+				                return false
+			            end
+		        end
 		        -- 돌진 - 이번 호출 전용 단일 대상만 통과시킨다(밀집 지역에서 이웃까지 겹쳐맞는 것 방지).
 		        if attackInfo == "skill.rush" then
 			            if not isvalid(self._T.rushCurrentTarget) or defender ~= self._T.rushCurrentTarget then
@@ -493,6 +511,22 @@ script PlayerAttack extends AttackComponent
 		        elseif attackInfo == "skill.ridingdragon" then
 		            -- (요청) 드래곤 라이딩 소환수 공격: 전투력의 200%~300%(다크드래곤과 동일 규격)
 		            local combatPower = self._T.pendingRidingDragonCombatPower or 0
+		            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
+		            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.herosummon" then
+		            -- 용사 소환수 공격: 용사 자신의 전투력(레벨×10) × 스킬별 배율(시전 직전 _T로 전달).
+		            local combatPower = self._T.pendingHeroSummonCombatPower or 0
+		            local mn = self._T.pendingHeroSummonMultMin or 1.0
+		            local mx = self._T.pendingHeroSummonMultMax or 1.5
+		            return math.floor(combatPower * (mn + _UtilLogic:RandomDouble() * (mx - mn)))
+		        elseif attackInfo == "skill.freezer" then
+		            -- 프리져 소환수 공격: 전투력의 200%~300%(드래곤 라이딩과 동일 규격).
+		            local combatPower = self._T.pendingFreezerCombatPower or 0
+		            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
+		            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.phoenix" then
+		            -- 피닉스 소환수 공격: 전투력의 200%~300%(프리져와 동일 규격).
+		            local combatPower = self._T.pendingPhoenixCombatPower or 0
 		            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
 		            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.rush" then
@@ -9805,7 +9839,8 @@ script PlayerAttack extends AttackComponent
 				---@type ArrowRainArrow
 				local comp = shard:GetComponent("script.ArrowRainArrow")
 				if isvalid(comp) then
-					comp.ArrowScale = 0.5
+					-- (피드백) 낙하물(얼음 조각) 크기 20% 확대 - 0.5 → 0.6.
+					comp.ArrowScale = 0.6
 					local mySpeed = (5 + _UtilLogic:RandomDouble() * 3) * 0.33
 					comp.Speed = mySpeed
 					comp.FallDistance = mySpeed * 1.08
@@ -10330,6 +10365,583 @@ script PlayerAttack extends AttackComponent
 			projComp:Fire(dirX, dirY)
 		end
 		log("[RapidFire] 화살 발사 dir=(" .. string.format("%.2f", dirX) .. "," .. string.format("%.2f", dirY) .. ") combatPower=" .. tostring(combatPower))
+	end
+
+	-- ── 폭풍의 시(4차) ──────────────────────────────────────────────
+	-- 키다운 홀드 연사. 발사 간격(0.2초)·종료 판정·방향 전환은 시전한 클라이언트
+	-- (SkillManager.HurricaneTick)가 담당하고, 서버는 (1) 홀드 시작/종료/방향전환 시 이펙트와
+	-- 반복 사운드를 멀티캐스트하고 (2) 요청이 올 때마다 화살 한 발을 스폰하는 것만 맡는다.
+	-- 리소스는 원본 팩 skill/1311.img/skill/13111002: prepare(시전 1회) → keydown(루프),
+	-- ball(화살), hit/0(적중), _audio/Use(반복 사용음).
+
+	@ExecSpace("ServerOnly")
+	method void BeginHurricane(number dirX)
+		-- 홀드 시작 - 모든 클라이언트에 시전 이펙트/반복 사운드 시작을 알리고,
+		-- (피드백) 연사 중에도 걸어다닐 수 있도록 이동을 막지 않는 대신 이동속도를 60%로 낮춘다.
+		-- 플레이어 속도는 서버 소유 MovementComponent.InputSpeed로만 조절된다(러시/헤이스트와 동일 규칙).
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then return end
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) and self._T.hurricaneSlowed ~= true then
+			self._T.hurricanePrevSpeed = mv.InputSpeed
+			mv.InputSpeed = mv.InputSpeed * 0.6
+			self._T.hurricaneSlowed = true
+			log("[Hurricane] 이동속도 60% 적용 " .. string.format("%.2f", self._T.hurricanePrevSpeed) .. " → " .. string.format("%.2f", mv.InputSpeed))
+		end
+		self:StartHurricaneVisuals(self.Entity, dirX)
+		log("[Hurricane] 홀드 시작 dirX=" .. tostring(dirX))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreHurricaneSpeed()
+		-- 연사가 끝나 이동속도를 원래대로 되돌린다. 종료 요청과 토큰 자동복구 두 경로에서
+		-- 호출되므로 여러 번 불려도 안전해야 한다(hurricaneSlowed 플래그로 1회만 복원).
+		if self._T.hurricaneSlowed ~= true then return end
+		self._T.hurricaneSlowed = false
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) then
+			mv.InputSpeed = self._T.hurricanePrevSpeed or (mv.InputSpeed / 0.6)
+			log("[Hurricane] 이동속도 복원 → " .. string.format("%.2f", mv.InputSpeed))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlipHurricane(number dirX)
+		-- 연사 중 좌/우 방향 전환 - 붙어있는 이펙트를 새 방향으로 다시 붙인다.
+		self:FlipHurricaneVisuals(self.Entity, dirX)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EndHurricaneHold()
+		-- 연사 종료: 이동속도(60%) 복원 + 이펙트/반복 사운드 정지.
+		self:RestoreHurricaneSpeed()
+		self:StopHurricaneVisuals(self.Entity)
+		log("[Hurricane] 홀드 종료")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackHurricane(number combatPower, number atkMultiplier, number rawDirX)
+		-- 폭풍의 시 한 발. 서버는 넘겨받은 좌/우 방향으로 수평 화살 한 발을 쏘는 것만 맡는다.
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+
+		local dirX = (rawDirX >= 0) and 1 or -1
+
+		-- (피드백) 연사 중에도 걸어다닐 수 있어야 하므로 조작은 잠그지 않는다(속도만 60% - BeginHurricane).
+		-- 종료 요청이 유실돼도 이동속도/이펙트/사운드가 영영 남지 않도록, 마지막 발사 1초 뒤
+		-- 토큰 가드로 자동 복구한다.
+		self._T.hurricaneCtrlToken = (self._T.hurricaneCtrlToken or 0) + 1
+		local myCtrlToken = self._T.hurricaneCtrlToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.hurricaneCtrlToken ~= myCtrlToken then return end
+			self:RestoreHurricaneSpeed()
+			self:StopHurricaneVisuals(self.Entity)
+		end, 1.0)
+
+		-- 활쏘기 모션은 서버가 아니라 시전한 클라이언트(SkillManager.PlayHurricanePose)가 질주 자세와
+		-- 같은 Loop 이벤트로 유지한다 - 서버 멀티캐스트 Onetime 모션(속사 방식)은 걷기를 뿌리박아
+		-- (피드백) "연사 중 걸어다니기"가 되지 않았다.
+		self:SpawnHurricaneProjectile(combatPower, dirX)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHurricaneProjectile(number combatPower, number dirX)
+		-- 폭풍의 시 화살 한 발을 맵에 스폰하고 수평으로 발사한다.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		self._T.hurricaneCount = (self._T.hurricaneCount or 0) + 1
+		local name = "hurricane_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.hurricaneCount)
+		-- 발쪽(원점)이 아니라 몸통 중심 높이에서 날아가도록 y를 올린다(다른 화살 스킬과 동일한 0.35).
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local proj = _SpawnService:SpawnByModelId("hurricaneprojectile", name, Vector3(myPos.x, myPos.y + 0.35, myPos.z), map)
+		if not isvalid(proj) then
+			log_warning("[PlayerAttack] Hurricane 발사체 스폰 실패")
+			return
+		end
+
+		---@type HurricaneProjectile
+		local projComp = proj:GetComponent("script.HurricaneProjectile")
+		if isvalid(projComp) then
+			projComp.CombatPower = combatPower
+			projComp.CritRate = self._T.currentCritRatePercent or 50
+			-- 지금 적용 중인 데미지 스킨(블리자드 중이면 얼음 스킨)을 발사체에 새겨준다 - 수동 표시에 쓰인다.
+			projComp.DamageSkinRUID = self:GetHitDamageSkinId()
+			projComp:Fire(dirX, 0)
+		end
+		log("[Hurricane] 화살 발사 dirX=" .. tostring(dirX) .. " combatPower=" .. tostring(combatPower))
+	end
+
+	@ExecSpace("Multicast")
+	method void StartHurricaneVisuals(Entity attacker, number dirX)
+		-- (요청) 키다운 시 처음에 prepare 이펙트를 1회 재생하고, 그 마지막 프레임부터는 keydown
+		-- 이펙트를 반복 재생한다. 사용음도 키를 누르고 있는 동안 계속 반복해서 들린다.
+		-- 원본 아트는 왼쪽 발사 기준이라 오른쪽을 볼 때 FlipX(스트레이프 시전 이펙트와 동일).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		self:StopHurricaneVisualsLocal()
+		self._T.hurricaneVisualsActive = true
+		self._T.hurricaneVisualDirX = dirX
+		-- 연사 중에는 기본 무기 이펙트를 숨긴다(속사가 발사마다 토글하던 것을 홀드 단위로 한 번만).
+		local ar = attacker.AvatarRendererComponent
+		if isvalid(ar) then ar.ShowDefaultWeaponEffects = false end
+		local opt = { ["FlipX"] = dirX > 0 }
+		-- (피드백) 몸쪽 이펙트 높이: 0.35 → 0.0 → "살짝 올려" 0.15로 확정.
+		self._T.hurricanePrepareSerial = _EffectService:PlayEffectAttached(
+			"4423619c1a49476697b459e49bddb575", attacker,
+			Vector3(0, 0.15, 0), 0, Vector3(1, 1, 1), false, opt
+		)
+		-- prepare 클립 길이(프레임 Delay 합산)만큼 기다렸다가 keydown 루프를 시작한다.
+		local prepDur = self:GetHurricanePrepareDuration()
+		self._T.hurricaneLoopToken = (self._T.hurricaneLoopToken or 0) + 1
+		local myTok = self._T.hurricaneLoopToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.hurricaneLoopToken ~= myTok then return end
+			if self._T.hurricaneVisualsActive ~= true then return end
+			if not isvalid(attacker) then return end
+			self._T.hurricaneLoopSerial = _EffectService:PlayEffectAttached(
+				"c47d84d453d0493c904046cc1d4ba9f2", attacker,
+				Vector3(0, 0.15, 0), 0, Vector3(1, 1, 1), true, { ["FlipX"] = dirX > 0 }
+			)
+		end, prepDur)
+		-- (피드백) "사용 사운드를 3배로 많이" - 기본 루프 재생에 더해 0.35초마다 같은 사운드를
+		-- 한 번씩 겹쳐 재생해 연사(0.1초/발)에 맞는 촘촘한 소리를 만든다.
+		_SoundService:PlayLoopSound("5be2bfc98ac5406485fd89dac2278ad4", 1.0)
+		self._T.hurricaneSndTimerId = _TimerService:SetTimerRepeat(function()
+			if self._T.hurricaneVisualsActive ~= true then return end
+			_SoundService:PlaySound("5be2bfc98ac5406485fd89dac2278ad4", 1.0)
+		end, 0.35)
+		log("[Hurricane] 시전 이펙트 시작 prepDur=" .. string.format("%.2f", prepDur) .. " dirX=" .. tostring(dirX))
+	end
+
+	@ExecSpace("Multicast")
+	method void FlipHurricaneVisuals(Entity attacker, number dirX)
+		-- 연사 중 좌/우 방향 전환: prepare는 다시 재생하지 않고, keydown 루프만 새 방향으로 즉시
+		-- 다시 붙인다(붙어있는 이펙트의 FlipX는 재생 중에 바꿀 수 없다).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		if self._T.hurricaneVisualsActive ~= true then return end
+		self._T.hurricaneVisualDirX = dirX
+		self._T.hurricaneLoopToken = (self._T.hurricaneLoopToken or 0) + 1
+		if self._T.hurricanePrepareSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.hurricanePrepareSerial)
+			self._T.hurricanePrepareSerial = nil
+		end
+		if self._T.hurricaneLoopSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.hurricaneLoopSerial)
+			self._T.hurricaneLoopSerial = nil
+		end
+		self._T.hurricaneLoopSerial = _EffectService:PlayEffectAttached(
+			"c47d84d453d0493c904046cc1d4ba9f2", attacker,
+			Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), true, { ["FlipX"] = dirX > 0 }
+		)
+	end
+
+	@ExecSpace("Multicast")
+	method void StopHurricaneVisuals(Entity attacker)
+		-- 홀드 종료 - 붙어있는 이펙트와 반복 사운드를 모두 멈춘다(여러 번 불려도 안전해야 한다).
+		if not self:IsClient() then return end
+		self:StopHurricaneVisualsLocal()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopHurricaneVisualsLocal()
+		-- 클라이언트 로컬 정리: 예약된 루프 시작 타이머 무효화 + 이펙트 제거 + 사운드 정지.
+		self._T.hurricaneVisualsActive = false
+		self._T.hurricaneLoopToken = (self._T.hurricaneLoopToken or 0) + 1
+		if self._T.hurricaneSndTimerId ~= nil then
+			_TimerService:ClearTimer(self._T.hurricaneSndTimerId)
+			self._T.hurricaneSndTimerId = nil
+		end
+		local ar = isvalid(self.Entity) and self.Entity.AvatarRendererComponent or nil
+		if isvalid(ar) then ar.ShowDefaultWeaponEffects = true end
+		if self._T.hurricanePrepareSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.hurricanePrepareSerial)
+			self._T.hurricanePrepareSerial = nil
+		end
+		if self._T.hurricaneLoopSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.hurricaneLoopSerial)
+			self._T.hurricaneLoopSerial = nil
+		end
+		_SoundService:StopSound("5be2bfc98ac5406485fd89dac2278ad4")
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetHurricanePrepareDuration()
+		-- prepare 애니메이션클립의 총 길이(초). 프레임별 Delay를 합산하고 한 번 재면 캐시한다.
+		if self._T.hurricanePrepDur ~= nil then return self._T.hurricanePrepDur end
+		local dur = 0
+		local clip = _ResourceService:LoadAnimationClipAndWait("4423619c1a49476697b459e49bddb575")
+		if clip ~= nil and clip.Frames ~= nil then
+			for _, f in ipairs(clip.Frames:ToTable()) do
+				dur = dur + (f.Delay or 0)
+			end
+		end
+		-- 프레임 Delay가 ms 단위(원본 WZ 규격)로 들어오는 경우 초 단위로 보정한다.
+		if dur > 5 then dur = dur / 1000 end
+		if dur <= 0 then dur = 0.6 end
+		self._T.hurricanePrepDur = dur
+		log("[Hurricane] prepare 클립 길이=" .. string.format("%.3f", dur) .. "초")
+		return dur
+	end
+
+	-- ── 스나이핑(4차 차지) ──────────────────────────────────────────
+	-- 키를 누르고 있으면 게이지(완충 10초)를 채우고, 떼면 게이지 비율만큼 데미지를 실은
+	-- 관통 화살(최대 10명) 한 발을 쏜다. 차지 단계(0~4초/4~7초/7~10초)마다 차지 이펙트/화살/
+	-- 슈팅 이펙트가 바뀐다. 게이지 누적/단계 판정/발사는 클라이언트(SkillManager.SnipingTick)가
+	-- 담당하고, 서버는 (1) 이동속도 50% 적용/복원, (2) 게이지 바·% 숫자 표시, (3) 이펙트
+	-- 멀티캐스트, (4) 발사체 스폰을 맡는다. 리소스는 원본 팩:
+	--   1단계 skill/3241000 (effect/ball + 슈팅=hit0), 2단계 skill/3221025, 3단계 skill/3241001,
+	--   공용 hit skill/3241002 hit/0, 게이지 ui/basic/keydownbar5/0/full.
+
+	method string GetSnipingChargeRUID(number stage)
+		-- 단계별 차지 이펙트(차지 중 5~12프레임 반복, 릴리즈 시 13~끝 재생).
+		if stage >= 2 then return "f74015c5accf42e79889e343489f3ed6" end
+		if stage >= 1 then return "79037c68813a4d48bf85a27bb1c34b5a" end
+		return "0b6df3e081d0484fb9a4aa174f9784a8"
+	end
+
+	method string GetSnipingBallRUID(number stage)
+		-- 단계별 화살 클립.
+		if stage >= 2 then return "eb55ee8b8efe4345aa9c0d480df70939" end
+		if stage >= 1 then return "2a51218fa53441b79ac41db6028a8110" end
+		return "38f9664abbec45a4b11b05ecc9ebfa02"
+	end
+
+	method string GetSnipingShootRUID(number stage)
+		-- 단계별 발사(슈팅) 이펙트.
+		if stage >= 2 then return "4f091580df214c7dbb846ce850f7f491" end
+		if stage >= 1 then return "c834c492754444f3b25046a222863743" end
+		return "2d79c1fb547846b4ae6ca7435b88d996"
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginSniping(number dirX)
+		-- 차지 시작: 이동속도 50% + 게이지 % 숫자 엔티티 스폰 + 하트비트 감시 + 이펙트 멀티캐스트.
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then return end
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) and self._T.snipingSlowed ~= true then
+			self._T.snipingPrevSpeed = mv.InputSpeed
+			mv.InputSpeed = mv.InputSpeed * 0.5
+			self._T.snipingSlowed = true
+			log("[Sniping] 이동속도 50% 적용 " .. string.format("%.2f", self._T.snipingPrevSpeed) .. " → " .. string.format("%.2f", mv.InputSpeed))
+		end
+		self:SpawnSnipingGaugeText()
+		self._T.snipingHolding = true
+		self._T.snipingLastHeartbeat = _UtilLogic.ElapsedSeconds
+		-- 클라이언트 하트비트(0.5초 간격)가 2.5초 이상 끊기면 릴리즈/취소 요청이 유실된 것으로 보고
+		-- 스스로 정리한다(속도/게이지가 영영 남지 않게 하는 안전장치).
+		if self._T.snipingWatchTimerId ~= nil then _TimerService:ClearTimer(self._T.snipingWatchTimerId) end
+		self._T.snipingWatchTimerId = _TimerService:SetTimerRepeat(function()
+			if self._T.snipingHolding ~= true then return end
+			if _UtilLogic.ElapsedSeconds - (self._T.snipingLastHeartbeat or 0) > 2.5 then
+				log_warning("[Sniping] 하트비트 유실 - 차지 자동 취소")
+				self:CancelSnipingHold()
+			end
+		end, 1.0)
+		self:StartSnipingVisuals(self.Entity, dirX)
+		log("[Sniping] 차지 시작 dirX=" .. tostring(dirX))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnSnipingGaugeText()
+		-- 머리 위 게이지(배경 Bg + 채움 Fill + % 숫자 Pct)를 플레이어 자식으로 스폰한다.
+		-- (피드백) keydownbar의 full 클립은 모든 프레임이 꽉 찬 바 그림이라, 같은 아트 2겹으로
+		-- 배경(어둡게 틴트)/채움(좌측 고정 스케일)을 만들어 "차오르는" 모습을 표현한다.
+		if isvalid(self._T.snipingGaugeText) then return end
+		local ent = _SpawnService:SpawnByModelId("snipinggaugetext", "SnipingGauge_" .. tostring(self.Entity.Name), Vector3(0, 1.05, 0), self.Entity)
+		if not isvalid(ent) then
+			log_warning("[Sniping] 게이지 스폰 실패")
+			return
+		end
+		local bg = ent:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			-- 배경은 같은 바 아트를 어둡게 깔아 "빈 게이지"로 보이게 한다(Color는 @Sync라 서버 지정 OK).
+			bg.SpriteRendererComponent.Color = Color(0.25, 0.25, 0.25, 0.8)
+		end
+		-- % 숫자는 월드 전용 TextRendererComponent를 쓴다 - Text/FontColor가 @Sync라 서버 대입만으로
+		-- 모든 클라이언트에 표시된다(TextComponent는 UI 전용이라 월드 엔티티에선 렌더링되지 않았다).
+		local pctEnt = ent:GetChildByName("Pct", false)
+		if isvalid(pctEnt) and isvalid(pctEnt.TextRendererComponent) then
+			pctEnt.TextRendererComponent.FontColor = Color(1, 1, 0.55, 1)
+		end
+		self._T.snipingGaugeText = ent
+		self:UpdateSnipingGaugeFill(0)
+		self:UpdateSnipingGaugePctText(0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateSnipingGaugePctText(number pct)
+		-- 게이지 오른쪽 % 숫자 갱신(TextRendererComponent.Text는 @Sync).
+		local ent = self._T.snipingGaugeText
+		if not isvalid(ent) then return end
+		local pctEnt = ent:GetChildByName("Pct", false)
+		if not isvalid(pctEnt) then return end
+		local tr = pctEnt.TextRendererComponent
+		if not isvalid(tr) then return end
+		tr.Text = tostring(math.floor(pct + 0.5)) .. "%"
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateSnipingGaugeFill(number pct)
+		-- 채움 바: 왼쪽 끝을 고정한 채 가로 스케일을 진행률만큼 늘린다(Transform은 @Sync라 서버 대입 OK).
+		-- 바 아트 절반 스케일 기준 반폭 0.35유닛.
+		local ent = self._T.snipingGaugeText
+		if not isvalid(ent) then return end
+		local fill = ent:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = math.max(0, math.min(pct, 100) / 100)
+		fill.TransformComponent.Scale = Vector3(0.5 * ratio, 0.5, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SnipingHeartbeat(number charge)
+		-- 클라이언트가 0.5초마다 보내는 게이지 값 - % 숫자 갱신 + 하트비트 갱신.
+		if self._T.snipingHolding ~= true then return end
+		self._T.snipingLastHeartbeat = _UtilLogic.ElapsedSeconds
+		local pct = math.floor(math.min(charge or 0, 10.0) / 10.0 * 100 + 0.5)
+		self:UpdateSnipingGaugeFill(pct)
+		self:UpdateSnipingGaugePctText(pct)
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method void SetSnipingStage(number stage, number dirX)
+		-- 차지 단계 전환(4초/7초) 또는 좌/우 방향 전환 - 차지 이펙트를 교체한다.
+		if self._T.snipingHolding ~= true then return end
+		self:SetSnipingStageVisuals(self.Entity, stage, dirX)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackSniping(number combatPower, number chargeRatio, number rawDirX, number stage)
+		-- 릴리즈: 차지 이펙트를 끝까지 재생 + 슈팅 이펙트 + 관통 화살 한 발.
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" then
+			self:CancelSnipingHold()
+			return
+		end
+		local dirX = (rawDirX >= 0) and 1 or -1
+		self:FinishSnipingServer()
+		self:PlaySnipingReleaseVisuals(self.Entity, stage, dirX)
+		self:PlayRapidFireMotion(self.Entity, "shoot1", dirX, 1.0)
+		self:SpawnSnipingProjectile(combatPower, chargeRatio, dirX, stage)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CancelSnipingHold()
+		-- 발사 없이 차지 종료(사망/사다리/다른 스킬/하트비트 유실).
+		self:FinishSnipingServer()
+		self:StopSnipingVisuals(self.Entity)
+		log("[Sniping] 차지 취소")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishSnipingServer()
+		-- 서버쪽 차지 상태 정리(여러 번 호출해도 안전): 속도 복원 + 게이지 텍스트 제거 + 감시 해제.
+		self._T.snipingHolding = false
+		if self._T.snipingWatchTimerId ~= nil then
+			_TimerService:ClearTimer(self._T.snipingWatchTimerId)
+			self._T.snipingWatchTimerId = nil
+		end
+		if isvalid(self._T.snipingGaugeText) then
+			self._T.snipingGaugeText:Destroy()
+		end
+		self._T.snipingGaugeText = nil
+		if self._T.snipingSlowed == true then
+			self._T.snipingSlowed = false
+			local mv = self.Entity.MovementComponent
+			if isvalid(mv) then
+				mv.InputSpeed = self._T.snipingPrevSpeed or (mv.InputSpeed / 0.5)
+				log("[Sniping] 이동속도 복원 → " .. string.format("%.2f", mv.InputSpeed))
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnSnipingProjectile(number combatPower, number chargeRatio, number dirX, number stage)
+		-- 관통 화살 한 발을 스폰한다. 화살 아트는 단계별 ball 클립으로 갈아끼운다.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		self._T.snipingCount = (self._T.snipingCount or 0) + 1
+		local name = "sniping_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.snipingCount)
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local proj = _SpawnService:SpawnByModelId("snipingprojectile", name, Vector3(myPos.x, myPos.y + 0.35, myPos.z), map)
+		if not isvalid(proj) then
+			log_warning("[PlayerAttack] Sniping 발사체 스폰 실패")
+			return
+		end
+		local spr = proj.SpriteRendererComponent
+		if isvalid(spr) then
+			spr.SpriteRUID = self:GetSnipingBallRUID(stage)
+		end
+		---@type SnipingProjectile
+		local projComp = proj:GetComponent("script.SnipingProjectile")
+		if isvalid(projComp) then
+			projComp.CombatPower = combatPower
+			projComp.ChargeRatio = chargeRatio
+			projComp.CritRate = self._T.currentCritRatePercent or 50
+			projComp.DamageSkinRUID = self:GetHitDamageSkinId()
+			projComp:Fire(dirX, 0)
+		end
+		log("[Sniping] 화살 발사 stage=" .. tostring(stage) .. " charge=" .. string.format("%.2f", chargeRatio) .. " dirX=" .. tostring(dirX) .. " combatPower=" .. tostring(combatPower))
+	end
+
+	@ExecSpace("Multicast")
+	method void StartSnipingVisuals(Entity attacker, number dirX)
+		-- 차지 시작 연출: 머리 위 게이지 바(10초에 걸쳐 차오름) + 1단계 차지 이펙트.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		self:StopSnipingVisualsLocal()
+		self._T.snipingVisualsActive = true
+		-- 게이지 바는 이펙트가 아니라 서버가 스폰한 엔티티(Bg/Fill/Pct)가 표시한다(SpawnSnipingGaugeText).
+		self:ApplySnipingChargeEffect(attacker, 0, dirX)
+		log("[Sniping] 차지 이펙트 시작")
+	end
+
+	@ExecSpace("Multicast")
+	method void SetSnipingStageVisuals(Entity attacker, number stage, number dirX)
+		-- 단계 전환/방향 전환: 이전 차지 이펙트를 지우고 해당 단계 이펙트로 교체한다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		if self._T.snipingVisualsActive ~= true then return end
+		self:ApplySnipingChargeEffect(attacker, stage, dirX)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplySnipingChargeEffect(Entity attacker, number stage, number dirX)
+		-- (요청) 차지 이펙트는 12프레임을 넘지 않는다: 0~12프레임을 1회 재생한 뒤 5~12프레임을
+		-- 반복한다(폭풍의 시 prepare→keydown과 같은 토큰 방식). 원본 아트는 왼쪽 발사 기준이라
+		-- 오른쪽을 볼 때 FlipX.
+		local ruid = self:GetSnipingChargeRUID(stage)
+		local flip = dirX > 0
+		self._T.snipingChargeToken = (self._T.snipingChargeToken or 0) + 1
+		local myTok = self._T.snipingChargeToken
+		if self._T.snipingChargeSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.snipingChargeSerial)
+			self._T.snipingChargeSerial = nil
+		end
+		if self._T.snipingChargeLoopSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.snipingChargeLoopSerial)
+			self._T.snipingChargeLoopSerial = nil
+		end
+		-- (피드백) 원본 아트가 화면을 덮을 만큼 커서 전체 이펙트 크기를 절반으로 줄인다.
+		self._T.snipingChargeSerial = _EffectService:PlayEffectAttached(
+			ruid, attacker, Vector3(0, 0.15, 0), 0, Vector3(0.5, 0.5, 0.5), false,
+			{ ["EndFrameIndex"] = 12, ["FlipX"] = flip }
+		)
+		local introDur = self:GetSnipingFrameRangeDuration(ruid, 0, 12)
+		_TimerService:SetTimerOnce(function()
+			if self._T.snipingChargeToken ~= myTok then return end
+			if self._T.snipingVisualsActive ~= true then return end
+			if not isvalid(attacker) then return end
+			self._T.snipingChargeSerial = nil
+			self._T.snipingChargeLoopSerial = _EffectService:PlayEffectAttached(
+				ruid, attacker, Vector3(0, 0.15, 0), 0, Vector3(0.5, 0.5, 0.5), true,
+				{ ["StartFrameIndex"] = 5, ["EndFrameIndex"] = 12, ["FlipX"] = flip }
+			)
+		end, introDur)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySnipingReleaseVisuals(Entity attacker, number stage, number dirX)
+		-- 릴리즈 연출: 게이지/차지 루프를 지우고, 차지 이펙트의 13프레임~끝을 1회 재생 + 슈팅 이펙트.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local chargeRuid = self:GetSnipingChargeRUID(stage)
+		local shootRuid = self:GetSnipingShootRUID(stage)
+		local flip = dirX > 0
+		self:StopSnipingVisualsLocal()
+		local tailSerial = _EffectService:PlayEffectAttached(
+			chargeRuid, attacker, Vector3(0, 0.15, 0), 0, Vector3(0.5, 0.5, 0.5), false,
+			{ ["StartFrameIndex"] = 13, ["FlipX"] = flip }
+		)
+		local shootSerial = _EffectService:PlayEffectAttached(
+			shootRuid, attacker, Vector3(0.2 * dirX, 0.35, 0), 0, Vector3(0.5, 0.5, 0.5), false,
+			{ ["FlipX"] = flip }
+		)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(tailSerial)
+			_EffectService:RemoveEffect(shootSerial)
+		end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void StopSnipingVisuals(Entity attacker)
+		-- 차지 취소 - 게이지/차지 이펙트를 모두 지운다(여러 번 불려도 안전).
+		if not self:IsClient() then return end
+		self:StopSnipingVisualsLocal()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopSnipingVisualsLocal()
+		-- 클라이언트 로컬 정리: 예약 타이머 무효화 + 게이지/차지 이펙트 제거.
+		self._T.snipingVisualsActive = false
+		self._T.snipingLoopToken = (self._T.snipingLoopToken or 0) + 1
+		self._T.snipingChargeToken = (self._T.snipingChargeToken or 0) + 1
+		if self._T.snipingChargeSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.snipingChargeSerial)
+			self._T.snipingChargeSerial = nil
+		end
+		if self._T.snipingChargeLoopSerial ~= nil then
+			_EffectService:RemoveEffect(self._T.snipingChargeLoopSerial)
+			self._T.snipingChargeLoopSerial = nil
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureSnipingClipCache(string ruid)
+		-- 클립 프레임 Delay 목록을 한 번만 읽어 캐시한다(ms 단위로 오면 초로 보정).
+		if self._T.snipClipCache == nil then self._T.snipClipCache = {} end
+		if self._T.snipClipCache[ruid] ~= nil then return end
+		local delays = {}
+		local total = 0
+		local clip = _ResourceService:LoadAnimationClipAndWait(ruid)
+		if clip ~= nil and clip.Frames ~= nil then
+			for _, f in ipairs(clip.Frames:ToTable()) do
+				local d = f.Delay or 0
+				table.insert(delays, d)
+				total = total + d
+			end
+		end
+		local scale = 1.0
+		if total > 5 then scale = 0.001 end
+		for i = 1, #delays do delays[i] = delays[i] * scale end
+		self._T.snipClipCache[ruid] = delays
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetSnipingClipDuration(string ruid)
+		-- 클립 전체 길이(초).
+		self:EnsureSnipingClipCache(ruid)
+		local delays = self._T.snipClipCache[ruid]
+		local total = 0
+		for i = 1, #delays do total = total + delays[i] end
+		return total
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetSnipingFrameRangeDuration(string ruid, number startIdx, number endIdx)
+		-- 0-기준 프레임 startIdx~endIdx 구간의 길이(초). 프레임 수를 넘으면 있는 만큼만 합산한다.
+		self:EnsureSnipingClipCache(ruid)
+		local delays = self._T.snipClipCache[ruid]
+		local total = 0
+		for i = startIdx + 1, math.min(endIdx + 1, #delays) do
+			total = total + delays[i]
+		end
+		if total <= 0 then total = 0.5 end
+		return total
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetSnipingClipFrameCount(string ruid)
+		-- 클립의 총 프레임 수.
+		self:EnsureSnipingClipCache(ruid)
+		return #self._T.snipClipCache[ruid]
 	end
 
 	-- ── 체인샷(2차) ──────────────────────────────────────────────────
@@ -13571,6 +14183,205 @@ script PlayerAttack extends AttackComponent
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 2.0)
+	end
+
+	-- ── 용사 소환(3차) ───────────────────────────────────────────────────
+	-- 전사 3계열(히어로/팔라딘/다크나이트) 중 랜덤 1명을 아바타 NPC로 소환한다. AI/장비/스킬은
+	-- script.HeroSummon이 담당하고, 여기서는 스폰과 skill.herosummon 판정 파이프라인만 맡는다.
+
+	@ExecSpace("ServerOnly")
+	method void SummonHero(number playerLevel)
+		-- 용사 소환: herosummon 모델(아바타 NPC)을 맵에 스폰. 기존 용사가 있으면 교체한다.
+		local old = self._T.heroSummonEntity
+		if isvalid(old) then old:Destroy() end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then
+			log_warning("[HeroSummon] 소환 실패 - CurrentMap 없음")
+			return
+		end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		self._T.heroSummonSeq = (self._T.heroSummonSeq or 0) + 1
+		local hero = _SpawnService:SpawnByModelId("herosummon", "HeroSummon" .. tostring(self._T.heroSummonSeq), Vector3(myPos.x, myPos.y + 0.2, 0), map)
+		if not isvalid(hero) then
+			log_warning("[HeroSummon] 소환 실패(spawn nil)")
+			return
+		end
+		hero:AddComponent("script.HeroSummon")
+		---@type HeroSummon
+		local comp = hero:GetComponent("script.HeroSummon")
+		if isvalid(comp) then
+			-- AddComponent 직후에는 프로퍼티 대입만 한다(같은 프레임 메서드 호출은 _T 미초기화로
+			-- LEA-2007 위험 - 실제 초기화는 HeroSummon이 첫 ServerTick에서 지연 실행).
+			local lines = { "hero", "paladin", "darkknight" }
+			comp.OwnerEntity = self.Entity
+			comp.HeroLevel = math.max(1, math.floor(playerLevel * 2 / 3))
+			comp.HeroLine = lines[_UtilLogic:RandomIntegerRange(1, 3)]
+			comp.Lifetime = 300
+		end
+		self._T.heroSummonEntity = hero
+		log("[HeroSummon] 스폰 완료 seq=" .. tostring(self._T.heroSummonSeq) .. " playerLevel=" .. tostring(playerLevel))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealHeroSummonHit(Entity target, number combatPower, number multMin, number multMax)
+		-- 용사 공격 1타: 단일 대상 포인터로 걸러 skill.herosummon(용사 전투력 × 배율) 판정.
+		if not isvalid(target) then return end
+		self._T.heroSummonCurrentTarget = target
+		self._T.pendingHeroSummonCombatPower = combatPower
+		self._T.pendingHeroSummonMultMin = multMin
+		self._T.pendingHeroSummonMultMax = multMax
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		self:AttackShadowSafe(shape, "skill.herosummon", target)
+	end
+
+	-- ── 프리져(4차) ──────────────────────────────────────────────────────
+	-- 5분간 프리져 소환수(FreezerSummon)를 소환한다. AI/이동/모션은 script.FreezerSummon이 담당하고,
+	-- 여기서는 스폰과 skill.freezer 판정(80% 확률 2초 빙결 포함)만 맡는다.
+
+	@ExecSpace("ServerOnly")
+	method void SummonFreezer(number combatPower)
+		-- 프리져 소환: spearburstfadingeffect 모델을 플레이어의 자식으로 스폰(라이딩드래곤과 동일 패턴).
+		-- 재시전하면 기존 프리져를 교체한다.
+		self._T.pendingFreezerCombatPower = combatPower
+		local old = self._T.freezerEntity
+		if isvalid(old) then old:Destroy() end
+		self._T.freezerSeq = (self._T.freezerSeq or 0) + 1
+		local freezer = _SpawnService:SpawnByModelId("spearburstfadingeffect", "Freezer" .. tostring(self._T.freezerSeq), Vector3(0, 0.8, 0), self.Entity)
+		if not isvalid(freezer) then
+			log_warning("[Freezer] 소환 실패(spawn nil)")
+			return
+		end
+		freezer:AddComponent("script.FreezerSummon")
+		---@type FreezerSummon
+		local comp = freezer:GetComponent("script.FreezerSummon")
+		if isvalid(comp) then
+			comp.OwnerEntity = self.Entity
+			comp.Lifetime = 600   -- (요청) 10분 버프
+		end
+		self._T.freezerEntity = freezer
+		-- 소환 사운드(mob/9830009.img의 _audio/Regen).
+		self:PlayBuffSound("6eb5b37dad16420baf8df8c29734f9f2")
+		log("[Freezer] 소환 완료 seq=" .. tostring(self._T.freezerSeq) .. " combatPower=" .. tostring(math.floor(combatPower)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealFreezerHit(Entity target)
+		-- 프리져 공격 1타: 단일 대상 포인터로 걸러 skill.freezer(전투력 200~300%) 판정.
+		-- (요청) 맞은 적은 80% 확률로 2초간 빙결(차지 블로우/아이스 샷의 빙결 재사용).
+		if not isvalid(target) then return end
+		self._T.freezerCurrentTarget = target
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		local hitComps = self:AttackShadowSafe(shape, "skill.freezer", target)
+		local actuallyHit = false
+		for _, hc in ipairs(hitComps) do
+			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
+				actuallyHit = true
+				break
+			end
+		end
+		if actuallyHit and _UtilLogic:RandomDouble() < 0.8 then
+			self:ApplyChargeBlowFreeze(target, 2.0)
+			log("[Freezer] 빙결 적중(2초) target=" .. target.Name)
+		end
+	end
+
+	-- ── 피닉스(4차) ──────────────────────────────────────────────────────
+	-- 10분간 피닉스 소환수(PhoenixSummon)를 소환한다. AI/이동/모션은 script.PhoenixSummon이 담당하고,
+	-- 여기서는 스폰과 skill.phoenix 판정(2초 스턴 + 머리 위 스턴 이펙트 포함)만 맡는다.
+
+	@ExecSpace("ServerOnly")
+	method void SummonPhoenix(number combatPower)
+		-- 피닉스 소환: spearburstfadingeffect 모델을 플레이어의 자식으로 스폰(프리져와 동일 패턴).
+		-- 재시전하면 기존 피닉스를 교체한다.
+		self._T.pendingPhoenixCombatPower = combatPower
+		local old = self._T.phoenixEntity
+		if isvalid(old) then old:Destroy() end
+		self._T.phoenixSeq = (self._T.phoenixSeq or 0) + 1
+		local phoenix = _SpawnService:SpawnByModelId("spearburstfadingeffect", "Phoenix" .. tostring(self._T.phoenixSeq), Vector3(0, 0.8, 0), self.Entity)
+		if not isvalid(phoenix) then
+			log_warning("[Phoenix] 소환 실패(spawn nil)")
+			return
+		end
+		phoenix:AddComponent("script.PhoenixSummon")
+		---@type PhoenixSummon
+		local comp = phoenix:GetComponent("script.PhoenixSummon")
+		if isvalid(comp) then
+			comp.OwnerEntity = self.Entity
+			comp.Lifetime = 600
+		end
+		self._T.phoenixEntity = phoenix
+		-- 소환 사운드(mob/9300089.img의 _audio/Regen).
+		self:PlayBuffSound("a30e038d7a9a4260abc1d645cf3aef75")
+		log("[Phoenix] 소환 완료 seq=" .. tostring(self._T.phoenixSeq) .. " combatPower=" .. tostring(math.floor(combatPower)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealPhoenixHit(Entity target)
+		-- 피닉스 공격 1타: 단일 대상 포인터로 걸러 skill.phoenix(전투력 200~300%) 판정.
+		-- (요청) 맞은 적은 2초간 스턴 + 스턴이 풀릴 때까지 머리 위에 피닉스 스킬 팩의 히트 이펙트를
+		-- 루프 재생(드래곤 로어 스턴 표시와 동일한 방식).
+		if not isvalid(target) then return end
+		self._T.phoenixCurrentTarget = target
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		local hitComps = self:AttackShadowSafe(shape, "skill.phoenix", target)
+		local actuallyHit = false
+		for _, hc in ipairs(hitComps) do
+			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
+				actuallyHit = true
+				break
+			end
+		end
+		if actuallyHit then
+			self:ApplyPhoenixStun(target, 2.0)
+			self:PlayPhoenixStunEffect(target, 2.0)
+			log("[Phoenix] 스턴 적중(2초) target=" .. target.Name)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyPhoenixStun(Entity target, number duration)
+		-- 피닉스 스턴: 코마 스턴과 같은 방식이되, 배치 몬스터가 AIWander를 쓰는 경우까지 포함해
+		-- (빙결 처리와 동일하게) AIChase/AIWander/Movement를 duration 동안 모두 꺼서 행동불능으로 만든다.
+		if not isvalid(target) then return end
+		local aiChase = target.AIChaseComponent
+		local wasChaseEnabled = isvalid(aiChase) and aiChase.Enable
+		if isvalid(aiChase) then aiChase.Enable = false end
+		local aiWander = target.AIWanderComponent
+		local wasWanderEnabled = isvalid(aiWander) and aiWander.Enable
+		if isvalid(aiWander) then aiWander.Enable = false end
+		local movement = target.MovementComponent
+		local wasMovementEnabled = isvalid(movement) and movement.Enable
+		if isvalid(movement) then
+			movement:Stop()
+			movement.Enable = false
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(target) then
+				if isvalid(aiChase) and wasChaseEnabled then aiChase.Enable = true end
+				if isvalid(aiWander) and wasWanderEnabled then aiWander.Enable = true end
+				if isvalid(movement) and wasMovementEnabled then movement.Enable = true end
+			end
+		end, duration)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayPhoenixStunEffect(Entity target, number duration)
+		-- 스턴이 풀릴 때까지 대상 머리 위에 피닉스 스킬 팩(skill/311.img/skill/3111005)의 hit/0 클립을
+		-- 루프 재생. 머리 높이는 코마 스턴 표시와 동일하게 HitComponent 콜라이더로 계산한다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local headY = 0.5
+		local hit = target.HitComponent
+		if isvalid(hit) then
+			headY = hit.ColliderOffset.y + hit.BoxSize.y / 2
+		end
+		local serial = _EffectService:PlayEffectAttached("3a436ae129ae4aab8ca9533d8864afc7", target, Vector3(0, headY, 0), 0, Vector3(1, 1, 1), true, { ["OrderInLayer"] = 7 })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, duration)
 	end
 
 	-- ── 드래곤 라이딩(3차) ────────────────────────────────────────────────

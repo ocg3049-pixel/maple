@@ -1,0 +1,354 @@
+@Component
+script FreezerSummon extends Component
+
+	-- 프리져(4차) 소환수. (요청) 리소스는 몬스터판 원본 팩 mob/9830009.img("프리저")의
+	-- 클립(stand/move/attack1/regen/die1)과 attack1 전용 히트 이펙트(attack1/info/hit)·사운드
+	-- (_audio/Attack1·Regen·Die)를 쓴다. 아이콘/스킬 등록은 기존 skill/321.img/skill/3211005 아이콘 유지.
+	-- 라이딩드래곤(RidingDragon.mlua)과 같은 구조: spearburstfadingeffect 모델(Transform+Sprite)을
+	-- 플레이어의 자식으로 스폰한 뒤 이 컴포넌트를 붙이고, 위치는 각 클라이언트가 매 프레임 직접
+	-- 계산해 움직인다(동기화 트래픽 0). 서버는 전투 판단만 하고 @Sync 상태로 클라에 알린다.
+	--
+	-- 드래곤 라이딩과 다른 점(요청):
+	--  · 이동속도가 더 빠르고 더 멀리(플레이어 기준 반경 7유닛) 날아가 공격한다.
+	--  · 대상이 없고 플레이어가 가만히 있으면 유저 "뒤 위"에서 stand 자세로 제자리 부양.
+	--  · 사거리 내 적이 생기면 그 자리까지 날아가 공격하고, 적이 없어지면 다시 돌아온다.
+	--  · 맞은 적은 80% 확률로 2초간 빙결(차지 블로우/아이스 샷의 ApplyChargeBlowFreeze 재사용).
+
+	property Entity OwnerEntity = nil            -- 서버 전용(공격 대상 탐색/데미지 주체). 클라는 부모로 충분.
+	property number Lifetime = 600               -- 서버 전용 수명(초). (요청) 10분 버프.
+	@Sync property string Mode = "idle"          -- "idle"(주인 곁 부양) | "engage"(적에게 출격)
+	@Sync property number TargetX = 0            -- engage 목적지(적 위치, 서버가 0.5초마다 갱신)
+	@Sync property number TargetY = 0
+	@Sync property string AtkState = ""          -- "" | "atk" (공격 모션 재생 중)
+	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- 서버: 수명 타이머 + 0.5초 간격 전투 판단 루프.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:PlayVanishFx()
+			_TimerService:SetTimerOnce(function()
+				if isvalid(self.Entity) then self.Entity:Destroy() end
+			end, 0.4)
+		end, self.Lifetime)
+		self._T.combatTimerId = _TimerService:SetTimerRepeat(function()
+			if not isvalid(self.Entity) then return end
+			self:CombatTick()
+		end, 0.5)
+		log("[Freezer] 소환 - 수명 " .. tostring(self.Lifetime) .. "초")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- 전투 루프 타이머 정리.
+		if self._T.combatTimerId ~= nil then
+			_TimerService:ClearTimer(self._T.combatTimerId)
+			self._T.combatTimerId = nil
+		end
+	end
+
+	@ExecSpace("Server")
+	method void ReportFreezerPos(number x, number y)
+		-- 소유 클라가 계산한 실제 프리져 월드좌표(공격 타이밍 판단 기준). 0.15초마다 갱신.
+		self._T.serverWorldPos = Vector2(x, y)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CombatTick()
+		-- 0.5초마다: idle이면 주인 주변 사거리(7유닛) 스캔 → 적이 있으면 출격(engage).
+		-- engage면 대상 유효성 검사 + 목적지 갱신 + 도착했으면 공격.
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		local ownerPos = self.OwnerEntity.TransformComponent.WorldPosition
+		local now = _UtilLogic.ElapsedSeconds
+
+		local target = self._T.engageTarget
+		if isvalid(target) then
+			---@type Monster
+			local mc = target:GetComponent("script.Monster")
+			local tp = target.TransformComponent.WorldPosition
+			local farX = tp.x - ownerPos.x
+			local farY = tp.y - ownerPos.y
+			-- 죽었거나 주인에게서 너무 멀어지면(8.5) 복귀.
+			-- (피드백) 공격 시퀀스(atk/gone/return) 진행 중에는 대상이 이번 공격으로 죽더라도
+			-- 모션을 절대 끊지 않는다 - 시퀀스 타이머가 끝까지 돈 뒤(AtkState="") 다음 틱에 복귀한다.
+			if (not isvalid(mc)) or mc.IsDead or (farX * farX + farY * farY) > 72.25 then
+				if self.AtkState == "" then
+					self._T.engageTarget = nil
+					self.Mode = "idle"
+				end
+				return
+			end
+			-- 목적지 = 적 몸 중심 약간 위(프리져가 공중에서 덮치는 그림).
+			self.TargetX = tp.x
+			self.TargetY = tp.y + 0.45
+			-- 도착 판정: 소유 클라가 보고한 실제 위치가 대상과 가까우면 공격.
+			local wp = self._T.serverWorldPos
+			if wp ~= nil and self.AtkState == "" and (self._T.nextAtkAt or 0) <= now then
+				local dx = self.TargetX - wp.x
+				local dy = self.TargetY - wp.y
+				if (dx * dx + dy * dy) <= 2.25 then
+					self:DoAttack(pa, target, wp)
+				end
+			end
+			return
+		end
+
+		-- idle: 주인 기준 반경 7유닛 안의 몬스터를 찾으면 출격.
+		local cands = pa:FindMonstersInRadius(Vector2(ownerPos.x, ownerPos.y), 7.0, 1)
+		if #cands > 0 then
+			self._T.engageTarget = cands[1]
+			self.Mode = "engage"
+			local tp = cands[1].TransformComponent.WorldPosition
+			self.TargetX = tp.x
+			self.TargetY = tp.y + 0.45
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DoAttack(any paComp, Entity target, Vector2 myPos)
+		-- (요청) 공격 시퀀스: attack1 모션(2초, 타격은 1초 시점) → 그 자리에서 사라짐(gone)
+		-- → 1.5초 뒤 "처음 attack1을 쓴 위치"에서 attack1을 역순 재생(return, 1.5초)하며 다시 나타남.
+		-- 위치 고정/역재생은 클라이언트가 @Sync AtkState 전환을 보고 처리한다.
+		---@type PlayerAttack
+		local pa = paComp
+		-- (피드백) 순서: attack1 완주(공격 프레임 10~20, ~1.2초) → 그 순간 프리저는 사라지고(gone)
+		-- 대상에게 활강 히트 이펙트(9863cc13, 16프레임 ~1.6초)+타격+타격음 → 이펙트 종료 후 1초
+		-- → 처음 소환된 유저 뒤(홈)에서 attack1을 6프레임부터 정방향 1회 재생(~1.6초)하며
+		-- "순간이동해 온" 것처럼 나타난다.
+		self._T.nextAtkAt = _UtilLogic.ElapsedSeconds + 5.7 + _UtilLogic:RandomDouble() * 1.0
+		local tp = target.TransformComponent.WorldPosition
+		self.FacingX = (tp.x >= myPos.x) and 1 or -1
+		self.AtkState = "atk"
+		local tt = target
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self.AtkState = "gone"
+			if isvalid(tt) then
+				self:PlayHitFx(tt)
+			end
+		end, 1.2)
+		-- (요청) 데미지는 히트 모션(활강 이펙트)의 4번째 프레임 시점(이펙트 시작 +0.3초)에 들어간다.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) or not isvalid(tt) then return end
+			if isvalid(pa) then pa:DealFreezerHit(tt) end
+		end, 1.5)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self.AtkState == "gone" then self.AtkState = "return" end
+		end, 3.8)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self.AtkState == "return" then self.AtkState = "" end
+		end, 5.4)
+	end
+
+	method table GetAttack1Frames()
+		-- attack1 클립(ae05cfb5...)의 21개 프레임 스프라이트 RUID(인덱스 0~20 순서).
+		-- 재등장(return)은 6프레임(거의 무)부터 20프레임까지 0.1초 간격 정방향 1회 재생으로 표현한다.
+		return {
+			"71b45cb575334b6c8f9600550a6fab07", "e2a70c91988042c2ad15899b52930de1",
+			"f9edfcdbc017459a8b2e2e5dc2059855", "5338dab178324afbab75f2ecc1432e62",
+			"b06a76b23efa4c4da71ce5a8f2d2a738", "5dbdffc5c4354e80ab70ce89a99c2e9f",
+			"746e837c321d4ad49ff7b2d45bebbe3b", "49067e2f9b48468f83670946feb36d00",
+			"c3ccd28a1538424ba8de3dbf7296cefc", "aa73d034ee744829a5adb80bba8ff653",
+			"6dfb1820aa224e1eba8c972e87b0f337", "2b7c26a68f7c4c5da65d1e2d41964e70",
+			"01ee429bfdec415db565efac779f5b41", "84277879bbd84fb0abde04d2a990b3ab",
+			"0ea4289706f64e88911df8d93578c5f0", "0e9c5b4660994c1b94c3a95e5c0e1b11",
+			"2069596aa0644c6382ad0bcffcd5f78b", "dcf8643257e74642a414667460a76333",
+			"eb7863f9c6ea452e9a595b37555a89fe", "8ae07b10339a4de4b2e4e3146ae6697f",
+			"710c5700232d496385735f158fd06ac6",
+		}
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHitFx(Entity target)
+		-- 히트 이펙트(mob 팩 attack1/info/hit = 새 활강 클립) + 타격 사운드(_audio/Attack1).
+		-- (피드백) 이 활강 클립은 "본체가 사라진(gone) 동안"에만 재생되므로 2마리로 보이지 않고,
+		-- 프리저가 순간이동으로 돌진해 때리고 돌아오는 원작 연출이 된다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached("9863cc13ee6f4de0b51d2888ac1370de", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
+		_SoundService:PlaySound("f03324b1068e4c1caf4d753262fc096f", 1.0)
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayVanishFx()
+		-- 소환 종료 시 그 자리에서 소멸(die1) 클립 + 소멸 사운드 1회 재생.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local wp = self.Entity.TransformComponent.WorldPosition
+		local serial = _EffectService:PlayEffect("9ff78a10c21047a7a9821d71255e53fc", self.Entity, Vector3(wp.x, wp.y, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 6 })
+		_SoundService:PlaySound("31dad2a61a904c4aa397eecd99d6b10f", 1.0)
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 클라: 위치(부양/출격 비행) + 클립 교체 + 좌우 방향 + 페이드인.
+		local tr = self.Entity.TransformComponent
+		if not isvalid(tr) then return end
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+
+		local parent = self.Entity.Parent
+		local pw = (isvalid(parent) and isvalid(parent.TransformComponent))
+			and parent.TransformComponent.WorldPosition or tr.WorldPosition
+
+		local look = 1
+		if isvalid(parent) then
+			local ctrl = parent.PlayerControllerComponent
+			if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
+		end
+
+		-- 홈(소환) 위치: (피드백) 캐릭터 쪽에 붙고(뒤쪽 0.5) 높이는 0.8(1.9→1.3→0.8 순차 하향).
+		-- 처음 생성/공격 후 재등장/평상시 부양이 모두 이 지점을 기준으로 한다.
+		local homeX = pw.x - look * 0.5
+		local homeY = pw.y + 0.8
+
+		-- 공격 시퀀스 상태 전환 감지: "atk" 진입 시점의 위치(anchor)를 기억해 공격/사라짐 동안 고정하고,
+		-- "return" 진입 시 역재생 타이머를 초기화한다.
+		local st = self.AtkState
+		if st ~= (self._T.lastAtkState or "") then
+			if st == "atk" then
+				local wp0 = self._T.worldPos or Vector3(homeX, homeY, 0)
+				self._T.atkAnchor = Vector3(wp0.x, wp0.y, 0)
+				self._T.atkT = 0
+			elseif st == "return" then
+				self._T.revT = 0
+			end
+			self._T.lastAtkState = st
+		end
+
+		if self._T.worldPos == nil then self._T.worldPos = Vector3(homeX, homeY, 0) end
+		local nx
+		local ny
+		local speed = 0
+		if (st == "atk" or st == "gone") and self._T.atkAnchor ~= nil then
+			-- 공격~사라짐 동안은 공격을 시작한 위치에 고정.
+			nx = self._T.atkAnchor.x
+			ny = self._T.atkAnchor.y
+		elseif st == "return" then
+			-- (피드백) 다시 나타나는 위치는 공격 지점이 아니라 "처음 소환된 위치"(유저 곁 홈).
+			nx = homeX
+			ny = homeY
+		else
+			-- 목적지: 출격 중엔 서버가 준 적 위치, 평상시엔 홈 + 완만한 상하 부양(bob).
+			local destX
+			local destY
+			if self.Mode == "engage" then
+				destX = self.TargetX
+				destY = self.TargetY
+			else
+				self._T.bobT = (self._T.bobT or 0) + delta
+				local bob = math.sin(self._T.bobT * 1.4) * 0.15
+				destX = homeX
+				destY = homeY + bob
+			end
+			local cur = self._T.worldPos
+			-- 등속 비행: (피드백) 1/5 감속 후 1.5배 상향 - 출격 2.25유닛/초, 복귀/따라다니기 1.65유닛/초.
+			local flySpeed = (self.Mode == "engage") and 2.25 or 1.65
+			local dx = destX - cur.x
+			local dy = destY - cur.y
+			local dist = math.sqrt(dx * dx + dy * dy)
+			nx = cur.x
+			ny = cur.y
+			local step = flySpeed * delta
+			if dist > 0.02 then
+				if step >= dist then
+					nx = destX
+					ny = destY
+				else
+					nx = cur.x + dx / dist * step
+					ny = cur.y + dy / dist * step
+				end
+			end
+			local moveDist = math.sqrt((nx - cur.x) ^ 2 + (ny - cur.y) ^ 2)
+			speed = (delta > 0) and (moveDist / delta) or 0
+		end
+		self._T.worldPos = Vector3(nx, ny, 0)
+		-- child라 Position은 부모(플레이어) 기준 로컬 좌표다.
+		tr.Position = Vector3(nx - pw.x, ny - pw.y, 0)
+
+		-- 소유 클라만 실제 월드좌표를 서버로 보고(공격 도착 판정 기준).
+		if isvalid(parent) and _UserService.LocalPlayer == parent then
+			self._T.reportTimer = (self._T.reportTimer or 0) + delta
+			if self._T.reportTimer >= 0.15 then
+				self._T.reportTimer = 0
+				self:ReportFreezerPos(nx, ny)
+			end
+		end
+
+		tr.Scale = Vector3(1.0, 1.0, 1)
+		if sr.SortingLayer ~= "MapLayer0" then sr.SortingLayer = "MapLayer0" end
+		if sr.OrderInLayer ~= 3 then sr.OrderInLayer = 3 end
+
+		-- 바라보는 방향: 공격 중엔 서버가 정한 FacingX, 이동 중엔 이동 방향, 제자리면 플레이어 방향.
+		local face = look
+		if self.AtkState ~= "" then
+			face = self.FacingX
+		elseif speed > 0.3 then
+			local moved = nx - (self._T.prevX or nx)
+			if math.abs(moved) > 0.0008 then
+				self._T.faceMove = (moved > 0) and 1 or -1
+			end
+			face = self._T.faceMove or look
+		end
+		self._T.prevX = nx
+		sr.FlipX = (face > 0)   -- 시트 원본이 왼쪽을 봄 → 오른쪽 볼 때만 Flip
+
+		-- 클립 선택(mob/9830009.img): 소환 직후 1.2초는 등장(regen) > 공격(attack1) >
+		-- 역재생 등장(return, 프레임 역순 수동 교체) > 이동(move) > 제자리(stand).
+		if self._T.spawnClock == nil then self._T.spawnClock = _UtilLogic.ElapsedSeconds end
+		local sinceSpawn = _UtilLogic.ElapsedSeconds - self._T.spawnClock
+		if st == "atk" or st == "gone" then
+			-- 공격 모션 = attack1의 10~20프레임(공격 부분)을 0.1초 간격 정방향 수동 교체.
+			-- (피드백) SpriteRUID 클립 + StartFrameIndex=10 방식은 화면에 아무것도 렌더되지 않았다
+			-- (attack1이 안 보인다는 신고) - 재등장(return)과 동일한 "개별 프레임 스프라이트 교체"
+			-- 방식으로 통일한다. gone 구간은 알파 0이라 마지막 프레임이 유지돼도 보이지 않는다.
+			self._T.atkT = (self._T.atkT or 0) + delta
+			local frames = self:GetAttack1Frames()
+			local idx = 10 + math.floor(self._T.atkT / 0.1)
+			if idx > 20 then idx = 20 end
+			local wantFrame = frames[idx + 1]
+			if sr.SpriteRUID ~= wantFrame then sr.SpriteRUID = wantFrame end
+		elseif st == "return" then
+			-- (피드백) 재등장 = attack1의 6프레임부터 정방향 1회 재생. 6프레임(폭 4px, 거의 무)에서
+			-- 시작해 10프레임(온몸)까지 펼쳐지고 이어서 날갯짓(10~20)까지 - "순간이동해 온" 연출.
+			-- 마지막(20)에 도달하면 서버가 평상시로 되돌릴 때까지 그 프레임을 유지한다.
+			self._T.revT = (self._T.revT or 0) + delta
+			local frames = self:GetAttack1Frames()
+			local idx = 6 + math.floor(self._T.revT / 0.1)
+			if idx > 20 then idx = 20 end
+			local wantFrame = frames[idx + 1]
+			if sr.SpriteRUID ~= wantFrame then sr.SpriteRUID = wantFrame end
+		else
+			-- (피드백) 이동/정지 클립 전환에 히스테리시스: 부양(bob) 속도(최대 ~0.2)가 단일 임계값
+			-- 근처를 오가면 stand↔move 클립이 매 순간 번갈아 재시작되어 모션이 뚝뚝 끊기고
+			-- (경직) 두 모션이 섞여 재생되는 것처럼 보였다. 0.5 이상에서만 이동 클립으로 올라가고
+			-- 0.15 미만에서만 정지 클립으로 내려온다.
+			if self._T.movingAnim then
+				if speed < 0.15 then self._T.movingAnim = false end
+			else
+				if speed > 0.5 then self._T.movingAnim = true end
+			end
+			local want = "1137e890f2e444bebfe4c51be7893f89"              -- stand
+			if sinceSpawn < 1.2 then
+				want = "e08387d34c1c43d6a895207f3608472b"                -- regen(등장)
+			elseif self._T.movingAnim then
+				want = "c5e8473026df4b0491f3ceb2af224af5"                -- move(비행 이동)
+			end
+			if sr.SpriteRUID ~= want then sr.SpriteRUID = want end
+		end
+
+		-- 페이드인: 처음 0.6초 알파 0→1. 사라짐(gone) 구간에는 알파 0으로 완전히 숨긴다.
+		if self._T.fadeStart == nil then self._T.fadeStart = _UtilLogic.ElapsedSeconds end
+		local ft = (_UtilLogic.ElapsedSeconds - self._T.fadeStart) / 0.6
+		local alpha = math.min(1.0, math.max(0.0, ft))
+		if st == "gone" then alpha = 0 end
+		sr.Color = Color(1, 1, 1, alpha)
+	end
+
+end

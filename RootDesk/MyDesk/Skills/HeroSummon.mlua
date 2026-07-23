@@ -1,0 +1,852 @@
+@Component
+script HeroSummon extends Component
+
+	-- 용사 소환(3차) 소환수. herosummon 모델(아바타 NPC: Rigidbody+Movement+AvatarRenderer+
+	-- CostumeManager+NameTag)을 맵의 자식으로 스폰한 뒤 이 컴포넌트를 붙인다(PlayerAttack.SummonHero).
+	-- 전사 3계열(히어로/팔라딘/다크나이트) 중 하나가 랜덤으로 정해지고, 레벨(플레이어의 2/3)에 따라
+	-- 직업명이 플레이어와 같은 구간(10/30/70/120)으로 바뀌며 직업별 스킬을 쓴다.
+	--   검사(공통 1차): 파워스트라이크/슬래쉬블래스트 (공격 쿨타임 3~7초)
+	--   파이터: +분노(30초) / 스피어맨: +파워가드(30초) / 페이지: +부스터(60초, 본인 것과 별개)
+	--   크루세이더: +콤보어택(버프)+코마 / 용기사: +스피어버스터+드래곤로어(15~30초) / 나이트: +공속 2단계(60초)
+	-- 이동은 서버 권한(몬스터와 동일): 발판 순찰/추적/점프/아랫점프, 주인과 10유닛 이상 멀어지면 순간이동.
+	-- 아바타 모션은 상태머신 없이 클라이언트가 @Sync 값(LocoState/MotionCmd)을 보고 body 엔티티에
+	-- ActionStateChangedEvent를 직접 보내 재생한다(컨트롤러가 없어 엔진 자동 재생과 충돌하지 않는다).
+
+	property Entity OwnerEntity = nil            -- 서버 전용(소환한 플레이어)
+	property number Lifetime = 300               -- 서버 전용 수명(초)
+	@Sync property number HeroLevel = 1          -- 용사 레벨(플레이어 레벨의 2/3)
+	@Sync property string HeroLine = "hero"      -- hero(히어로) / paladin(팔라딘) / darkknight(다크나이트)
+	@Sync property string LocoState = "stand"    -- stand / walk / jump (이동 모션)
+	@Sync property string MotionCmd = ""         -- "seq|모션명|재생속도" - 1회성 스킬 모션 명령
+
+	-- ── 셋업(서버) ────────────────────────────────────────────────
+	-- SummonHero는 AddComponent 직후 프로퍼티(OwnerEntity/HeroLevel/HeroLine)만 대입한다
+	-- (다크드래곤/라이딩드래곤과 동일 패턴). AddComponent와 같은 프레임에 메서드를 호출해
+	-- self._T를 만지면 [LEA-2007] '_T' nil이 나거나 @Sync 대입이 유실될 수 있어(실측),
+	-- 실제 초기화는 첫 ServerTick에서 지연 실행한다.
+
+	@ExecSpace("ServerOnly")
+	method void InitServer()
+		-- 첫 서버 틱에서 1회 실행되는 지연 초기화(외형/네임태그/수명/버프 예약).
+		self._T.dmgMult = 1.0
+		self._T.atkCdMult = 1.0
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.nextAttackAt = now + 1.0
+		self._T.nextSpecialAt = now + 8.0 + _UtilLogic:RandomDouble() * 8.0
+		-- (피드백) 소환 직후 발판 아래 몬스터를 향해 곧바로 떨어져 내려가지 않도록,
+		-- 잠깐(1.5초)은 추적/점프 없이 주인 발판 위에 정착해 있다가 움직이기 시작한다.
+		self._T.nextJumpAt = now + 1.5
+		self._T.noChaseUntil = now + 1.5
+		-- 외형: 고정 장비(드롭 아이템 방어구) + 직업별 무기 + 랜덤 헤어/성형 + 기본 바디
+		self:ApplyCostume()
+		-- 네임태그: 랜덤 한글 1~5글자 + "lv레벨" (예: 라라lv50)
+		local ntc = self.Entity.NameTagComponent
+		if isvalid(ntc) then
+			ntc.Name = self:MakeRandomName() .. "lv" .. tostring(math.floor(self.HeroLevel))
+		end
+		-- 수명 만료 시 제거
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then
+				log("[HeroSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)")
+				self.Entity:Destroy()
+			end
+		end, self.Lifetime)
+		self:ScheduleBuff(true)
+		self:PlaySummonFx()
+		log("[HeroSummon] 소환 완료 line=" .. self.HeroLine .. " level=" .. tostring(math.floor(self.HeroLevel))
+			.. " 직업=" .. self:GetJobName() .. " 전투력=" .. tostring(math.floor(self:GetCombatPower())))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyCostume()
+		-- 드롭 아이템으로 나오는 방어구 셋 + 직업 계열별 무기 + 랜덤 헤어/성형.
+		local cm = self.Entity.CostumeManagerComponent
+		if not isvalid(cm) then return end
+		local hairs = {
+			"af5d7c460c314959b7062d9501d1aa90", "0018d872ea76464fa1c981d65753afe8",
+			"00199c1161e843f8b1f3d3b92b039b8b",
+		}
+		local faces = {
+			"fa3ba1e407a7476e938e60d6362b5a66", "002edb95ebe24b40856d19b9fc8ffe39",
+			"003566cae02441718a5c0ed26b356f6f",
+		}
+		cm:SetEquip(MapleAvatarItemCategory.Body, "3cf4cb29ae344577b9eed37e531688a4")
+		cm:SetEquip(MapleAvatarItemCategory.Hair, hairs[_UtilLogic:RandomIntegerRange(1, #hairs)])
+		cm:SetEquip(MapleAvatarItemCategory.Face, faces[_UtilLogic:RandomIntegerRange(1, #faces)])
+		cm:SetEquip(MapleAvatarItemCategory.Cap, "274b50c184c047d8abf1b520c958ce98")        -- 연두색 머리띠
+		cm:SetEquip(MapleAvatarItemCategory.Cape, "aa8d1e49ff93486986fbb0f9b16d9565")       -- 엔틱 벨벳 망토
+		cm:SetEquip(MapleAvatarItemCategory.Coat, "ae8d3590a96e48c3b7cd75d46ebd3f15")       -- 흰색 반팔티
+		cm:SetEquip(MapleAvatarItemCategory.Pants, "61f10ef0a6204e0ab6593bdf36fed3e5")      -- 파란 청바지
+		cm:SetEquip(MapleAvatarItemCategory.Glove, "2e58683f2f094f099a0813c36e278dd5")      -- 노가다 목장갑
+		cm:SetEquip(MapleAvatarItemCategory.Shoes, "202544d7095c42c5bfb3046619ab58cc")      -- 가죽 샌들
+		-- 무기: 히어로=목검(두손) / 팔라딘=카알대검(실측 한손 카테고리) / 다크나이트=창(두손)
+		if self.HeroLine == "paladin" then
+			cm:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, "444f1da6365d4599a27bbfd207585856")
+		elseif self.HeroLine == "darkknight" then
+			cm:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, "dcaddf14378045cdbc6f512fa1a29d39")
+		else
+			cm:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, "43ad7bfeb9184252b24e6d60f76c17e5")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method string MakeRandomName()
+		-- 랜덤 한글 1~5글자 이름.
+		local syl = {
+			"라", "루", "리", "레", "로", "미", "나", "니", "도", "다", "한", "별", "솔", "윤", "채",
+			"호", "은", "가", "온", "슬", "유", "진", "서", "아", "무", "백", "청", "강", "빛", "결",
+		}
+		local n = _UtilLogic:RandomIntegerRange(1, 5)
+		local out = ""
+		for i = 1, n do
+			out = out .. syl[_UtilLogic:RandomIntegerRange(1, #syl)]
+		end
+		return out
+	end
+
+	-- ── 직업/스탯 계산 ────────────────────────────────────────────
+
+	method number GetStage()
+		-- 플레이어와 동일한 전직 구간: ~9 초보자(=1차 취급), 10~29 1차, 30~69 2차, 70~119 3차, 120+ 4차.
+		local lv = self.HeroLevel
+		if lv >= 120 then return 4 end
+		if lv >= 70 then return 3 end
+		if lv >= 30 then return 2 end
+		return 1
+	end
+
+	method string GetJobName()
+		-- 레벨에 따라 플레이어와 동일한 규칙으로 바뀌는 직업명.
+		if self.HeroLevel <= 9 then return "초보자" end
+		local names = { "검사", "파이터", "크루세이더", "히어로" }
+		if self.HeroLine == "paladin" then names = { "검사", "페이지", "나이트", "팔라딘" }
+		elseif self.HeroLine == "darkknight" then names = { "검사", "스피어맨", "용기사", "다크나이트" } end
+		return names[self:GetStage()]
+	end
+
+	method number GetCombatPower()
+		-- 레벨에 맞는 전투력(프로젝트 공식: 전투력 10당 1레벨의 역산).
+		return self.HeroLevel * 10
+	end
+
+	---@type PlayerAttack
+	method any GetOwnerAttack()
+		-- 주인 플레이어의 PlayerAttack 컴포넌트(판정/데미지 파이프라인 재사용).
+		if not isvalid(self.OwnerEntity) then return nil end
+		return self.OwnerEntity:GetComponent("script.PlayerAttack")
+	end
+
+	-- ── 프레임 틱 ────────────────────────────────────────────────
+
+	method void OnUpdate(number delta)
+		-- 서버=이동/AI, 클라이언트=아바타 모션 반영.
+		if self:IsServer() then
+			self:ServerTick(delta)
+		else
+			self:ClientTick(delta)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ServerTick(number delta)
+		if self._T.dying then return end
+		local owner = self.OwnerEntity
+		if not isvalid(owner) then
+			-- SummonHero의 프로퍼티 대입이 아직 안 왔을 수 있어 2초까지는 기다렸다가 제거한다.
+			self._T.noOwnerTime = (self._T.noOwnerTime or 0) + delta
+			if self._T.noOwnerTime > 2.0 then
+				self._T.dying = true
+				self.Entity:Destroy()
+			end
+			return
+		end
+		-- 첫 틱 지연 초기화(AddComponent 동일 프레임 호출을 피한다 - 상단 주석 참고).
+		if not self._T.inited then
+			self._T.inited = true
+			self:InitServer()
+		end
+		local tr = self.Entity.TransformComponent
+		local mv = self.Entity.MovementComponent
+		local rb = self.Entity.RigidbodyComponent
+		if not isvalid(tr) or not isvalid(mv) or not isvalid(rb) then return end
+		-- 주인이 다른 맵에 있으면 대기만 한다.
+		if owner.CurrentMap ~= self.Entity.CurrentMap then
+			mv:Stop()
+			self._T.moving = false
+			self:UpdateLoco(rb)
+			return
+		end
+		local now = _UtilLogic.ElapsedSeconds
+		local myPos = tr.WorldPosition
+		local ownerPos = owner.TransformComponent.WorldPosition
+		-- 주인과 일정 거리(8유닛) 이상 멀어지면 주인 곁으로 순간이동.
+		local odx = ownerPos.x - myPos.x
+		local ody = ownerPos.y - myPos.y
+		if (odx * odx + ody * ody) > 64.0 then
+			mv:SetWorldPosition(Vector2(ownerPos.x, ownerPos.y + 0.3))
+			self._T.target = nil
+			self:PlayTeleportFx()
+			log("[HeroSummon] 주인과 멀어져 순간이동")
+			return
+		end
+		-- 소환 직후 정착 시간에는 추적하지 않고 제자리에 서 있는다.
+		if (self._T.noChaseUntil or 0) > now then
+			mv:Stop()
+			self._T.moving = false
+			self:UpdateLoco(rb)
+			return
+		end
+		-- 대상 갱신: (피드백) 매번 랜덤 재선정하면 방향이 계속 뒤집히므로, 현재 대상이
+		-- 살아있고 사거리(6.5) 안이면 그대로 유지하고, 죽거나 벗어났을 때만 새로 고른다.
+		if (self._T.nextScanAt or 0) <= now then
+			self._T.nextScanAt = now + 0.3
+			local keep = false
+			local cur = self._T.target
+			if isvalid(cur) then
+				---@type Monster
+				local mc = cur:GetComponent("script.Monster")
+				if isvalid(mc) and not mc.IsDead then
+					local tp = cur.TransformComponent.WorldPosition
+					local ddx = tp.x - myPos.x
+					local ddy = tp.y - myPos.y
+					if (ddx * ddx + ddy * ddy) <= 42.25 and ddy <= 2.2 and ddy >= -3.0 then
+						keep = true
+					end
+				end
+			end
+			if not keep then
+				self._T.target = self:PickTarget(myPos)
+			end
+		end
+		local target = self._T.target
+		if isvalid(target) then
+			self:ChaseTick(myPos, target, now, mv, rb)
+		else
+			self:RoamTick(myPos, now, mv, rb)
+		end
+		-- (피드백) 좌우 방향 반영: 아바타 NPC에는 플레이어의 LookAt 경로가 없어 MoveToDirection으로는
+		-- 화면이 안 뒤집힌다(항상 왼쪽만 봄). 몬스터 관례대로 Scale.x 부호 반전으로 미러링한다
+		-- (기본 아트가 왼쪽을 보므로 오른쪽 볼 때 -1).
+		-- (피드백) 스킬 시전(잠금) 중에는 방향을 동결한다 - 시전 도중 방향이 홱홱 바뀌지 않게.
+		if (self._T.attackLockUntil or 0) <= now then
+			local face = self._T.faceDir or -1
+			local wantScaleX = 1
+			if face > 0 then wantScaleX = -1 end
+			if self._T.lastScaleX ~= wantScaleX then
+				self._T.lastScaleX = wantScaleX
+				tr.Scale = Vector3(wantScaleX, 1, 1)
+			end
+		end
+		self:UpdateLoco(rb)
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity PickTarget(Vector3 myPos)
+		-- 주변 몬스터 중 "y축으로 점프해도 공격할 수 없는"(2.2유닛 이상 위) 적은 건너뛴다.
+		-- (피드백) 아래쪽도 한 번의 아랫점프로 닿을 만한 범위(-3.0)까지만 - 소환하자마자
+		-- 한참 아래 몬스터 무리를 향해 발판에서 떨어져 내려가는 것을 막는다.
+		-- (피드백) 항상 최근접 하나만 고르면 밀집 지역에서 제자리에 붙박이가 되므로,
+		-- 닿을 수 있는 가까운 대상 최대 3마리 중 랜덤으로 골라 이리저리 움직이며 싸우게 한다.
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) then return nil end
+		local cands = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 6.0, 8)
+		local reach = {}
+		for _, t in ipairs(cands) do
+			if isvalid(t) then
+				local dy = t.TransformComponent.WorldPosition.y - myPos.y
+				if dy <= 2.2 and dy >= -3.0 then
+					table.insert(reach, t)
+				end
+			end
+		end
+		if #reach == 0 then return nil end
+		return reach[_UtilLogic:RandomIntegerRange(1, math.min(3, #reach))]
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ChaseTick(Vector3 myPos, Entity target, number now, MovementComponent mv, RigidbodyComponent rb)
+		-- 몬스터 추적: 접근 → 점프/아랫점프 → 사거리 안이면 스킬 사용(점프 공격 포함).
+		local tp = target.TransformComponent.WorldPosition
+		local dx = tp.x - myPos.x
+		local dy = tp.y - myPos.y
+		local adx = math.abs(dx)
+		local dir = 1
+		if dx < 0 then dir = -1 end
+		-- 스킬 모션 중에는 제자리에 멈추고, 방향(faceDir)도 시전 시작 시점 값으로 동결한다.
+		if (self._T.attackLockUntil or 0) > now then
+			mv:Stop()
+			self._T.moving = false
+			return
+		end
+		self._T.faceDir = dir
+		-- (피드백) 공격 사이 재배치 이동 - 밀집 지역에서도 붙박이가 되지 않고 활발히 움직인다.
+		-- (주의) PredictFootholdEnd는 여러 조각으로 이어진 긴 지형에서 조각 경계마다 true를
+		-- 반환해(실측) 엣지 감지로 쓸 수 없다 - 그냥 이동하고, 벽에 막히면 실제 이동량으로 감지한다.
+		if (self._T.repositionUntil or 0) > now then
+			local rdir = self._T.repositionDir or dir
+			mv:MoveToDirection(Vector2(rdir, 0), 0)
+			self._T.moving = true
+			self._T.faceDir = rdir
+			return
+		end
+		if adx > 0.9 then
+			mv:MoveToDirection(Vector2(dir, 0), 0)
+			self._T.moving = true
+		else
+			mv:Stop()
+			self._T.moving = false
+		end
+		-- 점프(위쪽 발판의 적) / 아랫점프(아래쪽 발판의 적).
+		if rb:IsOnGround() and (self._T.nextJumpAt or 0) <= now then
+			if dy > 0.6 and adx < 1.8 then
+				self._T.nextJumpAt = now + 1.0
+				mv:Jump()
+			elseif dy < -0.8 and adx < 2.2 then
+				self._T.nextJumpAt = now + 1.0
+				mv:DownJump()
+			end
+		end
+		-- (피드백) 추적 이동 중 가끔 깡총 점프 - 더 활발해 보이게.
+		if self._T.moving and rb:IsOnGround() and (self._T.nextHopAt or 0) <= now then
+			self._T.nextHopAt = now + 2.5 + _UtilLogic:RandomDouble() * 2.5
+			if _UtilLogic:RandomDouble() < 0.5 then
+				mv:Jump()
+			end
+		end
+		-- 공격 스킬(쿨타임 3~7초, 공중에서도 사거리 안이면 시전 = 점프 공격).
+		if adx < 1.6 and math.abs(dy) < 1.5 and (self._T.nextAttackAt or 0) <= now then
+			self:UseAttackSkill(target, dir, now)
+		end
+		-- 특수기(크루세이더 코마 / 용기사 드래곤로어, 15~30초).
+		if adx < 3.5 and (self._T.nextSpecialAt or 0) <= now then
+			self:UseSpecialSkill(dir, now)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RoamTick(Vector3 myPos, number now, MovementComponent mv, RigidbodyComponent rb)
+		-- 대상이 없으면 발판 위를 돌아다닌다(끝에서 반전, 가끔 멈춰 쉬거나 방향 전환).
+		if (self._T.attackLockUntil or 0) > now then
+			mv:Stop()
+			self._T.moving = false
+			return
+		end
+		-- (피드백) 더 활발하게: 멈춰 쉬는 확률을 낮추고(35%→10%) 방향 전환 주기도 짧게.
+		if self._T.roamDir == nil then self._T.roamDir = 1 end
+		if (self._T.roamToggleAt or 0) <= now then
+			self._T.roamToggleAt = now + 1.5 + _UtilLogic:RandomDouble() * 1.5
+			self._T.roamPaused = _UtilLogic:RandomDouble() < 0.1
+			if _UtilLogic:RandomDouble() < 0.5 then self._T.roamDir = -self._T.roamDir end
+		end
+		if self._T.roamPaused then
+			mv:Stop()
+			self._T.moving = false
+			return
+		end
+		-- 벽/막힘 감지: PredictFootholdEnd는 조각 발판 경계마다 true라 못 쓴다(실측).
+		-- 0.5초마다 실제 x 이동량을 재서, 걷는데도 거의 못 움직였으면 방향을 뒤집는다.
+		if (self._T.stuckCheckAt or 0) <= now then
+			if self._T.stuckLastX ~= nil and self._T.wasRoamMoving and math.abs(myPos.x - self._T.stuckLastX) < 0.05 then
+				self._T.roamDir = -self._T.roamDir
+			end
+			self._T.stuckCheckAt = now + 0.5
+			self._T.stuckLastX = myPos.x
+		end
+		self._T.wasRoamMoving = true
+		mv:MoveToDirection(Vector2(self._T.roamDir, 0), 0)
+		self._T.moving = true
+		self._T.faceDir = self._T.roamDir
+		-- 배회 중에도 가끔 깡총 점프.
+		if rb:IsOnGround() and (self._T.nextHopAt or 0) <= now then
+			self._T.nextHopAt = now + 3.0 + _UtilLogic:RandomDouble() * 3.0
+			if _UtilLogic:RandomDouble() < 0.4 then
+				mv:Jump()
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateLoco(RigidbodyComponent rb)
+		-- 이동 모션 상태를 @Sync로 클라이언트에 알린다(변할 때만 대입).
+		local want = "stand"
+		if not rb:IsOnGround() then want = "jump"
+		elseif self._T.moving then want = "walk" end
+		if self.LocoState ~= want then
+			self.LocoState = want
+		end
+	end
+
+	-- ── 공격 스킬(서버) ──────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method void UseAttackSkill(Entity target, number dir, number now)
+		-- (피드백) 공격 주기는 스킬 시전 딜레이(약 0.85초, 부스터/나이트 버프로 단축)만 지나면
+		-- 바로 다음 스킬을 알아서 쓴다. 스킬은 직업별 풀을 순환한다.
+		local cdMult = self._T.atkCdMult or 1.0
+		self._T.nextAttackAt = now + 0.85 * cdMult
+		-- (피드백) 스킬 딜레이(시전 모션) 중에는 절대 움직이지 않는다 - 잠금을 모션 전체(0.85초)로.
+		self._T.attackLockUntil = now + 0.85
+		-- 시전 시작 방향을 즉시 반영(잠금 동안 이 방향으로 동결).
+		self:ApplyFacing(dir)
+		-- (피드백) 시전이 완전히 끝난 뒤에만 잠깐 좌우로 재배치 이동(50%) - 제자리 붙박이 방지.
+		-- 재배치가 예약되면 그 시간만큼 다음 공격 시점도 함께 늦춘다(시전 0.85초 → 이동 0.35~0.7초 → 다음 공격).
+		if _UtilLogic:RandomDouble() < 0.5 then
+			local rdir = 1
+			if _UtilLogic:RandomDouble() < 0.5 then rdir = -1 end
+			local dur = 0.35 + _UtilLogic:RandomDouble() * 0.35
+			self._T.repositionDir = rdir
+			self._T.repositionUntil = now + 0.85 + dur
+			self._T.nextAttackAt = now + 0.85 + dur + 0.05
+		end
+		local pool = { "powerstrike", "slashblast" }
+		if self.HeroLine == "darkknight" and self:GetStage() >= 3 then
+			pool = { "powerstrike", "slashblast", "spearburst" }
+		end
+		self._T.atkIdx = ((self._T.atkIdx or 0) % #pool) + 1
+		local skillName = pool[self._T.atkIdx]
+		if skillName == "powerstrike" then
+			self:CastPowerStrike(target, dir)
+		elseif skillName == "slashblast" then
+			self:CastSlashBlast(dir)
+		else
+			self:CastSpearBurst(dir)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFacing(number dir)
+		-- 시전 시작 시점의 방향을 즉시 화면에 반영하고(faceDir+Scale), 이후 시전 잠금 동안 동결된다.
+		self._T.faceDir = dir
+		local wantScaleX = 1
+		if dir > 0 then wantScaleX = -1 end
+		if self._T.lastScaleX ~= wantScaleX then
+			self._T.lastScaleX = wantScaleX
+			local tr = self.Entity.TransformComponent
+			if isvalid(tr) then tr.Scale = Vector3(wantScaleX, 1, 1) end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method string NextSwingMotion()
+		-- 무기 계열별 공격 모션 순환: 목검(두손)=swingT, 카알대검(한손)=swingO, 창=swingP/stabT.
+		local swings = { "swingT1", "swingT2", "swingT3" }
+		if self.HeroLine == "paladin" then swings = { "swingO1", "swingO2", "swingO3" }
+		elseif self.HeroLine == "darkknight" then swings = { "swingP1", "swingP2", "stabT1", "stabT2" } end
+		self._T.swingIdx = ((self._T.swingIdx or 0) % #swings) + 1
+		return swings[self._T.swingIdx]
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayMotion(string motionName, number rate)
+		-- 1회성 스킬 모션을 클라이언트에 명령(단일 @Sync 문자열이라 필드 간 도착 순서 문제가 없다).
+		self._T.motionSeq = (self._T.motionSeq or 0) + 1
+		self.MotionCmd = tostring(self._T.motionSeq) .. "|" .. motionName .. "|" .. tostring(rate)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealHit(Entity target, number multMin, number multMax)
+		-- 주인 PlayerAttack의 skill.herosummon 파이프라인으로 1타(데미지 스킨/크리티컬 자동).
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) or not isvalid(target) then return end
+		local dm = self._T.dmgMult or 1.0
+		pa:DealHeroSummonHit(target, self:GetCombatPower(), multMin * dm, multMax * dm)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastPowerStrike(Entity target, number dir)
+		-- 파워스트라이크: 단일 대상, 전투력 100%~200%.
+		self:PlayMotion(self:NextSwingMotion(), 1.0)
+		self:PlayFxAttachedAt("522793cef4ff4b79bdf73b9eda9386f8", self.Entity, dir, 0)
+		local tt = target
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) or not isvalid(tt) then return end
+			self:DealHit(tt, 1.0, 2.0)
+			self:PlayFxAttachedAt("dad03b3a528348bf98295b01edd621a4", tt, dir, 0)
+		end, 0.35)
+		log("[HeroSummon] 파워스트라이크 (" .. self:GetJobName() .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastSlashBlast(number dir)
+		-- 슬래쉬블래스트: 주변 최대 6명 순차 타격, 전투력 50%~150%.
+		self:PlayMotion(self:NextSwingMotion(), 1.0)
+		self:PlayFxAttachedAt("44c1d14578e24c639e480f54b156a8a2", self.Entity, dir, 0)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa = self:GetOwnerAttack()
+			if not isvalid(pa) then return end
+			local myPos = self.Entity.TransformComponent.WorldPosition
+			local targets = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 2.4, 6)
+			for i, t in ipairs(targets) do
+				local tt = t
+				_TimerService:SetTimerOnce(function()
+					if not isvalid(self.Entity) or not isvalid(tt) then return end
+					self:DealHit(tt, 0.5, 1.5)
+					self:PlaySlashHitFx(tt, dir)
+				end, (i - 1) * 0.1)
+			end
+		end, 0.35)
+		log("[HeroSummon] 슬래쉬블래스트 (" .. self:GetJobName() .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastSpearBurst(number dir)
+		-- 스피어버스터(용기사): 주변 최대 6명, 전투력 150%~250%.
+		self:PlayMotion("stabT1", 1.0)
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if isvalid(pa) then
+			pa:PlaySpearBurstCircleEffect(self.Entity, dir, false)
+		end
+		self:PlaySoundFx("fcac442d953049d980da4b8d7bd766d8")
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa2 = self:GetOwnerAttack()
+			if not isvalid(pa2) then return end
+			local myPos = self.Entity.TransformComponent.WorldPosition
+			local targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 2.6, 6)
+			for _, t in ipairs(targets) do
+				if isvalid(t) then
+					self:DealHit(t, 1.5, 2.5)
+					pa2:PlaySpearBurstHitEffect(t, dir, 1, false)
+				end
+			end
+		end, 0.4)
+		log("[HeroSummon] 스피어버스터 (" .. self:GetJobName() .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UseSpecialSkill(number dir, number now)
+		-- 특수기: 크루세이더 이상=코마, 용기사 이상=드래곤로어. 쿨타임 15~30초.
+		local stage = self:GetStage()
+		local kind = nil
+		if self.HeroLine == "hero" and stage >= 3 then kind = "coma"
+		elseif self.HeroLine == "darkknight" and stage >= 3 then kind = "dragonroar" end
+		if kind == nil then
+			self._T.nextSpecialAt = now + 60.0
+			return
+		end
+		self._T.nextSpecialAt = now + 15.0 + _UtilLogic:RandomDouble() * 15.0
+		self._T.attackLockUntil = now + 1.0
+		self:ApplyFacing(dir)
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) then return end
+		self:PlayMotion(self:NextSwingMotion(), 1.0)
+		if kind == "coma" then
+			pa:PlayComaUseSound(self.Entity)
+			pa:PlayComaCastEffect(self.Entity, dir, 5)
+		else
+			pa:PlayDragonRoarCastEffect(self.Entity)
+		end
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa2 = self:GetOwnerAttack()
+			if not isvalid(pa2) then return end
+			local myPos = self.Entity.TransformComponent.WorldPosition
+			local targets
+			if kind == "coma" then
+				targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 4.0, 8)
+			else
+				targets = pa2:FindDragonRoarTargets(Vector2(myPos.x, myPos.y), 10)
+			end
+			for _, t in ipairs(targets) do
+				if isvalid(t) then
+					self:DealHit(t, 2.0, 3.0)
+					if kind == "coma" then
+						pa2:PlayComaHitEffect(t, 5)
+					else
+						pa2:PlayDragonRoarHitEffect(t)
+					end
+				end
+			end
+			log("[HeroSummon] " .. kind .. " 발동 targets=" .. tostring(#targets))
+		end, 0.5)
+		log("[HeroSummon] 특수기 " .. kind .. " (" .. self:GetJobName() .. ")")
+	end
+
+	-- ── 버프(서버) ───────────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method string GetBuffKind()
+		-- 현재 직업의 버프 종류. 없으면 "".
+		local stage = self:GetStage()
+		if self.HeroLine == "hero" then
+			if stage >= 3 then return "comboattack" end     -- 크루세이더/히어로
+			if stage == 2 then return "rage" end            -- 파이터(분노 30초)
+		elseif self.HeroLine == "paladin" then
+			if stage >= 3 then return "knight" end          -- 나이트/팔라딘(공속 2단계 1분)
+			if stage == 2 then return "booster" end         -- 페이지(부스터 1분, 본인 것과 별개)
+		elseif self.HeroLine == "darkknight" then
+			if stage == 2 then return "powerguard" end      -- 스피어맨(파워가드 30초)
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleBuff(boolean isFirst)
+		-- 버프 직업이면 지속시간이 끝날 즈음마다 재시전한다.
+		local kind = self:GetBuffKind()
+		if kind == "" then return end
+		local delay = 35.0 + _UtilLogic:RandomDouble() * 10.0
+		if kind == "booster" or kind == "knight" then
+			delay = 65.0 + _UtilLogic:RandomDouble() * 10.0
+		end
+		if isFirst then delay = 2.0 + _UtilLogic:RandomDouble() * 3.0 end
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:CastBuff(kind)
+			self:ScheduleBuff(false)
+		end, delay)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastBuff(string kind)
+		-- 버프 시전: 이펙트는 용사 자신에게(PlayerAttack의 공용 프레임 이펙트 재사용), 효과는 _T에 토큰으로.
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) then return end
+		local dir = self._T.faceDir or 1
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.attackLockUntil = now + 1.0
+		self._T.buffToken = (self._T.buffToken or 0) + 1
+		local tok = self._T.buffToken
+		if kind == "rage" then
+			-- 분노(30초): 데미지 1.3배 + 분노 프레임 이펙트/사운드.
+			self._T.dmgMult = 1.3
+			pa:SpawnBuffFrameEffectEx(pa:BuildRageFrames(), dir, 0.1, 0.25, self.Entity, 1.0, 1.0, 1.0)
+			pa:PlayBuffSound("267c7840593c419098060eb07e2b4dbb")
+			_TimerService:SetTimerOnce(function()
+				if self._T.buffToken == tok then self._T.dmgMult = 1.0 end
+			end, 30.0)
+			log("[HeroSummon] 버프: 분노(30초, 데미지 1.3배)")
+		elseif kind == "comboattack" then
+			-- 콤보어택(30초): 데미지 1.2배 + 시전 마법진/사운드.
+			self._T.dmgMult = 1.2
+			self:PlayComboFx()
+			_TimerService:SetTimerOnce(function()
+				if self._T.buffToken == tok then self._T.dmgMult = 1.0 end
+			end, 30.0)
+			log("[HeroSummon] 버프: 콤보 어택(30초, 데미지 1.2배)")
+		elseif kind == "powerguard" then
+			-- 파워가드(30초): 시각 효과(좌우 합쳐짐 + 본체 실드) 재현. 몬스터가 용사를 공격하지
+			-- 않으므로 반사 효과는 표현만 한다.
+			self:CastPowerGuardFx(pa, dir)
+			pa:PlayBuffSound("a83d56a314fd449cad236fd7d9b2fa63")
+			log("[HeroSummon] 버프: 파워가드(30초)")
+		elseif kind == "booster" then
+			-- 부스터(1분, 본인의 부스터와 별개): 공격 쿨타임 0.9배.
+			self._T.atkCdMult = 0.9
+			self:CastBoosterFx(pa, dir)
+			pa:PlayBuffSound("a83d56a314fd449cad236fd7d9b2fa63")
+			_TimerService:SetTimerOnce(function()
+				if self._T.buffToken == tok then self._T.atkCdMult = 1.0 end
+			end, 60.0)
+			log("[HeroSummon] 버프: 부스터(60초, 공격 쿨타임 0.9배)")
+		elseif kind == "knight" then
+			-- 나이트 공속 버프(1분): 공속 +2단계 = 쿨타임 0.81배(0.9^2).
+			self._T.atkCdMult = 0.81
+			self:CastBoosterFx(pa, dir)
+			pa:PlayBuffSound("a83d56a314fd449cad236fd7d9b2fa63")
+			_TimerService:SetTimerOnce(function()
+				if self._T.buffToken == tok then self._T.atkCdMult = 1.0 end
+			end, 60.0)
+			log("[HeroSummon] 버프: 공격속도 +2단계(60초, 쿨타임 0.81배)")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastPowerGuardFx(any paComp, number dir)
+		-- 파워가드 프레임 이펙트(PlayerAttack.AttackPowerGuard와 동일한 구성: 좌/우 절반이 합쳐진 뒤
+		-- 본체 실드 1회). 프레임 RUID 대응표: msw-dev-tools/resources/파워가드/RUID.md
+		---@type PlayerAttack
+		local pa = paComp
+		if not isvalid(pa) then return end
+		local leftRuids = {
+			"3697356e16ba486cb9069c432d976235", "d3c16c82974b4933b03eeba3c2ec644c",
+			"88b7df45f13e43f5acdb374b9d5286a8", "f12bdb312e404be5a58e7fb157ee9b8f",
+		}
+		local rightRuids = {
+			"6fcc6e7183704cff9ec8a356ff477c64", "a49bed1bd7f04571b78a6507bcc5f2b2",
+			"88175dd62ea3411faffee0446b5716f6", "5e9e7bdbc0624cd8b9aac4698f3ade58",
+		}
+		local shieldRuids = {
+			"b68ea6ee3e0445a0898f02da53070dab", "8bac5a8b9fe04382a50afac0bc65a994",
+			"04ab10c58c174b27b11be0beaf30f1b9", "23a03201d15f46dc8b7d34d9af562c04",
+			"14d58140ffe94bb383d8ce4fb7fef2d5", "b3199ee4a4ec48fc84a6aab4a824cd74",
+			"b1585d55ff8f4bb2af9e23d0fc4abe72", "a52d7487325540fea53e92d14b4e023f",
+		}
+		local leftFrames = {}
+		for _, r in ipairs(leftRuids) do
+			table.insert(leftFrames, { ruid = r, x = 0.185, y = 0.385, order = 10, sortingLayer = "" })
+		end
+		local rightFrames = {}
+		for _, r in ipairs(rightRuids) do
+			table.insert(rightFrames, { ruid = r, x = -0.245, y = 0.385, order = 3, sortingLayer = "MapLayer0" })
+		end
+		local shieldFrames = {}
+		for _, r in ipairs(shieldRuids) do
+			table.insert(shieldFrames, { ruid = r, x = 0.0, y = 0.395, order = 10, sortingLayer = "" })
+		end
+		pa:SpawnBuffFrameEffectEx(leftFrames, dir, 0.1, 0, self.Entity, 1.0, 1.0, 1.0)
+		pa:SpawnBuffFrameEffectEx(rightFrames, dir, 0.1, 0, self.Entity, 1.0, 1.0, 1.0)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa2 = self:GetOwnerAttack()
+			if not isvalid(pa2) then return end
+			pa2:SpawnBuffFrameEffectEx(shieldFrames, dir, 0.1, 0.2, self.Entity, 1.0, 1.0, 1.0)
+		end, 0.4)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastBoosterFx(any paComp, number dir)
+		-- 부스터 프레임 이펙트(PlayerAttack.AttackBooster와 동일 프레임을 용사에게 재생).
+		---@type PlayerAttack
+		local pa = paComp
+		if not isvalid(pa) then return end
+		local ruids = {
+			"42514aa334774d0bb0fade61945e5970", "9d4e8b3b2eab441a8aa42ef883531704",
+			"b7b99713c5ba4a55948ee31c7e213820", "c94fc0ca497c4ee2b2496bae4ded3259",
+			"d5f5ceb4d0a04e25b3b978755d7a2f85", "3d84f51e0bc84c99b90e1e299338401f",
+			"ea23c07eb82742709a0cad07d9614954", "c112602d64c84307b0438420d8d8a394",
+			"85ed511773ff4ba1be37b92190c0cd50",
+		}
+		local xs = { -0.03, 0.025, 0.04, 0.11, 0.145, 0.145, 0.03, 0.105, 0.12 }
+		local ys = { 0.06, 0.075, 0.165, 0.17, 0.17, 0.20, 0.225, 0.22, 0.22 }
+		local frames = pa:MakeOriginFrames(ruids, xs, ys, 5)
+		pa:SpawnBuffFrameEffectEx(frames, dir, 0.1, 0.2, self.Entity, 1.0, 1.0, 1.0)
+	end
+
+	-- ── 이펙트/사운드(멀티캐스트) ────────────────────────────────
+
+	@ExecSpace("Multicast")
+	method void PlayFxAttachedAt(string clipRuid, Entity anchor, number dirX, number offsetY)
+		-- 범용 1회 이펙트(대상/용사에 부착). dirX>0이면 좌우 반전(프로젝트 관례).
+		if not self:IsClient() then return end
+		if not isvalid(anchor) then return end
+		local options = { ["FlipX"] = dirX > 0, ["OrderInLayer"] = 6 }
+		local serial = _EffectService:PlayEffectAttached(clipRuid, anchor, Vector3(0, offsetY, 0), 0, Vector3(1, 1, 1), false, options)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySlashHitFx(Entity target, number dirX)
+		-- 슬래쉬블래스트 히트 이펙트(3종 랜덤) + 히트 사운드.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local hits = {
+			"41e13add2ba746d9bbe624a31205a848", "880e540095704e30af6a554d51b8a3b3",
+			"eed46092f65940a7a8e77a1bd8e2aa75",
+		}
+		local ruid = hits[math.floor(_UtilLogic:RandomDouble() * #hits) + 1]
+		local serial = _EffectService:PlayEffectAttached(ruid, target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = dirX > 0 })
+		_SoundService:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.5)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayComboFx()
+		-- 콤보어택 시전 마법진 버스트 + 사용음(다크드래곤과 동일한 RUID)을 용사 위치에서 재생.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		_EffectService:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
+		_SoundService:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySoundFx(string soundRuid)
+		-- 범용 사운드 재생.
+		if not self:IsClient() then return end
+		if soundRuid == nil or soundRuid == "" then return end
+		_SoundService:PlaySound(soundRuid, 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySummonFx()
+		-- 소환 시 1회: 영웅의 메아리(효과+사운드)를 용사 위치에서 재생.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
+		_SoundService:PlaySound("358e9f9bdc8c45e893c5a1f839bea8cf", 1.0)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 2.5)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayTeleportFx()
+		-- 주인 곁으로 순간이동할 때 1회 재생.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(0.7, 0.7, 1), false, { ["OrderInLayer"] = 8 })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 2.0)
+	end
+
+	-- ── 클라이언트 모션 반영 ─────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void ClientTick(number delta)
+		-- 스킬 모션 재생 중이 아니면 LocoState(stand/walk/jump)에 맞는 이동 클립을 body에 보낸다.
+		local ar = self.Entity.AvatarRendererComponent
+		if not isvalid(ar) then return end
+		local body = ar:GetBodyEntity()
+		if not isvalid(body) then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.motionLockUntil or 0) > now then return end
+		local want = self.LocoState
+		if self._T.lastLoco == want then return end
+		local ev = ActionStateChangedEvent()
+		if want == "walk" then
+			ev.CoreActionName = "walk1"
+			ev.PartsActionName = "walk1"
+			ev.PlayType = SpriteAnimClipPlayType.Loop
+		elseif want == "jump" then
+			ev.CoreActionName = "jump"
+			ev.PartsActionName = "jump"
+			ev.PlayType = SpriteAnimClipPlayType.Loop
+		else
+			ev.CoreActionName = "stand1"
+			ev.PartsActionName = "stand1"
+			ev.PlayType = SpriteAnimClipPlayType.ZigzagLoop
+		end
+		body:SendEvent(ev)
+		self._T.lastLoco = want
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- 1회성 스킬 모션 명령(MotionCmd = "seq|모션명|재생속도") 도착 시 body에 Onetime 재생.
+		if name ~= "MotionCmd" then return end
+		local s = tostring(value or "")
+		if s == "" then return end
+		local motion = string.match(s, "^[^|]+|([^|]+)|")
+		local rateStr = string.match(s, "|([^|]+)$")
+		if motion == nil or motion == "" then return end
+		local ar = self.Entity.AvatarRendererComponent
+		if not isvalid(ar) then return end
+		local body = ar:GetBodyEntity()
+		if not isvalid(body) then return end
+		local rate = tonumber(rateStr) or 1.0
+		local ev = ActionStateChangedEvent()
+		ev.CoreActionName = motion
+		ev.PartsActionName = motion
+		ev.PlayRate = rate
+		ev.PlayType = SpriteAnimClipPlayType.Onetime
+		body:SendEvent(ev)
+		self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 0.7 / math.max(rate, 0.001)
+		self._T.lastLoco = nil   -- 모션이 끝나면 이동 클립을 다시 적용하게 강제
+	end
+
+end

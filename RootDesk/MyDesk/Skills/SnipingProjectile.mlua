@@ -1,0 +1,98 @@
+@Component
+script SnipingProjectile extends Component
+
+	-- 스나이핑(4차) 차지 화살. 키를 누르고 있는 동안 게이지(최대 10초)를 채웠다가 떼면
+	-- 한 발이 나가며, 차지 단계(0~4초/4~7초/7~10초)에 따라 화살 아트가 달라진다
+	-- (원본 팩 skill/3241000·3221025·3241001의 ball - 스폰 시 PlayerAttack이 SpriteRUID를 갈아끼운다).
+	-- 화살은 적을 관통하며 최대 MaxTargets(10)명까지 데미지를 준다.
+	-- 원본 ball 클립은 머리가 -x(왼쪽) 기준이라 다른 화살 스킬처럼 +180도 보정한다.
+
+	property number Speed = 12
+
+	property number MaxLifetime = 1.0
+
+	property number CombatPower = 0
+
+	-- 차지 비율(0.0~1.0). 데미지 배율(500~600% → 5000~6000%)을 결정한다.
+	property number ChargeRatio = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다(속사와 동일한 이유).
+	property number CritRate = 50
+
+	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID. 비어 있으면 공용 기본 히트 스킨으로 폴백한다.
+	property string DamageSkinRUID = ""
+
+	-- 관통 최대 타격 인원.
+	property integer MaxTargets = 10
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화(서버 전용 필드). 관통 화살이라 명중해도 사라지지 않고 hitList로 중복만 막는다.
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hitCount = 0
+			self._T.hitList = {}
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 방향으로 발사 시작(+180도 보정 - 원본 화살 머리가 -x 기준).
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(dirY, dirX)) + 180
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHitTarget(string targetName)
+		-- 이미 맞힌 대상인지(관통 중복 타격 방지). SnipingProjectileAttack.IsAttackTarget이 호출한다.
+		return self._T.hitList ~= nil and self._T.hitList[targetName] == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsFull()
+		-- 최대 타격 인원(10명)을 다 채웠는지.
+		return (self._T.hitCount or 0) >= self.MaxTargets
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RegisterHit(string targetName)
+		-- 명중 기록(SnipingProjectileAttack.CalcDamage가 호출). 10명을 채우면 다음 프레임에 사라진다.
+		if self._T.hitList == nil then self._T.hitList = {} end
+		self._T.hitList[targetName] = true
+		self._T.hitCount = (self._T.hitCount or 0) + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		-- 10명을 다 맞혔으면 사라진다(판정과 같은 프레임 파괴를 피해 다음 프레임에 파괴 - 다른 화살과 동일).
+		if self:IsFull() then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self._T.lifetime = self._T.lifetime + delta
+		if self._T.lifetime >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * delta, self._T.dirY * self.Speed * delta)
+
+		-- 매 프레임 화살 위치에서 원형 판정을 낸다(관통이라 살짝 넉넉한 0.35).
+		---@type SnipingProjectileAttack
+		local ac = self.Entity:GetComponent("script.SnipingProjectileAttack")
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			ac:AttackFast(CircleShape(Vector2(pos.x, pos.y), 0.35), "skill.sniping", CollisionGroups.HitBox)
+		end
+	end
+
+end

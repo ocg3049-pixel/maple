@@ -1,0 +1,94 @@
+@Component
+script SnipingProjectileAttack extends AttackComponent
+
+	-- 스나이핑(4차) 차지 화살의 판정/데미지. 차지 비율(0~1)에 따라 한 명당
+	-- 전투력의 500%~600%(무차지) → 5000%~6000%(완충)를 선형 보간해 입힌다.
+	-- 화살은 관통하며 최대 10명까지 타격한다(중복 타격은 hitList로 방지).
+	-- 적중 이펙트는 원본 팩 skill/3241002의 hit/0을 맞은 대상 몸에 1회 재생한다.
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- 이미 맞힌 대상과 10명 초과 타격을 막는다(관통 화살 공용 패턴).
+		if isvalid(defender.PlayerComponent) then return false end
+		---@type SnipingProjectile
+		local proj = self.Entity:GetComponent("script.SnipingProjectile")
+		if proj ~= nil then
+			if proj:IsFull() then return false end
+			if proj:HasHitTarget(defender.Name) then return false end
+		end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 실제 명중이 확정된 시점(이 훅)에만 호출되므로 여기서 명중을 기록한다.
+		---@type SnipingProjectile
+		local proj = self.Entity:GetComponent("script.SnipingProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local t = 0
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			t = math.max(0, math.min(1, proj.ChargeRatio or 0))
+			proj:RegisterHit(defender.Name)
+		end
+		-- (요청) 게이지에 따라 500%~600% → 5000%~6000%로 선형 증가.
+		local lowMult = 5.0 + 45.0 * t
+		local highMult = 6.0 + 54.0 * t
+		local mult = lowMult + _UtilLogic:RandomDouble() * (highMult - lowMult)
+		local dmg = math.floor(combatPower * mult)
+		-- 크리티컬은 대상마다 독립적으로 굴리고 배율을 반환값에 바로 곱한다
+		-- (CalcCritical은 엔진의 이중 배율 적용을 막기 위해 항상 false - 다른 화살 스킬과 동일).
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		self:ShowSnipingDamageSkin(defender, dmg, isCritical, self:GetProjectileDamageSkinId())
+		self:PlaySnipingHitEffect(defender)
+		return dmg
+	end
+
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		-- CalcDamage가 자체적으로 크리티컬 배율을 이미 곱했으므로 항상 false.
+		return false
+	end
+
+	@ExecSpace("Client")
+	method void ShowSnipingDamageSkin(Entity target, integer damage, boolean isCritical, string skinRuid)
+		-- 관통으로 여러 명이 잇따라 맞는다 - 각 대상 머리 위 기본 위치에 그대로 띄운다.
+		if not isvalid(target) then return end
+		_DamageSkinService:Play(
+			target, skinRuid, 0,
+			{ damage }, DamageSkinTweenType.Default, isCritical,
+			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+		log("[Sniping] ShowDamageSkin damage=" .. tostring(damage) .. " crit=" .. tostring(isCritical))
+	end
+
+	@ExecSpace("Client")
+	method void PlaySnipingHitEffect(Entity target)
+		-- 공용 hit 이펙트(skill/3241002 hit/0)를 맞은 대상 몸(히트박스 중심 높이)에서 1회 재생한다.
+		if not isvalid(target) then return end
+		local offsetY = 0.3
+		local hitComp = target.HitComponent
+		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
+		-- (피드백) 전체 이펙트 절반 크기.
+		local serial = _EffectService:PlayEffectAttached(
+			"6ab9e621e7dc437d9febc430efe12cbe", target,
+			Vector3(0, offsetY, 0), 0, Vector3(0.5, 0.5, 0.5), false, {}
+		)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.5)
+	end
+
+	method string GetProjectileDamageSkinId()
+		-- 발사한 플레이어의 현재 데미지 스킨. 비어 있으면 기본 히트 스킨으로 폴백한다.
+		---@type SnipingProjectile
+		local proj = self.Entity:GetComponent("script.SnipingProjectile")
+		if isvalid(proj) and proj.DamageSkinRUID ~= "" then
+			return proj.DamageSkinRUID
+		end
+		return "3271c3e79bf04ecba9a107d55495970d"
+	end
+
+end
