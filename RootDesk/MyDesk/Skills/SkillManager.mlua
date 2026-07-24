@@ -175,7 +175,7 @@ script SkillManager extends Logic
 				-- 동일하게 바뀌고 직업별 스킬(분노/파워가드/부스터/콤보어택+코마/스피어버스터+드래곤로어/
 				-- 공속 버프)을 쓴다. 아이콘/소환 이펙트/사운드는 원본 팩 skill/000.img/skill/0001005
 				-- (영웅의 메아리)의 icon / effect / _audio/Use를 그대로 쓴다.
-				{ ruid = "ec65789e35b34c90bdf883a51c76a720", name = "용사 소환",           level = 1, desc = "전사 용사(히어로·팔라딘·다크나이트 계열 중\n랜덤 1명)를 5분간 소환한다.\n용사 레벨은 내 레벨의 2/3이며, 몬스터를\n추적해 직업에 맞는 스킬로 싸우고\n멀어지면 곁으로 순간이동한다.\n장비는 드롭 방어구+직업 무기, 외형은 랜덤.\n재사용 대기시간 30초." },
+				{ ruid = "ec65789e35b34c90bdf883a51c76a720", name = "용사 소환",           level = 1, desc = "전사 용사(히어로·팔라딘·다크나이트 계열 중\n랜덤 1명)를 5분간 소환한다.\n용사 레벨은 내 레벨의 2/3이며, 몬스터를\n추적해 직업에 맞는 스킬로 싸우고\n멀어지면 곁으로 순간이동한다.\n장비는 드롭 방어구+직업 무기, 외형은 랜덤.\n재사용 대기시간 없음 - 다시 사용하면\n기존 용사를 없애고 새로 소환한다." },
 			},
 			["4"] = {
 				{ ruid = "8fce886b020349699cab77be0dafe5d7", name = "부메랑 스탭",         level = 1, desc = "회전하며 전방의 적을 베어낸다." },
@@ -301,23 +301,26 @@ script SkillManager extends Logic
 				slotTouch:ConnectEvent(UITouchDownEvent, function(e)
 					if e.TouchId == -1 then
 						if _KeySettingManager:IsCarryingFunc() then
-							-- 기능을 집은 상태로 퀵슬롯 클릭 → 그 슬롯에 연결된 키로 기능을 옮긴다
-							_KeySettingManager:DropFuncOnKey(self:GetKeyForBarPos(slotPos))
+							-- 기능을 집은 상태로 퀵슬롯 클릭 → 그 슬롯에 놓는다 (자리에 있던 스킬/기능은 집힌다)
+							_KeySettingManager:DropFuncOnBarKey(self:GetKeyForBarPos(slotPos))
 						elseif _KeySettingManager:IsRemapMode() then
 							-- 퀵슬롯 리매핑 모드: 이 슬롯에 연결할 키 입력을 대기시킨다
 							_KeySettingManager:OnBarSlotPicked(slotPos)
 						elseif self._T.skillClickMode then
-							-- 클릭 배정 모드: 스킬창/키세팅에서 클릭 후 슬롯 클릭
-							-- (기능 키에 연결된 슬롯이면 배정하지 않고 계속 들고 있는다)
-							local barKey = self:GetKeyForBarPos(slotPos)
-							if _KeySettingManager:GetFuncOnKey(barKey) == "" then
-								self:AssignSkillToSlot(barKey, self._T.clickModeRUID, self._T.clickModeName)
-								self:ClearSkillSelection()
-							else
-								log("[SkillManager] 기능 키 [" .. barKey .. "] 슬롯 — 스킬 배정 불가")
-							end
+							-- 클릭 배정 모드: 집은 스킬을 이 슬롯에 놓는다 (자리에 스킬이 있으면 스왑해 집는다)
+							self:OnBarSlotAssign(slotPos)
 						else
-							self:OnBarSlotDragStart(slotPos)
+							-- 슬롯 키에 기능(창 단축키)이 올려져 있으면 기능을 집는다 (스킬과 동일한 이동 UX)
+							-- 단, 같은 클릭의 화면 터치 핸들러가 방금 여기에 놓은 기능이면 다시 집지 않는다
+							local barKey = self:GetKeyForBarPos(slotPos)
+							local fid = _KeySettingManager:GetFuncOnKey(barKey)
+							if fid ~= "" then
+								if not _KeySettingManager:JustDroppedFunc() then
+									_KeySettingManager:PickUpFunc(fid, barKey)
+								end
+							else
+								self:OnBarSlotPickUp(slotPos)
+							end
 						end
 					end
 				end)
@@ -755,12 +758,20 @@ script SkillManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void EnterClickMode(string ruid, string name, string origin)
-		-- 스킬을 집은 상태(클릭 배정 모드)로 전환한다. origin: "window" | "keysetting" | "spare"
+		-- 스킬을 집은 상태(클릭 배정 모드)로 전환한다. origin: "window" | "keysetting" | "spare" | "bar"
 		self._T.skillClickMode = true
 		self._T.clickModeRUID  = ruid
 		self._T.clickModeName  = name
 		self._T.clickModeOrigin = origin
 		self:ShowDragGhost(ruid)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnterClickModeFromBar(string ruid, string name, string fromKey)
+		-- 퀵슬롯에서 집힌/밀려난 스킬을 클릭 배정 모드로 전환한다 (KeySettingManager 연동용).
+		-- fromKey는 Esc 복귀용 원래 키 - ""이면 복귀할 자리가 없어 Esc 시 그냥 내려놓는다.
+		self:EnterClickMode(ruid, name, "bar")
+		self._T.clickModeFromKey = fromKey
 	end
 
 	@ExecSpace("ClientOnly")
@@ -798,6 +809,19 @@ script SkillManager extends Logic
 		-- 퀵슬롯 리매핑 키 캡처 중에는 스킬/창 단축키를 모두 무시한다 (KeySettingManager가 처리)
 		if _KeySettingManager:IsCapturingKey() then return end
 		local k = e.key
+		-- 퀵슬롯에서 클릭으로 집은 스킬은 Esc로 원래 슬롯에 되돌린다 (빈 곳 클릭 제거의 실수 방지용)
+		if k == KeyboardKey.Escape and self._T.skillClickMode and self._T.clickModeOrigin == "bar" then
+			local fromKey = self._T.clickModeFromKey or ""
+			if fromKey ~= "" then
+				local cur = self._T.slotData[fromKey]
+				if (cur == nil or cur.ruid == "") and _KeySettingManager:GetFuncOnKey(fromKey) == "" then
+					self:AssignSkillToSlot(fromKey, self._T.clickModeRUID, self._T.clickModeName)
+				end
+			end
+			self:ClearSkillSelection()
+			log("[SkillManager] 퀵슬롯 집기 취소 - 원래 슬롯으로 복귀")
+			return
+		end
 		-- (질주) 좌/우 방향키 "더블탭"(0.5초 내 두 번) → 그 방향으로 질주 진입. 공격키(Ctrl) → 질주 해제.
 		if k == KeyboardKey.LeftArrow or k == KeyboardKey.RightArrow then
 			local dir = (k == KeyboardKey.LeftArrow) and "left" or "right"
@@ -1983,9 +2007,10 @@ script SkillManager extends Logic
 				end
 			end
 			self._T.teleportOnCooldown = true
+			-- (피드백) "너무 연속해서 빠르게 사용된다" - 재사용 대기시간 1.2배(0.45 → 0.54초).
 			_TimerService:SetTimerOnce(function()
 				self._T.teleportOnCooldown = false
-			end, 0.45)
+			end, 0.54)
 			self:RequestFireTeleport(dirKey)
 			return
 		end
@@ -2146,17 +2171,17 @@ script SkillManager extends Logic
 			return
 		end
 		if slot.name == "용사 소환" then
-			-- 용사 소환(3차): 독립 쿨타임 30초. 소환 중 재시전하면 기존 용사가 새 용사로 교체된다.
+			-- 용사 소환(3차): (피드백) 재사용 대기시간 없음 - 언제든 다시 쓰면 기존 용사를 없애고
+			-- 새 용사로 재소환한다(교체는 서버 PlayerAttack.SummonHero가 처리). 연타 오발동만 짧게(0.5초) 막는다.
 			local now = _UtilLogic.ElapsedSeconds
-			if (self._T.heroSummonCooldownUntil or 0) > now then
-				log("[SkillManager] 용사 소환: 쿨타임 중(" .. tostring(math.ceil(self._T.heroSummonCooldownUntil - now)) .. "초 남음)")
-				return
-			end
-			self._T.heroSummonCooldownUntil = now + 30.0
+			if (self._T.heroSummonRecastGateUntil or 0) > now then return end
+			self._T.heroSummonRecastGateUntil = now + 0.5
 			-- 용사 레벨 산정용 내 레벨(전투력 10당 1레벨 - UIMyInfoManager와 동일 공식).
 			local playerLevel = math.floor(_CharInfoManager:CalcCombatPower() / 10)
 			self:RequestFireHeroSummon(playerLevel)
-			log("[SkillManager] 용사 소환! (지속 5분, 재사용 30초, 내 레벨=" .. tostring(playerLevel) .. ")")
+			-- 우측 상단 버프바에 소환 지속시간(5분)을 표시한다 - 재소환 시 타이머가 새로 갱신된다.
+			_HeroSummonBuffUI:ShowBuff(300)
+			log("[SkillManager] 용사 소환! (지속 5분, 쿨타임 없음 - 재사용 시 교체, 내 레벨=" .. tostring(playerLevel) .. ")")
 			return
 		end
 		-- (브랜디쉬2 콤보) 브랜디쉬 진행 [절반~끝]에 브랜디쉬를 재입력하면, 공용 쿨다운 게이트에 막혀 그냥
@@ -3938,7 +3963,8 @@ script SkillManager extends Logic
 			"/ui/DefaultGroup/InvenWindow",
 			"/ui/DefaultGroup/EquipWindow",
 			"/ui/DefaultGroup/EnhanceWindow",
-			"/ui/DefaultGroup/SkillWindow"
+			"/ui/DefaultGroup/SkillWindow",
+			"/ui/DefaultGroup/KeySettingWindow"
 		}
 		local maxIdx = 0
 		for _, p in ipairs(paths) do
@@ -3957,21 +3983,52 @@ script SkillManager extends Logic
 	-- ── SkillBar 드래그 ────────────────────────────────────────────────
 
 	@ExecSpace("ClientOnly")
-	method void OnBarSlotDragStart(string pos)
+	method void OnBarSlotAssign(string pos)
+		-- 클릭 배정 모드에서 퀵슬롯 슬롯을 클릭했을 때: 집은 스킬을 이 슬롯 키에 놓는다.
+		-- 자리에 이미 다른 스킬/기능이 있으면 밀려난 쪽을 곧바로 집어 계속 옮길 수 있다
+		-- (키세팅 창 키 타일의 스왑과 동일한 UX).
+		if not self._T.skillClickMode then return end
+		local barKey = self:GetKeyForBarPos(pos)
+		local fid = _KeySettingManager:GetFuncOnKey(barKey)
+		if fid ~= "" then
+			-- 기능이 있는 슬롯: 스킬을 놓고 밀려난 기능을 곧바로 집는다
+			local carriedRuid = self._T.clickModeRUID
+			local carriedName = self._T.clickModeName
+			_KeySettingManager:TakeFuncOffKey(fid)
+			self:AssignSkillToSlot(barKey, carriedRuid, carriedName)
+			_KeySettingManager:PickUpFunc(fid, "")
+			log("[SkillManager] 슬롯 [" .. barKey .. "] 스왑 - 스킬 놓고 기능 " .. fid .. " 집음")
+			return
+		end
+		local old = self._T.slotData[barKey]
+		local oldRuid = (old ~= nil) and (old.ruid or "") or ""
+		local oldName = (old ~= nil) and (old.name or "") or ""
+		local newRuid = self._T.clickModeRUID
+		local newName = self._T.clickModeName
+		self:AssignSkillToSlot(barKey, newRuid, newName)
+		if oldRuid ~= "" and oldRuid ~= newRuid then
+			self:EnterClickMode(oldRuid, oldName, "bar")
+			self._T.clickModeFromKey = barKey
+			log("[SkillManager] 슬롯 [" .. barKey .. "] 스왑 - " .. oldName .. " 집음")
+		else
+			self:ClearSkillSelection()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBarSlotPickUp(string pos)
+		-- 퀵슬롯 스킬을 클릭-클릭으로 집는다 (홀드 드래그 불필요 - 다음 클릭에서 놓는다).
+		-- 다른 슬롯/키 타일 클릭 → 그곳에 배정, 빈 곳 클릭 → 퀵슬롯에서 제거, Esc → 원래 슬롯 복귀.
 		-- pos = 퀵슬롯 위치 접미사. 실제 키는 barKeys로 조회한다.
 		local key = self:GetKeyForBarPos(pos)
 		local slot = self._T.slotData[key]
 		if slot == nil or slot.ruid == "" then return end
-		self._T.isDraggingSkill = true
-		self._T.dragSkillRUID   = slot.ruid
-		self._T.dragSkillName   = slot.name
-		self._T.dragSource      = "bar"
-		self._T.dragFromKey     = key
 		self._T.slotData[key] = { ruid = "", name = "" }
 		self:UpdateBarSlotVisual(pos)
 		_KeySettingManager:NotifyHotkeysChanged()
-		self:ShowDragGhost(self._T.dragSkillRUID)
-		log("[SkillManager] SkillBar 드래그 시작: [" .. key .. "] " .. slot.name)
+		self:EnterClickMode(slot.ruid, slot.name, "bar")
+		self._T.clickModeFromKey = key
+		log("[SkillManager] 퀵슬롯 [" .. key .. "] " .. slot.name .. " 집음 (클릭 배정)")
 		-- 슬롯에서 스킬을 떼어내는 것도 단축키 변경이므로 저장 예약
 		_CharacterPersistence:MarkDirty("hotkey")
 		-- 어썰터를 슬롯에서 떼어냈다면 스택 수 표시를 숨기거나 갱신한다.
@@ -4025,6 +4082,7 @@ script SkillManager extends Logic
 		self._T.clickModeRUID  = ""
 		self._T.clickModeName  = ""
 		self._T.clickModeOrigin = ""
+		self._T.clickModeFromKey = ""
 		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
 		if isvalid(ghost) then ghost.Enable = false end
 		log("[SkillManager] 클릭 배정 모드 해제")
@@ -4307,10 +4365,11 @@ script SkillManager extends Logic
 				ghost.UITransformComponent.anchoredPosition = ghostUI
 			end
 			-- 스킬창/키세팅 창이 모두 닫히면 배정 모드도 취소
+			-- (퀵슬롯에서 집은 스킬은 창 없이도 들고 다닐 수 있으므로 예외)
 			local cWin = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
 			local skillWinOpen = isvalid(cWin) and cWin.Enable
 			local keySettingOpen = _KeySettingManager:IsWindowOpen()
-			if not skillWinOpen and not keySettingOpen then
+			if not skillWinOpen and not keySettingOpen and self._T.clickModeOrigin ~= "bar" then
 				self:ClearSkillSelection()
 			else
 				-- 새 클릭이 스킬바 슬롯/스킬창/키세팅 창 어디에도 해당하지 않으면(빈 곳 클릭) 배정 해제
@@ -4327,12 +4386,12 @@ script SkillManager extends Logic
 					end
 					local insideKeySetting = _KeySettingManager:IsPointInWindow(ghostUI.x, ghostUI.y)
 					if slotKey == "" and not insideWin and not insideKeySetting then
-						-- 키세팅/여분 슬롯에서 집은 스킬을 바닥에 놓으면 여분 슬롯으로 보관된다
-						if self._T.clickModeOrigin == "keysetting" or self._T.clickModeOrigin == "spare" then
-							_KeySettingManager:AddToSpare(self._T.clickModeRUID, self._T.clickModeName)
-							log("[SkillManager] 빈 곳 클릭 — 여분 슬롯으로 이동")
-						else
+						-- 스킬은 여분 슬롯에 보관하지 않는다 - 빈 곳에 놓으면 단축키에서 제거된다
+						-- (스킬창에서 언제든 다시 가져올 수 있음. 스킬창 출신은 원본이 그대로라 취소일 뿐)
+						if self._T.clickModeOrigin == "window" then
 							log("[SkillManager] 빈 곳 클릭 — 클릭 배정 취소")
+						else
+							log("[SkillManager] 빈 곳 클릭 — 제거: " .. self._T.clickModeName)
 						end
 						self:ClearSkillSelection()
 					end

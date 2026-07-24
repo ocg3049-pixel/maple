@@ -21,6 +21,10 @@ script KeySettingManager extends Logic
 		self._T.carryFromKey = ""     -- 그 기능이 원래 있던 키
 
 		self._T.barSnapshot = nil     -- 퀵슬롯 설정 창을 열기 전의 퀵슬롯 키 매핑 (취소용)
+		self._T.winDrag = false       -- 타이틀바 드래그 중인지
+		self._T.winDragOffX = 0.0     -- 드래그 시작 시 커서-창 오프셋
+		self._T.winDragOffY = 0.0
+		self._T.pickupGuard = false   -- 같은 클릭의 중복 이벤트로 인한 즉시 놓기 방지
 
 		-- 창/다이얼로그/딤 숨김 (.ui에서는 enable=true로 시작 - 비활성 부모의 자식 컴포넌트 미생성 문제 회피)
 		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
@@ -85,12 +89,6 @@ script KeySettingManager extends Logic
 				changed = true
 			end
 		end
-		-- Space는 배정 가능 키가 아니지만 기본 점프 매핑이 살아있으므로 항상 제거한다.
-		local spaceAction = pc:GetActionName(KeyboardKey.Space)
-		if spaceAction ~= nil and spaceAction ~= "" then
-			pc:RemoveActionKey(KeyboardKey.Space)
-			changed = true
-		end
 		if changed or not self._T.movementKeysLogged then
 			self._T.movementKeysLogged = true
 			log("[KeySetting] 액션 키 적용 (공격=" .. tostring(attackKey) .. ", 점프=" .. tostring(jumpKey) .. ")")
@@ -116,6 +114,7 @@ script KeySettingManager extends Logic
 			{ id = "RCtrl", name = "Ctrl", keyEnum = KeyboardKey.RightControl },
 			{ id = "LAlt",  name = "Alt",  keyEnum = KeyboardKey.LeftAlt },
 			{ id = "RAlt",  name = "Alt",  keyEnum = KeyboardKey.RightAlt },
+			{ id = "Space", name = "Space", keyEnum = KeyboardKey.Space },
 			{ id = "F1",  name = "F1",  keyEnum = KeyboardKey.F1 },
 			{ id = "F2",  name = "F2",  keyEnum = KeyboardKey.F2 },
 			{ id = "F3",  name = "F3",  keyEnum = KeyboardKey.F3 },
@@ -416,8 +415,54 @@ script KeySettingManager extends Logic
 		-- 열기 전 상태 스냅샷 (저장 안 하고 닫으면 여기로 복귀)
 		self._T.snapshot = self:BuildSnapshot()
 		w.Enable = true
+		-- 창 규칙: 새로 연 창은 이미 열려있는 다른 창들보다 앞에 온다
+		self:BringWindowToFront()
 		self:RenderAll()
 		log("[KeySetting] 창 열림")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BringWindowToFront()
+		-- 키세팅 창을 다른 창들(인벤/장비/치장/강화/스킬/캐릭터/팝업)보다 앞으로 올린다.
+		-- 다른 매니저의 BringWindowToFront와 같은 방식: 창 목록 중 최대 형제 인덱스로 이동.
+		local paths = {
+			"/ui/DefaultGroup/InvenWindow",
+			"/ui/DefaultGroup/EquipWindow",
+			"/ui/DefaultGroup/DecoWindow",
+			"/ui/DefaultGroup/EnhanceWindow",
+			"/ui/DefaultGroup/SkillWindow",
+			"/ui/DefaultGroup/CharInfoWindow",
+			"/ui/DefaultGroup/TooltipPanel",
+			"/ui/DefaultGroup/ItemTypeSelectPopup",
+			"/ui/DefaultGroup/BoxQuantityPopup",
+			"/ui/DefaultGroup/KeySettingWindow",
+		}
+		local maxIdx = 0
+		for _, p in ipairs(paths) do
+			local e = _EntityService:GetEntityByPath(p)
+			if isvalid(e) then
+				local idx = _UILogic:GetSiblingIndex(e.UITransformComponent)
+				if idx > maxIdx then maxIdx = idx end
+			end
+		end
+		local target = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if isvalid(target) then
+			_UILogic:SetSiblingIndex(target.UITransformComponent, maxIdx)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartWindowDrag()
+		-- 타이틀바를 잡고 창 드래그 시작. 드래그하는 창은 다른 창들보다 앞으로 올린다.
+		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+		if not isvalid(w) then return end
+		self._T.winDrag = true
+		local cursor = _InputService:GetCursorPosition()
+		local winPos = w.UITransformComponent.anchoredPosition
+		self._T.winDragOffX = (cursor.x - 960) - winPos.x
+		self._T.winDragOffY = (cursor.y - 540) - winPos.y
+		self:BringWindowToFront()
+		log("[KeySetting] 창 드래그 시작")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -677,7 +722,7 @@ script KeySettingManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RestoreHint()
-		self:SetHint("스킬/기능(장비·인벤·강화·스킬·캐릭터·월드맵·키설정·공격·점프)을 클릭한 뒤 키나 퀵슬롯을 클릭해 배정합니다. 빈 곳에 놓으면 여분 슬롯으로 이동합니다.")
+		self:SetHint("스킬/기능(장비·인벤·강화·스킬·캐릭터·월드맵·키설정·공격·점프)을 클릭한 뒤 키나 퀵슬롯을 클릭해 배정합니다. 빈 곳에 놓으면 기능은 여분 슬롯으로 가고 스킬은 제거됩니다.")
 	end
 
 	-- ── 기능 키 클릭-클릭 이동 ────────────────────────────────────────
@@ -694,6 +739,8 @@ script KeySettingManager extends Logic
 		_SkillManager:ClearSkillSelection()
 		self._T.carryFunc = funcId
 		self._T.carryFromKey = fromKey
+		-- 같은 클릭의 중복 이벤트가 원래 자리에 곧바로 되돌리는(=취소) 것을 막는 1프레임 가드
+		self._T.pickupGuard = true
 		self:ShowFuncGhost(funcId)
 		self:SetHint("[" .. self:GetFuncIdLabel(funcId) .. "] 기능을 집었습니다 - 키/퀵슬롯을 클릭해 배정하거나 빈 곳을 클릭해 여분 슬롯에 보관하세요 (Esc 취소)")
 		self:RenderAll()
@@ -729,6 +776,28 @@ script KeySettingManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		-- 같은 클릭의 중복 이벤트(슬롯 터치 + 화면 터치)가 방금 집은 기능을 곧바로 놓아버리지 않도록
+		-- 픽업 가드는 프레임마다 풀어준다 (이벤트 → OnUpdate 순서라 같은 클릭 안에서만 유효)
+		self._T.pickupGuard = false
+
+		-- 창 드래그: 마우스를 떼면 종료, 누르고 있는 동안 커서를 따라 이동 (다른 창들과 동일한 방식)
+		if self._T.winDrag == true then
+			if not _InputService:IsKeyPressed(KeyboardKey.Mouse0) then
+				self._T.winDrag = false
+				log("[KeySetting] 창 드래그 종료")
+			else
+				local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
+				if isvalid(w) then
+					local cursor = _InputService:GetCursorPosition()
+					local newX = (cursor.x - 960) - self._T.winDragOffX
+					local newY = (cursor.y - 540) - self._T.winDragOffY
+					if newX < -900 then newX = -900 elseif newX > 900 then newX = 900 end
+					if newY < -500 then newY = -500 elseif newY > 500 then newY = 500 end
+					w.UITransformComponent.anchoredPosition = Vector2(newX, newY)
+				end
+			end
+		end
+
 		-- 기능을 집고 있는 동안 고스트가 커서를 따라다닌다 (스킬 고스트는 SkillManager가 담당)
 		if not self:IsCarryingFunc() then return end
 		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
@@ -756,6 +825,83 @@ script KeySettingManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void TakeFuncOffKey(string funcId)
+		-- 키에서 기능을 떼어낸다 - 스킬이 그 자리에 들어올 때 밀려나는 쪽 처리용 (SkillManager 연동)
+		if funcId == nil or funcId == "" then return end
+		local fk = self:EnsureFuncKeys()
+		fk[funcId] = ""
+		self:ApplyPlayerActionKeys()
+		_CharacterPersistence:MarkDirty("hotkey")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MarkFuncDropGuard()
+		-- 기능을 놓은 직후 잠깐(같은 클릭의 중복 이벤트 동안) 재집기를 막는다.
+		-- 화면 터치 핸들러가 퀵슬롯에 기능을 놓은 뒤, 같은 클릭의 슬롯 터치 핸들러가
+		-- 방금 놓인 기능을 곧바로 다시 집어버리는 버그 방지.
+		self._T.dropGuardUntil = _UtilLogic.ElapsedSeconds + 0.12
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean JustDroppedFunc()
+		-- 직전(같은 클릭)에 기능을 놓았는지 - SkillManager 슬롯 핸들러의 재집기 방지용
+		local guardUntil = self._T.dropGuardUntil or 0.0
+		return _UtilLogic.ElapsedSeconds < guardUntil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DropFuncOnBarKey(string targetKey)
+		-- 퀵슬롯 슬롯에 기능을 놓는다 - 스킬과 동일한 UX.
+		-- 자리에 다른 기능/스킬이 있으면 놓고, 밀려난 쪽을 곧바로 집어 계속 옮길 수 있다.
+		-- (키보드 타일에 놓는 DropFuncOnKey는 원래 키와 자동 맞교환하는 기존 방식 유지)
+		local fid = self._T.carryFunc
+		local fromKey = self._T.carryFromKey
+		if fid == "" or targetKey == "" then return end
+		-- 같은 클릭으로 방금 집은 기능이면 아직 놓지 않는다 (중복 이벤트의 즉시 재놓기 방지)
+		if self._T.pickupGuard == true then return end
+		self:MarkFuncDropGuard()
+		if targetKey == fromKey then
+			self:CancelFuncCarry()
+			return
+		end
+		local otherFunc = self:GetFuncOnKey(targetKey)
+		local sk = _SkillManager:GetSkillOnKey(targetKey)
+		local fk = self:EnsureFuncKeys()
+		self._T.carryFunc = ""
+		self._T.carryFromKey = ""
+		self:HideFuncGhost()
+		fk[fid] = targetKey
+		if otherFunc ~= "" then
+			-- 밀려난 기능을 곧바로 집는다 (원래 키는 방금 놓은 기능이 차지했으므로 취소 시 여분 슬롯행)
+			fk[otherFunc] = ""
+			self:ApplyPlayerActionKeys()
+			_SkillManager:InitBarIcons()
+			_CharacterPersistence:MarkDirty("hotkey")
+			self:PickUpFunc(otherFunc, "")
+			log("[KeySetting] 기능 놓기+스왑: " .. fid .. " → [" .. targetKey .. "], " .. otherFunc .. " 집음")
+			return
+		elseif sk ~= nil and sk.ruid ~= "" then
+			-- 밀려난 스킬을 곧바로 집는다 (스킬끼리의 스왑과 동일)
+			_SkillManager:RemoveSkillFromKey(targetKey)
+			self:ApplyPlayerActionKeys()
+			_SkillManager:InitBarIcons()
+			_CharacterPersistence:MarkDirty("hotkey")
+			_SkillManager:EnterClickModeFromBar(sk.ruid, sk.name, "")
+			log("[KeySetting] 기능 놓기+스왑: " .. fid .. " → [" .. targetKey .. "], 스킬 " .. tostring(sk.name) .. " 집음")
+			if self:IsWindowOpen() then self:RenderAll() end
+			return
+		end
+		self:ApplyPlayerActionKeys()
+		_SkillManager:InitBarIcons()
+		_CharacterPersistence:MarkDirty("hotkey")
+		if self:IsWindowOpen() then
+			self:RenderAll()
+			self:RestoreHint()
+		end
+		log("[KeySetting] 기능 이동: " .. fid .. " [" .. tostring(fromKey) .. "] → [" .. targetKey .. "]")
+	end
+
+	@ExecSpace("ClientOnly")
 	method void DropFuncOnKey(string targetKey)
 		-- 집은 기능을 targetKey에 놓는다. 그 키에 다른 기능이 있으면 서로 교환하고,
 		-- 스킬이 있으면 그 스킬이 기능이 있던 키로 옮겨간다 (한 키 = 스킬 또는 기능 하나).
@@ -763,7 +909,11 @@ script KeySettingManager extends Logic
 		local fid = self._T.carryFunc
 		local fromKey = self._T.carryFromKey
 		if fid == "" or targetKey == "" then return end
+		-- 이 클릭으로 기능이 놓이므로(취소 포함), 같은 클릭의 중복 이벤트가 다시 집지 못하게 막는다
+		self:MarkFuncDropGuard()
 		if targetKey == fromKey then
+			-- 방금 집은 클릭의 중복 이벤트면 무시하고 계속 들고 있는다 (퀵슬롯에서 집을 때)
+			if self._T.pickupGuard == true then return end
 			self:CancelFuncCarry()
 			return
 		end
@@ -789,8 +939,8 @@ script KeySettingManager extends Logic
 				_SkillManager:AssignSkillToSlot(fromKey, sk.ruid, sk.name)
 				log("[KeySetting] 기능 ↔ 스킬 교환: [" .. targetKey .. "] " .. tostring(sk.name) .. " → [" .. fromKey .. "]")
 			else
-				self:AddToSpare(sk.ruid, sk.name)
-				log("[KeySetting] 스킬 밀림 → 여분 슬롯: " .. tostring(sk.name))
+				-- 스킬은 여분 슬롯에 보관하지 않는다 (스킬창에서 언제든 다시 가져올 수 있음)
+				log("[KeySetting] 스킬 밀림 → 제거: " .. tostring(sk.name))
 			end
 		else
 			log("[KeySetting] 기능 이동: " .. fid .. " [" .. tostring(fromKey) .. "] → [" .. targetKey .. "]")
@@ -803,19 +953,6 @@ script KeySettingManager extends Logic
 	end
 
 	-- ── 여분 슬롯 ─────────────────────────────────────────────────────
-
-	@ExecSpace("ClientOnly")
-	method void AddToSpare(string ruid, string name)
-		-- 키에서 제거된 스킬을 여분 슬롯에 보관한다 (가득 차면 버려진다)
-		if ruid == nil or ruid == "" then return end
-		if #self._T.spare >= 16 then
-			log("[KeySetting] 여분 슬롯이 가득 참 - 스킬 버려짐: " .. tostring(name))
-			return
-		end
-		table.insert(self._T.spare, { ruid = ruid, name = name, funcId = "" })
-		self:RenderSpare()
-		log("[KeySetting] 여분 슬롯에 보관: " .. tostring(name))
-	end
 
 	@ExecSpace("ClientOnly")
 	method void AddFuncToSpare(string funcId)
@@ -840,6 +977,7 @@ script KeySettingManager extends Logic
 		-- 집고 있던 기능을 여분 슬롯으로 보낸다 (빈 곳 클릭 / 여분 슬롯 클릭)
 		local fid = self._T.carryFunc
 		if fid == "" then return end
+		self:MarkFuncDropGuard()
 		self._T.carryFunc = ""
 		self._T.carryFromKey = ""
 		self:HideFuncGhost()
@@ -992,15 +1130,20 @@ script KeySettingManager extends Logic
 		end
 
 		-- 4) 창 열림 중 Esc: 다이얼로그 → 리매핑 → 기능 이동 → 창 순으로 닫기
-		if k == KeyboardKey.Escape and self:IsWindowOpen() then
-			if self._T.dialogOpen then
-				self:CancelQuickSlot()
-			elseif self._T.remapMode then
-				self:CancelRemap()
-			elseif self._T.carryFunc ~= "" then
+		--    창이 닫혀있어도 퀵슬롯에서 기능을 집은 상태면 Esc로 취소할 수 있다
+		if k == KeyboardKey.Escape then
+			if self:IsWindowOpen() then
+				if self._T.dialogOpen then
+					self:CancelQuickSlot()
+				elseif self._T.remapMode then
+					self:CancelRemap()
+				elseif self._T.carryFunc ~= "" then
+					self:CancelFuncCarry()
+				else
+					self:CloseWindow()
+				end
+			elseif self._T.carryFunc ~= nil and self._T.carryFunc ~= "" then
 				self:CancelFuncCarry()
-			else
-				self:CloseWindow()
 			end
 		end
 	end
@@ -1054,7 +1197,15 @@ script KeySettingManager extends Logic
 		end
 
 		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
-		if not isvalid(w) or not w.Enable then return end
+		if not isvalid(w) or not w.Enable then
+			-- 창이 닫혀있어도 퀵슬롯에서 기능을 집을 수 있다. 빈 곳에 놓으면 키에서 빠지고
+			-- 여분 슬롯에 보관된다 (스킬과 달리 기능은 사라지면 되찾을 곳이 없으므로).
+			-- (퀵슬롯 슬롯 위 클릭은 슬롯 터치 핸들러가 배정/집기를 처리하므로 여기서 건드리지 않는다)
+			if self:IsCarryingFunc() and _SkillManager:FindSkillBarSlot(ux, uy) == "" then
+				self:DropCarryToSpare()
+			end
+			return
+		end
 		local wp = w.UITransformComponent.anchoredPosition
 		self:HandleWindowClick(ux - wp.x, uy - wp.y)
 	end
@@ -1078,6 +1229,13 @@ script KeySettingManager extends Logic
 				self:SwitchPreset(n)
 				return
 			end
+		end
+
+		-- 타이틀바(닫기 ×/프리셋 제외 영역)를 잡으면 창 드래그 시작
+		local titleEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/TitleBar")
+		if self:HitRect(lx, ly, titleEnt) then
+			self:StartWindowDrag()
+			return
 		end
 
 		-- 하단 버튼
@@ -1113,14 +1271,14 @@ script KeySettingManager extends Logic
 					return
 				end
 			end
-			-- 퀵슬롯 바 위에 놓으면 그 칸에 연결된 키에 배정한다 (SkillManager의 슬롯 터치 핸들러와
-			-- 중복 처리돼도 먼저 처리한 쪽이 carry를 비우므로 나중 쪽은 그냥 지나간다)
+			-- 퀵슬롯 바 위에 놓으면 그 슬롯에 놓는다 - 자리에 있던 스킬/기능은 집힌다
+			-- (SkillManager의 슬롯 터치 핸들러와 중복 처리는 픽업/드롭 가드가 걸러낸다)
 			local wEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow")
 			if isvalid(wEnt) then
 				local wp = wEnt.UITransformComponent.anchoredPosition
 				local barPos = _SkillManager:FindSkillBarSlot(lx + wp.x, ly + wp.y)
 				if barPos ~= "" then
-					self:DropFuncOnKey(_SkillManager:GetKeyForBarPos(barPos))
+					self:DropFuncOnBarKey(_SkillManager:GetKeyForBarPos(barPos))
 					return
 				end
 			end
@@ -1166,13 +1324,13 @@ script KeySettingManager extends Logic
 			end
 		end
 
-		-- 여분 슬롯: 클릭 배정 모드면 보관, 아니면 집기
+		-- 여분 슬롯: 기능 전용 보관함 - 스킬을 들고 클릭하면 보관하지 않고 제거된다
 		for i = 1, 16 do
 			local ent = _EntityService:GetEntityByPath("/ui/DefaultGroup/KeySettingWindow/Spare_" .. tostring(i))
 			if self:HitRect(lx, ly, ent) then
 				if _SkillManager:IsClickMode() then
 					local payload = _SkillManager:GetClickPayload()
-					self:AddToSpare(payload.ruid, payload.name)
+					log("[KeySetting] 여분 슬롯에는 스킬을 보관하지 않음 — 제거: " .. tostring(payload.name))
 					_SkillManager:ClearSkillSelection()
 				else
 					local s = self._T.spare[i]

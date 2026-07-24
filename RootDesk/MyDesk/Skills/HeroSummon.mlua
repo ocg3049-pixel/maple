@@ -319,7 +319,9 @@ script HeroSummon extends Component
 			self:UseAttackSkill(target, dir, now)
 		end
 		-- 특수기(크루세이더 코마 / 용기사 드래곤로어, 15~30초).
-		if adx < 3.5 and (self._T.nextSpecialAt or 0) <= now then
+		-- (버그 수정) 같은 틱에 위 일반기(UseAttackSkill)가 방금 잠금을 걸었으면 특수기는 다음 기회로
+		-- 미룬다 - 스피어버스터 선딜 중에 드래곤로어가 겹쳐 시전되는 문제 방지.
+		if adx < 3.5 and (self._T.nextSpecialAt or 0) <= now and (self._T.attackLockUntil or 0) <= now then
 			self:UseSpecialSkill(dir, now)
 		end
 	end
@@ -402,13 +404,22 @@ script HeroSummon extends Component
 		local pool = { "powerstrike", "slashblast" }
 		if self.HeroLine == "darkknight" and self:GetStage() >= 3 then
 			pool = { "powerstrike", "slashblast", "spearburst" }
+		elseif self.HeroLine == "paladin" and self:GetStage() >= 3 then
+			-- (피드백) 레벨 70 이상 팔라딘 계열(나이트/팔라딘)은 차지 블로우가 주력기 -
+			-- 디바인 4속성을 주기적으로 바꿔가며 시전한다(CastChargeBlow가 전환을 관리).
+			pool = { "chargeblow" }
 		end
 		self._T.atkIdx = ((self._T.atkIdx or 0) % #pool) + 1
 		local skillName = pool[self._T.atkIdx]
+		-- (피드백) 콤보 어택 버프 중에는 스킬을 쓸 때마다 콤보 구슬이 +1씩 다시 차오른다
+		-- (코마가 전부 소모한 뒤 채워지는 모습).
+		self:AddHeroOrb()
 		if skillName == "powerstrike" then
 			self:CastPowerStrike(target, dir)
 		elseif skillName == "slashblast" then
 			self:CastSlashBlast(dir)
+		elseif skillName == "chargeblow" then
+			self:CastChargeBlow(target, dir)
 		else
 			self:CastSpearBurst(dir)
 		end
@@ -442,6 +453,14 @@ script HeroSummon extends Component
 		-- 1회성 스킬 모션을 클라이언트에 명령(단일 @Sync 문자열이라 필드 간 도착 순서 문제가 없다).
 		self._T.motionSeq = (self._T.motionSeq or 0) + 1
 		self.MotionCmd = tostring(self._T.motionSeq) .. "|" .. motionName .. "|" .. tostring(rate)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayPose(string motionName, number frameIdx)
+		-- 지정한 액션의 한 프레임에 정지하는 포즈 명령(스피어버스터 5단 조합 모션용 -
+		-- PlayerAttack.ApplySpearBurstPose와 같은 원리). MotionCmd 4번째 칸에 프레임 번호를 실어 보낸다.
+		self._T.motionSeq = (self._T.motionSeq or 0) + 1
+		self.MotionCmd = tostring(self._T.motionSeq) .. "|" .. motionName .. "|0.001|" .. tostring(frameIdx)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -494,29 +513,182 @@ script HeroSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CastSpearBurst(number dir)
-		-- 스피어버스터(용기사): 주변 최대 6명, 전투력 150%~250%.
-		self:PlayMotion("stabT1", 1.0)
+		-- 스피어버스터(용기사): 원본(PlayerAttack.AttackSpearBurst)과 동일한 타임라인을 용사 기준으로
+		-- 재생한다(원본 코드의 시점 상수를 그대로 사용 - 원본이 바뀌면 여기도 함께 맞출 것).
+		--   (피드백) 사용 전 1초 제자리 → [원본 시퀀스] 날개(c7051cc2)+5단 조합 포즈 모션 시작 /
+		--   +0.35초 마법진+용머리(split growth) / +0.288초부터 0.15초 간격으로 찌르기 이펙트 3종
+		--   (852883a5→3c2ee6e6→521bf9f6, 각각 공격 사운드 포함)과 3줄 데미지+피격 이펙트
+		--   → 사용 후 1.5초 제자리.
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.attackLockUntil = now + 3.3       -- 선딜 1.0 + 모션 콤보 0.72 + 후딜 1.5(+여유)
+		self._T.nextAttackAt = math.max(self._T.nextAttackAt or 0, now + 3.4)
+		self._T.repositionUntil = 0
+		-- 대상은 원본처럼 시전 시작 시점에 고정한다(3타 도중 죽어도 3줄이 다 나가도록).
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		---@type PlayerAttack
+		local pa0 = self:GetOwnerAttack()
+		if not isvalid(pa0) then return end
+		local lockedTargets = pa0:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 2.6, 6)
+
+		-- t=1.0(선딜 끝): 날개 + 5단 조합 포즈 모션 시작 + 마법진/용머리(+0.35).
+		-- ⚠ 날개/마법진은 용사 자식 엔티티로 붙는데 용사는 좌우를 루트 Scale.x(-1)로 뒤집으므로
+		--   (ApplyFacing), 차지 블로우 궤적과 동일하게 항상 왼쪽 기준(-1)으로 붙여 이중 반전을 피한다.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa = self:GetOwnerAttack()
+			if not isvalid(pa) then return end
+			-- 날개(원본과 같은 좌표/트윈: 등 뒤 -0.1, 0.45+0.45초 페이드).
+			pa:SpawnSpearBurstFadingEffectAt(
+				"c7051cc242c54208a7c22df2b4bcc28e", Vector2(-0.1 * -1, 0.0), false,
+				1.0, 1.0, 1.0, 0.0, 0.45, 0.45, -1, false, "", 0, 0, 0, 0, self.Entity
+			)
+			-- 5단 조합 포즈: stabT1 0/1/2 → stabTF 1 → stabT2 2 (원본 poseInterval 0.144초).
+			local poses = {
+				{ action = "stabT1", frame = 0 },
+				{ action = "stabT1", frame = 1 },
+				{ action = "stabT1", frame = 2 },
+				{ action = "stabTF", frame = 1 },
+				{ action = "stabT2", frame = 2 },
+			}
+			for i, p in ipairs(poses) do
+				local pose = p
+				_TimerService:SetTimerOnce(function()
+					if not isvalid(self.Entity) then return end
+					self:PlayPose(pose.action, pose.frame)
+				end, (i - 1) * 0.144)
+			end
+			-- 마법진+용머리(split growth) - 원본과 같은 +0.35초, 몸통 앞(0.2)/높이 0.35.
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(self.Entity) then return end
+				---@type PlayerAttack
+				local pa2 = self:GetOwnerAttack()
+				if not isvalid(pa2) then return end
+				pa2:SpawnSpearBurstFadingEffectAt(
+					"d757a7ca9e3b417fb2d0d5b725baa12c", Vector2(0.2 * -1, 0.35), false,
+					0.75, 1.76, 0.6, 0.6, 0.0, 0.8 / 1.5 * 1.05, 10, true, "7d52e3968f954e2dabc8f5a050adcd40",
+					-0.20, 0.39, -0.21, 0.37, self.Entity
+				)
+			end, 0.35)
+		end, 1.0)
+
+		-- 찌르기 이펙트 3종 + 3줄 데미지: 원본과 같은 시점(0.288 + 0.15 간격), 선딜 1초만큼 뒤로.
+		for hitIndex = 1, 3 do
+			local hi = hitIndex
+			local at = 1.0 + 0.288 + (hi - 1) * 0.15
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(self.Entity) then return end
+				---@type PlayerAttack
+				local pa = self:GetOwnerAttack()
+				if not isvalid(pa) then return end
+				-- 찌르기 이펙트(공격 사운드 포함 - 원본과 동일하게 1타=마법진 찌르기/2타/3타 순).
+				-- (버그 수정) 용사에 부착되는 이펙트는 용사의 루트 Scale.x(-1) 미러를 함께 타므로,
+				-- 실제 방향(dir)을 넘기면 오른쪽을 볼 때 위치/방향이 이중 반전되어 반대쪽에서 재생됐다.
+				-- 차지 블로우 궤적과 같은 관례로 항상 왼쪽 기준(-1)을 넘긴다(오른쪽은 부모 미러가 뒤집는다).
+				if hi == 1 then
+					pa:PlaySpearBurstCircleEffect(self.Entity, -1, false)
+				elseif hi == 2 then
+					pa:PlaySpearBurstBuildupEffect1(self.Entity, -1, false)
+				else
+					pa:PlaySpearBurstBuildupEffect2(self.Entity, -1, false)
+				end
+				-- 고정해둔 대상 전원에게 hi번째 줄 데미지 + 원본 피격 이펙트.
+				-- (피드백) 자동 표시로는 3타가 같은 자리에 떠 "한 줄로 3번"처럼 보였다 -
+				-- 원본과 동일한 위/중간/아래 3줄 수동 배치(DealHeroSummonStabHit)로 표시한다.
+				local hitCount = 0
+				local dm = self._T.dmgMult or 1.0
+				for _, t in ipairs(lockedTargets) do
+					if isvalid(t) then
+						local m = pa:RollSpearBurstMult()
+						pa:DealHeroSummonStabHit(t, self:GetCombatPower(), m * dm, hi)
+						pa:PlaySpearBurstHitEffect(t, dir, hi, false)
+						hitCount = hitCount + 1
+					end
+				end
+				if hi == 3 then
+					log("[HeroSummon] 스피어버스터 3타 완료 targets=" .. tostring(hitCount))
+				end
+			end, at)
+		end
+		log("[HeroSummon] 스피어버스터 시전(선딜 1초/후딜 1.5초, 원본 타임라인) (" .. self:GetJobName() .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastChargeBlow(Entity target, number dir)
+		-- 차지 블로우(70+ 팔라딘 주력기): 파워스트라이크급 공격에 현재 디바인 속성의 검 궤적과
+		-- 상태이상(얼음=빙결 / 불=화상 / 전기=빙결 대상 2배+장판 / 성=+30%+스턴)을 싣는다.
+		-- (피드백) 원본의 디바인 4종 전환을 자동화 - 15~25초마다 다른 속성으로 스스로 바꾼다.
+		local now = _UtilLogic.ElapsedSeconds
+		-- (피드백) 속성 전환 주기: 2~10초 사이 랜덤.
+		if self._T.divineMode == nil then
+			self._T.divineMode = _UtilLogic:RandomIntegerRange(1, 4)
+			self._T.nextDivineAt = now + 2.0 + _UtilLogic:RandomDouble() * 8.0
+		elseif (self._T.nextDivineAt or 0) <= now then
+			self._T.nextDivineAt = now + 2.0 + _UtilLogic:RandomDouble() * 8.0
+			local nextMode = self._T.divineMode
+			while nextMode == self._T.divineMode do
+				nextMode = _UtilLogic:RandomIntegerRange(1, 4)
+			end
+			self._T.divineMode = nextMode
+			log("[HeroSummon] 디바인 속성 전환 → " .. tostring(nextMode) .. " (1얼음/2불/3전기/4성)")
+		end
+		local mode = self._T.divineMode
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
-		if isvalid(pa) then
-			pa:PlaySpearBurstCircleEffect(self.Entity, dir, false)
-		end
-		self:PlaySoundFx("fcac442d953049d980da4b8d7bd766d8")
+		if not isvalid(pa) then return end
+		local motion = self:NextSwingMotion()
+		self:PlayMotion(motion, 1.0)
+		local myMode = mode
+		local myMotion = motion
+		-- (피드백) 검 궤적이 시전 즉시 나와 모션과 안 맞았다 - 원본(파워스트라이크 판정 시점과 동일한
+		-- 0.45초 뒤)에 맞춰 궤적과 판정을 함께 지연한다.
 		_TimerService:SetTimerOnce(function()
 			if not isvalid(self.Entity) then return end
 			---@type PlayerAttack
 			local pa2 = self:GetOwnerAttack()
 			if not isvalid(pa2) then return end
+			-- 속성 검 궤적: 플레이어 차지 블로우와 같은 프레임 표/행 배정(팔라딘 모션이 같은 한손검 swingO 계열).
+			-- 용사는 좌우를 루트 Scale.x(-1)로 뒤집으므로(ApplyFacing), 자식으로 붙는 궤적 이펙트가
+			-- 부모 미러와 이중으로 뒤집히지 않게 항상 왼쪽 기준(-1)으로 붙인다 - 오른쪽을 볼 땐
+			-- 부모 미러가 위치/방향을 함께 뒤집어 준다.
+			local frames = pa2:GetChargeBlowTrailFrames(myMode, myMotion)
+			if frames ~= nil then
+				local row = pa2:GetChargeBlowTrailRow(myMotion)
+				pa2:SpawnChargeBlowTrailFramesAt(frames, -1, 0.75, 0.35, 1.0,
+					pa2:IsChargeBlowTrailMirrored(myMode, row), pa2:IsChargeBlowTrailFlippedY(myMotion),
+					pa2:GetChargeBlowTrailScaleY(myMotion), self.Entity)
+			end
 			local myPos = self.Entity.TransformComponent.WorldPosition
-			local targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 2.6, 6)
+			local targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 2.0, 3)
 			for _, t in ipairs(targets) do
 				if isvalid(t) then
-					self:DealHit(t, 1.5, 2.5)
-					pa2:PlaySpearBurstHitEffect(t, dir, 1, false)
+					local factor = 1.0
+					if myMode == 4 then
+						factor = 1.3
+					elseif myMode == 3 and pa2:IsTargetFrozen(t) then
+						factor = 2.0
+					end
+					self:DealHit(t, 1.0 * factor, 2.0 * factor)
+					if myMode == 1 then
+						-- (피드백) 속성 중복 타격: 화상 중인 적을 얼음으로 때리면 원본과 동일하게
+						-- "화상 저주" 장판(20초, 3초마다 전투력 100%)을 남긴다. 빙결(50%)과는 별개로 항상 발동.
+						if pa2:IsTargetBurning(t) then pa2:SpawnChargeBlowCurseZone(t) end
+						if _UtilLogic:RandomDouble() < 0.5 then pa2:ApplyChargeBlowFreeze(t, 3.0) end
+					elseif myMode == 2 then
+						if _UtilLogic:RandomDouble() < 0.5 then pa2:ApplyChargeBlowBurn(t) end
+					elseif myMode == 3 then
+						-- 속성 중복 타격: 빙결된 적을 전기로 때리면 2배 + 전용 히트 이펙트 + 10초 장판(원본과 동일).
+						if factor >= 2.0 then
+							pa2:PlayChargeBlowShockHitEffect(t)
+							pa2:SpawnChargeBlowShockZone(t)
+						end
+					else
+						pa2:ApplyChargeBlowStun(t)
+					end
 				end
 			end
-		end, 0.4)
-		log("[HeroSummon] 스피어버스터 (" .. self:GetJobName() .. ")")
+		end, 0.45)
+		log("[HeroSummon] 차지 블로우 mode=" .. tostring(mode) .. " (" .. self:GetJobName() .. ")")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -531,43 +703,74 @@ script HeroSummon extends Component
 			return
 		end
 		self._T.nextSpecialAt = now + 15.0 + _UtilLogic:RandomDouble() * 15.0
-		self._T.attackLockUntil = now + 1.0
 		self:ApplyFacing(dir)
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) then return end
-		self:PlayMotion(self:NextSwingMotion(), 1.0)
-		if kind == "coma" then
-			pa:PlayComaUseSound(self.Entity)
-			pa:PlayComaCastEffect(self.Entity, dir, 5)
-		else
-			pa:PlayDragonRoarCastEffect(self.Entity)
+		if kind == "dragonroar" then
+			self:CastDragonRoar(dir, now)
+			return
 		end
+		-- 코마(크루세이더 이상): 기존 규격 유지. (피드백) 시전과 함께 떠 있던 콤보 구슬을 전부
+		-- 소모한다 - 이후 스킬을 쓸 때마다 다시 하나씩 차오른다(AddHeroOrb).
+		self._T.attackLockUntil = now + 1.0
+		self:ClearHeroOrbs()
+		self:PlayMotion(self:NextSwingMotion(), 1.0)
+		pa:PlayComaUseSound(self.Entity)
+		pa:PlayComaCastEffect(self.Entity, dir, 5)
 		_TimerService:SetTimerOnce(function()
 			if not isvalid(self.Entity) then return end
 			---@type PlayerAttack
 			local pa2 = self:GetOwnerAttack()
 			if not isvalid(pa2) then return end
 			local myPos = self.Entity.TransformComponent.WorldPosition
-			local targets
-			if kind == "coma" then
-				targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 4.0, 8)
-			else
-				targets = pa2:FindDragonRoarTargets(Vector2(myPos.x, myPos.y), 10)
-			end
+			local targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 4.0, 8)
 			for _, t in ipairs(targets) do
 				if isvalid(t) then
 					self:DealHit(t, 2.0, 3.0)
-					if kind == "coma" then
-						pa2:PlayComaHitEffect(t, 5)
-					else
-						pa2:PlayDragonRoarHitEffect(t)
-					end
+					pa2:PlayComaHitEffect(t, 5)
 				end
 			end
-			log("[HeroSummon] " .. kind .. " 발동 targets=" .. tostring(#targets))
+			log("[HeroSummon] coma 발동 targets=" .. tostring(#targets))
 		end, 0.5)
-		log("[HeroSummon] 특수기 " .. kind .. " (" .. self:GetJobName() .. ")")
+		log("[HeroSummon] 특수기 coma (" .. self:GetJobName() .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastDragonRoar(number dir, number now)
+		-- 드래곤로어(용기사 이상): (피드백) 원본 규격으로 재작업.
+		--   사용 전 1초 제자리 → 시전(alert 모션 + 원본 시전 이펙트/사운드/화면흔들림 + 2초 자기 스턴 표시)
+		--   → 1.5초 뒤 폭발(전방위 최대 20명, 전투력 1000%~1300% + 원본 히트 이펙트) → 사용 후 3초 제자리.
+		self._T.attackLockUntil = now + 5.5    -- 선딜 1.0 + 폭발까지 1.5 + 후딜 3.0
+		self._T.nextAttackAt = math.max(self._T.nextAttackAt or 0, now + 5.6)
+		self._T.repositionUntil = 0
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa = self:GetOwnerAttack()
+			if not isvalid(pa) then return end
+			self:PlayMotion("alert", 1.0)
+			pa:PlayDragonRoarCastEffect(self.Entity)
+			pa:PlayDragonRoarStunEffect(self.Entity)
+		end, 1.0)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			---@type PlayerAttack
+			local pa = self:GetOwnerAttack()
+			if not isvalid(pa) then return end
+			local myPos = self.Entity.TransformComponent.WorldPosition
+			local targets = pa:FindDragonRoarTargets(Vector2(myPos.x, myPos.y), 20)
+			for _, t in ipairs(targets) do
+				if isvalid(t) then
+					-- 배율은 원본과 같은 공식(RollDragonRoarMult)을 읽는다 - 원본이 바뀌면 자동 반영.
+					local m = pa:RollDragonRoarMult()
+					self:DealHit(t, m, m)
+					pa:PlayDragonRoarHitEffect(t)
+				end
+			end
+			log("[HeroSummon] 드래곤로어 폭발 targets=" .. tostring(#targets))
+		end, 2.5)
+		log("[HeroSummon] 드래곤로어 시전(선딜 1초/후딜 3초) (" .. self:GetJobName() .. ")")
 	end
 
 	-- ── 버프(서버) ───────────────────────────────────────────────
@@ -626,13 +829,20 @@ script HeroSummon extends Component
 			end, 30.0)
 			log("[HeroSummon] 버프: 분노(30초, 데미지 1.3배)")
 		elseif kind == "comboattack" then
-			-- 콤보어택(30초): 데미지 1.2배 + 시전 마법진/사운드.
+			-- 콤보어택(30초): 데미지 1.2배 + 시전 마법진/사운드 + (피드백) 플레이어와 같은
+			-- 궤도를 도는 콤보 구슬 연출. 버프 중 스킬을 쓸 때마다 +1(최대 5), 코마가 전부 소모한다.
 			self._T.dmgMult = 1.2
+			self._T.comboBuffActive = true
 			self:PlayComboFx()
+			self:AddHeroOrb()
 			_TimerService:SetTimerOnce(function()
-				if self._T.buffToken == tok then self._T.dmgMult = 1.0 end
+				if self._T.buffToken == tok then
+					self._T.dmgMult = 1.0
+					self._T.comboBuffActive = false
+					self:ClearHeroOrbs()
+				end
 			end, 30.0)
-			log("[HeroSummon] 버프: 콤보 어택(30초, 데미지 1.2배)")
+			log("[HeroSummon] 버프: 콤보 어택(30초, 데미지 1.2배 + 콤보 구슬)")
 		elseif kind == "powerguard" then
 			-- 파워가드(30초): 시각 효과(좌우 합쳐짐 + 본체 실드) 재현. 몬스터가 용사를 공격하지
 			-- 않으므로 반사 효과는 표현만 한다.
@@ -658,6 +868,61 @@ script HeroSummon extends Component
 			end, 60.0)
 			log("[HeroSummon] 버프: 공격속도 +2단계(60초, 쿨타임 0.81배)")
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AddHeroOrb()
+		-- 콤보 구슬 +1(최대 5): 플레이어 AddComboOrb와 같은 구성 - 첫 구슬에 중앙 큰 원도 함께.
+		-- ComboOrb 컴포넌트는 부모가 플레이어가 아니어도 동작하는 범용 구조라 용사 자식으로 그대로 쓴다.
+		if self._T.comboBuffActive ~= true then return end
+		local count = self._T.heroOrbCount or 0
+		if count >= 5 then return end
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) then return end
+		local idx = count + 1
+		self._T.heroOrbCount = idx
+		if idx == 1 then
+			local center = _SpawnService:SpawnByModelId("spearburstfadingeffect", "HeroOrbCenter", Vector3(0, 0.35, 0), self.Entity)
+			if isvalid(center) then
+				center:AddComponent("script.ComboOrb")
+				---@type ComboOrb
+				local cc = center:GetComponent("script.ComboOrb")
+				if isvalid(cc) then
+					cc.IsCenterOrb = true
+					cc.OrbSpriteRUID = "9cfc22d7db1842608b648d9d7b5d216e"
+				end
+				self._T.heroOrbCenter = center
+			end
+		end
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", "HeroOrb" .. idx, Vector3(0, 0.35, 0), self.Entity)
+		if isvalid(fx) then
+			fx:AddComponent("script.ComboOrb")
+			---@type ComboOrb
+			local comp = fx:GetComponent("script.ComboOrb")
+			if isvalid(comp) then
+				comp.OrbIndex = idx
+				comp.OrbSpriteRUID = pa:GetComboOrbSpriteRuid(idx)
+			end
+			self._T.heroOrbEntities = self._T.heroOrbEntities or {}
+			table.insert(self._T.heroOrbEntities, fx)
+		end
+		log("[HeroSummon] 콤보 구슬 +1 → " .. tostring(idx) .. "/5")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearHeroOrbs()
+		-- 콤보 구슬 전부 + 중앙 큰 원 제거(코마 소모 / 버프 종료).
+		self._T.heroOrbCount = 0
+		local orbs = self._T.heroOrbEntities or {}
+		for _, e in ipairs(orbs) do
+			if isvalid(e) then e:Destroy() end
+		end
+		self._T.heroOrbEntities = {}
+		if isvalid(self._T.heroOrbCenter) then
+			self._T.heroOrbCenter:Destroy()
+		end
+		self._T.heroOrbCenter = nil
 	end
 
 	@ExecSpace("ServerOnly")
@@ -827,25 +1092,38 @@ script HeroSummon extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnSyncProperty(string name, any value)
-		-- 1회성 스킬 모션 명령(MotionCmd = "seq|모션명|재생속도") 도착 시 body에 Onetime 재생.
+		-- 1회성 스킬 모션 명령 도착 시 body에 재생.
+		--   "seq|모션명|재생속도"          → Onetime 전체 재생
+		--   "seq|모션명|0.001|프레임번호"  → 그 프레임 하나에 정지(포즈 - 스피어버스터 조합 모션용.
+		--   구간 길이 0이면 엔진이 무시하므로 End=Start+1, PlayRate 0.001로 사실상 정지시킨다)
 		if name ~= "MotionCmd" then return end
 		local s = tostring(value or "")
 		if s == "" then return end
-		local motion = string.match(s, "^[^|]+|([^|]+)|")
-		local rateStr = string.match(s, "|([^|]+)$")
+		local parts = {}
+		for p in string.gmatch(s, "[^|]+") do
+			table.insert(parts, p)
+		end
+		local motion = parts[2]
 		if motion == nil or motion == "" then return end
 		local ar = self.Entity.AvatarRendererComponent
 		if not isvalid(ar) then return end
 		local body = ar:GetBodyEntity()
 		if not isvalid(body) then return end
-		local rate = tonumber(rateStr) or 1.0
-		local ev = ActionStateChangedEvent()
-		ev.CoreActionName = motion
-		ev.PartsActionName = motion
-		ev.PlayRate = rate
-		ev.PlayType = SpriteAnimClipPlayType.Onetime
+		local rate = tonumber(parts[3]) or 1.0
+		local frameIdx = tonumber(parts[4])
+		local ev
+		if frameIdx ~= nil then
+			ev = ActionStateChangedEvent(motion, motion, 0.001, SpriteAnimClipPlayType.Onetime, frameIdx, frameIdx + 1)
+			self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 0.6
+		else
+			ev = ActionStateChangedEvent()
+			ev.CoreActionName = motion
+			ev.PartsActionName = motion
+			ev.PlayRate = rate
+			ev.PlayType = SpriteAnimClipPlayType.Onetime
+			self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 0.7 / math.max(rate, 0.001)
+		end
 		body:SendEvent(ev)
-		self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 0.7 / math.max(rate, 0.001)
 		self._T.lastLoco = nil   -- 모션이 끝나면 이동 클립을 다시 적용하게 강제
 	end
 
