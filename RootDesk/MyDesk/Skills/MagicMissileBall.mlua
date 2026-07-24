@@ -1,0 +1,195 @@
+@Component
+script MagicMissileBall extends Component
+
+	-- 매직 미사일 구체 하나의 수명 전체를 담당한다.
+	-- 단계: wait(생성 이펙트 잔여) → aim(타겟 방향으로 서서히 회전) → fly(유도 비행).
+	-- (피드백 반영) 발사 전에는 구체 클립(17ce...)을 반복 재생하지 않고 정지 프레임(모델 기본
+	-- SpriteRUID = 클립 1프레임 스프라이트)만 보여주고, 발사 순간에 루프 클립으로 교체해 날아간다.
+	-- 데미지 판정은 스스로 하지 않고 OwnerEntity의 PlayerAttack:DealMagicMissileHit에 위임한다
+	-- (아이스 샷/스트레이프의 LockHit 위임 패턴과 동일한 이유 - 판정/데미지 공식/스킨을 PlayerAttack에 모아둔다).
+
+	-- 발사 후 비행 속도
+	property number Speed = 10
+
+	-- 발사 후 최대 비행 시간(타겟이 사라져도 무한히 날지 않게)
+	property number MaxLifetime = 3
+
+	-- 명중 판정 거리
+	property number HitRadius = 0.5
+
+	-- 조준 회전 시간. 처음 0.5초에서 (피드백) "회전 속도를 2배로" 요청으로 0.25초로 단축 -
+	-- 같은 각도를 절반 시간에 돌므로 회전 속도가 정확히 2배가 된다.
+	property number AimDuration = 0.25
+
+	-- 생성 이펙트(dcac... 1~7프레임)가 끝날 때까지의 잔여 대기. 구체는 마지막 프레임쯤 나타나므로 짧다.
+	property number PreAimDelay = 0.15
+
+	property Entity TargetEntity = ""
+	property Entity OwnerEntity = ""
+
+	-- (피드백) 시전 시점에 미리 확정한 이 구체의 데미지. 시전 시 타겟들의 HP와 대조해
+	-- "이 구체까지 맞으면 죽는" 몬스터에는 다음 구체가 배정되지 않게 하는 예측 분배의 근거값이라,
+	-- 실제 명중 시에도 이 값이 그대로 적용된다(명중 시 새로 굴리면 예측이 어긋날 수 있음).
+	property number PresetDamage = 0
+
+	method void OnBeginPlay()
+		-- 서버 전용 진행 상태 초기화. 각도는 "머리가 향하는 방향(도)"으로 들고 다니고,
+		-- 원본 아트 화살촉이 -x를 향하므로 실제 ZRotation에는 +180을 더해 적용한다(아이스 샷과 동일 보정).
+		if self:IsServer() then
+			self._T.phase = "wait"
+			self._T.timer = 0
+			self._T.hit = false
+			self._T.angle = 0
+			self._T.fallbackX = 0
+			self._T.fallbackY = 0
+			self._T.hasFallback = false
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Setup(Entity target, Entity ownerEnt, number dirX, number presetDamage)
+		-- 스폰 직후 1회 호출. 초기 머리 방향은 캐릭터가 바라보는 쪽 수평.
+		self.TargetEntity = target
+		self.OwnerEntity = ownerEnt
+		self.PresetDamage = presetDamage
+		if dirX >= 0 then
+			self._T.angle = 0
+		else
+			self._T.angle = 180
+		end
+		if target ~= nil and isvalid(target) then
+			local tp = target.TransformComponent.WorldPosition
+			self._T.fallbackX = tp.x
+			self._T.fallbackY = tp.y
+			self._T.hasFallback = true
+		end
+		self:ApplyAngle()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyAngle()
+		-- 머리 방향(각도) → ZRotation 반영(+180: 원본 화살촉이 -x 방향).
+		self.Entity.TransformComponent.ZRotation = self._T.angle + 180
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetDesiredAngle()
+		-- 현재 타겟(죽었으면 마지막 위치)을 향하는 머리 방향(도)을 계산한다.
+		local myPos = self.Entity.TransformComponent.Position
+		local tx, ty = nil, nil
+		if isvalid(self.TargetEntity) then
+			local tp = self.TargetEntity.TransformComponent.WorldPosition
+			tx, ty = tp.x, tp.y
+			self._T.fallbackX = tx
+			self._T.fallbackY = ty
+			self._T.hasFallback = true
+		elseif self._T.hasFallback then
+			tx, ty = self._T.fallbackX, self._T.fallbackY
+		end
+		if tx == nil then
+			return self._T.angle
+		end
+		return math.deg(math.atan(ty - myPos.y, tx - myPos.x))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Launch()
+		-- 조준이 끝난 순간 호출: 타겟 방향으로 각도를 꺾어(스냅) 확정하고, 발사 이펙트(6df2...)를
+		-- 발사 시작 위치에서 비행 각도로 재생시키고, 구체 그림을 정지 프레임 → 루프 클립으로 교체해 날린다.
+		self._T.angle = self:GetDesiredAngle()
+		self:ApplyAngle()
+		-- (피드백 반영) 프레임 루프는 날아갈 때만 - 발사 순간에 루프 클립으로 교체.
+		self.Entity.SpriteRendererComponent.SpriteRUID = "17ce8549b56d4da0ae49b9912e0d25af"
+		if isvalid(self.OwnerEntity) then
+			---@type PlayerAttack
+			local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+			if isvalid(pa) then
+				local p = self.Entity.TransformComponent.Position
+				pa:PlayMagicMissileLaunchEffect(p.x, p.y, p.z, self._T.angle + 180)
+			end
+		end
+		self._T.phase = "fly"
+		self._T.timer = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		local phase = self._T.phase
+		if phase == nil then return end
+		self._T.timer = self._T.timer + delta
+
+		if phase == "wait" then
+			if self._T.timer >= self.PreAimDelay then
+				self._T.phase = "aim"
+				self._T.timer = 0
+			end
+			return
+		end
+
+		if phase == "aim" then
+			-- 남은 시간에 비례해 목표 각도로 서서히 수렴(움직이는 타겟도 매 프레임 재계산).
+			local desired = self:GetDesiredAngle()
+			local remain = self.AimDuration - self._T.timer
+			if remain <= 0 then
+				-- (피드백 반영) 발사 플래시 대기 단계 없이 조준이 끝나면 곧바로 발사한다.
+				self:Launch()
+				return
+			end
+			local diff = (desired - self._T.angle + 180) % 360 - 180
+			local frac = delta / remain
+			if frac > 1 then frac = 1 end
+			self._T.angle = self._T.angle + diff * frac
+			self:ApplyAngle()
+			return
+		end
+
+		-- fly: 유도 비행 + 명중 판정
+		if self._T.hit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+		if self._T.timer >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		local myPos = self.Entity.TransformComponent.Position
+		local tx, ty = nil, nil
+		if isvalid(self.TargetEntity) then
+			local tp = self.TargetEntity.TransformComponent.WorldPosition
+			tx, ty = tp.x, tp.y
+			self._T.fallbackX = tx
+			self._T.fallbackY = ty
+			self._T.hasFallback = true
+		elseif self._T.hasFallback then
+			tx, ty = self._T.fallbackX, self._T.fallbackY
+		end
+
+		if tx ~= nil then
+			local dx = tx - myPos.x
+			local dy = ty - myPos.y
+			local dist = math.sqrt(dx * dx + dy * dy)
+			if dist <= self.HitRadius then
+				self._T.hit = true
+				if isvalid(self.TargetEntity) and isvalid(self.OwnerEntity) then
+					---@type PlayerAttack
+					local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+					if isvalid(pa) then
+						pa:DealMagicMissileHit(self.TargetEntity, self.PresetDamage)
+					end
+				end
+				return
+			end
+			-- 유도: 매 프레임 방향 재계산(살아있는 타겟이 움직여도 따라간다).
+			self._T.angle = math.deg(math.atan(dy, dx))
+			self:ApplyAngle()
+		end
+
+		local rad = math.rad(self._T.angle)
+		self.Entity.TransformComponent:Translate(
+			math.cos(rad) * self.Speed * delta,
+			math.sin(rad) * self.Speed * delta
+		)
+	end
+
+end

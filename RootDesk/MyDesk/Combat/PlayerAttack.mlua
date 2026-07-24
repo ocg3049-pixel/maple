@@ -217,6 +217,12 @@ script PlayerAttack extends AttackComponent
 		                return false
 		            end
 		        end
+		        -- 매직 미사일 - 구체 하나가 명중할 때마다 이번 호출 전용 단일 대상만 통과시킨다(썬더볼트와 동일한 패턴).
+		        if attackInfo == "skill.magicmissile" then
+		            if not isvalid(self._T.magicMissileCurrentTarget) or defender ~= self._T.magicMissileCurrentTarget then
+		                return false
+		            end
+		        end
 		        -- 힐이 언데드 몬스터에게 데미지를 입힐 때도 썬더볼트와 동일한 이유로 "이번 호출 전용 단일 대상"만 통과시킨다.
 		        if attackInfo == "skill.heal" then
 		            if not isvalid(self._T.healCurrentUndeadTarget) or defender ~= self._T.healCurrentUndeadTarget then
@@ -593,6 +599,18 @@ script PlayerAttack extends AttackComponent
 		            -- 더블스탭 사례처럼 같은 프레임 안에서 연달아 호출되므로 math.random() 대신 _UtilLogic:RandomDouble() 사용.
 		            local combatPower = self._T.pendingThunderboltCombatPower or 0
 		            local mult = 0.8 + _UtilLogic:RandomDouble() * (1.3 - 0.8)
+		            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.magicmissile" then
+		            -- 매직 미사일: 구체 하나당 전투력의 100%~150% - 단, (피드백) 데미지는 시전 시점에
+		            -- 미리 확정해(HP 예측 분배의 근거값) DealMagicMissileHit이 캐싱해둔 값을 그대로 쓴다.
+		            -- 명중 시 새로 굴리면 "이 구체로 죽는다"는 예측이 어긋날 수 있기 때문. 캐시가 없는
+		            -- 예외 경로만 기존처럼 즉석에서 굴린다.
+		            local preset = self._T.magicMissileHitPreset or 0
+		            if preset > 0 then
+		                return preset
+		            end
+		            local combatPower = self._T.pendingMagicMissileCombatPower or 0
+		            local mult = 1.0 + _UtilLogic:RandomDouble() * (1.5 - 1.0)
 		            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.heal" then
 		            -- 힐이 언데드 몬스터에게 입히는 데미지 - 썬더볼트와 동일한 전투력 80%~130% 공식.
@@ -2319,6 +2337,13 @@ script PlayerAttack extends AttackComponent
 		                playerCtrl.LookDirectionX = self._T.lockedThunderboltDirX
 		            end
 		        end
+		        -- 매직 미사일 모션 재생 중에도 동일하게 방향을 고정한다 (다른 스킬과 별도 플래그)
+		        if self._T.isMagicMissileDirectionLocked then
+		            local playerCtrl = self.Entity.PlayerControllerComponent
+		            if isvalid(playerCtrl) then
+		                playerCtrl.LookDirectionX = self._T.lockedMagicMissileDirX
+		            end
+		        end
 		        -- 힐 모션 재생 중에도 동일하게 방향을 고정한다 (다른 스킬과 별도 플래그)
 		        if self._T.isHealDirectionLocked then
 		            local playerCtrl = self.Entity.PlayerControllerComponent
@@ -3568,6 +3593,35 @@ script PlayerAttack extends AttackComponent
 		            end
 		        end
 
+		        -- 매직 미사일 전용 처리 (썬더볼트와 동일한 패턴이지만 별도의 플래그를 사용 - 서로 간섭하지 않는다)
+		        if self._T.isMagicMissileMotionPlaying then
+		            local playerCtrl = self.Entity.PlayerControllerComponent
+		            if isvalid(playerCtrl) then
+		                playerCtrl.LookDirectionX = self._T.lockedMagicMissileDirX
+		            end
+		            local motionName = self._T.lockedMagicMissileMotionName
+		            if not motionName then return end
+		            local avatarRenderer = self.Entity.AvatarRendererComponent
+		            if not isvalid(avatarRenderer) then return end
+		            local body = avatarRenderer:GetBodyEntity()
+		            if not isvalid(body) then return end
+		            local motionEvent = ActionStateChangedEvent(motionName, motionName, self._T.lockedMagicMissilePlayRate or 1.0, SpriteAnimClipPlayType.Onetime)
+		            body:SendEvent(motionEvent)
+		            log("[MagicMissile] HandleStateChangeEvent re-applied motion over " .. tostring(event.CurrentStateName) .. ": " .. tostring(motionName))
+		            return
+		        end
+		        if self._T.isMagicMissileDirectionLocked and event.CurrentStateName ~= "IDLE" then
+		            local playerCtrl = self.Entity.PlayerControllerComponent
+		            if isvalid(playerCtrl) then
+		                playerCtrl.LookDirectionX = self._T.lockedMagicMissileDirX
+		            end
+		            local sc = self.Entity.StateComponent
+		            if isvalid(sc) then
+		                sc:ChangeState("IDLE")
+		                log("[MagicMissile] HandleStateChangeEvent forced back to IDLE from " .. tostring(event.CurrentStateName))
+		            end
+		        end
+
 		        -- 힐 전용 처리 (다른 스킬과 동일한 패턴이지만 별도의 플래그를 사용 - 서로 간섭하지 않는다)
 		        if self._T.isHealMotionPlaying then
 		            local playerCtrl = self.Entity.PlayerControllerComponent
@@ -4325,7 +4379,8 @@ script PlayerAttack extends AttackComponent
 		        local dirX = playerCtrl.LookDirectionX
 		        self._T.pendingMagicClawDirX = dirX
 
-		        -- 단일 고정 표적: 더블스탭과 동일한 방향 인식 탐색(파워스트라이크 판정 박스 크기 그대로 사용).
+		        -- (재피드백) 매직클로는 "바라보는 방향 전방의 타겟만" 공격한다 - 등 뒤 적으로 자동 방향
+		        -- 전환하던 동작을 제거하고, 전방 범위 안에서 가장 가까운 적을 고르는 원래 방식으로 복원.
 		        self._T.magicClawTarget = self:FindMagicClawTarget(Vector2(worldPos.x, worldPos.y), dirX)
 
 		        self._T.pendingMagicClawWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
@@ -4360,8 +4415,10 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method Entity FindMagicClawTarget(Vector2 fromPos, number dirX)
-		        -- 매직클로 전용 대상 탐색: 더블스탭(FindDoubleStabTarget)과 동일한 방향 인식 방식.
-		        -- 사거리는 파워스트라이크 기준 박스(2칸) 대비 x축(전방) 2.5배·y축(위아래) 1.5배로 늘렸다.
+		        -- 매직클로 전용 대상 탐색: 바라보는 방향 전방(dx*dirX >= 0)의 살아있는 몬스터 중
+		        -- 가장 가까운 하나를 고른다. (재피드백으로 "앞뒤 무관 최근접" 방식에서 전방 전용으로 복원 -
+		        -- 등 뒤 적으로 자동 방향 전환하는 문제 제거.)
+		        -- 사거리는 파워스트라이크 기준 박스(2칸) 대비 x축(전방) 2.5배·y축(위아래) 1.5배.
 		        local map = self.Entity.CurrentMap
 		        if not isvalid(map) then return nil end
 		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
@@ -4998,6 +5055,303 @@ script PlayerAttack extends AttackComponent
 		-- (호출 시점 자체가 DealThunderboltHits에서 인덱스*0.04초 딜레이로 예약되어 있음).
 		if not self:IsClient() then return end
 		_SoundService:PlaySound("d3205fdd08e34b68bc01292a997531ed", 1.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackMagicMissile(number combatPower, number atkMultiplier, number playerLevel)
+		-- 매직 미사일(1차): 등 뒤 랜덤 위치에 마법 구체(레벨 비례 개수)를 소환하고, 각 구체가
+		-- 전방의 타겟을 향해 서서히 조준 회전한 뒤 발사 플래시와 함께 유도 비행해 명중 시
+		-- 전투력의 100%~150% 피해를 준다. 구체 시퀀스 자체는 MagicMissileBall 엔티티가 진행하고,
+		-- 여기서는 소환/타겟 분배/시전 모션/판정(DealMagicMissileHit)만 담당한다.
+		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 다른 스킬과 동일하게 정리.
+		self:StopBreather()
+		-- 사다리/로프/사망 상태에서는 사용 불가 (다른 스킬과 동일 가드).
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+		if self._T.isMagicMissiling then
+			return
+		end
+		self._T.isMagicMissiling = true
+
+		local mult = math.max(0.1, math.min(atkMultiplier or 1.0, 3.0))
+		self._T.pendingMagicMissileCombatPower = combatPower
+
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local worldPos = self.Entity.TransformComponent.WorldPosition
+		local dirX = playerCtrl.LookDirectionX
+		self._T.pendingMagicMissileDirX = dirX
+
+		-- 구체 개수: 20레벨에 1개, 이후 10레벨마다 1개 추가(30→2, 40→3, 50→4 ...) - 피드백으로 30→10레벨 단위로 변경.
+		-- 상한은 요청으로 8→20개(210레벨 도달). 20레벨 미만도 최소 1개는 소환한다.
+		local ballCount = 1
+		if playerLevel >= 20 then
+			ballCount = 1 + math.floor((playerLevel - 20) / 10)
+		end
+		if ballCount > 20 then ballCount = 20 end
+
+		-- (피드백) HP 예측 기반 분배: 전방의 몬스터를 가까운 순으로 골라두고, 구체마다 데미지를
+		-- "시전 시점에 미리 확정"한 뒤 타겟의 남은 HP에서 차감해 나간다. 예측상 이미 죽는 몬스터에는
+		-- 다음 구체를 배정하지 않아, 한 방 데미지 구체 5개 + 몬스터 5마리면 5마리가 전부 한 번에 죽는다.
+		local targets = self:FindMagicMissileTargets(Vector2(worldPos.x, worldPos.y), dirX, ballCount)
+
+		self._T.pendingMagicMissileWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+
+		-- 스킬 사용 사운드 + 캐릭터 모션(매직클로/썬더볼트와 동일한 후보군/재생 방식)
+		self:PlayMagicMissileUseSound(self.Entity)
+		local swing = self:GetMagicMissileSwing()
+		self:PlayMagicMissileMotion(self.Entity, swing.name, dirX, mult)
+
+		-- 타겟별 "예측 남은 HP" 테이블 - 시전 시점의 실제 몬스터 HP에서 시작한다.
+		local remainingHp = {}
+		for idx, targetEnt in ipairs(targets) do
+			---@type Monster
+			local mc = targetEnt:GetComponent("script.Monster")
+			if isvalid(mc) then
+				remainingHp[idx] = mc.Hp
+			else
+				remainingHp[idx] = 999999
+			end
+		end
+
+		-- 구체별 소환: 등 뒤 일정 범위 안 랜덤 위치에 생성 이펙트(dcac 클립 1~7프레임)를 먼저 재생하고,
+		-- 구체 본체(정지 프레임)는 생성 이펙트 마지막 프레임쯤(0.9초 뒤)에 나타난다(요청 사양 - 이펙트가
+		-- 서서히 사라지며 구체가 남는 연출).
+		for i = 1, ballCount do
+			local offX = -dirX * (0.5 + _UtilLogic:RandomDouble() * 0.8)
+			local offY = 0.35 + _UtilLogic:RandomDouble() * 0.85
+			local bx = worldPos.x + offX
+			local by = worldPos.y + offY
+			local bz = worldPos.z
+
+			-- 이 구체의 데미지를 미리 확정(전투력 100%~150%)하고, 예측상 아직 살아있는 가장 가까운
+			-- 몬스터에 배정한 뒤 그 몬스터의 예측 HP에서 차감한다. 전부 죽을 예정이면 기존처럼 순환 분배
+			-- (남는 구체가 허공에 안 뜨게 이미 죽을 몬스터 위치로라도 날린다).
+			local presetDamage = math.floor(combatPower * (1.0 + _UtilLogic:RandomDouble() * 0.5))
+			local target = nil
+			local chosenIdx = nil
+			for idx = 1, #targets do
+				if remainingHp[idx] > 0 then
+					chosenIdx = idx
+					break
+				end
+			end
+			if chosenIdx == nil and #targets > 0 then
+				chosenIdx = ((i - 1) % #targets) + 1
+			end
+			if chosenIdx ~= nil then
+				target = targets[chosenIdx]
+				remainingHp[chosenIdx] = remainingHp[chosenIdx] - presetDamage
+				log("PlayerAttack: MagicMissile ball " .. tostring(i) .. " -> " .. tostring(target.Name) .. " preset=" .. tostring(presetDamage) .. " 남은예측HP=" .. tostring(remainingHp[chosenIdx]))
+			end
+
+			self:PlayMagicMissileSpawnEffect(bx, by, bz, dirX)
+			local capturedTarget = target
+			local capturedPreset = presetDamage
+			-- (피드백) 생성 이펙트가 PlayRate 2배로 절반 시간에 끝나므로 구체 등장도 0.9→0.45초로 앞당긴다.
+			_TimerService:SetTimerOnce(function()
+				self:SpawnMagicMissileBall(bx, by, bz, capturedTarget, dirX, capturedPreset)
+			end, 0.45)
+		end
+
+		-- 컨트롤 잠금 해제: 썬더볼트와 동일한 규격(0.6초*배율). 구체 시퀀스는 이와 독립적으로 계속 진행된다.
+		_TimerService:SetTimerOnce(function()
+			self:RestoreMagicMissileControl()
+		end, 0.6 * mult)
+
+		log("PlayerAttack: AttackMagicMissile level=" .. tostring(playerLevel) .. " balls=" .. tostring(ballCount) .. " targets=" .. tostring(#targets))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FindMagicMissileTargets(Vector2 fromPos, number dirX, integer maxCount)
+		-- 매직 미사일 대상 선정: 캐릭터가 바라보는 전방(가로 6칸, 세로 위아래 3칸)의 살아있는
+		-- script.Monster를 가까운 순으로 정렬해 최대 maxCount명까지 반환한다(실제 판정 없이 위치 탐색만).
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return {} end
+		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local candidates = {}
+		for _, comp in ipairs(monsterComps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local pos = mc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if dx * dirX >= 0 and math.abs(dx) <= 6.0 and math.abs(dy) <= 3.0 then
+					table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx) })
+				end
+			end
+		end
+		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		local result = {}
+		for i = 1, math.min(#candidates, maxCount) do
+			table.insert(result, candidates[i].entity)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnMagicMissileBall(number px, number py, number pz, Entity target, number dirX, number presetDamage)
+		-- 생성 이펙트 마지막 프레임 시점에 호출되어 구체 엔티티를 실제로 소환한다.
+		if not isvalid(self.Entity) then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		if self._T.magicMissileCount == nil then self._T.magicMissileCount = 0 end
+		self._T.magicMissileCount = self._T.magicMissileCount + 1
+		local name = "magicmissile_" .. tostring(self._T.magicMissileCount)
+		local ball = _SpawnService:SpawnByModelId("magicmissileball", name, Vector3(px, py, pz), map)
+		if ball == nil then
+			log_warning("PlayerAttack: SpawnMagicMissileBall - spawn failed (model 'magicmissileball')")
+			return
+		end
+		---@type MagicMissileBall
+		local bc = ball:GetComponent("script.MagicMissileBall")
+		if not isvalid(bc) then
+			log_warning("PlayerAttack: SpawnMagicMissileBall - MagicMissileBall component not found")
+			return
+		end
+		bc:Setup(target, self.Entity, dirX, presetDamage)
+		log("PlayerAttack: SpawnMagicMissileBall " .. name .. " target=" .. (isvalid(target) and tostring(target.Name) or "none") .. " preset=" .. tostring(presetDamage))
+	end
+
+	@ExecSpace("Server")
+	method void RestoreMagicMissileControl()
+		self._T.isMagicMissiling = false
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		if isvalid(playerCtrl) and self._T.pendingMagicMissileWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
+		-- (기능 추가) 다른 스킬과 동일하게 컨트롤 복구 시점에 공용 숨고르기(PlayBreather)를 시작한다.
+		self:PlayBreather(self.Entity, self._T.pendingMagicMissileDirX or 1)
+	end
+
+	@ExecSpace("Server")
+	method void DealMagicMissileHit(Entity target, number presetDamage)
+		-- 구체(MagicMissileBall)가 타겟에 도달한 순간 호출되어 그 대상 하나에게만 판정을 실행한다
+		-- (썬더볼트의 대상별 판정과 동일한 단일 대상 게이트 - 밀집 지역에서 이웃까지 겹쳐 맞는 것 방지).
+		-- presetDamage: 시전 시점에 미리 확정해 HP 예측 분배에 쓴 값 - CalcDamageBase가 그대로 돌려준다.
+		if not isvalid(self.Entity) then return end
+		if not isvalid(target) then return end
+		self._T.magicMissileCurrentTarget = target
+		self._T.magicMissileHitPreset = presetDamage
+		local targetPos = target.TransformComponent.WorldPosition
+		local shape = CircleShape(Vector2(targetPos.x, targetPos.y), 0.6)
+		local hitComps = self:AttackShadowSafe(shape, "skill.magicmissile", target)
+		local actuallyHit = false
+		for _, hc in ipairs(hitComps) do
+			if isvalid(hc) and isvalid(hc.Entity) and hc.Entity == target then
+				actuallyHit = true
+				break
+			end
+		end
+		if actuallyHit then
+			self:PlayMagicMissileHitEffect(target)
+		end
+		log("PlayerAttack: DealMagicMissileHit target=" .. tostring(target.Name) .. " actuallyHit=" .. tostring(actuallyHit))
+	end
+
+	method table GetMagicMissileSwing()
+		-- 매직클로/썬더볼트와 동일한 모션 후보군(swingO1/O2/O3)을 순차 순환 재생한다.
+		local candidates = {
+			{ name = "swingO1" },
+			{ name = "swingO2" },
+			{ name = "swingO3" },
+		}
+		self._T.magicMissileSwingIndex = (self._T.magicMissileSwingIndex or 0) % #candidates + 1
+		return candidates[self._T.magicMissileSwingIndex]
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMagicMissileMotion(Entity attacker, string motionName, number dirX, number atkMultiplier)
+		-- 매직 미사일 전용 모션 재생. 썬더볼트(PlayThunderboltMotion)와 완전히 동일한 방식 - 별도 플래그로 서로 간섭하지 않는다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local avatarRenderer = attacker.AvatarRendererComponent
+		if not isvalid(avatarRenderer) then return end
+		local body = avatarRenderer:GetBodyEntity()
+		if not isvalid(body) then return end
+
+		avatarRenderer.ShowDefaultWeaponEffects = false
+
+		local playerCtrl = attacker.PlayerControllerComponent
+		if isvalid(attacker.MovementComponent) then
+			attacker.MovementComponent:Stop()
+		end
+		if isvalid(playerCtrl) then
+			playerCtrl.LookDirectionX = dirX
+		end
+		self._T.isMagicMissileDirectionLocked = true
+		self._T.lockedMagicMissileDirX = dirX
+		self._T.lockedMagicMissileMotionName = motionName
+		self._T.isMagicMissileMotionPlaying = true
+
+		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local playRate = 1.0 / mult
+		self._T.lockedMagicMissilePlayRate = playRate
+
+		local motionEvent = ActionStateChangedEvent(motionName, motionName, playRate, SpriteAnimClipPlayType.Onetime)
+		body:SendEvent(motionEvent)
+		log("[MagicMissile] PlayMagicMissileMotion sent: " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
+
+		_TimerService:SetTimerOnce(function()
+			if isvalid(avatarRenderer) then
+				avatarRenderer.ShowDefaultWeaponEffects = true
+			end
+			self._T.isMagicMissileMotionPlaying = false
+		end, 0.55 * mult)
+
+		_TimerService:SetTimerOnce(function()
+			self._T.isMagicMissileDirectionLocked = false
+			local sc = self.Entity.StateComponent
+			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+				sc:ChangeState("IDLE")
+				sc:ChangeState("MOVE")
+				sc:ChangeState("IDLE")
+			end
+		end, 0.80 * mult)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMagicMissileUseSound(Entity attacker)
+		-- 스킬 사용 즉시 재생되는 사운드 (피드백으로 교체된 전용 사용음).
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		_SoundService:PlaySound("a2ade2fb109b490cb95814c0622b4f4f", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMagicMissileSpawnEffect(number px, number py, number pz, number dirX)
+		-- 구체 생성 이펙트: dcac510901fe451282ad7b93abc3032d의 1~7프레임(0-base 0~6)만 재생한다(피드백 사양).
+		-- 아트 속 미사일 머리가 -x(왼쪽) 기준이라 오른쪽을 볼 때 FlipX.
+		-- (피드백) 구체(화살) 위치/크기와 안 맞아 조금 뒤(-0.2*dirX)·아래(-0.15)로 내리고 크기를 30% 키움(0.6→0.78).
+		if not self:IsClient() then return end
+		-- (피드백) 생성 이펙트 재생 속도 2배(PlayRate=2) - 구체 등장 타이머(0.45초)와 짝을 이룬다.
+		local options = { ["StartFrameIndex"] = 0, ["EndFrameIndex"] = 6, ["FlipX"] = dirX > 0, ["PlayRate"] = 2.0 }
+		_EffectService:PlayEffect("dcac510901fe451282ad7b93abc3032d", self.Entity, Vector3(px - 0.2 * dirX, py - 0.15, pz), 0, Vector3(0.78, 0.78, 1), false, options)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMagicMissileLaunchEffect(number px, number py, number pz, number zRot)
+		-- 발사 이펙트: 6df269a10323437c8acf7c7937fff4c1를 구체가 날아가기 시작한 위치에서
+		-- 비행 각도로 재생한다(피드백 사양). zRot에는 구체와 같은 +180 보정(원본 궤적 -x 기준)이 포함되어 넘어온다.
+		if not self:IsClient() then return end
+		_EffectService:PlayEffect("6df269a10323437c8acf7c7937fff4c1", self.Entity, Vector3(px, py, pz), zRot, Vector3(0.7, 0.7, 1), false, {})
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMagicMissileHitEffect(Entity target)
+		-- 명중 이펙트 + 타격음: 피드백으로 지정된 hit 클립을 대상 몸에서 재생.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		_EffectService:PlayEffectAttached("37667e283b994c4a94880227dbe4d387", target, Vector3(0, 0.2, 0), 0, Vector3(1, 1, 1), false, {})
+		_SoundService:PlaySound("5b622d47e7e4412b8217bcfcef140946", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
