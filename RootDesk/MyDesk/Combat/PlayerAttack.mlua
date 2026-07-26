@@ -162,6 +162,10 @@ script PlayerAttack extends AttackComponent
 		        if attackInfo == "dot.chargeblow.burn" or attackInfo == "dot.chargeblow.shock" or attackInfo == "dot.chargeblow.curse" then
 		            return isvalid(self._T.chargeBlowDotTarget) and defender == self._T.chargeBlowDotTarget
 		        end
+		        -- 불의 영역 화염 지대 도트도 같은 단일 대상 게이트를 쓴다.
+		        if attackInfo == "dot.firezone" then
+		            return isvalid(self._T.fireZoneDotTarget) and defender == self._T.fireZoneDotTarget
+		        end
 		        -- 기본 공격(attackInfo가 nil)은 단일 대상 - 미리 골라둔 가장 가까운 대상만 통과시킨다
 		        if attackInfo == nil then
 		            if not isvalid(self._T.normalAttackTarget) or defender ~= self._T.normalAttackTarget then
@@ -559,6 +563,10 @@ script PlayerAttack extends AttackComponent
 		        elseif attackInfo == "dot.chargeblow.curse" then
 		            -- 화상 저주(화상 중인 적을 얼음으로 타격): 3초마다 전투력의 100%, 20초간.
 		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * 1.0)
+		        elseif attackInfo == "dot.firezone" then
+		            -- 불의 영역 화염 지대: 2초마다 전투력의 200%~300%, 10초간.
+		            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
+		            return math.floor((self._T.pendingFireZonePower or 0) * mult)
 		        elseif attackInfo == "skill.powerstrike" then
 		            local combatPower = self._T.pendingCombatPower or 0
 		            local mult = 0.5 + math.random() * (3.0 - 1.0)
@@ -1170,6 +1178,10 @@ script PlayerAttack extends AttackComponent
 		            return
 		        end
 
+		        -- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		        ---@type LuckySevenProjectileAttack
+		        local projAtk = proj:GetComponent("script.LuckySevenProjectileAttack")
+		        if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		        ---@type LuckySevenProjectile
 		        local pc = proj:GetComponent("script.LuckySevenProjectile")
 		        if pc == nil then return end
@@ -5408,7 +5420,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method table FindHealTargets(Vector2 fromPos, integer maxCount)
-		-- 힐 대상 선정: 썬더볼트와 동일한 탐색 범위(방향 무관, 가로 6칸·세로 1칸)에서 자신을 제외한
+		-- 힐 대상 선정: 방향 무관, 좌우 ±3.6·위아래 ±3.6(피드백: 좌우 1.2배 확대 + 위아래를 좌우와 동일하게)에서 자신을 제외한
 		-- 다른 플레이어(회복 대상)와 언데드 몬스터(script.Monster.IsUndead=true, 피해 대상)를 함께 찾아
 		-- 가까운 순으로 정렬해 최대 maxCount명까지 후보로 반환한다. 각 항목은 { entity, kind = "player"|"undead" }.
 		local map = self.Entity.CurrentMap
@@ -5426,7 +5438,8 @@ script PlayerAttack extends AttackComponent
 							local pos = userEntity.TransformComponent.WorldPosition
 							local dx = pos.x - fromPos.x
 							local dy = pos.y - fromPos.y
-							if math.abs(dx) <= 3.0 and math.abs(dy) <= 1.0 then
+							-- (피드백) 좌우 3.0→3.6(1.2배), 위아래도 좌우와 같은 3.6으로 확대.
+							if math.abs(dx) <= 3.6 and math.abs(dy) <= 3.6 then
 								table.insert(candidates, { entity = userEntity, dist = math.abs(dx), kind = "player" })
 							end
 						end
@@ -5443,8 +5456,23 @@ script PlayerAttack extends AttackComponent
 				local pos = mc.Entity.TransformComponent.WorldPosition
 				local dx = pos.x - fromPos.x
 				local dy = pos.y - fromPos.y
-				if math.abs(dx) <= 3.0 and math.abs(dy) <= 1.0 then
+				if math.abs(dx) <= 3.6 and math.abs(dy) <= 3.6 then
 					table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx), kind = "undead" })
+				end
+			end
+		end
+
+		-- 소환된 용사(HeroSummon)도 회복 대상이다 - HP가 남아 있는(묘지 상태가 아닌) 경우만.
+		local heroComps = map:GetChildComponentsByTypeName("script.HeroSummon", true)
+		for _, comp in ipairs(heroComps) do
+			---@type HeroSummon
+			local hs = comp
+			if isvalid(hs) and isvalid(hs.Entity) and hs.HeroHp > 0 then
+				local pos = hs.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if math.abs(dx) <= 3.6 and math.abs(dy) <= 3.6 then
+					table.insert(candidates, { entity = hs.Entity, dist = math.abs(dx), kind = "hero" })
 				end
 			end
 		end
@@ -5481,6 +5509,8 @@ script PlayerAttack extends AttackComponent
 			if isvalid(t.entity) then
 				if t.kind == "player" then
 					self:ApplyHealToPlayer(t.entity, self._T.pendingHealCombatPower or 0)
+				elseif t.kind == "hero" then
+					self:ApplyHealToHero(t.entity, self._T.pendingHealCombatPower or 0)
 				elseif t.kind == "undead" then
 					-- 이번 Attack() 호출은 이 대상 하나만 통과하도록 지정 (썬더볼트와 동일한 교차 히트 방지 패턴).
 					self._T.healCurrentUndeadTarget = t.entity
@@ -5529,6 +5559,39 @@ script PlayerAttack extends AttackComponent
 			self:PlayHealTargetEffect(target)
 		end
 		self:ShowHealDamageSkin(target, actualHealed)
+	end
+
+	@ExecSpace("Server")
+	method void ApplyHealToHero(Entity heroEntity, number combatPower)
+		-- 소환된 용사 회복: 플레이어와 같은 공식(전투력의 5%~15% 랜덤)으로 HeroHp를 채우고 HP바를
+		-- 갱신하며, 실제 회복량만큼 파란(힐) 데미지스킨 표시 + 전용 이펙트를 머리 위에 1회 재생한다.
+		if not isvalid(heroEntity) then return end
+		---@type HeroSummon
+		local hs = heroEntity:GetComponent("script.HeroSummon")
+		if not isvalid(hs) or hs.HeroHp <= 0 then return end
+		local baseHeal = combatPower * 0.10
+		local mult = 0.5 + _UtilLogic:RandomDouble() * 1.0
+		local healAmount = math.floor(baseHeal * mult)
+		if healAmount <= 0 then return end
+		local newHp = math.min(hs.HeroHp + healAmount, hs.HeroMaxHp)
+		local actualHealed = newHp - hs.HeroHp
+		if actualHealed <= 0 then return end
+		hs.HeroHp = newHp
+		hs:UpdateHpBar()
+		self:PlayHeroHealEffect(heroEntity)
+		self:ShowHealDamageSkin(heroEntity, actualHealed)
+		log("PlayerAttack: 용사 회복 +" .. tostring(actualHealed) .. " → HP " .. tostring(math.floor(hs.HeroHp)) .. "/" .. tostring(math.floor(hs.HeroMaxHp)))
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHeroHealEffect(Entity target)
+		-- 힐을 받은 용사 머리 위에 재생되는 전용 이펙트(1회).
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached("2ea4ea3b4d4a492e981d3536b14d7da6", target, Vector3(0, 0.7, 0), 0, Vector3(1, 1, 1), false, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.5)
 	end
 
 	@ExecSpace("Multicast")
@@ -6264,6 +6327,9 @@ script PlayerAttack extends AttackComponent
 		-- 0.4초 이내에 몰려서 들어오고(가장 느린 스피어버스터도 히트 간격 최대 ~0.3초), 다음 재사용은
 		-- 쿨다운(0.7초 이상)이 지난 뒤라 서로 겹치지 않는다는 실측 타이밍에 기반한 시간창 방식.
 		if not self:IsServer() then return end
+		-- (불의 영역/빙하지대) 버프 지속 중 공격 적중 시 확률 프록 - 투사체/독안개 등 별도
+		-- AttackComponent를 쓰는 스킬과 판정을 공유하도록 공용 메서드로 분리했다(TryProcElementalZones).
+		self:TryProcElementalZones(defender)
 		-- (기능 추가) 쉐도우 파트너 - 더블스탭/매직클로/스피어버스터(수동 표시 스킬)는 각자 전용
 		-- Show*DamageSkin에서 직접 보너스를 묶어 표시하므로 여기서는 건너뛴다(shadowEchoIsManualSkin).
 		if self._T.shadowEchoBonus ~= nil and not self._T.shadowEchoIsManualSkin and isvalid(defender) then
@@ -7365,6 +7431,10 @@ script PlayerAttack extends AttackComponent
 		if zone ~= nil then
 			zone:Init(combatPower)
 		end
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 독안개 판정 컴포넌트에 새겨준다.
+		---@type PoisonMistAttack
+		local mistAtk = mist:GetComponent("script.PoisonMistAttack")
+		if mistAtk ~= nil then mistAtk.OwnerEntity = self.Entity end
 		log("[PoisonMist] 소환 x=" .. tostring(pos.x) .. " y=" .. tostring(pos.y))
 	end
 
@@ -8926,6 +8996,10 @@ script PlayerAttack extends AttackComponent
 			sprite.SpriteRUID = arrowRuid
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type FireArrowProjectileAttack
+		local projAtk = proj:GetComponent("script.FireArrowProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type FireArrowProjectile
 		local projComp = proj:GetComponent("script.FireArrowProjectile")
 		if isvalid(projComp) then
@@ -8947,7 +9021,7 @@ script PlayerAttack extends AttackComponent
 		-- 순수 좌우 방향(dirY==0)은 회전 대신 FlipX로 반전한다 - 180도 회전을 쓰면 이펙트 원점이 발밑까지
 		-- 밀려 내려가는 문제가 있어서(사용자 확인 - 왼쪽은 정상, 오른쪽만 밀림), 회전 없이 좌우만 미러링한다.
 		-- 위/아래/대각선 방향은 회전이 필요하므로 그대로 두되, 방향별로 사용자가 실제 화면으로 확인해 지적한
-		-- 어긋난 위치를 방향별 로컬 오프셋으로 보정한다(위=좌측+상단으로, 아래=우측으로, 우측아래=우측으로, 우측위=상단으로 더).
+		-- 어긋난 위치를 방향별 로컬 오프셋으로 보정한다(위=좌측+상단으로, 아래=우측+상단으로, 우측아래=우측+상단으로, 우측위=상단으로 더).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local angleDeg = 0
@@ -8964,20 +9038,35 @@ script PlayerAttack extends AttackComponent
 		elseif dirX == 0 and dirY < 0 then
 			-- 아래
 			angleDeg = math.deg(math.atan(dirY, dirX)) + 180
-			offsetX = 0.15
+			offsetX = 0.35
+			offsetY = 0.3
 		elseif dirX > 0 and dirY > 0 then
 			-- 우측위
 			angleDeg = math.deg(math.atan(dirY, dirX)) + 180
-			offsetY = 0.3
+			offsetX = -0.15
+			offsetY = 0.45
 		elseif dirX > 0 and dirY < 0 then
 			-- 우측아래
 			angleDeg = math.deg(math.atan(dirY, dirX)) + 180
-			offsetX = 0.15
-		else
-			-- 좌측위/좌측아래 (아직 별도 피드백 없음 - 기존 기본 보정 유지)
+			offsetX = 0.2
+			offsetY = 0.45
+		elseif dirX < 0 and dirY > 0 then
+			-- 좌측위 (앞쪽 = 왼쪽이므로 offsetX는 음수)
 			angleDeg = math.deg(math.atan(dirY, dirX)) + 180
-			if dirY > 0 then
-				offsetY = 0.2
+			offsetX = -0.2
+			offsetY = 0.2
+		else
+			-- 좌측아래 (아직 별도 피드백 없음 - 기존 기본 보정 유지)
+			angleDeg = math.deg(math.atan(dirY, dirX)) + 180
+		end
+		-- 순수 상하 발사(위/아래)는 캐릭터가 원래 보던 좌우 방향을 유지한 채 쏘는데, 위 보정값들은
+		-- 오른쪽을 볼 때 기준으로 맞춘 값이다. 왼쪽을 볼 때는 아바타 반전으로 몸의 시각적 중심이
+		-- 왼쪽으로 치우쳐 이펙트가 상대적으로 오른쪽에 붙어 보인다(사용자 확인 - 오른쪽 볼 때는 정상).
+		-- 왼쪽을 보고 있으면 그만큼 왼쪽으로 추가 보정한다.
+		if dirX == 0 and dirY ~= 0 then
+			local playerCtrl = attacker.PlayerControllerComponent
+			if isvalid(playerCtrl) and playerCtrl.LookDirectionX < 0 then
+				offsetX = offsetX - 0.15
 			end
 		end
 		local castOptions = { ["FlipX"] = flipX }
@@ -9146,6 +9235,10 @@ script PlayerAttack extends AttackComponent
 			sprite.SpriteRUID = arrowRuid
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type IronArrowProjectileAttack
+		local projAtk = proj:GetComponent("script.IronArrowProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type IronArrowProjectile
 		local projComp = proj:GetComponent("script.IronArrowProjectile")
 		if isvalid(projComp) then
@@ -9355,6 +9448,10 @@ script PlayerAttack extends AttackComponent
 			return
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type ArrowBlowProjectileAttack
+		local projAtk = proj:GetComponent("script.ArrowBlowProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type ArrowBlowProjectile
 		local projComp = proj:GetComponent("script.ArrowBlowProjectile")
 		if isvalid(projComp) then
@@ -9505,6 +9602,10 @@ script PlayerAttack extends AttackComponent
 			sprite.SpriteRUID = ballRuid
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type DoubleShotProjectileAttack
+		local projAtk = proj:GetComponent("script.DoubleShotProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type DoubleShotProjectile
 		local projComp = proj:GetComponent("script.DoubleShotProjectile")
 		if isvalid(projComp) then
@@ -9732,6 +9833,10 @@ script PlayerAttack extends AttackComponent
 			return
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type StrafeProjectileAttack
+		local projAtk = proj:GetComponent("script.StrafeProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type StrafeProjectile
 		local projComp = proj:GetComponent("script.StrafeProjectile")
 		if isvalid(projComp) then
@@ -10761,6 +10866,10 @@ script PlayerAttack extends AttackComponent
 			return
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type RapidFireProjectileAttack
+		local projAtk = proj:GetComponent("script.RapidFireProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type RapidFireProjectile
 		local projComp = proj:GetComponent("script.RapidFireProjectile")
 		if isvalid(projComp) then
@@ -10868,6 +10977,10 @@ script PlayerAttack extends AttackComponent
 			return
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type HurricaneProjectileAttack
+		local projAtk = proj:GetComponent("script.HurricaneProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type HurricaneProjectile
 		local projComp = proj:GetComponent("script.HurricaneProjectile")
 		if isvalid(projComp) then
@@ -11185,6 +11298,10 @@ script PlayerAttack extends AttackComponent
 		if isvalid(spr) then
 			spr.SpriteRUID = self:GetSnipingBallRUID(stage)
 		end
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type SnipingProjectileAttack
+		local projAtk = proj:GetComponent("script.SnipingProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type SnipingProjectile
 		local projComp = proj:GetComponent("script.SnipingProjectile")
 		if isvalid(projComp) then
@@ -11970,6 +12087,10 @@ script PlayerAttack extends AttackComponent
 			sprite.SpriteRUID = ballRuid
 		end
 
+		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
+		---@type AvengerProjectileAttack
+		local projAtk = proj:GetComponent("script.AvengerProjectileAttack")
+		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
 		---@type AvengerProjectile
 		local projComp = proj:GetComponent("script.AvengerProjectile")
 		if isvalid(projComp) then
@@ -14768,9 +14889,293 @@ script PlayerAttack extends AttackComponent
 			comp.HeroLevel = math.max(1, math.floor(playerLevel * 2 / 3))
 			comp.HeroLine = lines[_UtilLogic:RandomIntegerRange(1, 3)]
 			comp.Lifetime = 300
+			-- 용사 HP = 주인 최대 HP의 2/3 (머리 위 HP바 표시용 - HeroSummon.SpawnHpBar)
+			local ownerMaxHp = 50
+			if isvalid(self.Entity.PlayerComponent) then
+				ownerMaxHp = self.Entity.PlayerComponent.MaxHp or 50
+			end
+			comp.HeroMaxHp = math.max(1, math.floor(ownerMaxHp * 2 / 3))
+			comp.HeroHp = comp.HeroMaxHp
 		end
 		self._T.heroSummonEntity = hero
 		log("[HeroSummon] 스폰 완료 seq=" .. tostring(self._T.heroSummonSeq) .. " playerLevel=" .. tostring(playerLevel))
+	end
+
+	-- ── 불의 영역(2차 버프) ─────────────────────────────────────────
+	-- 10분간: 공격 적중(OnAttack) 시 10% 확률로 그 자리에 화염 지대를 만든다.
+	-- 화염 지대 = 10초 유지, 2초마다 범위 안 몬스터에게 전투력의 200%~300% 피해.
+	-- 리소스: 시전 4a729e5b(불색 틴트)/사용음 af39b536/생성음 6d345fda/장판 4종 랜덤.
+
+	@ExecSpace("ServerOnly")
+	method void CastFireZoneBuff(number combatPower)
+		-- 버프 활성(10분) + 공용 alert2 시전(모션/조작잠금/사용음) + 시전 이펙트.
+		self._T.fireZoneBuffUntil = _UtilLogic.ElapsedSeconds + 600.0
+		self._T.fireZoneCombatPower = combatPower
+		self:CastBuffMotion("af39b536300f43d3a657fc82d63abfe3", 1.0, nil)
+		self:PlayFireZoneCastFx()
+		log("[FireZone] 불의 영역 버프 시작(10분, 전투력=" .. tostring(math.floor(combatPower)) .. ")")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayFireZoneCastFx()
+		-- 시전자 몸 이펙트 1회. (피드백) 원본 클립 색을 불색(주황-붉은 틴트)으로 바꿔 재생한다.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		-- (피드백) 몸 주변 마법진을 조금 위로(0 → 0.3).
+		local serial = _EffectService:PlayEffectAttached("4a729e5b7b0f4759ba197dcbb1d25a8b", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Color"] = Color(1, 0.45, 0.12, 1) })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 4.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnFireZone(Vector3 pos)
+		-- 화염 지대 생성: 생성음+장판 이펙트(4종 랜덤, 10초 루프) + 2초마다 범위 판정(총 5회).
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local zonePower = self._T.fireZoneCombatPower or 0
+		local idx = _UtilLogic:RandomIntegerRange(1, 4)
+		self:PlayFireZoneSpawnFx(Vector3(pos.x, pos.y, 0), idx)
+		local ticksLeft = 5
+		local tick
+		tick = function()
+			if ticksLeft <= 0 then return end
+			ticksLeft = ticksLeft - 1
+			if not isvalid(self.Entity) or not isvalid(map) then return end
+			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			for _, comp in ipairs(monsterComps) do
+				---@type Monster
+				local mc = comp
+				if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+					local mp = mc.Entity.TransformComponent.WorldPosition
+					if math.abs(mp.x - pos.x) <= 1.5 and math.abs(mp.y - pos.y) <= 1.2 then
+						self:DealFireZoneDotDamage(mc.Entity, zonePower)
+					end
+				end
+			end
+			_TimerService:SetTimerOnce(tick, 2.0)
+		end
+		_TimerService:SetTimerOnce(tick, 2.0)
+		log("[FireZone] 화염 지대 생성 x=" .. string.format("%.2f", pos.x) .. " y=" .. string.format("%.2f", pos.y))
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayFireZoneSpawnFx(Vector3 pos, integer idx)
+		-- 생성 사운드 + 4종 중 서버가 고른 화염 장판 이펙트를 10초 루프 재생.
+		-- (요청) 몬스터를 가리면 안 된다 - 화상저주 장판과 같은 원리로 OrderInLayer만으론 안 되고
+		-- SortingLayer를 몬스터와 같은 "MapLayer0"으로 맞춘 뒤 몬스터(2)보다 작은 1로 깐다.
+		if not self:IsClient() then return end
+		local mapEntity = self.Entity.CurrentMap
+		if not isvalid(mapEntity) then return end
+		_SoundService:PlaySound("6d345fda6041465680c0238ff8a1f12d", 1.0)
+		local ruids = {
+			"288e10be2948421ebd107829c10f07ba", "923441a3738d45acbf57a54160cef756",
+			"9691429ecec748e792173dd277901ee0", "6dd0db759f9a4f6680f298105676d203",
+		}
+		local i = math.max(1, math.min(idx, 4))
+		local ruid = ruids[i]
+		-- (실측 보정) 4종을 같은 y에 나란히 재생해 스크린샷으로 잰 클립별 내부 여백 편차:
+		-- 1번(288e10be)은 몬스터 위치 그대로 바닥에 붙지만 2/3/4번은 각각 ~0.25/0.55/1.0유닛 떠서
+		-- 클립별로 그만큼 내려 붙인다.
+		local yOffsets = { 0.0, -0.25, -0.55, -1.0 }
+		local groundedPos = Vector3(pos.x, pos.y + yOffsets[i], pos.z)
+		local zoneOptions = { ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 1 }
+		local serial = _EffectService:PlayEffect(ruid, mapEntity, groundedPos, 0, Vector3(1, 1, 1), true, zoneOptions)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 10.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealFireZoneDotDamage(Entity target, number combatPower)
+		-- 화염 지대 도트 1회(단일 대상 게이트 - 차지블로우 도트와 동일 패턴). 이 판정의 OnAttack이
+		-- 다시 화염 지대를 낳는 연쇄를 inFireZoneTick 플래그로 차단한다.
+		if not isvalid(target) then return end
+		self._T.pendingFireZonePower = combatPower
+		self._T.fireZoneDotTarget = target
+		self._T.inFireZoneTick = true
+		local pos = target.TransformComponent.WorldPosition
+		self:AttackFrom(Vector2(1.4, 2.0), Vector2(pos.x, pos.y + 0.7), "dot.firezone", CollisionGroups.HitBox)
+		self._T.inFireZoneTick = false
+		self._T.fireZoneDotTarget = nil
+	end
+
+	method void TryProcElementalZones(Entity defender)
+		-- 불의 영역/빙하지대 온히트 프록 공용 진입점. 본체 공격(OnAttack)뿐 아니라 투사체(파이어 에로우
+		-- 등 11종)/독안개(포이즌 미스트)처럼 별도 AttackComponent로 판정하는 스킬도 각자의 OnAttack에서
+		-- 시전자의 이 메서드를 호출한다 - "프록이 발동하는 스킬이 한정되어 있다"는 피드백의 원인이
+		-- 본체 OnAttack에만 판정이 걸려 있던 것이라서다. 화염/빙하 지대 자신의 도트 판정이 다시 지대를
+		-- 낳는 연쇄는 기존 inFireZoneTick 플래그로 그대로 차단한다.
+		if not self:IsServer() then return end
+		if not isvalid(defender) then return end
+		if self._T.inFireZoneTick then return end
+		-- (불의 영역) 버프 지속 중 공격 적중 시 10% 확률로 그 자리에 화염 지대를 만든다.
+		if (self._T.fireZoneBuffUntil or 0) > _UtilLogic.ElapsedSeconds
+			and _UtilLogic:RandomDouble() < 0.1 then
+			self:SpawnFireZone(defender.TransformComponent.WorldPosition)
+		end
+		-- (빙하지대) 불의 영역과 독립적으로 10% 확률 - 두 버프가 모두 켜져 있으면 각각 굴린다.
+		if (self._T.glacierBuffUntil or 0) > _UtilLogic.ElapsedSeconds
+			and _UtilLogic:RandomDouble() < 0.1 then
+			self:SpawnGlacierZone(defender.TransformComponent.WorldPosition)
+		end
+	end
+
+	-- ── 빙하지대(2차 버프) ──────────────────────────────────────────
+	-- 불의 영역의 얼음 판: 10분 버프, 공격 적중 시 10% 확률로 그 자리에 빙하 영역
+	-- (지속 10초, 2초마다 전투력 200%~300% - 화염 지대와 같은 데미지 딜러 공유).
+	-- 시전 마법진은 불의 영역과 같은 클립(4a729e5b)을 얼음/눈색(파랑-흰 틴트)으로 재생.
+	-- 장판 비주얼: 눈결정 클립(f69a8c62)을 작은 랜덤 크기로 다수, 10초간 랜덤 위치에 계속 내린다.
+
+	@ExecSpace("ServerOnly")
+	method void CastGlacierZoneBuff(number combatPower)
+		-- 버프 활성(10분) + 공용 alert2 시전(모션/조작잠금/사용음) + 시전 이펙트.
+		self._T.glacierBuffUntil = _UtilLogic.ElapsedSeconds + 600.0
+		self._T.glacierCombatPower = combatPower
+		self:CastBuffMotion("af39b536300f43d3a657fc82d63abfe3", 1.0, nil)
+		self:PlayGlacierCastFx()
+		log("[GlacierZone] 빙하지대 버프 시작(10분, 전투력=" .. tostring(math.floor(combatPower)) .. ")")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayGlacierCastFx()
+		-- 시전자 몸 이펙트 1회 - 불의 영역과 같은 마법진을 얼음/눈색(파랑-흰) 틴트로 재생(마법진 y=0.3).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("4a729e5b7b0f4759ba197dcbb1d25a8b", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Color"] = Color(0.6, 0.85, 1, 1) })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 4.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnGlacierZone(Vector3 pos)
+		-- 빙하 영역 생성: 화염 지대와 같은 틱 구조(10초, 2초마다 ±1.5/±1.2 범위, 전투력 200~300%).
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local zonePower = self._T.glacierCombatPower or 0
+		self:PlayGlacierZoneFx(Vector3(pos.x, pos.y, 0))
+		local ticksLeft = 5
+		local tick
+		tick = function()
+			if ticksLeft <= 0 then return end
+			ticksLeft = ticksLeft - 1
+			if not isvalid(self.Entity) or not isvalid(map) then return end
+			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			for _, comp in ipairs(monsterComps) do
+				---@type Monster
+				local mc = comp
+				if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+					local mp = mc.Entity.TransformComponent.WorldPosition
+					if math.abs(mp.x - pos.x) <= 1.5 and math.abs(mp.y - pos.y) <= 1.2 then
+						self:DealFireZoneDotDamage(mc.Entity, zonePower)
+					end
+				end
+			end
+			_TimerService:SetTimerOnce(tick, 2.0)
+		end
+		_TimerService:SetTimerOnce(tick, 2.0)
+		log("[GlacierZone] 빙하 영역 생성 x=" .. string.format("%.2f", pos.x) .. " y=" .. string.format("%.2f", pos.y))
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayGlacierZoneFx(Vector3 pos)
+		-- 생성 사운드(전용 미지정 - 화염 생성음 공유) + 눈결정을 작은 랜덤 크기(0.15~0.35)로
+		-- 0.3초마다 2개씩, 영역(±1.5) 안 랜덤 위치에 10초간 계속 내린다. 몬스터를 가리지 않게
+		-- 화염 지대와 같은 MapLayer0/OrderInLayer 1.
+		if not self:IsClient() then return end
+		local mapEntity = self.Entity.CurrentMap
+		if not isvalid(mapEntity) then return end
+		_SoundService:PlaySound("6d345fda6041465680c0238ff8a1f12d", 1.0)
+		local elapsed = 0
+		local spawnTimer
+		spawnTimer = _TimerService:SetTimerRepeat(function()
+			elapsed = elapsed + 0.3
+			if elapsed > 10.0 then
+				if spawnTimer then _TimerService:ClearTimer(spawnTimer) end
+				return
+			end
+			-- (피드백) 생성량 절반: 0.3초마다 2개 → 1개.
+			local s = 0.15 + _UtilLogic:RandomDouble() * 0.2
+			local x = pos.x - 1.5 + _UtilLogic:RandomDouble() * 3.0
+			-- (피드백) 생성 높이 상한을 기존(+1.8)의 2/3인 +1.2로 제한.
+			local y = pos.y + 0.2 + _UtilLogic:RandomDouble() * 1.0
+			-- (피드백) 재생속도 절반(0.5배) + 두 번째 프레임(인덱스 1) 제거 - 한 번에 프레임을 건너뛸 수
+			-- 없어 [0]과 [2~끝] 두 구간으로 나눠 이어 재생한다(프레임당 ~0.1초/0.5배=0.2초 추정 핸드오프).
+			-- (피드백) 투명도 75%.
+			local optsA = { ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 1, ["PlayRate"] = 0.5, ["Alpha"] = 0.75, ["StartFrameIndex"] = 0, ["EndFrameIndex"] = 0 }
+			local serialA = _EffectService:PlayEffect("f69a8c62757a40c6bb0d5a8e6e903aab", mapEntity, Vector3(x, y, 0), 0, Vector3(s, s, 1), false, optsA)
+			_TimerService:SetTimerOnce(function()
+				_EffectService:RemoveEffect(serialA)
+				if not isvalid(mapEntity) then return end
+				local optsB = { ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 1, ["PlayRate"] = 0.5, ["Alpha"] = 0.75, ["StartFrameIndex"] = 2 }
+				local serialB = _EffectService:PlayEffect("f69a8c62757a40c6bb0d5a8e6e903aab", mapEntity, Vector3(x, y, 0), 0, Vector3(s, s, 1), false, optsB)
+				_TimerService:SetTimerOnce(function()
+					_EffectService:RemoveEffect(serialB)
+				end, 3.0)
+			end, 0.2)
+		end, 0.3)
+	end
+
+	-- ── 리저렉션(4차) ───────────────────────────────────────────────
+	-- 죽어 쓰러져 있는(사망 상태 10초 안) 소환 용사를 그 자리에서 HP 가득 찬 상태로 부활시킨다.
+	-- 리소스: 원본 팩 skill/232.img/skill/2321006 (시전 c6f54657 / 부활 64b8f9ee / 사용음 fda4b435).
+
+	@ExecSpace("ServerOnly")
+	method void CastResurrection()
+		-- 시전 이펙트+사용음은 대상이 없어도 재생한다. (피드백) 시전 이펙트와 부활 이펙트는 동시에
+		-- 시작하고, 부활 이펙트 7프레임 시점에 부활시킨다(프레임당 0.12초 - WZ 표준 딜레이 가정).
+		-- (피드백) 사용 모션은 2차 버프와 같은 alert2 계열 공용 시전(숨고르기+조작잠금). 잠금은
+		-- 시전 이펙트 전체 길이의 0.7배: 19×0.12/0.7×0.7 ≈ 2.28초(클라 스킬 잠금과 동일).
+		-- 사용음은 CastBuffMotion이 함께 재생한다.
+		self:CastBuffMotion("fda4b4350ef14f07b2de294974efe1aa", 1.0, 19 * 0.12 / 0.7 * 0.7)
+		self:PlayResurrectionCastFx()
+		local hero = self._T.heroSummonEntity
+		if not isvalid(hero) then
+			log("[PlayerAttack] 리저렉션 - 부활 대상 없음(소환 용사 없음)")
+			return
+		end
+		---@type HeroSummon
+		local hs = hero:GetComponent("script.HeroSummon")
+		if not isvalid(hs) or hs.HeroHp > 0 then
+			log("[PlayerAttack] 리저렉션 - 부활 대상 없음(용사가 죽어 있지 않음)")
+			return
+		end
+		-- 부활이 확정됐으니 사망 소멸 타이머를 먼저 멈춰 연출 도중 파괴되지 않게 한다.
+		hs:PrepareResurrect()
+		self:PlayResurrectionReviveFx(hero)
+		-- (피드백 최종) 두 이펙트 모두 원본의 0.7배 재생 - 프레임당 0.12초 / 0.7 ≈ 0.171초.
+		local frameDur = 0.12 / 0.7
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(hero) then return end
+			---@type HeroSummon
+			local hs2 = hero:GetComponent("script.HeroSummon")
+			if isvalid(hs2) then hs2:Resurrect() end
+		end, 7 * frameDur)
+		log("[PlayerAttack] 리저렉션 시전 - 용사 부활 예약")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayResurrectionCastFx()
+		-- 시전자 몸에서 시전 이펙트 1회 (사용음은 CastBuffMotion의 공용 시전이 재생한다).
+		-- (피드백 최종) 전체를 원본 속도의 0.7배로 균일 재생(구간 분할 없음).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("c6f54657879448b496daecc8a15c2918", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["PlayRate"] = 0.7 })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 5.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayResurrectionReviveFx(Entity target)
+		-- 죽어 쓰러진 용사 자리에 남기는 부활 이펙트 1회(발밑 y=0 부착, 원본 속도의 0.7배).
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached("64b8f9ee7c4f43ef98f77296c4ef145b", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["PlayRate"] = 0.7 })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 5.0)
 	end
 
 	@ExecSpace("ServerOnly")

@@ -14,6 +14,8 @@ script HeroSummon extends Component
 
 	property Entity OwnerEntity = nil            -- 서버 전용(소환한 플레이어)
 	property number Lifetime = 300               -- 서버 전용 수명(초)
+	property number HeroMaxHp = 100              -- 서버 전용: 최대 HP(주인 최대 HP의 2/3)
+	property number HeroHp = 100                 -- 서버 전용: 현재 HP
 	@Sync property number HeroLevel = 1          -- 용사 레벨(플레이어 레벨의 2/3)
 	@Sync property string HeroLine = "hero"      -- hero(히어로) / paladin(팔라딘) / darkknight(다크나이트)
 	@Sync property string LocoState = "stand"    -- stand / walk / jump (이동 모션)
@@ -44,7 +46,8 @@ script HeroSummon extends Component
 		if isvalid(ntc) then
 			ntc.Name = self:MakeRandomName() .. "lv" .. tostring(math.floor(self.HeroLevel))
 		end
-		-- 수명 만료 시 제거
+		-- 수명 만료 시 제거 (만료 시각은 리저렉션 부활 시 버프바 잔여시간 복원에도 쓴다)
+		self._T.lifetimeEndAt = now + self.Lifetime
 		_TimerService:SetTimerOnce(function()
 			if isvalid(self.Entity) then
 				log("[HeroSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)")
@@ -52,6 +55,9 @@ script HeroSummon extends Component
 			end
 		end, self.Lifetime)
 		self:ScheduleBuff(true)
+		self:SpawnHpBar()
+		-- 몬스터 공격 피격(HitEvent) 수신 - 런타임 AddComponent라 정적 @EventSender 대신 명시 연결.
+		self._T.hitEventHandler = self.Entity:ConnectEvent(HitEvent, self.OnHeroHit)
 		self:PlaySummonFx()
 		log("[HeroSummon] 소환 완료 line=" .. self.HeroLine .. " level=" .. tostring(math.floor(self.HeroLevel))
 			.. " 직업=" .. self:GetJobName() .. " 전투력=" .. tostring(math.floor(self:GetCombatPower())))
@@ -235,6 +241,7 @@ script HeroSummon extends Component
 			if self._T.lastScaleX ~= wantScaleX then
 				self._T.lastScaleX = wantScaleX
 				tr.Scale = Vector3(wantScaleX, 1, 1)
+				self:SyncHpBarMirror(wantScaleX)
 			end
 		end
 		self:UpdateLoco(rb)
@@ -379,6 +386,202 @@ script HeroSummon extends Component
 		end
 	end
 
+	-- ── 머리 위 HP바(서버) ───────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHpBar()
+		-- 머리 위 HP바: 스나이핑 게이지와 같은 snipinggaugetext 모델(Bg/Fill/Pct)을 용사 자식으로
+		-- 스폰해 재사용한다. Pct 텍스트는 대입하지 않아 빈 문자열(수치 숫자 미표시 - 요청 사항).
+		-- Color/Transform이 @Sync라 서버 대입만으로 모든 클라이언트에 표시된다.
+		local bar = _SpawnService:SpawnByModelId("snipinggaugetext", "HeroHpBar", Vector3(0, 1.05, 0), self.Entity)
+		if not isvalid(bar) then
+			log_warning("[HeroSummon] HP바 스폰 실패")
+			return
+		end
+		-- (피드백) 바 아트(keydownbar full 클립)는 애니메이션 클립이라 그대로 두면 프레임이 계속 돌며
+		-- 반짝인다 - PlayRate=0으로 정지시켜 평소에는 반짝이지 않게 한다(피격 플래시는 FlashHpBar가 담당).
+		local bg = bar:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			bg.SpriteRendererComponent.Color = Color(0.25, 0.25, 0.25, 0.8)
+			bg.SpriteRendererComponent.PlayRate = 0
+		end
+		local fill = bar:GetChildByName("Fill", false)
+		if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+			-- 차지 게이지가 아니라 HP로 읽히도록 붉게 틴트한다.
+			fill.SpriteRendererComponent.Color = Color(1, 0.3, 0.3, 1)
+			fill.SpriteRendererComponent.PlayRate = 0
+		end
+		self._T.hpBar = bar
+		self:UpdateHpBar()
+		log("[HeroSummon] HP바 표시 " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateHpBar()
+		-- 채움 바 갱신: 스나이핑 게이지와 동일하게 왼쪽 끝 고정 + 가로 스케일 = HP 비율.
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		local fill = bar:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = 0
+		if self.HeroMaxHp > 0 then
+			ratio = math.max(0, math.min(1, self.HeroHp / self.HeroMaxHp))
+		end
+		fill.TransformComponent.Scale = Vector3(0.5 * ratio, 0.5, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlashHpBar()
+		-- 피격 순간 2회 깜빡임: 밝음(흰 틴트)↔평소(붉은 틴트)를 두 번 반복한다.
+		-- 타임라인: 0=밝음 → 0.12=복원 → 0.20=밝음 → 0.32=복원(최종). 토큰으로 연속 피격 시
+		-- 이전 깜빡임 타이머를 무시하고 새 시퀀스가 이어받는다. Color는 @Sync라 서버 대입 OK.
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		self._T.hpFlashToken = (self._T.hpFlashToken or 0) + 1
+		local tok = self._T.hpFlashToken
+		local bright = Color(1, 1, 1, 1)
+		local normal = Color(1, 0.3, 0.3, 1)
+		local function setFillColor(c)
+			if self._T.hpFlashToken ~= tok then return end
+			if not isvalid(bar) then return end
+			local fill = bar:GetChildByName("Fill", false)
+			if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+				fill.SpriteRendererComponent.Color = c
+			end
+		end
+		setFillColor(bright)
+		local steps = {
+			{ at = 0.12, color = normal },
+			{ at = 0.20, color = bright },
+			{ at = 0.32, color = normal },
+		}
+		for _, s in ipairs(steps) do
+			local stepColor = s.color
+			_TimerService:SetTimerOnce(function()
+				setFillColor(stepColor)
+			end, s.at)
+		end
+	end
+
+	method void OnHeroHit(HitEvent event)
+		-- 몬스터에게 맞음(서버에서 ConnectEvent로 연결됨): 0.5초 무적 게이트 후 HP 차감,
+		-- 0이 되면 소환 해제. 플레이어(PlayerHit)와 달리 자체 HP 프로퍼티를 직접 깎는다.
+		if self._T.dying then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.hitImmuneUntil or 0) > now then return end
+		self._T.hitImmuneUntil = now + 0.5
+		self.HeroHp = math.max(0, self.HeroHp - event.TotalDamage)
+		self:UpdateHpBar()
+		self:FlashHpBar()
+		log("[HeroSummon] 피격 -" .. tostring(event.TotalDamage) .. " → HP " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)))
+		if self.HeroHp <= 0 then
+			self:UnsummonByDeath()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UnsummonByDeath()
+		-- HP 0: (피드백 - 묘비 낙하 대신) 사망 모션으로 바꾸고 움직이지 않고 있다가 2초 후 사라진다.
+		-- 사망 시 플레이어가 죽을 때와 같은 느낌의 사망 사운드를 함께 재생한다.
+		-- 사망 상태 동안은 아무 행동도 하지 않는다(dying 가드 - ServerTick/DealHit/CastBuff 전부 차단).
+		if self._T.dying then return end
+		self._T.dying = true
+		log("[HeroSummon] HP 0 - 사망 상태 진입(20초 후 소멸)")
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) then mv:Stop() end
+		-- (피드백) 플레이어 사망과 동일한 움직임: 엔진의 플레이어 Dead 해석(Core="dead"+Parts="stand1",
+		-- **Loop**, 배속 1)을 그대로 재현한다. Loop라 재생이 끝나 서기 자세로 되돌아가는 일이 없고
+		-- (기존 Onetime=끝나면 복귀 / 포즈 고정=1프레임 정지 문제 모두 해소), 5초 내내 애니메이션이 유지된다.
+		-- 클라 모션 잠금도 dead 특례로 사망 상태 내내 걸린다(OnSyncProperty 참고).
+		self:PlayMotion("dead", 1.0)
+		self:PlaySoundFx("6e462a4ae44b4a518ea68fde456ea5c3")
+		if isvalid(self.OwnerEntity) and isvalid(self.OwnerEntity.PlayerComponent) then
+			self:NotifyUnsummoned(self.OwnerEntity.PlayerComponent.UserId)
+		end
+		-- 소멸 타이머는 리저렉션 부활 시 취소할 수 있게 id를 남긴다.
+		self._T.deathTimerId = _TimerService:SetTimerOnce(function()
+			self._T.deathTimerId = nil
+			if isvalid(self.Entity) then
+				log("[HeroSummon] 사망 상태 종료 - 소환 해제")
+				self:PlayUnsummonFx()
+				self.Entity:Destroy(0.2)
+			end
+		end, 20.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PrepareResurrect()
+		-- 리저렉션 시전 확정: 사망 소멸 타이머를 멈춰 부활 연출 도중 파괴되지 않게 한다.
+		if self._T.deathTimerId then
+			_TimerService:ClearTimer(self._T.deathTimerId)
+			self._T.deathTimerId = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Resurrect()
+		-- 리저렉션(4차): 죽어 쓰러져 있던 용사를 그 자리에서 HP 가득 찬 상태로 부활시킨다.
+		if not self._T.dying then return end
+		self:PrepareResurrect()
+		self._T.dying = false
+		self.HeroHp = self.HeroMaxHp
+		self:UpdateHpBar()
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.hitImmuneUntil = now + 1.0     -- 부활 직후 1초 피격 무시
+		self._T.attackLockUntil = 0
+		self._T.nextAttackAt = now + 1.0
+		self._T.noChaseUntil = now + 1.0       -- 부활 직후 잠깐 제자리 정착
+		-- 클라이언트: 사망 스핀 중지 + 아바타 원복 + 이동 클립 재개(MotionCmd "revive" 특례).
+		self:PlayMotion("revive", 1.0)
+		-- 주인 버프바를 남은 소환 시간으로 복원한다.
+		local remaining = math.max(0, (self._T.lifetimeEndAt or now) - now)
+		if remaining > 0 and isvalid(self.OwnerEntity) and isvalid(self.OwnerEntity.PlayerComponent) then
+			self:NotifyResurrected(remaining, self.OwnerEntity.PlayerComponent.UserId)
+		end
+		log("[HeroSummon] 리저렉션 부활 - HP " .. tostring(math.floor(self.HeroMaxHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. " 잔여수명 " .. tostring(math.floor(remaining)) .. "초")
+	end
+
+	@ExecSpace("Client")
+	method void NotifyResurrected(number remaining)
+		-- 주인 클라이언트: 우측 상단 용사 소환 버프바를 남은 시간으로 다시 띄운다.
+		_HeroSummonBuffUI:ShowBuff(remaining)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayUnsummonFx()
+		-- 사라짐 연출: 순간이동과 같은 이펙트를 현재 위치에 비부착으로 재생한다
+		-- (부착 재생하면 0.25초 뒤 엔티티 제거와 함께 이펙트가 끊긴다).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local pos = self.Entity.TransformComponent.WorldPosition
+		_EffectService:PlayEffect("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(pos.x, pos.y + 0.3, 0), 0, Vector3(0.7, 0.7, 1), false, nil)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyUnsummoned()
+		-- 주인 클라이언트: 우측 상단 용사 소환 버프바를 즉시 내린다.
+		_HeroSummonBuffUI:HideBuff()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- 서버에서 연결한 피격 이벤트 해제.
+		if self._T.hitEventHandler then
+			self.Entity:DisconnectEvent(HitEvent, self._T.hitEventHandler)
+			self._T.hitEventHandler = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SyncHpBarMirror(number scaleX)
+		-- 용사는 좌우를 루트 Scale.x(-1)로 뒤집으므로(ApplyFacing), HP바가 함께 뒤집혀 채움 기준이
+		-- 좌우로 널뛰지 않게 바 로컬 Scale.x를 같은 부호로 맞춰 상쇄한다(부모 -1 × 로컬 -1 = +1).
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		bar.TransformComponent.Scale = Vector3(scaleX, 1, 1)
+	end
+
 	-- ── 공격 스킬(서버) ──────────────────────────────────────────
 
 	@ExecSpace("ServerOnly")
@@ -435,6 +638,7 @@ script HeroSummon extends Component
 			self._T.lastScaleX = wantScaleX
 			local tr = self.Entity.TransformComponent
 			if isvalid(tr) then tr.Scale = Vector3(wantScaleX, 1, 1) end
+			self:SyncHpBarMirror(wantScaleX)
 		end
 	end
 
@@ -466,6 +670,8 @@ script HeroSummon extends Component
 	@ExecSpace("ServerOnly")
 	method void DealHit(Entity target, number multMin, number multMax)
 		-- 주인 PlayerAttack의 skill.herosummon 파이프라인으로 1타(데미지 스킨/크리티컬 자동).
+		-- 묘지 상태에서는 죽기 전에 예약된 공격 타이머가 뒤늦게 발동해도 무시한다.
+		if self._T.dying then return end
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) or not isvalid(target) then return end
@@ -578,6 +784,7 @@ script HeroSummon extends Component
 			local at = 1.0 + 0.288 + (hi - 1) * 0.15
 			_TimerService:SetTimerOnce(function()
 				if not isvalid(self.Entity) then return end
+				if self._T.dying then return end
 				---@type PlayerAttack
 				local pa = self:GetOwnerAttack()
 				if not isvalid(pa) then return end
@@ -811,6 +1018,8 @@ script HeroSummon extends Component
 	@ExecSpace("ServerOnly")
 	method void CastBuff(string kind)
 		-- 버프 시전: 이펙트는 용사 자신에게(PlayerAttack의 공용 프레임 이펙트 재사용), 효과는 _T에 토큰으로.
+		-- 묘지 상태에서는 재시전 예약이 발동해도 무시한다.
+		if self._T.dying then return end
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) then return end
@@ -1033,6 +1242,7 @@ script HeroSummon extends Component
 		-- 범용 사운드 재생.
 		if not self:IsClient() then return end
 		if soundRuid == nil or soundRuid == "" then return end
+		log("[HeroSummon] (클라) 사운드 재생 " .. soundRuid)
 		_SoundService:PlaySound(soundRuid, 1.0)
 	end
 
@@ -1063,6 +1273,30 @@ script HeroSummon extends Component
 
 	@ExecSpace("ClientOnly")
 	method void ClientTick(number delta)
+		-- 사망 사운드 프리로드: 로드 전 첫 PlaySound는 무음으로 스킵될 수 있어 미리 올려둔다.
+		if not self._T.deathSndPreloaded then
+			self._T.deathSndPreloaded = true
+			_SoundService:LoadSound("6e462a4ae44b4a518ea68fde456ea5c3")
+		end
+		-- 사망 연출: 쓰러진 자세(각도 고정)가 작은 원(반경 0.048)을 그리며 150도/초로 맴돈다.
+		-- 아바타 루트(body+얼굴+파츠)만 움직이므로 히어로 루트의 네임태그/HP바는 제자리.
+		-- ⚠ 자세 자체를 회전(ZRotation)시키지는 않는다 - 원래 EulerAngles 오타(존재하지 않는 필드)로
+		-- 회전이 조용히 무시되고 위치 궤도만 적용되던 것이 사용자가 실관찰로 튜닝·승인한 최종 연출이었고,
+		-- ZRotation으로 실제 회전을 켜자 "각도가 바뀌면서 돈다"는 피드백을 받아 위치 궤도만 남긴다.
+		if self._T.deadSpinBody ~= nil then
+			local sb = self._T.deadSpinBody
+			if isvalid(sb) then
+				local t = _UtilLogic.ElapsedSeconds - (self._T.deadSpinStart or 0)
+				local mirror = 1
+				local rootTr = self.Entity.TransformComponent
+				if isvalid(rootTr) and rootTr.Scale.x < 0 then mirror = -1 end
+				local deg = ((t * 150) % 360) * mirror
+				local rad = math.rad(deg)
+				local tr = sb.TransformComponent
+				tr.Position = Vector3(self._T.deadSpinBaseX + 0.048 * math.cos(rad), self._T.deadSpinBaseY + 0.048 * math.sin(rad), self._T.deadSpinBaseZ)
+			end
+			return
+		end
 		-- 스킬 모션 재생 중이 아니면 LocoState(stand/walk/jump)에 맞는 이동 클립을 body에 보낸다.
 		local ar = self.Entity.AvatarRendererComponent
 		if not isvalid(ar) then return end
@@ -1105,6 +1339,50 @@ script HeroSummon extends Component
 		end
 		local motion = parts[2]
 		if motion == nil or motion == "" then return end
+		if motion == "revive" then
+			-- 리저렉션 부활: 사망 스핀을 즉시 멈추고 아바타 루트를 원위치(원래 높이)/원회전으로 되돌린 뒤
+			-- 잠금을 풀어 이동 클립(stand/walk)을 즉시 재개한다. 스핀 중지 플래그를 먼저 꺼서
+			-- 같은 프레임의 ClientTick이 궤도 오프셋을 다시 쓰지 못하게 한다.
+			self._T.deadSpinBody = nil
+			-- 캐시가 아니라 현재 아바타 루트를 새로 조회해 원복한다(도중 교체됐어도 안전).
+			local rar = self.Entity.AvatarRendererComponent
+			if isvalid(rar) then
+				local rroot = rar:GetAvatarRootEntity()
+				if isvalid(rroot) then
+					local tr = rroot.TransformComponent
+					tr.Position = Vector3(self._T.deadSpinBaseX or 0, self._T.deadSpinBaseY or 0, self._T.deadSpinBaseZ or 0)
+					tr.ZRotation = 0
+				end
+			end
+			self._T.motionLockUntil = 0
+			self._T.lastLoco = nil
+			return
+		end
+		if motion == "dead" then
+			-- (피드백) 플레이어 사망과 동일한 연출: 쓰러진(dead 0번 프레임 - 유일하게 보이는 프레임)
+			-- 자세가 작은 원을 그리며 왼쪽(반시계)으로 돈다. 회전은 아바타 body 엔티티만 돌리므로
+			-- 루트에 붙은 네임태그/HP바는 제자리에 있다. 실제 회전은 ClientTick이 매 프레임 수행.
+			local dar = self.Entity.AvatarRendererComponent
+			if not isvalid(dar) then return end
+			local dbody = dar:GetBodyEntity()
+			if not isvalid(dbody) then return end
+			-- 사망 상태(20초) 내내 이동 클립이 덮지 않게 소멸 시점 너머까지 잠근다.
+			self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 21.0
+			self._T.lastLoco = nil
+			local ev2 = ActionStateChangedEvent("dead", "stand1", 0.001, SpriteAnimClipPlayType.Onetime, 0, 1)
+			dbody:SendEvent(ev2)
+			-- (피드백) body만 돌리면 얼굴(눈)이 안 따라온다 - 얼굴은 별개 엔티티(GetFaceEntity)라서.
+			-- body/얼굴/파츠 전체를 묶는 아바타 루트 엔티티를 돌린다(네임태그/HP바는 이 바깥이라 제자리).
+			local spinRoot = dar:GetAvatarRootEntity()
+			if not isvalid(spinRoot) then spinRoot = dbody end
+			local btr = spinRoot.TransformComponent
+			self._T.deadSpinBody = spinRoot
+			self._T.deadSpinStart = _UtilLogic.ElapsedSeconds
+			self._T.deadSpinBaseX = btr.Position.x
+			self._T.deadSpinBaseY = btr.Position.y
+			self._T.deadSpinBaseZ = btr.Position.z
+			return
+		end
 		local ar = self.Entity.AvatarRendererComponent
 		if not isvalid(ar) then return end
 		local body = ar:GetBodyEntity()
