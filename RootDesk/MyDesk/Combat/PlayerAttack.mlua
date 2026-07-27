@@ -357,6 +357,12 @@ script PlayerAttack extends AttackComponent
 		                return false
 		            end
 		        end
+		        -- 메테오 운석(바닥에 닿은 자리) - 이번 호출 전용 단일 대상만 통과시킨다(블리자드 기둥과 동일한 패턴).
+		        if attackInfo == "skill.meteor" then
+		            if not isvalid(self._T.meteorCurrentTarget) or defender ~= self._T.meteorCurrentTarget then
+		                return false
+		            end
+		        end
 		        -- 패링 반격 - 주변 최대 6명 다중 대상이지만, 이번 호출 전용 단일 대상만 통과시킨다
 		        -- (블리자드/드래곤로어와 동일한 패턴 - 밀집 지역에서 이웃까지 겹쳐 맞히는 것을 막는다).
 		        if attackInfo == "skill.parry" then
@@ -367,6 +373,12 @@ script PlayerAttack extends AttackComponent
 		        -- 새비지블로우 - 전방 1명만 6번 때리는 단일 대상 스킬. 시전 시점에 고정해둔 그 대상만 통과시킨다.
 		        if attackInfo == "skill.savageblow" then
 		            if not isvalid(self._T.savageBlowCurrentTarget) or defender ~= self._T.savageBlowCurrentTarget then
+		                return false
+		            end
+		        end
+		        -- 암행 표창 - 이번 호출 전용 단일 대상만 통과시킨다(매직 미사일과 동일한 패턴).
+		        if attackInfo == "skill.amhaeng" then
+		            if not isvalid(self._T.amhaengCurrentTarget) or defender ~= self._T.amhaengCurrentTarget then
 		                return false
 		            end
 		        end
@@ -389,6 +401,15 @@ script PlayerAttack extends AttackComponent
 	method void SyncCritDamage(number damagePercent)
 		self._T.currentCritDamagePercent = damagePercent
 		log("[PlayerAttack] SyncCritDamage 수신: " .. tostring(damagePercent) .. "%")
+	end
+
+	-- 캐릭터 정보창과 동일한 전투력을 서버로 동기화한다 - SyncCritRate와 동일한 이유(전투력 계산에
+	-- 쓰이는 장비/잠재능력은 클라이언트 전용 상태)로 SkillManager가 스킬을 사용할 때마다
+	-- CharInfoManager:CalcCombatPower()의 최신값을 넘겨준다. 시전 없이 서버가 자체 발동시키는
+	-- 패시브(암행 등)의 데미지 공식이 이 값을 참조한다.
+	@ExecSpace("Server")
+	method void SyncCombatPower(number combatPower)
+		self._T.currentCombatPower = combatPower
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
@@ -620,6 +641,16 @@ script PlayerAttack extends AttackComponent
 		            local combatPower = self._T.pendingMagicMissileCombatPower or 0
 		            local mult = 1.0 + _UtilLogic:RandomDouble() * (1.5 - 1.0)
 		            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.amhaeng" then
+		            -- 암행(1차 패시브): 표창 하나당 전투력의 100%~200% - 그림자가 던지는 시점에
+		            -- 미리 확정한 값(preset)을 DealAmhaengHit이 캐싱해두고 그대로 쓴다.
+		            local preset = self._T.amhaengHitPreset or 0
+		            if preset > 0 then
+		                return preset
+		            end
+		            local combatPower = self._T.currentCombatPower or 0
+		            local mult = 1.0 + _UtilLogic:RandomDouble()
+		            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.heal" then
 		            -- 힐이 언데드 몬스터에게 입히는 데미지 - 썬더볼트와 동일한 전투력 80%~130% 공식.
 		            local combatPower = self._T.pendingHealCombatPower or 0
@@ -652,6 +683,12 @@ script PlayerAttack extends AttackComponent
 			            -- 블리자드 얼음조각: 떨어진 자리에 있던 몬스터가 0.3초 뒤 받는 피해 - 전투력의 100%~150%.
 			            local combatPower = self._T.pendingBlizzardCombatPower or 0
 			            local mult = 1.0 + _UtilLogic:RandomDouble() * (1.5 - 1.0)
+			            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.meteor" then
+			            -- 메테오 운석: 바닥에 닿은 자리의 몬스터에게 전투력의 700%~1000% 피해
+			            -- (블리자드 타일과 동일 규격 - 대상마다 독립적으로 새로 굴린다).
+			            local combatPower = self._T.pendingMeteorCombatPower or 0
+			            local mult = 7.0 + _UtilLogic:RandomDouble() * (10.0 - 7.0)
 			            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.spearburst" then
 			            -- 배율은 RollSpearBurstMult 한 곳에서 관리한다 - 용사 소환(HeroSummon.CastSpearBurst)도
@@ -5069,11 +5106,31 @@ script PlayerAttack extends AttackComponent
 		_SoundService:PlaySound("d3205fdd08e34b68bc01292a997531ed", 1.0)
 	end
 
+	method Color GetMagicMissileElementColor(string element)
+		-- 매직 에로우(3차 토글) 속성별 틴트 색. 빛=노랑·하양, 얼음=파랑, 불=붉은색.
+		-- 무속성(빈 문자열)은 흰색(틴트 없음 = 원본색 그대로)을 돌려준다. 구체 스프라이트와
+		-- 생성/발사 이펙트에 곱셈 틴트로 공통 적용된다(서버/클라 양쪽에서 호출 - ExecSpace 미지정).
+		-- (피드백: "색이 탁하다" → "색변화가 잘 안 보인다") 원본 구체 아트가 흰색-파랑 계열이라
+		-- 채도 낮은 틴트는 모든 채널이 1.0 이상으로 클램프돼 화면에서 그냥 흰색으로 보인다.
+		-- 채도를 높이고(낮은 채널을 1.0 아래로 확실히 내림) 밝기는 HDR로 약간만 올려(1.4~1.5)
+		-- 흰 코어 + 선명한 속성색이 되도록 조정 - 루프 재생 스크린샷으로 4색 비교 검증 완료.
+		if element == "light" then
+			return Color.HSVToRGB(0.13, 0.8, 1.4, true)
+		elseif element == "ice" then
+			return Color.HSVToRGB(0.58, 0.85, 1.4, true)
+		elseif element == "fire" then
+			return Color.HSVToRGB(0.015, 0.85, 1.5, true)
+		end
+		return Color(1.0, 1.0, 1.0, 1.0)
+	end
+
 	@ExecSpace("ServerOnly")
-	method void AttackMagicMissile(number combatPower, number atkMultiplier, number playerLevel)
+	method void AttackMagicMissile(number combatPower, number atkMultiplier, number playerLevel, string element)
 		-- 매직 미사일(1차): 등 뒤 랜덤 위치에 마법 구체(레벨 비례 개수)를 소환하고, 각 구체가
 		-- 전방의 타겟을 향해 서서히 조준 회전한 뒤 발사 플래시와 함께 유도 비행해 명중 시
-		-- 전투력의 100%~150% 피해를 준다. 구체 시퀀스 자체는 MagicMissileBall 엔티티가 진행하고,
+		-- 전투력의 100%~150% 피해를 준다. element는 매직 에로우 토글 속성(""/"light"/"ice"/"fire") -
+		-- 켜져 있으면 구체/이펙트가 속성색으로 물든다(데미지 2배는 combatPower에 이미 반영되어 넘어온다).
+		-- 구체 시퀀스 자체는 MagicMissileBall 엔티티가 진행하고,
 		-- 여기서는 소환/타겟 분배/시전 모션/판정(DealMagicMissileHit)만 담당한다.
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 다른 스킬과 동일하게 정리.
 		self:StopBreather()
@@ -5164,12 +5221,12 @@ script PlayerAttack extends AttackComponent
 				log("PlayerAttack: MagicMissile ball " .. tostring(i) .. " -> " .. tostring(target.Name) .. " preset=" .. tostring(presetDamage) .. " 남은예측HP=" .. tostring(remainingHp[chosenIdx]))
 			end
 
-			self:PlayMagicMissileSpawnEffect(bx, by, bz, dirX)
+			self:PlayMagicMissileSpawnEffect(bx, by, bz, dirX, element)
 			local capturedTarget = target
 			local capturedPreset = presetDamage
 			-- (피드백) 생성 이펙트가 PlayRate 2배로 절반 시간에 끝나므로 구체 등장도 0.9→0.45초로 앞당긴다.
 			_TimerService:SetTimerOnce(function()
-				self:SpawnMagicMissileBall(bx, by, bz, capturedTarget, dirX, capturedPreset)
+				self:SpawnMagicMissileBall(bx, by, bz, capturedTarget, dirX, capturedPreset, element)
 			end, 0.45)
 		end
 
@@ -5210,7 +5267,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void SpawnMagicMissileBall(number px, number py, number pz, Entity target, number dirX, number presetDamage)
+	method void SpawnMagicMissileBall(number px, number py, number pz, Entity target, number dirX, number presetDamage, string element)
 		-- 생성 이펙트 마지막 프레임 시점에 호출되어 구체 엔티티를 실제로 소환한다.
 		if not isvalid(self.Entity) then return end
 		local map = self.Entity.CurrentMap
@@ -5223,13 +5280,19 @@ script PlayerAttack extends AttackComponent
 			log_warning("PlayerAttack: SpawnMagicMissileBall - spawn failed (model 'magicmissileball')")
 			return
 		end
+		-- (요청) 매직 에로우 속성이 켜져 있으면 구체 스프라이트를 속성색으로 틴트한다.
+		-- SpriteRendererComponent.Color는 @Sync라 서버에서 쓰면 클라에 전파되고,
+		-- 발사 시 SpriteRUID를 루프 클립으로 교체해도 Color는 별도 프로퍼티라 그대로 유지된다.
+		if element ~= "" and isvalid(ball.SpriteRendererComponent) then
+			ball.SpriteRendererComponent.Color = self:GetMagicMissileElementColor(element)
+		end
 		---@type MagicMissileBall
 		local bc = ball:GetComponent("script.MagicMissileBall")
 		if not isvalid(bc) then
 			log_warning("PlayerAttack: SpawnMagicMissileBall - MagicMissileBall component not found")
 			return
 		end
-		bc:Setup(target, self.Entity, dirX, presetDamage)
+		bc:Setup(target, self.Entity, dirX, presetDamage, element)
 		log("PlayerAttack: SpawnMagicMissileBall " .. name .. " target=" .. (isvalid(target) and tostring(target.Name) or "none") .. " preset=" .. tostring(presetDamage))
 	end
 
@@ -5339,27 +5402,38 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("Multicast")
-	method void PlayMagicMissileSpawnEffect(number px, number py, number pz, number dirX)
+	method void PlayMagicMissileSpawnEffect(number px, number py, number pz, number dirX, string element)
 		-- 구체 생성 이펙트: dcac510901fe451282ad7b93abc3032d의 1~7프레임(0-base 0~6)만 재생한다(피드백 사양).
 		-- 아트 속 미사일 머리가 -x(왼쪽) 기준이라 오른쪽을 볼 때 FlipX.
 		-- (피드백) 구체(화살) 위치/크기와 안 맞아 조금 뒤(-0.2*dirX)·아래(-0.15)로 내리고 크기를 30% 키움(0.6→0.78).
+		-- element: 매직 에로우 토글 속성 - Multicast는 서버 _T를 못 읽으므로 파라미터로 받아 색을 입힌다(강화 스킬 공통 패턴).
 		if not self:IsClient() then return end
 		-- (피드백) 생성 이펙트 재생 속도 2배(PlayRate=2) - 구체 등장 타이머(0.45초)와 짝을 이룬다.
 		local options = { ["StartFrameIndex"] = 0, ["EndFrameIndex"] = 6, ["FlipX"] = dirX > 0, ["PlayRate"] = 2.0 }
+		if element ~= "" then
+			options["Color"] = self:GetMagicMissileElementColor(element)
+		end
 		_EffectService:PlayEffect("dcac510901fe451282ad7b93abc3032d", self.Entity, Vector3(px - 0.2 * dirX, py - 0.15, pz), 0, Vector3(0.78, 0.78, 1), false, options)
 	end
 
 	@ExecSpace("Multicast")
-	method void PlayMagicMissileLaunchEffect(number px, number py, number pz, number zRot)
+	method void PlayMagicMissileLaunchEffect(number px, number py, number pz, number zRot, string element)
 		-- 발사 이펙트: 6df269a10323437c8acf7c7937fff4c1를 구체가 날아가기 시작한 위치에서
 		-- 비행 각도로 재생한다(피드백 사양). zRot에는 구체와 같은 +180 보정(원본 궤적 -x 기준)이 포함되어 넘어온다.
+		-- element가 있으면 속성색 틴트(원본이 순백 클립이라 곱셈 틴트가 그대로 속성색이 된다).
 		if not self:IsClient() then return end
-		_EffectService:PlayEffect("6df269a10323437c8acf7c7937fff4c1", self.Entity, Vector3(px, py, pz), zRot, Vector3(0.7, 0.7, 1), false, {})
+		local options = {}
+		if element ~= "" then
+			options["Color"] = self:GetMagicMissileElementColor(element)
+		end
+		_EffectService:PlayEffect("6df269a10323437c8acf7c7937fff4c1", self.Entity, Vector3(px, py, pz), zRot, Vector3(0.7, 0.7, 1), false, options)
 	end
 
 	@ExecSpace("Multicast")
 	method void PlayMagicMissileHitEffect(Entity target)
 		-- 명중 이펙트 + 타격음: 피드백으로 지정된 hit 클립을 대상 몸에서 재생.
+		-- (피드백) 매직 에로우 속성이 켜져 있어도 명중 이펙트는 틴트하지 않고 원본 색 그대로 둔다
+		-- (속성색은 구체/생성/발사 이펙트에만 적용).
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
 		_EffectService:PlayEffectAttached("37667e283b994c4a94880227dbe4d387", target, Vector3(0, 0.2, 0), 0, Vector3(1, 1, 1), false, {})
@@ -8226,8 +8300,8 @@ script PlayerAttack extends AttackComponent
 		self:EchoShadowSkillEffectAttached("96b261657b0c4aa792bd6f3e7d6c6681", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
 		_SoundService:PlaySound("267aa4a9324f460b80bc04600aa4d0e0", 1.0)
 		-- 시전 시점부터 c50b1e30을 20초간 재생한다(클립이 20초보다 짧을 수 있어 반복 재생 후 20초에 정지).
-		-- (기능 수정) "배경 소리가 잘 안 들린다" - 볼륨 0.5 → 0.8.
-		_SoundService:PlayLoopSound("c50b1e30210d4019a97da3e76c33079f", 0.8)
+		-- (기능 수정) "배경 소리가 잘 안 들린다" - 볼륨 0.5 → 0.8 → (요청) 1.5배인 1.2로.
+		_SoundService:PlayLoopSound("c50b1e30210d4019a97da3e76c33079f", 1.2)
 		_TimerService:SetTimerOnce(function()
 			_SoundService:StopSound("c50b1e30210d4019a97da3e76c33079f")
 		end, 20.0)
@@ -8237,6 +8311,28 @@ script PlayerAttack extends AttackComponent
 	method void ApplyBlizzardDamageSkin()
 		-- (기능 수정) 블리자드 시전 후 19초 동안(15초 → +4초 연장) 데미지 스킨(공격 숫자 모양)을
 		-- 얼음 스킨으로 바꿨다가 시간이 끝나면 원래 스킨으로 되돌린다.
+		-- (버그 수정) 메테오와 겹쳐 쓰면 서로의 스킬 스킨을 "원본"으로 잘못 저장해 기본으로 안 돌아오던
+		-- 문제 - 저장/복구를 공용 관리(ApplySkillDamageSkinShared)로 옮겼다.
+		self:ApplySkillDamageSkinShared("blizzard", "d0bbfb140e164860b8b30281613a42c3")
+		-- (기능 수정) 유지 시간 15초 → 19초(+4초 연장 요청).
+		_TimerService:SetTimerOnce(function()
+			self:RestoreBlizzardDamageSkin()
+		end, 19.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreBlizzardDamageSkin()
+		-- 19초 뒤 복구 요청 - 실제 복구는 공용 관리가 "마지막 스킬 스킨이 끝났을 때"만 수행한다.
+		self:RestoreSkillDamageSkinShared("blizzard")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplySkillDamageSkinShared(string skillKey, string skinRuid)
+		-- 스킬 데미지 스킨 교체의 공용 관리자(블리자드/메테오 공용).
+		-- (버그 수정) 스킬별로 "원본 스킨"을 따로 저장하면, 두 스킬을 겹쳐 쓸 때 나중 스킬이 앞 스킬의
+		-- "스킬 스킨"을 원본으로 저장해버려 지속시간이 다 끝나도 기본 스킨으로 안 돌아온다.
+		-- → 원본(base)은 "스킬 스킨이 하나도 활성화되지 않은 시점"에 한 번만 공용으로 저장하고,
+		--   복구는 마지막 활성 스킬이 끝나는 순간에만 base로 되돌린다.
 		-- 데미지 스킨은 "공격자" 쪽 DamageSkinSettingComponent.DamageSkinId 가 결정한다
 		-- (맞는 쪽에는 DamageSkinSpawnerComponent가 있어야 숫자가 뜬다 - 몬스터 모델에 이미 있다).
 		if not isvalid(self.Entity) then return end
@@ -8247,39 +8343,54 @@ script PlayerAttack extends AttackComponent
 			skinComp = self.Entity:GetComponent("MOD.Core.DamageSkinSettingComponent")
 		end
 		if not isvalid(skinComp) then
-			log_warning("[PlayerAttack] DamageSkinSettingComponent를 찾지 못해 블리자드 데미지 스킨을 적용하지 못했습니다")
+			log_warning("[PlayerAttack] DamageSkinSettingComponent를 찾지 못해 스킬 데미지 스킨을 적용하지 못했습니다: " .. tostring(skillKey))
 			return
 		end
-		-- 원래 스킨은 "문자열 id"로 기억한다(DataRef 객체를 그대로 들고 있으면 나중에 값이 바뀔 수 있다).
-		-- 19초 안에 다시 시전되는 경우(쿨타임 20초라 정상적으론 없다)에도 원본이 덮이지 않게 한 번만 저장한다.
-		if self._T.blizzardSkinOriginalId == nil then
-			local cur = skinComp.DamageSkinId
-			self._T.blizzardSkinOriginalId = (cur ~= nil) and cur.DataId or ""
+		if self._T.skillSkinActive == nil then
+			self._T.skillSkinActive = {}
 		end
-		skinComp.DamageSkinId = DataRef("d0bbfb140e164860b8b30281613a42c3")
-		log("PlayerAttack: 블리자드 데미지 스킨 적용 (19초) 원본=" .. tostring(self._T.blizzardSkinOriginalId))
-
-		-- (기능 수정) 유지 시간 15초 → 19초(+4초 연장 요청).
-		_TimerService:SetTimerOnce(function()
-			self:RestoreBlizzardDamageSkin()
-		end, 19.0)
+		local anyActive = false
+		for _, v in pairs(self._T.skillSkinActive) do
+			if v then
+				anyActive = true
+				break
+			end
+		end
+		-- 원본은 문자열 id로 기억한다(DataRef 객체를 그대로 들고 있으면 나중에 값이 바뀔 수 있다).
+		if not anyActive then
+			local cur = skinComp.DamageSkinId
+			self._T.skillSkinBaseId = (cur ~= nil) and cur.DataId or ""
+		end
+		self._T.skillSkinActive[skillKey] = true
+		skinComp.DamageSkinId = DataRef(skinRuid)
+		log("PlayerAttack: 스킬 데미지 스킨 적용 [" .. tostring(skillKey) .. "] 원본(base)=" .. tostring(self._T.skillSkinBaseId))
 	end
 
 	@ExecSpace("ServerOnly")
-	method void RestoreBlizzardDamageSkin()
-		-- 15초 뒤 원래 데미지 스킨으로 복구한다.
+	method void RestoreSkillDamageSkinShared(string skillKey)
+		-- 이 스킬의 스킨 활성 표시를 내리고, 아직 활성인 다른 스킬 스킨이 있으면 복구를 보류한다
+		-- (그 스킬이 끝날 때 base로 복구된다). 마지막 스킬이면 base 스킨으로 되돌린다.
 		if not isvalid(self.Entity) then return end
+		if self._T.skillSkinActive == nil then
+			self._T.skillSkinActive = {}
+		end
+		self._T.skillSkinActive[skillKey] = nil
+		for otherKey, v in pairs(self._T.skillSkinActive) do
+			if v then
+				log("PlayerAttack: 스킬 데미지 스킨 복구 보류 [" .. tostring(skillKey) .. "] - [" .. tostring(otherKey) .. "] 아직 활성")
+				return
+			end
+		end
 		local skinComp = self.Entity:GetComponent("MOD.Core.DamageSkinSettingComponent")
 		if not isvalid(skinComp) then return end
-		local originalId = self._T.blizzardSkinOriginalId
-		if originalId == nil then return end
-		if originalId == "" then
+		local originalId = self._T.skillSkinBaseId
+		if originalId == nil or originalId == "" then
 			-- 원본이 비어 있었다면(컴포넌트를 새로 붙인 경우 등) 기본 공격 데미지 스킨으로 되돌린다.
 			originalId = "3271c3e79bf04ecba9a107d55495970d"
 		end
 		skinComp.DamageSkinId = DataRef(originalId)
-		self._T.blizzardSkinOriginalId = nil
-		log("PlayerAttack: 블리자드 데미지 스킨 원상복구 -> " .. tostring(originalId))
+		self._T.skillSkinBaseId = nil
+		log("PlayerAttack: 스킬 데미지 스킨 원상복구 [" .. tostring(skillKey) .. "] -> " .. tostring(originalId))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -8312,19 +8423,22 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayBlizzardBgmDuck()
-		-- (기능 수정) 시전하는 동안 맵의 메인 BGM을 서서히 50%까지만 낮추고(20% → 50%), 13초 뒤부터 원상복귀.
-		-- 1.5초에 걸쳐 줄어들고(→ 50%), 11.5초 유지(= 시전 후 13초 시점), 2.5초에 걸쳐 원래대로.
-		-- 블리자드 자체 사운드(시전음/눈보라 루프)는 BGM 채널이 아니라 그대로 들린다.
+		-- 시전하는 동안 맵의 메인 BGM을 서서히 낮추고 13초 뒤부터 원상복귀.
+		-- 1.5초에 걸쳐 줄어들고, 11.5초 유지(= 시전 후 13초 시점), 2.5초에 걸쳐 원래대로.
+		-- (요청) 블리자드/메테오의 스킬 BGM이 나올 때 기존 맵 BGM이 겹쳐 들리지 않게 목표 볼륨 50% → 10%.
+		-- 스킬 자체 사운드(시전음/눈보라·메테오 루프)는 BGM 채널이 아니라 그대로 들린다.
+		-- 메테오(PlayMeteorCastEffect 경로)도 이 메서드를 그대로 재사용하므로 같이 10%가 적용된다.
 		if not self:IsClient() then return end
-		_BlizzardBgmDucker:StartDuck(1.5, 11.5, 2.5, 0.5)
+		_BlizzardBgmDucker:StartDuck(1.5, 11.5, 2.5, 0.1)
 	end
 
 	@ExecSpace("Multicast")
 	method void PlayBlizzardScreenDim()
-		-- 맵 전체가 서서히 "약간만" 어두워졌다가(최대 알파 0.35) 서서히 밝아진다.
+		-- 맵 전체가 서서히 "약간만" 어두워졌다가 서서히 밝아진다.
 		-- (기능 수정) "밝아지는 시점을 2초 앞당겨달라" - 유지 시간 15초 → 13초.
+		-- (요청) 어두워지는 정도를 약하게 - 최대 알파 0.35 → 0.2.
 		if not self:IsClient() then return end
-		_BlizzardScreenDim:StartDim(1.5, 13.0, 2.5, 0.35)
+		_BlizzardScreenDim:StartDim(1.5, 13.0, 2.5, 0.2)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -12280,17 +12394,37 @@ script PlayerAttack extends AttackComponent
 			return
 		end
 
+		-- (기능 추가) "대상 주변 적들도 최대 6명까지 데미지를 입히면서 히트이펙트를 달아달라"는 요청 -
+		-- 썬더볼트와 동일한 패턴(위치 기반 탐색 후 동시 타격)으로, 주 대상의 위치를 중심으로 근처
+		-- 적을 가까운 순으로 최대 6명까지 찾는다(주 대상 자신도 거리 0으로 포함됨).
+		-- (요청) 착지 지점 계산에 써야 하므로 순간이동 전에 미리 찾는다.
+		local targetPos = target.TransformComponent.WorldPosition
+		local splashTargets = self:FindAssaulterSplashTargets(Vector2(targetPos.x, targetPos.y), 6)
+
+		-- (요청) 착지 지점은 주 대상이 아니라 "이번에 맞는 적들 중 진행 방향으로 가장 먼 적"의
+		-- 뒤쪽(+1.0)이다 - 캐릭터 1, 몬스터 3이면 4에 서는 규칙을 맞은 적 전원에 적용한 것.
+		local farX = targetPos.x
+		local farY = targetPos.y
+		for _, st in ipairs(splashTargets) do
+			if isvalid(st) then
+				local sp = st.TransformComponent.WorldPosition
+				if (sp.x - farX) * dirX > 0 then
+					farX = sp.x
+					farY = sp.y
+				end
+			end
+		end
+
 		local rb = self.Entity.RigidbodyComponent
 		local map = self.Entity.CurrentMap
 		if isvalid(rb) and isvalid(map) then
 			local fh = map.FootholdComponent
 			-- (기능 수정) "몬스터 뒤로 이동한 뒤 너무 가깝다 - 조금 더 이동시켜달라"는 요청 - 0.6 → 1.0.
-			local targetPos = target.TransformComponent.WorldPosition
 			local BEHIND_OFFSET = 1.0
-			local landX = targetPos.x + dirX * BEHIND_OFFSET
-			local landY = targetPos.y
+			local landX = farX + dirX * BEHIND_OFFSET
+			local landY = farY
 			if isvalid(fh) then
-				local nearFh = self:FindNearbyFootholdAtX(fh, landX, targetPos.y, 1.2)
+				local nearFh = self:FindNearbyFootholdAtX(fh, landX, farY, 1.2)
 				if nearFh ~= nil then
 					landY = nearFh:GetYByX(landX) + 0.05
 				end
@@ -12310,11 +12444,6 @@ script PlayerAttack extends AttackComponent
 
 		self:PlayAssaulterReappearEffects(self.Entity)
 
-		-- (기능 추가) "대상 주변 적들도 최대 6명까지 데미지를 입히면서 히트이펙트를 달아달라"는 요청 -
-		-- 썬더볼트와 동일한 패턴(위치 기반 탐색 후 동시 타격)으로, 착지한 대상의 위치를 중심으로 근처
-		-- 적을 가까운 순으로 최대 6명까지 찾는다(주 대상 자신도 거리 0으로 포함됨).
-		local targetPos = target.TransformComponent.WorldPosition
-		local splashTargets = self:FindAssaulterSplashTargets(Vector2(targetPos.x, targetPos.y), 6)
 		self:DealAssaulterHits(splashTargets)
 
 		-- (기능 변경) 착지 즉시 어썰터만은 딜레이 없이 연속 시전할 수 있게 한다 (요청사항) -
@@ -12402,17 +12531,23 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("Multicast")
-	method void PlayAssaulterHitEffect(Entity target)
-		-- 맞은 대상 한 명의 자리에 흑백톤(어둡게 틴트한) 히트 이펙트(5fd114...)를 재생한다 - 주 대상/주변
-		-- 적 모두 동일하게 대상마다 따로 호출된다.
+	method void PlayAssaulterHitEffect(Entity target, number dirX)
+		-- 맞은 대상 한 명의 자리에 히트 이펙트(5fd114c9)를 원본 색 그대로 재생한다 - 주 대상/주변 적
+		-- 모두 대상마다 따로 호출된다. (요청) 이펙트 방향은 몬스터가 아니라 "플레이어가 보는(돌진한)
+		-- 방향"을 따라야 한다 - 대상에 부착(PlayEffectAttached)하면 몬스터의 좌우반전(Scale.x)을
+		-- 물려받으므로, 부착 대신 대상의 현재 위치에 고정 재생하고 FlipX를 dirX로 직접 지정한다
+		-- (사라지는 자리 이펙트와 같은 방식).
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
-		-- 검은색/회색 느낌으로 어둡게 틴트.
-		local hitOptions = { ["Color"] = Color(0.2, 0.2, 0.2, 1.0) }
-		-- (기능 수정) "y값을 조금 위로 올려달라"는 요청 - 0 -> 0.3.
-		local serial = _EffectService:PlayEffectAttached("5fd114c93ac7453e9b54e228f2c62064", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, hitOptions)
+		local mapEntity = self.Entity.CurrentMap
+		if not isvalid(mapEntity) then return end
+		-- (피드백) 실제로 보니 방향이 반대 - 반전 조건을 뒤집는다(dirX < 0일 때 FlipX).
+		local options = { ["FlipX"] = dirX < 0 }
+		local tp = target.TransformComponent.WorldPosition
+		local pos = Vector3(tp.x, tp.y + 0.3, 0)
+		local serial = _EffectService:PlayEffect("5fd114c93ac7453e9b54e228f2c62064", mapEntity, pos, 0, Vector3(1, 1, 1), false, options)
 		-- 쉐도우 파트너: 같은 히트 이펙트를 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생.
-		self:EchoShadowHitEffect("5fd114c93ac7453e9b54e228f2c62064", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), hitOptions)
+		self:EchoShadowHitEffectAtPos("5fd114c93ac7453e9b54e228f2c62064", pos, 0, Vector3(1, 1, 1), options)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
@@ -12442,7 +12577,7 @@ script PlayerAttack extends AttackComponent
 				-- (기능 추가) "코마처럼 몬스터를 3초간 행동불능 상태로 만들고 b0bd80f44c...를 스턴 동안 띄워달라"는 요청 -
 				-- 주 대상뿐 아니라 이번에 맞은 주변 적 전원에게 동일하게 적용한다.
 				if actuallyHit then
-					self:PlayAssaulterHitEffect(target)
+					self:PlayAssaulterHitEffect(target, self._T.pendingAssaulterDirX or 1)
 					self:PlayAssaulterStunEffect(target)
 					self:ApplyAssaulterStun(target)
 					hitCount = hitCount + 1
@@ -14901,6 +15036,145 @@ script PlayerAttack extends AttackComponent
 		log("[HeroSummon] 스폰 완료 seq=" .. tostring(self._T.heroSummonSeq) .. " playerLevel=" .. tostring(playerLevel))
 	end
 
+	-- ── 암행(1차 패시브) ─────────────────────────────────────────────
+	-- 스킬 1회 시전이 한 대상을 때리는 타수만큼 20% 확률로(TryProcElementalZones에서
+	-- 시전별 추적 대상 기준으로 굴림 - 다수 대상으로 퍼진 같은 줄은 1번만) 맞은 적 주변
+	-- 랜덤 위치(1.5~4.0, 좌우 랜덤 + 위쪽 0~1.2 부양)에 그림자를 소환한다. 그림자는
+	-- 별도 생성 이펙트 없이 투명도 70%로 나타나 스윙 모션(skill/411.img/skill/4111002
+	-- special/swingO1·O2·O3·OF 중 랜덤 1, 0.7배속)으로 표창을 하나 던지고, 그 자리에서
+	-- 서서히 투명해지며 사라진다(dead 클립 없이 알파 페이드 - 그래서 그림자는 이펙트가
+	-- 아니라 엔티티(amhaengshadow 모델)로 스폰해 SpriteRenderer 알파를 계단식으로 낮춘다).
+	-- 표창은 그림자→적 각도로 날아가 전투력의 100%~200% 피해를 준다(AmhaengShuriken 위임).
+
+	@ExecSpace("ServerOnly")
+	method void SpawnAmhaengShadow(Entity target)
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		if not isvalid(target) then return end
+		local tp = target.TransformComponent.WorldPosition
+		-- (피드백) "너무 멀리서, 좌우에서만 소환된다" - 거리를 1.5~4.0으로 좁히고,
+		-- 위쪽 0~1.2 랜덤 부양을 더해 대각선 위치에서도 나타나게 한다(그림자라 공중 부양 허용).
+		local dist = 1.5 + _UtilLogic:RandomDouble() * (4.0 - 1.5)
+		local side = 1
+		if _UtilLogic:RandomDouble() < 0.5 then side = -1 end
+		local sx = tp.x + side * dist
+		local sy = tp.y + _UtilLogic:RandomDouble() * 1.2
+		-- 그림자가 몬스터 쪽을 바라보는 방향: 몬스터가 그림자의 오른쪽이면 +1, 왼쪽이면 -1.
+		local faceDir = 1
+		if tp.x < sx then faceDir = -1 end
+		-- 그림자 스윙 클립(skill/411.img/skill/4111002 special/swingO1·O2·O3·OF) 중 랜덤 1.
+		local clips = {
+			"edfb3dd0204f49e1a5dfac95520439b8", -- special/swingO1
+			"07531c9679d44f7992d7c66871b5f551", -- special/swingO2
+			"fc164d4b226e4a22bab992992cdfdd4c", -- special/swingO3
+			"1e8698fd912644f28458031b25a62827", -- special/swingOF
+		}
+		local clipIdx = _UtilLogic:RandomIntegerRange(1, 4)
+		self._T.amhaengSeq = (self._T.amhaengSeq or 0) + 1
+		local seq = self._T.amhaengSeq
+
+		-- 그림자 엔티티 스폰: 클립 원점이 발밑 기준(실측)이라 지면 y 그대로 두면 땅 위에 선다.
+		-- (피드백) 스윙은 0.7배 느리게 재생 - 이후 타이밍(표창 던지기/페이드 시작)도 1/0.7배로 늘려 맞춘다.
+		local shadow = _SpawnService:SpawnByModelId("amhaengshadow", "amhshadow_" .. tostring(seq), Vector3(sx, sy, 0), map)
+		if not isvalid(shadow) then
+			log_warning("[Amhaeng] 그림자 스폰 실패")
+			return
+		end
+		local spr = shadow.SpriteRendererComponent
+		if isvalid(spr) then
+			spr.SpriteRUID = clips[clipIdx]
+			spr.PlayRate = 0.7
+			-- (피드백) 그림자 투명도 70%(Alpha=0.7 - 쉐도우 파트너와 같은 규약). 페이드는 이 값에서 시작한다.
+			spr.Color = Color(1, 1, 1, 0.7)
+		end
+		-- 클립 기본 방향은 왼쪽 바라봄(WZ 캐릭터 클립 관례) - 오른쪽을 봐야 하면 Scale.x 반전.
+		if faceDir >= 0 then
+			shadow.TransformComponent.Scale = Vector3(-1, 1, 1)
+		end
+
+		-- 표창은 스윙 중간(0.15/0.7≈0.21초)에 그림자 손 높이에서 스폰된다. 데미지는 던지는 시점에 확정.
+		local cp = math.max(self._T.currentCombatPower or 0, 10)
+		local presetDamage = math.floor(cp * (1.0 + _UtilLogic:RandomDouble()))
+		local projName = "amhaeng_" .. tostring(seq)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) or not isvalid(map) then return end
+			local proj = _SpawnService:SpawnByModelId("amhaengshuriken", projName, Vector3(sx + faceDir * 0.3, sy + 0.6, 0), map)
+			if not isvalid(proj) then
+				log_warning("[Amhaeng] 표창 스폰 실패")
+				return
+			end
+			---@type AmhaengShuriken
+			local comp = proj:GetComponent("script.AmhaengShuriken")
+			if comp ~= nil then
+				comp:Setup(target, self.Entity, presetDamage)
+			end
+		end, 0.21)
+		-- (피드백) dead 클립 없이, 던진 뒤(0.3/0.7≈0.43초)부터 그 자리에서 서서히 투명해지며 사라진다.
+		_TimerService:SetTimerOnce(function()
+			self:FadeOutAmhaengShadow(shadow)
+		end, 0.43)
+		log("[Amhaeng] 그림자 소환 x=" .. string.format("%.2f", sx) .. " y=" .. string.format("%.2f", sy) .. " face=" .. tostring(faceDir) .. " clip=" .. tostring(clipIdx) .. " dmg=" .. tostring(presetDamage))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FadeOutAmhaengShadow(Entity shadowEnt)
+		-- 그림자 알파를 0.6초에 걸쳐 5계단으로 낮춘 뒤 파괴한다(독구름 PlayFadeOut과 동일한
+		-- 계단식 타이머 패턴 - 네이티브 SpriteRenderer.Color는 서버 대입이 클라이언트로 동기화된다).
+		local steps = 5
+		local stepTime = 0.12
+		local stepIndex = 0
+		local fadeStep
+		fadeStep = function()
+			stepIndex = stepIndex + 1
+			if not isvalid(shadowEnt) then return end
+			local spr = shadowEnt.SpriteRendererComponent
+			if isvalid(spr) then
+				-- 기본 투명도 70%에서 시작해 0까지 내려간다.
+				local a = 0.7 * (1 - stepIndex / steps)
+				if a < 0 then a = 0 end
+				spr.Color = Color(1, 1, 1, a)
+			end
+			if stepIndex < steps then
+				_TimerService:SetTimerOnce(fadeStep, stepTime)
+			else
+				shadowEnt:Destroy(0.05)
+			end
+		end
+		fadeStep()
+	end
+
+	@ExecSpace("Server")
+	method void DealAmhaengHit(Entity target, number presetDamage)
+		-- 표창(AmhaengShuriken)이 타겟에 도달한 순간 호출되어 그 대상 하나에게만 판정을 실행한다
+		-- (매직 미사일과 동일한 단일 대상 게이트). 판정 동안 inAmhaengHit을 켜서 암행 데미지 줄이
+		-- 다시 암행을 발동시키는 연쇄를 막는다.
+		if not isvalid(self.Entity) then return end
+		if not isvalid(target) then return end
+		self._T.amhaengCurrentTarget = target
+		self._T.amhaengHitPreset = presetDamage
+		self._T.inAmhaengHit = true
+		local targetPos = target.TransformComponent.WorldPosition
+		local shape = CircleShape(Vector2(targetPos.x, targetPos.y), 0.6)
+		self:AttackShadowSafe(shape, "skill.amhaeng", target)
+		self._T.inAmhaengHit = false
+		self._T.amhaengCurrentTarget = nil
+		self._T.amhaengHitPreset = 0
+		-- (피드백) 표창이 대상에 닿는 순간 지정된 hit 클립을 대상 몸에서 재생한다 - 판정 성공
+		-- 여부와 무관하게 표창이 도달한 시점이므로 항상 재생(새비지블로우 히트 이펙트와 같은 방침).
+		self:PlayAmhaengHitEffect(target)
+		log("PlayerAttack: DealAmhaengHit target=" .. tostring(target.Name) .. " dmg=" .. tostring(presetDamage))
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAmhaengHitEffect(Entity target)
+		-- 암행 표창 명중 이펙트: 사용자 지정 hit 클립을 대상 몸(y+0.2 = 표창 조준점과 동일)에서
+		-- 재생한다(매직 미사일 명중 이펙트 PlayMagicMissileHitEffect와 동일한 부착 재생 패턴).
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		_EffectService:PlayEffectAttached("458e72f0720a4584a9a7fc3642b6e601", target, Vector3(0, 0.2, 0), 0, Vector3(1, 1, 1), false, {})
+		log("[Amhaeng] 표창 명중 이펙트 재생 target=" .. tostring(target.Name))
+	end
+
 	-- ── 불의 영역(2차 버프) ─────────────────────────────────────────
 	-- 10분간: 공격 적중(OnAttack) 시 10% 확률로 그 자리에 화염 지대를 만든다.
 	-- 화염 지대 = 10초 유지, 2초마다 범위 안 몬스터에게 전투력의 200%~300% 피해.
@@ -15008,6 +15282,34 @@ script PlayerAttack extends AttackComponent
 		-- 낳는 연쇄는 기존 inFireZoneTick 플래그로 그대로 차단한다.
 		if not self:IsServer() then return end
 		if not isvalid(defender) then return end
+		-- (암행 - 1차 패시브) 발동 판정은 "데미지 줄마다"가 아니라 "스킬 1회 시전이 한 대상을
+		-- 몇 번 때리느냐"만큼 20% 확률을 굴린다(요청사항). 예: 매직클로(1명 2타)=2번,
+		-- 슬래쉬블래스트(5명 각 1타)=1번, 스피어버스터(5명 3줄)=3번, 새비지블로우=6번.
+		-- 구현: 시전마다 "처음 맞은 대상" 하나를 추적 대상으로 고정하고, 그 대상에게 들어오는
+		-- 히트에서만 1회씩 굴린다 - 다른 대상 히트는 같은 줄이 옆 대상으로 퍼진 것이므로 굴리지
+		-- 않는다. 시전 구분은 콤보 구슬 스택과 동일한 실측 시간창 방식(같은 시전의 히트는 0.4초
+		-- 이내에 몰리고, 재사용은 쿨다운 0.7초 이상이라 겹치지 않는다). 추적 대상이 도중에 죽으면
+		-- (isvalid 실패) 다음 히트의 대상으로 갈아탄다(폭풍의 시처럼 연사 중 대상이 바뀌는 경우).
+		-- 쉐도우 파트너 중에는 모든 실히트가 원본+보너스 2줄이므로 히트당 2번 굴린다
+		-- (새비지블로우+쉐도우 파트너 = 단일 대상 12줄 = 12번). 암행 표창 자신의 데미지로는
+		-- 다시 발동하지 않는다(연쇄 방지 - inAmhaengHit).
+		-- 화염/빙하 지대의 도트 데미지 줄에서도 발동하도록 inFireZoneTick 가드보다 앞에 둔다.
+		if not self._T.inAmhaengHit then
+			local now = _UtilLogic.ElapsedSeconds
+			local sinceLast = now - (self._T.amhaengTrackTime or -10)
+			if sinceLast >= 0.4 or not isvalid(self._T.amhaengTrackTarget) then
+				self._T.amhaengTrackTarget = defender
+			end
+			self._T.amhaengTrackTime = now
+			if defender == self._T.amhaengTrackTarget then
+				local rollCount = (self._T.shadowPartnerActive == true) and 2 or 1
+				for _ = 1, rollCount do
+					if _UtilLogic:RandomDouble() < 0.2 then
+						self:SpawnAmhaengShadow(defender)
+					end
+				end
+			end
+		end
 		if self._T.inFireZoneTick then return end
 		-- (불의 영역) 버프 지속 중 공격 적중 시 10% 확률로 그 자리에 화염 지대를 만든다.
 		if (self._T.fireZoneBuffUntil or 0) > _UtilLogic.ElapsedSeconds
@@ -15515,6 +15817,346 @@ script PlayerAttack extends AttackComponent
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
+	end
+
+	-- ── 메테오 (4차) ────────────────────────────────────────────────────
+	-- 리소스팩: skill/1211.img/skill/12111003 (메테오)
+	--   effect = 47286e5fd6eb4a989792415aacf07f73 (시전자 몸쪽 이펙트)
+	--   tile/0~8 = 하늘에서 떨어지는 운석 이펙트 9종 (아래 GetMeteorTileClips)
+	--   _audio/Use = d906d21dc9bd4c8cb66861d423044a65 / _audio/Hit = 0500714fee8645bb9a4894535ea723b1
+	-- 블리자드(AttackBlizzard)와 같은 규격(운석 개수 15+10 / 운석당 최대 6명·반경 1.2 / 전투력 700~1000% /
+	-- 쿨타임 20초 / 조작 잠금 3초)을 그대로 미러링한 스킬이다. 눈/얼음 전용 연출(폭설/얼음 데미지 스킨/
+	-- 반짝임/배경 이펙트)만 제외했고, 화면 어두워짐/BGM 덕킹은 범용 연출이라 그대로 재사용한다.
+
+	method table GetMeteorTileClips()
+		-- 메테오 팩의 운석 이펙트 9종(tile/0~8).
+		--   frames   = 그 클립의 총 프레임 수 - MeteorTileVisual이 "지금 재생 중인 것이 정말 이 클립인지"를
+		--              판별하는 데 쓴다(모델 기본 클립의 프레임 이벤트를 우리 것으로 오인하는 것 방지).
+		--   hitFrame = 운석이 실제로 바닥에 도달하는 프레임(요청받은 값 - 14/16/18).
+		--              이 프레임에 도달한 순간 그 자리에 데미지가 들어간다.
+		return {
+			{ ruid = "3d2d26d6025a451cb2ee86f81c3f5c67", frames = 23, hitFrame = 14 }, -- tile/0
+			{ ruid = "7a06895b1964498a867682c9688492fb", frames = 23, hitFrame = 14 }, -- tile/1
+			{ ruid = "f10a72f238fd4e629b8c5c0f5b177e0a", frames = 22, hitFrame = 14 }, -- tile/2
+			{ ruid = "f0aa22db64814b95937dd9e10a106b74", frames = 25, hitFrame = 16 }, -- tile/3
+			{ ruid = "6af9eb7233fe4d2aa4151981c5a212dc", frames = 25, hitFrame = 16 }, -- tile/4
+			{ ruid = "6a13c3d0dc334cf7991f6751ee1eecfd", frames = 25, hitFrame = 16 }, -- tile/5
+			{ ruid = "9ddeb5688a21456c8268748a0da5264c", frames = 27, hitFrame = 18 }, -- tile/6
+			{ ruid = "4ff70cf57b1742d7aa9c0be30ea87881", frames = 27, hitFrame = 18 }, -- tile/7
+			{ ruid = "dae60053f27744168340f70ae309dbc7", frames = 27, hitFrame = 18 }, -- tile/8
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealMeteorTileArea(Vector2 pos)
+		-- 운석 하나가 바닥에 닿은 자리에 데미지를 준다. 운석 하나당 최대 6명까지만 때린다(블리자드 타일과 동일).
+		-- 초기 운석 15개와 이후 운석 10개가 모두 이 경로를 쓴다 - 데미지 방식이 완전히 동일하다.
+		if not isvalid(self.Entity) then return end
+		-- FindBlizzardShardTargets는 "반경 안 살아있는 몬스터 목록"을 돌려주는 범용 탐색 헬퍼라 그대로 재사용한다
+		-- (블리자드 시전 상태와는 무관하게 동작한다).
+		local targets = self:FindBlizzardShardTargets(pos, 1.2)
+		local hit = 0
+		for _, t in ipairs(targets) do
+			if hit >= 6 then break end
+			self:DealMeteorHit(t)
+			hit = hit + 1
+		end
+		-- 착지음(_audio/Hit): 초기 운석 15개가 동시에 닿으면 15번 겹쳐 터지므로 0.3초에 1번만 재생한다.
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.meteorLastHitSoundAt or -1) + 0.3 <= now then
+			self._T.meteorLastHitSoundAt = now
+			self:PlayMeteorHitSound(pos.x, pos.y)
+		end
+		log("PlayerAttack: 메테오 운석 피해 pos=(" .. tostring(pos.x) .. "," .. tostring(pos.y) .. ") 맞은 몬스터=" .. tostring(hit) .. "/" .. tostring(#targets) .. " (운석당 최대 6)")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackMeteor(number combatPower, number atkMultiplier)
+		-- 메테오 타임라인 (쿨타임 20초는 클라이언트 SkillManager가 관리/표시 - 블리자드와 동일 규격):
+		--   0.0s      시전 이펙트(47286e5f) + 사용음(d906d21d)
+		--             + 맵이 서서히 살짝 어두워짐 / 메인 BGM 덕킹(블리자드의 범용 연출 Logic 재사용)
+		--             + 조작 잠금 3초
+		--   ~0.5-0.9s 운석 15개 생성 - 클립마다 바닥에 도달하는 프레임(14/16/18)이 달라서, 생성 시점을
+		--             그만큼 앞당겨 보정한다(모두 약 2.3초에 "동시에" 착지 = 동시 데미지, 요청사항)
+		--   3~18s     범위 안 몬스터 위치에 운석 10개 추가 낙하
+		--
+		--   데미지는 오직 운석에서만 나온다 - 운석 하나가 자기 클립의 hitFrame(바닥에 도달하는 프레임)에
+		--   도달한 순간, 그 자리(반경 1.2)의 몬스터를 운석당 최대 6명까지 전투력의 700~1000%로 때린다.
+		--   → 초기 운석 15개와 이후 운석 10개가 완전히 같은 방식(SpawnOneMeteorTile).
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
+			return
+		end
+		if self._T.isMeteoring then
+			log("PlayerAttack: AttackMeteor 요청 차단됨(이미 진행 중)")
+			return
+		end
+		self._T.isMeteoring = true
+		self._T.pendingMeteorCombatPower = combatPower
+
+		-- 추가 운석은 캐릭터가 움직여도 "시전한 위치" 기준으로 떨어져야 하므로 시전 좌표를 고정해둔다.
+		local castPos = self.Entity.TransformComponent.WorldPosition
+		self._T.meteorCastX = castPos.x
+		self._T.meteorCastY = castPos.y
+
+		-- 시전 후 3초 동안은 이동/점프/공격 등 다른 행동을 할 수 없다(블리자드와 동일한 방식).
+		-- 다른 이유로 이미 꺼져 있었다면(예: 사망 처리) 그 상태를 되살리지 않도록 이전 값을 기억해둔다.
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		self._T.pendingMeteorWasControllerEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then
+			playerCtrl.Enable = false
+		end
+		log("PlayerAttack: 메테오 조작 잠금 시작 (3초) Enable=" .. tostring(isvalid(playerCtrl) and playerCtrl.Enable))
+		if isvalid(self.Entity.MovementComponent) then
+			self.Entity.MovementComponent:Stop()
+		end
+		_TimerService:SetTimerOnce(function()
+			self:RestoreMeteorControl()
+		end, 3.0)
+
+		-- (요청) 블리자드가 데미지 스킨을 얼음 스킨으로 바꾸는 것과 같은 시간(19초) 동안
+		-- 메테오 전용 스킨(7709d0a8)으로 교체한다.
+		self:ApplyMeteorDamageSkin()
+
+		self:PlayMeteorCastEffect(self.Entity)
+		-- 화면 어두워짐: 블리자드와 같은 트윈이지만 (요청) 미세하게 붉은 느낌의 오버레이 색을 쓴다.
+		-- BGM 덕킹은 블리자드의 범용 연출 Logic(BlizzardBgmDucker)을 그대로 재사용한다.
+		self:PlayMeteorScreenDim()
+		self:PlayBlizzardBgmDuck()
+
+		-- 운석 15개는 클립별 보정 지연을 두고 하나씩 생성돼 전부 동시에 착지한다.
+		self:SpawnMeteorTiles()
+
+		-- 재시전 잠금은 블리자드와 같은 타이밍(4.5초)에 풀어준다(쿨타임 20초는 클라이언트가 따로 관리).
+		_TimerService:SetTimerOnce(function()
+			self._T.isMeteoring = false
+		end, 4.5)
+
+		-- 운석 10개를 3~18초 사이 각자 다른 랜덤 시점에 "범위 안 몬스터가 있는 위치"에 추가로 떨어뜨린다.
+		for i = 1, 10 do
+			local delay = 3.0 + _UtilLogic:RandomDouble() * 15.0
+			_TimerService:SetTimerOnce(function()
+				self:SpawnMeteorTileOnMonster()
+			end, delay)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreMeteorControl()
+		-- 시전 3초 뒤 조작을 되돌린다. 시전 전에 이미 꺼져 있었다면(사망 등) 그대로 둔다.
+		if not isvalid(self.Entity) then return end
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local wasLocked = isvalid(playerCtrl) and (not playerCtrl.Enable)
+		if isvalid(playerCtrl) and self._T.pendingMeteorWasControllerEnabled then
+			playerCtrl.Enable = true
+		end
+		log("PlayerAttack: 메테오 조작 잠금 해제 (3초 유지됨=" .. tostring(wasLocked) .. ")")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMeteorCastEffect(Entity attacker)
+		-- 시전 즉시 캐릭터 몸쪽에서 1회 재생되는 이펙트 2종 + 사용음 + 배경 루프 사운드.
+		-- 블리자드 시전 이펙트와 동일한 레이어링 - 아바타와 같은 SortingLayer(MapLayer0)에 올리고
+		-- OrderInLayer를 아바타(4)보다 작게(2) 줘서 "지형보다 앞, 캐릭터보다 뒤"에 깔린다.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		local backOption = { ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 2 }
+		local castOffset = Vector3(0, 0, 0)
+		_EffectService:PlayEffectAttached("47286e5fd6eb4a989792415aacf07f73", attacker, castOffset, 0, Vector3(1, 1, 1), false, backOption)
+		-- (요청) 같은 팩의 effect0(2eb15c8e)도 사용자 몸쪽에서 함께 재생한다.
+		_EffectService:PlayEffectAttached("2eb15c8e49f8492f948c5292cd31171f", attacker, castOffset, 0, Vector3(1, 1, 1), false, backOption)
+		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
+		self:EchoShadowSkillEffectAttached("47286e5fd6eb4a989792415aacf07f73", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
+		self:EchoShadowSkillEffectAttached("2eb15c8e49f8492f948c5292cd31171f", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
+		_SoundService:PlaySound("d906d21dc9bd4c8cb66861d423044a65", 1.0)
+		-- (요청) 블리자드의 배경 루프 사운드(c50b1e30, 20초)와 같은 방식으로 메테오 전용 사운드를 20초간 재생한다
+		-- (클립이 20초보다 짧을 수 있어 반복 재생 후 20초에 정지 - 블리자드와 동일한 볼륨).
+		-- (피드백 이력) 사운드 교체: 89da231b → af3acec8 → de5f1d1c. 볼륨 1.5배: 0.8 → 1.2.
+		_SoundService:PlayLoopSound("de5f1d1c7ed644b9a31a31d5c078ed31", 1.2)
+		_TimerService:SetTimerOnce(function()
+			_SoundService:StopSound("de5f1d1c7ed644b9a31a31d5c078ed31")
+		end, 20.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMeteorScreenDim()
+		-- 맵 전체가 서서히 "약간만" 어두워졌다가 서서히 밝아진다 - 트윈 규격은 블리자드(1.5/13/2.5)와
+		-- 동일하고, 오버레이 색만 미세하게 붉은 느낌(어두운 적색)으로 준다.
+		-- (요청) 어두워지고 붉어지는 정도를 약하게 - 최대 알파 0.35 → 0.2(블리자드와 동일하게 낮춤).
+		if not self:IsClient() then return end
+		_BlizzardScreenDim:StartDimTinted(1.5, 13.0, 2.5, 0.2, 0.3, 0.03, 0.03)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyMeteorDamageSkin()
+		-- (요청) 메테오 시전 후 19초 동안(블리자드의 스킨 교체와 같은 시간) 데미지 스킨(공격 숫자 모양)을
+		-- 메테오 전용 스킨(7709d0a8)으로 바꿨다가 시간이 끝나면 원래 스킨으로 되돌린다.
+		-- (버그 수정) 블리자드와 겹쳐 쓰면 기본 스킨으로 안 돌아오던 문제 - 저장/복구를 공용 관리
+		-- (ApplySkillDamageSkinShared)로 옮겼다(블리자드 쪽 주석 참고).
+		self:ApplySkillDamageSkinShared("meteor", "7709d0a8994d47528542989badf1c85d")
+		_TimerService:SetTimerOnce(function()
+			self:RestoreMeteorDamageSkin()
+		end, 19.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestoreMeteorDamageSkin()
+		-- 19초 뒤 복구 요청 - 실제 복구는 공용 관리가 "마지막 스킬 스킨이 끝났을 때"만 수행한다.
+		self:RestoreSkillDamageSkinShared("meteor")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnMeteorTiles()
+		-- 시전자 주변의 "발판이 있는 자리"를 골라 운석 15개를 생성한다(블리자드 초기 타일과 같은 규격).
+		-- 서로 겹치지 않도록 이미 고른 자리들과 최소 거리(MIN_GAP) 이상 떨어진 후보만 채택하고,
+		-- 후보 뽑기가 실패해도 무한 루프에 빠지지 않도록 시도 횟수를 제한한다.
+		if not isvalid(self.Entity) then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local fh = map.FootholdComponent
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local clips = self:GetMeteorTileClips()
+
+		local WANT = 15
+		local MIN_GAP = 0.9      -- 이펙트 간 최소 거리(월드 유닛)
+		local RANGE_X = 10.4     -- 시전자 기준 좌우 탐색 범위
+		local RANGE_Y = 3.9      -- 시전자 기준 상하 탐색 범위(다른 층 발판도 포함)
+		local MAX_TRIES = 2000
+
+		local placed = {}
+		local tries = 0
+		while #placed < WANT and tries < MAX_TRIES do
+			tries = tries + 1
+			local x = myPos.x + (_UtilLogic:RandomDouble() * 2.0 - 1.0) * RANGE_X
+			local probeY = myPos.y + (_UtilLogic:RandomDouble() * 2.0 - 1.0) * RANGE_Y
+			local y = nil
+			if isvalid(fh) then
+				local hitFh = self:FindNearbyFootholdAtX(fh, x, probeY, 3.0)
+				if hitFh ~= nil then
+					y = hitFh:GetYByX(x) + 0.05
+				end
+			end
+			if y ~= nil then
+				local ok = true
+				for _, p in ipairs(placed) do
+					local dx = p.x - x
+					local dy = p.y - y
+					if math.sqrt(dx * dx + dy * dy) < MIN_GAP then
+						ok = false
+						break
+					end
+				end
+				if ok then
+					table.insert(placed, { x = x, y = y })
+				end
+			end
+		end
+
+		-- (요청사항) "처음에 동시에 떨어져야" - 운석마다 바닥에 도달하는 프레임(hitFrame: 14~18)이 달라서,
+		-- 같은 시점에 생성하면 착지(=데미지) 시점이 최대 4프레임만큼 어긋난다. 그래서 생성 시점을 hitFrame만큼
+		-- 앞당겨 보정한다:
+		--     생성지연 = 기준지연 - hitFrame * 프레임당시간   (hitFrame이 큰 클립일수록 먼저 생성)
+		-- 이렇게 하면 모든 초기 운석이 "기준지연" 시점에 동시에 착지한다. 데미지 자체는 여전히 실제 재생
+		-- 프레임(FrameIndex) 이벤트로 들어가므로, 아래 프레임당시간 값이 조금 틀려도 착지 순간에는 정확히 맞는다
+		-- (동시성만 그만큼 흐트러진다). 블리자드 초기 타일과 완전히 같은 방식이다.
+		-- 프레임당 재생 시간: 첫 플레이테스트 실측으로 보정(0.1 → 0.147초. 착지 로그의 재생경과/hitFrame가
+		-- 14프레임=2.05초 / 16프레임=2.38초 / 18프레임=2.64초로 전부 ≈0.147초/프레임).
+		local FRAME_SEC = 0.147
+		local MAX_HIT_FRAME = 18     -- 클립들 중 가장 늦게 닿는 프레임(tile/6~8)
+		local LAND_AT = 0.5 + MAX_HIT_FRAME * FRAME_SEC   -- 모든 초기 운석이 착지하는 시점(≈3.15초)
+
+		for i, p in ipairs(placed) do
+			local clip = clips[_UtilLogic:RandomIntegerRange(1, #clips)]
+			-- 착지 시점(LAND_AT)에서 이 클립이 바닥에 닿는 데 걸리는 시간을 빼면 이 운석의 생성 시점이 된다.
+			local delay = LAND_AT - clip.hitFrame * FRAME_SEC
+			if delay < 0.1 then
+				delay = 0.1
+			end
+			local px, py = p.x, p.y
+			local idx = i
+			_TimerService:SetTimerOnce(function()
+				self:SpawnOneMeteorTile(map, clip.ruid, clip.frames, clip.hitFrame, Vector3(px, py, 0), idx)
+			end, delay)
+		end
+		log("PlayerAttack: 메테오 운석 생성 " .. tostring(#placed) .. "/" .. tostring(WANT) .. "개 (시도 " .. tostring(tries) .. "회, 착지 " .. tostring(LAND_AT) .. "초에 동시)")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnOneMeteorTile(Entity map, string clipRuid, integer clipFrames, integer hitFrame, Vector3 pos, integer index)
+		-- 운석 이펙트 1개 생성. 클립을 처음부터 끝까지 한 번 재생하고 사라진다(클라이언트 MeteorTileVisual).
+		-- 데미지는 클립이 hitFrame(운석이 바닥에 도달하는 프레임)에 도달한 순간 그 자리에 들어간다 -
+		-- 시전자 클라이언트의 MeteorTileVisual이 프레임 이벤트를 보고 서버(DealMeteorTileArea)를 호출한다.
+		local fxEntity = _SpawnService:SpawnByModelId("spearburstfadingeffect", "MeteorTile_" .. tostring(index), pos, map)
+		if not isvalid(fxEntity) then
+			log_warning("PlayerAttack: 메테오 운석 이펙트 스폰 실패 index=" .. tostring(index))
+			return
+		end
+		fxEntity:AddComponent("script.MeteorTileVisual")
+		local comp = fxEntity:GetComponent("script.MeteorTileVisual")
+		if isvalid(comp) then
+			comp.ExpectedFrames = clipFrames
+			comp.HitFrameIndex = hitFrame
+			comp.CasterEntity = self.Entity
+			-- 운석 이펙트도 블리자드 타일과 동일하게 캐릭터(기본 4)보다 뒤로 가도록 음수 OrderInLayer를 준다.
+			comp.OrderInLayerValue = -1
+			comp.AlphaValue = 1.0
+			comp.TintR = 1.0
+			comp.TintG = 1.0
+			comp.TintB = 1.0
+			comp.IsFlipX = false
+			-- ClipRUID는 마지막에 넣는다 - 클라이언트의 OnSyncProperty(ClipRUID)가 실제 적용을 트리거하므로,
+			-- 그 시점엔 나머지 값들이 이미 도착해 있어야 한다.
+			comp.ClipRUID = clipRuid
+		end
+		-- 클립 1회 재생분(길어야 3초 남짓)만큼만 살려두고 정리한다.
+		_TimerService:SetTimerOnce(function()
+			if isvalid(fxEntity) then
+				fxEntity:Destroy()
+			end
+		end, 6.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnMeteorTileOnMonster()
+		-- 운석 팩 클립 9종 중 하나를 "범위 안 몬스터가 있는 자리"에 생성한다(블리자드 추가 타일과 같은 규격).
+		-- 랜덤 발판에 뿌리면 몬스터가 없는 허공에 떨어지는 경우가 많아, 범위 안 살아있는 몬스터 중
+		-- 하나를 골라 그 발밑(몬스터 위치)에 떨어뜨린다. 몬스터가 하나도 없으면 아무것도 하지 않는다.
+		if not isvalid(self.Entity) then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local cx = self._T.meteorCastX or self.Entity.TransformComponent.WorldPosition.x
+		local cy = self._T.meteorCastY or self.Entity.TransformComponent.WorldPosition.y
+		-- 판정 범위(드래곤 로어와 동일: 가로 15.0 / 세로 7.5) 안의 살아있는 몬스터들(범용 탐색 헬퍼 재사용).
+		local candidates = self:FindDragonRoarTargets(Vector2(cx, cy), 30)
+		if #candidates == 0 then return end
+		local target = candidates[_UtilLogic:RandomIntegerRange(1, #candidates)]
+		if not isvalid(target) then return end
+		local tpos = target.TransformComponent.WorldPosition
+
+		local clips = self:GetMeteorTileClips()
+		local clip = clips[_UtilLogic:RandomIntegerRange(1, #clips)]
+		self._T.meteorExtraCount = (self._T.meteorExtraCount or 0) + 1
+		local idx = 1000 + self._T.meteorExtraCount   -- 초기 운석(1~15)과 이름이 겹치지 않게
+		self:SpawnOneMeteorTile(map, clip.ruid, clip.frames, clip.hitFrame, Vector3(tpos.x, tpos.y, 0), idx)
+		log("PlayerAttack: 메테오 추가 운석 생성 (몬스터 위치) pos=(" .. tostring(tpos.x) .. "," .. tostring(tpos.y) .. ") hitFrame=" .. tostring(clip.hitFrame))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealMeteorHit(Entity target)
+		-- 운석이 닿은 자리에 있던 몬스터 1마리에게 피해를 준다(이번 호출 전용 단일 대상 패턴 - 블리자드 기둥과 동일).
+		if not isvalid(target) then return end
+		self._T.meteorCurrentTarget = target
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		self:AttackShadowSafe(shape, "skill.meteor", target)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayMeteorHitSound(number px, number py)
+		-- 운석 착지음(_audio/Hit). 착지 지점 기준 3D 재생.
+		if not self:IsClient() then return end
+		_SoundService:PlaySoundAtPos("0500714fee8645bb9a4894535ea723b1", Vector3(px, py, 0), self.Entity, 0.8)
 	end
 
 end

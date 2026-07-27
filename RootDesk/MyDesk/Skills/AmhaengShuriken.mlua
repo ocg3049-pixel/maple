@@ -1,0 +1,112 @@
+@Component
+script AmhaengShuriken extends Component
+
+	-- 암행(1차) 표창 하나의 수명 전체를 담당한다. 그림자가 던지는 수리검으로, 스폰 직후
+	-- 그림자→타겟 각도를 계산해 그 방향으로 날아가고, 명중 시 OwnerEntity의
+	-- PlayerAttack:DealAmhaengHit에 판정을 위임한다(매직 미사일 구체와 동일한 위임 패턴 -
+	-- 판정/데미지 공식/스킨을 PlayerAttack에 모아둔다).
+
+	property number Speed = 7
+	property number MaxLifetime = 2
+	-- (피드백) "표창이 몬스터 위로 날아가 거기서 사라진다" - 반경 0.5는 조준점에서 0.5유닛
+	-- 떨어진 허공에서 명중 처리돼 보였다. 몸에 닿아 보이도록 0.3으로 좁힌다(조준점도 y+0.5→+0.2).
+	property number HitRadius = 0.3
+
+	-- 표창 원본 스프라이트의 기본 방향 보정: 진행 방향과 날이 일치하도록 ZRotation에 항상 가산한다.
+	-- (실측) 교체된 표창(2fc1bc6b)은 기본적으로 9시 방향(180도)을 가리킨다 - 이전 표창(f501c1cd)은
+	-- 7시(-120도)여서 120이었고, 교체 시 다시 실측해 맞출 것.
+	property number RotationOffset = 180
+
+	property Entity TargetEntity = ""
+	property Entity OwnerEntity = ""
+	property number PresetDamage = 0
+
+	method void OnBeginPlay()
+		-- 서버 전용 진행 상태 초기화.
+		if self:IsServer() then
+			self._T.flying = false
+			self._T.timer = 0
+			self._T.hit = false
+			self._T.angle = 0
+			self._T.fallbackX = 0
+			self._T.fallbackY = 0
+			self._T.hasFallback = false
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Setup(Entity target, Entity ownerEnt, number presetDamage)
+		-- 스폰 직후 1회 호출: 수리검이므로 그림자(현재 위치)와 타겟 사이의 각도를 계산해
+		-- 회전을 그 방향으로 맞추고 곧바로 날린다.
+		self.TargetEntity = target
+		self.OwnerEntity = ownerEnt
+		self.PresetDamage = presetDamage
+		local myPos = self.Entity.TransformComponent.Position
+		local tx, ty = myPos.x + 1, myPos.y
+		if isvalid(target) then
+			-- (피드백) 조준점을 y+0.5에서 y+0.2로 낮춘다 - 작은 몬스터는 +0.5가 머리 위 허공이라
+			-- 표창이 몸에 닿지 않는 위치에서 사라져 보였다.
+			local tp = target.TransformComponent.WorldPosition
+			tx, ty = tp.x, tp.y + 0.2
+			self._T.fallbackX = tx
+			self._T.fallbackY = ty
+			self._T.hasFallback = true
+		end
+		self._T.angle = math.deg(math.atan(ty - myPos.y, tx - myPos.x))
+		self.Entity.TransformComponent.ZRotation = self._T.angle + self.RotationOffset
+		self._T.flying = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self._T.flying then return end
+		if self._T.hit then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+		self._T.timer = self._T.timer + delta
+		if self._T.timer >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		local myPos = self.Entity.TransformComponent.Position
+		local tx, ty = nil, nil
+		if isvalid(self.TargetEntity) then
+			local tp = self.TargetEntity.TransformComponent.WorldPosition
+			tx, ty = tp.x, tp.y + 0.2
+			self._T.fallbackX = tx
+			self._T.fallbackY = ty
+			self._T.hasFallback = true
+		elseif self._T.hasFallback then
+			tx, ty = self._T.fallbackX, self._T.fallbackY
+		end
+
+		if tx ~= nil then
+			local dx = tx - myPos.x
+			local dy = ty - myPos.y
+			if math.sqrt(dx * dx + dy * dy) <= self.HitRadius then
+				self._T.hit = true
+				if isvalid(self.TargetEntity) and isvalid(self.OwnerEntity) then
+					---@type PlayerAttack
+					local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+					if isvalid(pa) then
+						pa:DealAmhaengHit(self.TargetEntity, self.PresetDamage)
+					end
+				end
+				return
+			end
+			-- 살아있는 타겟이 움직여도 빗나가지 않게 매 프레임 목표점을 갱신하고,
+			-- 수리검의 표시 각도도 실제 진행 방향에 맞춘다.
+			self._T.angle = math.deg(math.atan(dy, dx))
+			self.Entity.TransformComponent.ZRotation = self._T.angle + self.RotationOffset
+		end
+
+		local rad = math.rad(self._T.angle)
+		self.Entity.TransformComponent:Translate(
+			math.cos(rad) * self.Speed * delta,
+			math.sin(rad) * self.Speed * delta
+		)
+	end
+
+end
