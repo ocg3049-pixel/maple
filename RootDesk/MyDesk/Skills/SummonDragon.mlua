@@ -1,0 +1,648 @@
+@Component
+script SummonDragon extends Component
+
+	-- 용 소환(6마리) 소환수. 스킬 한 번에 서로 다른 용 6마리가 동시에 소환된다
+	-- (PlayerAttack.SummonSixDragons). 로직은 드래곤 라이딩(RidingDragon)과 비슷하되
+	-- **탑승은 없고**, 각자 주인 주변을 날아다니며(DragonIndex별 궤도) 주기적으로 몬스터를 공격한다.
+	--
+	-- 드래곤 라이딩과 다른 점:
+	--  1) 플레이어의 자식이 아니라 **맵의 자식**으로 스폰되고, 위치는 **서버가** 매 틱 계산해
+	--     TransformComponent.Position에 직접 쓴다(Body 없는 엔티티라 직접 대입이 정석 -
+	--     msw-scripting §11). 서버 좌표가 곧 실제 좌표라 HitComponent 피격 판정이 제자리에서 맞는다.
+	--  2) HP가 있다(주인 최대 HP의 1/2). 머리 위 HP바가 뜨고, 몬스터에게 맞으면 깎이며,
+	--     0이 되면 사라진다. 플레이어의 힐 스킬로 회복시킬 수도 있다(PlayerAttack.ApplyHealToDragon).
+	--
+	-- 리소스: 6종 몹 팩의 stand/move/attack 클립을 그대로 쓴다(DRAGONS 표 참고).
+	--   1 마뇽 mob/9300511.img · 2 심연의 마뇽 mob/9834307.img · 3 마뇽 mob/2600022.img
+	--   4 레비아탄 mob/2400575.img · 5 레비아탄 mob/9300516.img · 6 플라잉 레드 와이번 mob/8300002.img
+
+	property Entity OwnerEntity = nil               -- 서버 전용(소환한 플레이어)
+	property number Lifetime = 600                  -- 서버 전용 수명(초) - 요청 스펙 10분
+	property number DragonMaxHp = 100               -- 서버 전용: 최대 HP(주인 최대 HP의 1/2)
+	property number DragonHp = 100                  -- 서버 전용: 현재 HP
+	@Sync property integer DragonIndex = 1          -- 1~6 (어떤 용인지 - 클립/크기 선택)
+	@Sync property string AtkState = ""             -- "" 평상시 | "atk" 공격 모션 중
+	@Sync property integer AtkClip = 1              -- 이번 공격에 쓰는 attacks[] 인덱스(팩마다 2~3종)
+	@Sync property number FacingX = -1              -- -1=왼쪽(원본) / +1=오른쪽(Flip)
+	@Sync property boolean Moving = false           -- 이동 클립 / 제자리 클립 선택용
+
+	-- ── 용 6종 클립표 ────────────────────────────────────────────
+	-- rel_path 기준: stand / move(= 8300002는 fly) / attack1~3, 히트 이펙트는 attackN/info/hit.
+	-- 시트 크기가 제각각이라(158x118 ~ 953x675) 화면상 비슷해 보이도록 용별 배율을 따로 준다.
+	--
+	-- **공격 타이밍(요청 값 + 실측)**: 6개 팩 attack 클립의 썸네일 GIF 프레임 딜레이를 전부 재보니
+	-- 예외 없이 **150ms/프레임**이었다(이전에 0.12초로 가정했던 것은 틀린 값). 따라서
+	--   타격 시점(hitSec) = 지정 타격 프레임 × 0.15 , 클립 길이(durSec) = 총 프레임 수 × 0.15.
+	-- 지정 타격 프레임(사용자 제공): 9300511 a1=12 a2=13 a3=7 / 9834307 a1=24 a2=11 /
+	--   2600022 a1=12 a2=12 a3=6 / 2400575 a1=12 a2=12 / 9300516 a1=12 a2=12 / 8300002 a1=9 a2=3 a3=3.
+
+	method table GetDragonSpec(integer idx)
+		-- 용 번호(1~6)에 해당하는 클립/사운드/배율을 돌려준다. 범위를 벗어나면 1번으로 취급.
+		local specs = {
+			{   -- 1 마뇽 (mob/9300511.img) 204x248
+				name = "마뇽",
+				stand = "b3c129ed24244b43bcc25dcc6e31513c",
+				move  = "7631c122d4b443aaa1747ee76d6ffc19",
+				scale = 0.85,
+				attacks = {
+					{ clip = "f12f202e2dc4444b8ebb60527eb61048", hitSec = 1.80, durSec = 4.50,   -- 30프레임 / 타격 12
+						hit = "81a8b7f2067740a488c253fa9a84d98e", sound = "040018c3821c4674984f7e81129baf64" },
+					{ clip = "3ecb4e02b33f4246ab23cc62df4fffc8", hitSec = 1.95, durSec = 3.90,   -- 26프레임 / 타격 13
+						hit = "a45018d3899c4f3abd1906e1c6ec66a5", sound = "040018c3821c4674984f7e81129baf64" },
+					{ clip = "e1da82c80fa247948d99838f0ca849e0", hitSec = 1.05, durSec = 3.00,   -- 20프레임 / 타격 7
+						hit = "c6ab8412f1fa46e99a3fc06b46760404", sound = "ee61f2961a6345748e57a860c70644de" },
+				},
+			},
+			{   -- 2 심연의 마뇽 (mob/9834307.img) 457x444 - 시트가 매우 커서 배율을 크게 낮춘다
+				name = "심연의 마뇽",
+				stand = "ecbcacff5da54b6ea1e9b70c764049da",
+				move  = "9eaf8d44351947c5a4de0775e92d7cab",
+				scale = 0.42,
+				-- 전용 히트 클립이 없는 팩이라 히트 이펙트는 1번(마뇽) 것을 빌려 쓴다.
+				attacks = {
+					{ clip = "6330a20714bc46228b292a8b87b33350", hitSec = 3.60, durSec = 6.60,   -- 44프레임 / 타격 24
+						hit = "81a8b7f2067740a488c253fa9a84d98e", sound = "4261e0588da3434abdf6b5150d5e40b5" },
+					{ clip = "5261aedaa0024889a7a456a9163256d6", hitSec = 1.65, durSec = 3.30,   -- 22프레임 / 타격 11
+						hit = "81a8b7f2067740a488c253fa9a84d98e", sound = "e82bcc07650f4cc58bbfdd5f9104b495" },
+				},
+			},
+			{   -- 3 마뇽 (mob/2600022.img) 204x248
+				name = "마뇽",
+				stand = "b8cdd7920392456f99272649c7cb7c2d",
+				move  = "7988e04f93f749e39d199da40324bf5f",
+				scale = 0.85,
+				attacks = {
+					{ clip = "4aa4b090aa304f898a8f91caeb59d736", hitSec = 1.80, durSec = 4.35,   -- 29프레임 / 타격 12
+						hit = "5ac6554c0ea94009bbd9389df0542339", sound = "f783efef20e94aedb798b1d01e7a2ee5" },
+					{ clip = "636bebcce89546e08f7e930bcf81708e", hitSec = 1.80, durSec = 3.90,   -- 26프레임 / 타격 12
+						hit = "b6b5849af24a416ab1680a1dced9697f", sound = "f783efef20e94aedb798b1d01e7a2ee5" },
+					{ clip = "79ca2314b4fb420c96526e3d3464b15b", hitSec = 0.90, durSec = 3.00,   -- 20프레임 / 타격 6
+						hit = "128fe611ea9347aab589c5b5d4d8fc5b", sound = "1116cf6b36ab43e4a159567b345fb37b" },
+				},
+			},
+			{   -- 4 레비아탄 (mob/2400575.img) 208x234
+				name = "레비아탄",
+				stand = "1396fade727d4bc0a2c5d237d5f1ead0",
+				move  = "f7683fc4160043e3983bd3eac9343525",
+				scale = 0.85,
+				-- 전용 히트 클립이 없는 팩이라 5번(같은 레비아탄) 것을 빌려 쓴다.
+				attacks = {
+					{ clip = "28f30566686f4275ac8b60c8e7faa390", hitSec = 1.80, durSec = 4.20,   -- 28프레임 / 타격 12
+						hit = "7665c85dd8b7434983c9a918932d9687", sound = "63be9417034044edbcb595a86899d66b" },
+					{ clip = "e70f8fef4f8846239a92ec9ca00f5631", hitSec = 1.80, durSec = 4.65,   -- 31프레임 / 타격 12
+						hit = "3b72c485b35d485a8ef730a6b259652d", sound = "05214ba4dd00477eb56a37aba6d9e62a" },
+				},
+			},
+			{   -- 5 레비아탄 (mob/9300516.img) 208x234
+				name = "레비아탄",
+				stand = "44801c827b5d47668cccce275c8ecad6",
+				move  = "6d8fa946b4be416b8b26e3a6ac33b331",
+				scale = 0.85,
+				attacks = {
+					{ clip = "538f24563b364ca9bf2d71d754495368", hitSec = 1.80, durSec = 4.20,   -- 28프레임 / 타격 12
+						hit = "7665c85dd8b7434983c9a918932d9687", sound = "4c4de5015de24ef2ac29ae14cf15e4f1" },
+					{ clip = "d835c8159f0545fa809382b8317e63f6", hitSec = 1.80, durSec = 4.65,   -- 31프레임 / 타격 12
+						hit = "3b72c485b35d485a8ef730a6b259652d", sound = "3301ae5580b5471581f08f88e7e9776a" },
+				},
+			},
+			{   -- 6 플라잉 레드 와이번 (mob/8300002.img) 158x118 - stand 클립이 없어 fly로 통일
+				name = "플라잉 레드 와이번",
+				stand = "f8dff9f88b29443d96e2d2ddeadaf21d",
+				move  = "f8dff9f88b29443d96e2d2ddeadaf21d",
+				scale = 1.1,
+				-- 이 팩에는 공격 사운드가 없어(Damage/Die 뿐) Damage 음을 공용으로 쓴다.
+				attacks = {
+					{ clip = "2f584ee545b24545be6416932f42a116", hitSec = 1.35, durSec = 2.70,   -- 18프레임 / 타격 9
+						hit = "5b103b6e54394bbbbd10872b35216485", sound = "243b267d6a4a46bb9edd2649ac41e071" },
+					{ clip = "234ab2660c58461499546934b472f822", hitSec = 0.45, durSec = 2.70,   -- 18프레임 / 타격 3
+						hit = "97a4f213ddec4bcc9a9389d5e1ca3fdb", sound = "243b267d6a4a46bb9edd2649ac41e071" },
+					{ clip = "5c2c5de81a3e463da7f7cbd0f228debb", hitSec = 0.45, durSec = 2.70,   -- 18프레임 / 타격 3
+						hit = "e4de19b78e224845a564f0d1ec8b502e", sound = "243b267d6a4a46bb9edd2649ac41e071" },
+				},
+			},
+		}
+		local i = idx
+		if i < 1 or i > #specs then i = 1 end
+		return specs[i]
+	end
+
+	-- ── 셋업(서버) ────────────────────────────────────────────────
+	-- SummonSixDragons는 AddComponent 직후 프로퍼티만 대입한다(용사/힐러와 동일 패턴).
+	-- 같은 프레임에 메서드를 호출하면 [LEA-2007] '_T' nil / @Sync 대입 유실이 나므로,
+	-- 실제 초기화는 두 번째 서버 틱에서 지연 실행한다(힐러에서 1틱은 부족한 것이 실측됐다).
+
+	@ExecSpace("ServerOnly")
+	method void InitServer()
+		-- 첫 초기화: 궤도 위상/수명/HP바/피격 연결/공격 예약.
+		local now = _UtilLogic.ElapsedSeconds
+		-- 상하 흔들림 위상만 용마다 60도씩 벌려 6마리가 같은 박자로 출렁이지 않게 한다.
+		self._T.bobPhase = (self.DragonIndex - 1) * (math.pi * 2 / 6)
+		self._T.bobT = 0
+		-- (실측 조정) 비행 높이: 처음엔 0.9~1.6이었는데 몬스터 공격 판정 박스가 발밑에서 +1.0까지
+		-- 덮어서 6마리가 10초 만에 전멸했다. 날짐승답게 더 높이 띄운다(공격 사거리 4.0이라
+		-- 여전히 지상의 적을 때린다).
+		self._T.flyBaseY = 1.7 + (self.DragonIndex % 3) * 0.35
+		self._T.lifetimeEndAt = now + self.Lifetime
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then
+				self:PlayVanishFx()
+				_TimerService:SetTimerOnce(function()
+					if isvalid(self.Entity) then self.Entity:Destroy() end
+				end, 0.2)
+			end
+		end, self.Lifetime)
+		self:SpawnHpBar()
+		self._T.hitEventHandler = self.Entity:ConnectEvent(HitEvent, self.OnDragonHit)
+		self:ScheduleAttack()
+		self:PlaySummonFx()
+		log("[SummonDragon] " .. tostring(self.DragonIndex) .. "번 용(" .. self:GetDragonSpec(self.DragonIndex).name
+			.. ") 소환 완료 HP=" .. tostring(math.floor(self.DragonHp)) .. "/" .. tostring(math.floor(self.DragonMaxHp)))
+	end
+
+	-- ── 프레임 틱 ────────────────────────────────────────────────
+
+	method void OnUpdate(number delta)
+		if self:IsServer() then
+			self:ServerTick(delta)
+		else
+			self:ClientTick(delta)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ServerTick(number delta)
+		if self._T.dying then return end
+		local owner = self.OwnerEntity
+		if not isvalid(owner) then
+			self._T.noOwnerTime = (self._T.noOwnerTime or 0) + delta
+			if self._T.noOwnerTime > 2.0 then
+				self._T.dying = true
+				self.Entity:Destroy()
+			end
+			return
+		end
+		if not self._T.inited then
+			self._T.initTicks = (self._T.initTicks or 0) + 1
+			if self._T.initTicks < 2 then return end
+			self._T.inited = true
+			self:InitServer()
+		end
+		local tr = self.Entity.TransformComponent
+		if not isvalid(tr) then return end
+		-- 주인이 다른 맵에 있으면 그대로 대기한다.
+		if owner.CurrentMap ~= self.Entity.CurrentMap then return end
+
+		local ownerPos = owner.TransformComponent.WorldPosition
+		local now = _UtilLogic.ElapsedSeconds
+		-- 실제 비행 좌표는 _T에 따로 들고, 화면 좌표(tr.Position)는 여기에 상하 흔들림만 얹는다
+		-- (흔들림이 이동 좌표에 누적되지 않게 분리).
+		if self._T.flyX == nil then
+			local p0 = tr.Position
+			self._T.flyX = p0.x
+			self._T.flyY = p0.y
+		end
+		local curX = self._T.flyX
+		local curY = self._T.flyY
+		local originX = curX   -- 이번 틱 이동 전 x(진행 방향 판정용)
+
+		-- (피드백) 예전에는 매 틱 "주인 현재 위치 기준 궤도점"을 목표로 삼아 3.5/초로 따라붙었다.
+		-- 그러면 플레이어가 한 발짝만 움직여도 6마리가 즉시 같은 방향으로 끌려가 부자연스러웠다.
+		-- 이제는 각자 **자기 목표점(wander target)을 향해 자유 비행**한다. 목표점은 주인 주변
+		-- 넓은 범위에서 가끔씩만 새로 고르므로, 플레이어의 순간 움직임이 비행에 바로 전달되지 않는다.
+		local pdx = ownerPos.x - curX
+		local pdy = ownerPos.y - curY
+		local pd2 = pdx * pdx + pdy * pdy
+
+		-- 주인과 아주 멀어졌으면(맵 이동/텔레포트 등) 곁으로 즉시 복귀시킨다.
+		if pd2 > 225.0 then
+			self:PickFlyTarget(ownerPos, now)
+			self._T.flyX = self._T.flyTargetX
+			self._T.flyY = self._T.flyTargetY
+			tr.Position = Vector3(self._T.flyX, self._T.flyY, 0)
+			self.Moving = false
+			return
+		end
+
+		local moved = 0
+		local chaseX = nil
+		-- 공격 중에는 그 자리에 머문다(모션이 흔들려 보이지 않게).
+		if self.AtkState == "" then
+			-- ── ① 사냥감 접근 단계 ──────────────────────────────────
+			-- (피드백) 예전에는 사거리 안에 적이 있으면 **날고 있던 그 자리에서** 공격 클립만 재생해,
+			-- 용은 공중에 있고 몬스터는 지상에 있어 화면상 허공을 때리는 것처럼 보였다.
+			-- 이제는 공격 전에 대상 바로 위까지 날아가서(ATTACK_HOVER) 때린다.
+			local chase = self._T.chaseTarget
+			if isvalid(chase) then
+				---@type Monster
+				local mc = chase:GetComponent("script.Monster")
+				local giveUp = (not isvalid(mc)) or mc.IsDead or ((self._T.chaseUntil or 0) <= now)
+				if giveUp then
+					self._T.chaseTarget = nil
+				else
+					local cp = chase.TransformComponent.WorldPosition
+					local tx = cp.x
+					local ty = cp.y + 0.8            -- 몬스터 바로 위에서 내려친다
+					local dx = tx - curX
+					local dy = ty - curY
+					local dist = math.sqrt(dx * dx + dy * dy)
+					if dist <= 1.2 then
+						-- 도착 - 실제 공격 시작(이 시점의 위치가 곧 타격 중심이 된다).
+						self:BeginAttack(chase, now)
+					else
+						local step = math.min(dist, 2.6 * delta)
+						curX = curX + dx / dist * step
+						curY = curY + dy / dist * step
+						moved = step
+						self._T.flyX = curX
+						self._T.flyY = curY
+						chaseX = tx
+					end
+				end
+			end
+
+			-- ── ② 평상시 배회 ──────────────────────────────────────
+			if chaseX == nil and self.AtkState == "" then
+				-- 목표점 갱신: ①아직 없음 ②머문 시간이 다 됨 ③거의 도착 ④주인과 멀어짐(활동반경 밖)
+				local needNew = false
+				if self._T.flyTargetX == nil then
+					needNew = true
+				elseif (self._T.flyRepickAt or 0) <= now then
+					needNew = true
+				else
+					local tdx = self._T.flyTargetX - curX
+					local tdy = self._T.flyTargetY - curY
+					if (tdx * tdx + tdy * tdy) < 0.2 then needNew = true end
+				end
+				if pd2 > 42.25 then needNew = true end   -- 주인과 6.5유닛 밖이면 새 목표를 주인 쪽으로
+				if needNew then self:PickFlyTarget(ownerPos, now) end
+
+				-- 목표점을 향해 일정 속도로 난다. 많이 벌어졌을 때만 따라잡기 속도를 낸다.
+				-- (요청) 비행 속도는 이전(배회 1.9 / 따라잡기 5.2)의 **2/3**로 낮췄다.
+				local dx = self._T.flyTargetX - curX
+				local dy = self._T.flyTargetY - curY
+				local dist = math.sqrt(dx * dx + dy * dy)
+				local speed = 1.27
+				if pd2 > 42.25 then speed = 3.47 end
+				if dist > 0.0001 then
+					local step = math.min(dist, speed * delta)
+					curX = curX + dx / dist * step
+					curY = curY + dy / dist * step
+					moved = step
+				end
+				self._T.flyX = curX
+				self._T.flyY = curY
+			end
+		end
+
+		-- 상하 흔들림(제자리에서도 날갯짓하는 느낌) - 이동 좌표와 분리해 화면에만 얹는다.
+		self._T.bobT = (self._T.bobT or 0) + delta
+		local bob = math.sin(self._T.bobT * 1.5 + (self._T.bobPhase or 0)) * 0.10
+		tr.Position = Vector3(curX, curY + bob, 0)
+
+		-- 이동/제자리 클립 전환(변할 때만 @Sync 대입).
+		local wantMoving = (delta > 0) and ((moved / delta) > 0.35) or false
+		if self.Moving ~= wantMoving then self.Moving = wantMoving end
+
+		-- 바라보는 방향: 공격 중엔 서버가 정한 FacingX 유지, 평소엔 실제 진행 방향(배회/사냥감 접근 공통).
+		if self.AtkState == "" and math.abs(curX - originX) > 0.0008 then
+			local face = -1
+			if curX > originX then face = 1 end
+			if self.FacingX ~= face then self.FacingX = face end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PickFlyTarget(Vector3 ownerPos, number now)
+		-- 주인 주변 넓은 범위에서 다음 비행 목표점을 하나 고른다.
+		-- (피드백) "활동 반경은 다소 넓어도 상관없다" - 좌우 1.5~5.0유닛, 높이는 비행 기준선
+		-- 위아래로 흩어지게 잡아 6마리가 제각기 다른 곳을 날아다니게 한다.
+		local ang = _UtilLogic:RandomDouble() * math.pi * 2
+		local rx = 1.5 + _UtilLogic:RandomDouble() * 3.5
+		self._T.flyTargetX = ownerPos.x + math.cos(ang) * rx
+		self._T.flyTargetY = ownerPos.y + (self._T.flyBaseY or 1.7) + math.sin(ang) * 0.9
+		-- 도착 전이라도 2.5~5.5초마다 목표를 새로 골라 계속 배회하게 한다.
+		self._T.flyRepickAt = now + 2.5 + _UtilLogic:RandomDouble() * 3.0
+	end
+
+	-- ── 공격(서버) ───────────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleAttack()
+		-- 드래곤 라이딩과 같은 주기(5~7초)로 사거리 안의 적을 공격한다.
+		-- 단 공격 클립이 긴 용(심연의 마뇽 attack1 = 6.6초)은 그 주기보다 모션이 길어 다음 차례가
+		-- 통째로 건너뛰어지므로, 그 용의 가장 긴 클립 + 여유(1초)를 최소 간격으로 잡는다.
+		local spec = self:GetDragonSpec(self.DragonIndex)
+		local maxDur = 1.6
+		for _, a in ipairs(spec.attacks) do
+			if a.durSec > maxDur then maxDur = a.durSec end
+		end
+		local base = math.max(5.0, maxDur + 1.0)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:TryAttack()
+			self:ScheduleAttack()
+		end, base + _UtilLogic:RandomDouble() * 2.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryAttack()
+		-- (피드백) 여기서는 **사냥감만 정한다**. 실제 공격(BeginAttack)은 ServerTick의 접근 단계가
+		-- 대상 바로 위(1.2유닛 이내)까지 날아간 뒤에 시작한다 - 예전처럼 날던 자리에서 클립만
+		-- 재생하면 용은 공중, 몬스터는 지상이라 화면상 허공을 때리는 것처럼 보였다.
+		if self._T.dying then return end
+		if self.AtkState ~= "" then return end
+		if isvalid(self._T.chaseTarget) then return end   -- 이미 사냥감을 쫓는 중
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		local wp = self.Entity.TransformComponent.WorldPosition
+		-- 접근해서 때리므로 탐색 범위는 예전(4.0)보다 넓게 잡는다.
+		local targets = pa:FindMonstersInRadius(Vector2(wp.x, wp.y), 7.0, 6)
+		-- (피드백) FindMonstersInRadius는 **원형(유클리드) 반경**이라 반경 7.0이 아래쪽으로도 7유닛
+		-- 뻗는다. 그래서 용이 한참 아래 발판의 몬스터까지 잡아 내려 꽂히면서 "y축 아래 사거리가
+		-- 길다"는 신고를 받았다. 아래 방향만 따로 제한한다(위쪽은 그대로).
+		targets = self:FilterDownReach(targets, wp.y, 3.5)
+		if #targets == 0 then return end
+		self._T.chaseTarget = targets[1]
+		self._T.chaseUntil = _UtilLogic.ElapsedSeconds + 4.0   -- 4초 안에 못 붙으면 포기하고 배회 복귀
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FilterDownReach(table list, number fromY, number downLimit)
+		-- 목록에서 "기준 높이보다 downLimit보다 더 아래에 있는" 몬스터를 걸러낸다.
+		-- 공용 FindMonstersInRadius는 원형 반경이라 아래쪽으로도 반경만큼 닿는데, 하늘을 나는 용이
+		-- 저 아래 발판까지 내리꽂는 게 부자연스럽다는 피드백을 반영한 용 소환 전용 제한이다.
+		-- (위쪽은 제한하지 않는다 - 신고 대상이 아니었고, 용은 원래 위에서 내려다보며 싸운다.)
+		local out = {}
+		for _, t in ipairs(list) do
+			if isvalid(t) then
+				local dy = t.TransformComponent.WorldPosition.y - fromY
+				if dy >= -downLimit then
+					table.insert(out, t)
+				end
+			end
+		end
+		return out
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginAttack(Entity target, number now)
+		-- 사냥감 바로 위에 도착한 시점에 호출된다. 공격 모션을 재생하고, 타격 시점에
+		-- **그때의 용 위치 기준**으로 다시 주변을 훑어 실제로 겹쳐 있는 몬스터를 때린다
+		-- (예약 시점의 목록을 그대로 쓰면 그 사이 몬스터가 움직여 또 허공을 치게 된다).
+		if self._T.dying then return end
+		if self.AtkState ~= "" then return end
+		self._T.chaseTarget = nil
+		local wp = self.Entity.TransformComponent.WorldPosition
+		local tp = target.TransformComponent.WorldPosition
+		local face = -1
+		if tp.x >= wp.x then face = 1 end
+		self.FacingX = face
+		-- 공격 클립을 그 용이 가진 2~3종 중 하나로 고른다(클립마다 타격 시점/히트 이펙트/사운드가 다르다).
+		-- ⚠ AtkClip을 AtkState보다 **먼저** 대입해야 클라가 이전 클립으로 한 프레임 잘못 재생하지 않는다.
+		local spec = self:GetDragonSpec(self.DragonIndex)
+		local pick = _UtilLogic:RandomIntegerRange(1, #spec.attacks)
+		self.AtkClip = pick
+		self.AtkState = "atk"
+		local atk = spec.attacks[pick]
+		self:PlayAttackSound(atk.sound)
+
+		-- 타격 시점: 지정 타격 프레임 × 0.15초(전 클립 프레임 딜레이 150ms 실측).
+		local hitAt = atk.hitSec
+		local hitRuid = atk.hit
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			if self._T.dying then return end
+			if not isvalid(self.OwnerEntity) then return end
+			---@type PlayerAttack
+			local pa2 = self.OwnerEntity:GetComponent("script.PlayerAttack")
+			if not isvalid(pa2) then return end
+			local hp = self.Entity.TransformComponent.WorldPosition
+			-- 타격 반경 2.2 = 용이 내려친 자리 주변. 접근 후 때리므로 이 안에 실제 몬스터가 있다.
+			-- 여기도 원형 반경이라 아래로 2.2까지 닿는다 - 아래 방향만 1.6으로 좁혀
+			-- 한 칸 아래 발판의 적까지 휩쓸지 않게 한다.
+			-- 아래쪽을 걸러내면 후보가 줄어드니 넉넉히 받아온 뒤(6), 타격 대상은 예전과 같이 3마리로 자른다.
+			local hits = self:FilterDownReach(pa2:FindMonstersInRadius(Vector2(hp.x, hp.y), 2.2, 6), hp.y, 1.6)
+			for i, t in ipairs(hits) do
+				if i > 3 then break end
+				if isvalid(t) then
+					local tt = t
+					_TimerService:SetTimerOnce(function()
+						if not isvalid(tt) or not isvalid(self.Entity) then return end
+						if self._T.dying then return end
+						self:PlayHitFx(tt, hitRuid)
+						---@type PlayerAttack
+						local pa3 = self.OwnerEntity:GetComponent("script.PlayerAttack")
+						if isvalid(pa3) then pa3:DealSummonDragonHit(tt) end
+					end, (i - 1) * 0.08)
+				end
+			end
+		end, hitAt)
+
+		-- 공격 모션 종료 → 평상시로 복귀.
+		-- (피드백) 예전엔 1.6초 고정이라 클립이 끝나기 전에 이동/제자리 클립으로 돌아가
+		-- "공격 모션이 하다 말고 끊긴다"는 신고를 받았다. 고른 클립의 실제 길이
+		-- (총 프레임 × 0.15초)만큼 상태를 유지해 끝까지 재생시킨다(그동안 이동은 멈춘다).
+		local holdDur = atk.durSec
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then self.AtkState = "" end
+		end, holdDur)
+	end
+
+	-- ── HP / 피격(서버) ──────────────────────────────────────────
+
+	method void OnDragonHit(HitEvent event)
+		-- 몬스터에게 맞음(서버에서 ConnectEvent로 연결). 0.5초 무적 게이트 후 HP 차감.
+		if self._T.dying then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.hitImmuneUntil or 0) > now then return end
+		self._T.hitImmuneUntil = now + 0.5
+		self.DragonHp = math.max(0, self.DragonHp - event.TotalDamage)
+		self:UpdateHpBar()
+		self:FlashHpBar()
+		log("[SummonDragon] " .. tostring(self.DragonIndex) .. "번 용 피격 -" .. tostring(event.TotalDamage)
+			.. " → HP " .. tostring(math.floor(self.DragonHp)) .. "/" .. tostring(math.floor(self.DragonMaxHp)))
+		if self.DragonHp <= 0 then
+			self:KillDragon()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void KillDragon()
+		-- HP 0: 소멸 이펙트를 재생하고 사라진다(용사/힐러와 달리 쓰러진 자세는 없다 - 날짐승).
+		if self._T.dying then return end
+		self._T.dying = true
+		log("[SummonDragon] " .. tostring(self.DragonIndex) .. "번 용 격추 - 소멸")
+		self:PlayVanishFx()
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then self.Entity:Destroy() end
+		end, 0.25)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHpBar()
+		-- 머리 위 HP바: 용사/힐러와 같은 snipinggaugetext 모델 재사용(Bg/Fill, 숫자는 표시하지 않는다).
+		local bar = _SpawnService:SpawnByModelId("snipinggaugetext", "DragonHpBar", Vector3(0, 0.95, 0), self.Entity)
+		if not isvalid(bar) then
+			log_warning("[SummonDragon] HP바 스폰 실패")
+			return
+		end
+		local bg = bar:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			bg.SpriteRendererComponent.Color = Color(0.25, 0.25, 0.25, 0.8)
+			bg.SpriteRendererComponent.PlayRate = 0
+		end
+		local fill = bar:GetChildByName("Fill", false)
+		if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+			fill.SpriteRendererComponent.Color = Color(1, 0.3, 0.3, 1)
+			fill.SpriteRendererComponent.PlayRate = 0
+		end
+		self._T.hpBar = bar
+		self:UpdateHpBar()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateHpBar()
+		-- 채움 바 갱신(왼쪽 끝 고정 + 가로 스케일 = HP 비율) - 용사/힐러와 동일 규격.
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		local fill = bar:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = 0
+		if self.DragonMaxHp > 0 then
+			ratio = math.max(0, math.min(1, self.DragonHp / self.DragonMaxHp))
+		end
+		fill.TransformComponent.Scale = Vector3(0.5 * ratio, 0.5, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlashHpBar()
+		-- 피격 시 2회 깜빡임(용사/힐러와 동일한 토큰 패턴).
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		self._T.hpFlashToken = (self._T.hpFlashToken or 0) + 1
+		local tok = self._T.hpFlashToken
+		local bright = Color(1, 1, 1, 1)
+		local normal = Color(1, 0.3, 0.3, 1)
+		local function setFillColor(c)
+			-- ⚠ 격추되면 0.25초 뒤 엔티티가 지워지는데 이 깜빡임 타이머는 0.32초까지 남아 있다.
+			--   지워진 뒤 self._T를 건드리면 [LEA-2007] '_T' nil 에러가 난다(격추 6건 실측) -
+			--   _T를 만지기 전에 엔티티 생존 여부를 먼저 확인한다.
+			if not isvalid(self.Entity) then return end
+			if self._T == nil then return end
+			if self._T.hpFlashToken ~= tok then return end
+			if not isvalid(bar) then return end
+			local fill = bar:GetChildByName("Fill", false)
+			if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+				fill.SpriteRendererComponent.Color = c
+			end
+		end
+		setFillColor(bright)
+		local steps = {
+			{ at = 0.12, color = normal },
+			{ at = 0.20, color = bright },
+			{ at = 0.32, color = normal },
+		}
+		for _, s in ipairs(steps) do
+			local stepColor = s.color
+			_TimerService:SetTimerOnce(function()
+				setFillColor(stepColor)
+			end, s.at)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		if self._T.hitEventHandler then
+			self.Entity:DisconnectEvent(HitEvent, self._T.hitEventHandler)
+			self._T.hitEventHandler = nil
+		end
+	end
+
+	-- ── 이펙트/사운드(멀티캐스트) ────────────────────────────────
+
+	@ExecSpace("Multicast")
+	method void PlayHitFx(Entity target, string clipRuid)
+		-- 맞은 몬스터 몸에서 용별 히트 이펙트 1회(드래곤 라이딩과 같은 규격).
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		if clipRuid == nil or clipRuid == "" then return end
+		local serial = _EffectService:PlayEffectAttached(clipRuid, target, Vector3(0, 0.3, 0), 0, Vector3(1.1, 1.1, 1), false, { ["OrderInLayer"] = 7 })
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 1.5)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayAttackSound(string soundRuid)
+		if not self:IsClient() then return end
+		if soundRuid == nil or soundRuid == "" then return end
+		_SoundService:PlaySound(soundRuid, 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySummonFx()
+		-- 소환 순간 그 자리에 1회(드래곤 라이딩의 워프 이펙트 재사용).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local wp = self.Entity.TransformComponent.WorldPosition
+		local serial = _EffectService:PlayEffect("86500681cfad4e8488cf4ba9376fe801", self.Entity, Vector3(wp.x, wp.y, 0), 0, Vector3(1.1, 1.1, 1), false, { ["OrderInLayer"] = 7 })
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayVanishFx()
+		-- 수명 만료 / 격추 시 그 자리에 1회(엔티티가 곧 지워지므로 부착하지 않는다).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local wp = self.Entity.TransformComponent.WorldPosition
+		local serial = _EffectService:PlayEffect("1b59436ee8a34893be13d1ed75104cb1", self.Entity, Vector3(wp.x, wp.y, 0), 0, Vector3(1.1, 1.1, 1), false, { ["OrderInLayer"] = 6 })
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+	end
+
+	-- ── 클라이언트: 클립/방향/크기 ───────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void ClientTick(number delta)
+		-- 위치는 서버가 @Sync Transform으로 내려주므로, 클라는 겉모습만 담당한다.
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+		local spec = self:GetDragonSpec(self.DragonIndex)
+
+		-- 클립: 공격 중(고른 attacks[AtkClip]) > 이동 중이면 비행 > 제자리.
+		local want = spec.stand
+		if self.AtkState == "atk" then
+			local ai = self.AtkClip
+			if ai < 1 or ai > #spec.attacks then ai = 1 end
+			want = spec.attacks[ai].clip
+		elseif self.Moving then
+			want = spec.move
+		end
+		if sr.SpriteRUID ~= want then sr.SpriteRUID = want end
+
+		-- 시트 원본이 왼쪽을 보므로 오른쪽을 볼 때만 Flip한다.
+		local wantFlip = (self.FacingX > 0)
+		if sr.FlipX ~= wantFlip then sr.FlipX = wantFlip end
+
+		-- 크기: 시트 크기 편차가 커서 용마다 다른 배율을 준다.
+		local tr = self.Entity.TransformComponent
+		if isvalid(tr) and tr.Scale.x ~= spec.scale then
+			tr.Scale = Vector3(spec.scale, spec.scale, 1)
+		end
+
+		-- 캐릭터에 가리도록 아바타와 같은 레이어 + 낮은 OrderInLayer(라이딩과 동일).
+		if sr.SortingLayer ~= "MapLayer0" then sr.SortingLayer = "MapLayer0" end
+		if sr.OrderInLayer ~= 3 then sr.OrderInLayer = 3 end
+
+		-- 페이드인: 처음 0.8초 동안 알파 0→1.
+		if self._T.fadeStart == nil then self._T.fadeStart = _UtilLogic.ElapsedSeconds end
+		local ft = (_UtilLogic.ElapsedSeconds - self._T.fadeStart) / 0.8
+		if ft < 1.0 then
+			sr.Color = Color(1, 1, 1, math.min(1.0, math.max(0.0, ft)))
+		elseif self._T.fadeDone ~= true then
+			self._T.fadeDone = true
+			sr.Color = Color(1, 1, 1, 1)
+		end
+	end
+
+end

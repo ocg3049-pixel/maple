@@ -265,6 +265,12 @@ script PlayerAttack extends AttackComponent
 				                return false
 			            end
 		        end
+		        -- 용 소환(6마리 소환수 공격) - 이번 호출 전용 단일 대상만 통과시킨다(라이딩과 동일한 패턴).
+		        if attackInfo == "skill.summondragon" then
+			            if not isvalid(self._T.summonDragonCurrentTarget) or defender ~= self._T.summonDragonCurrentTarget then
+				                return false
+			            end
+		        end
 		        -- 용사 소환(소환수 공격) - 이번 호출 전용 단일 대상만 통과시킨다(다크드래곤과 동일한 패턴).
 		        -- .stab(스피어버스터 3줄 수동 표시 판)도 같은 단일 대상 게이트를 쓴다.
 		        if attackInfo == "skill.herosummon" or attackInfo == "skill.herosummon.stab" then
@@ -317,6 +323,12 @@ script PlayerAttack extends AttackComponent
 		        -- 파이어 샷 - 아이스 샷과 동일한 단일 대상 게이트.
 		        if attackInfo == "skill.fireshot" then
 			            if not isvalid(self._T.fireShotCurrentTarget) or defender ~= self._T.fireShotCurrentTarget then
+			                return false
+			            end
+		        end
+		        -- 궁병 지원 - 지원 화살이 도착한 그 대상 하나만 통과시킨다(아이스 샷과 동일한 패턴).
+		        if attackInfo == "skill.archersupport" then
+			            if not isvalid(self._T.archerSupportCurrentTarget) or defender ~= self._T.archerSupportCurrentTarget then
 			                return false
 			            end
 		        end
@@ -560,6 +572,11 @@ script PlayerAttack extends AttackComponent
 		            local combatPower = self._T.pendingRidingDragonCombatPower or 0
 		            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
 		            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.summondragon" then
+			            -- 용 소환(6마리) 소환수 공격: 드래곤 라이딩과 같은 규격(전투력의 200%~300%).
+			            local combatPower = self._T.pendingSummonDragonCombatPower or 0
+			            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
+			            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.herosummon" or attackInfo == "skill.herosummon.stab" then
 		            -- 용사 소환수 공격: 용사 자신의 전투력(레벨×10) × 스킬별 배율(시전 직전 _T로 전달).
 		            -- .stab은 용사 스피어버스터 1줄(자동 표시를 끄고 원본처럼 3줄 수동 배치 - DealHeroSummonStabHit).
@@ -785,6 +802,11 @@ script PlayerAttack extends AttackComponent
 			            -- 파이어 샷: 아이스 샷과 동일한 규격(대상 하나당 전투력의 500%~700%).
 			            local combatPower = self._T.pendingFireShotCombatPower or 0
 			            local mult = 5.0 + _UtilLogic:RandomDouble() * (7.0 - 5.0)
+			            return math.floor(combatPower * mult)
+		        elseif attackInfo == "skill.archersupport" then
+			            -- 궁병 지원: 지원 화살 한 발당 전투력의 200%~300%(30초간 총 15발인 지속 스킬 규격).
+			            local combatPower = self._T.pendingArcherSupportCombatPower or 0
+			            local mult = 2.0 + _UtilLogic:RandomDouble() * (3.0 - 2.0)
 			            return math.floor(combatPower * mult)
 		        end
 		        return 50
@@ -3057,6 +3079,8 @@ script PlayerAttack extends AttackComponent
 			left = left - 1
 			if left <= 0 then
 				self._T.chargeBlowBurning[key] = nil
+				-- 화상이 끝나면 서버에서 한 번 더 색을 되돌린다(클라 blink 종료 처리가 유실돼도 안전).
+				self:ClearChargeBlowTint(target)
 			else
 				self._T.chargeBlowBurning[key] = left
 				_TimerService:SetTimerOnce(tick, 3.0)
@@ -3065,9 +3089,64 @@ script PlayerAttack extends AttackComponent
 		_TimerService:SetTimerOnce(tick, 3.0)
 	end
 
+	@ExecSpace("ServerOnly")
+	method void ApplyElementalBurn(Entity target, number burnCombatPower)
+		-- (요청 2026-07-28) 불 속성 스킬에 맞으면 확률로 걸리는 화상.
+		--   메테오 30% / 파이어 샷 20% / 매직 에로우(불) 20% / 불의 영역 10%
+		-- 차지 블로우(스윙 강화=불)의 화상과 "같은 상태"로 취급한다 - 같은 chargeBlowBurning 테이블에
+		-- 기록하므로 IsTargetBurning이 true가 되고, 화상 중인 적을 얼음 차지 블로우(스티그마)로 때리면
+		-- 화상 저주 장판이 그대로 발동한다(요청: 화상이 차지 블로우 속성 효과를 발동시킬 것).
+		-- 지속 4초(요청) - 그 동안 연한 빨강 두 톤으로 물들고, 1초마다 전투력의 25%씩 4회 피해.
+		if not isvalid(target) then return end
+		if self._T.chargeBlowBurning == nil then self._T.chargeBlowBurning = {} end
+		local key = target.Path
+		local totalTicks = 4          -- 4초 / 1초
+		if self._T.chargeBlowBurning[key] ~= nil then
+			-- 이미 화상 중이면 새로 걸지 않고 남은 횟수만 다시 채운다(차지 블로우 화상과 동일한 갱신 규칙).
+			-- 색 연출도 같이 4초 연장한다 - 안 하면 상태는 남았는데 색만 먼저 빠져 어긋난다.
+			self._T.chargeBlowBurning[key] = totalTicks
+			self:PlayChargeBlowBurnVisual(target, 4.0)
+			return
+		end
+		self._T.chargeBlowBurning[key] = totalTicks
+		local combatPower = burnCombatPower
+		self:PlayChargeBlowBurnVisual(target, 4.0)
+		local tick
+		tick = function()
+			if self._T.chargeBlowBurning == nil then return end
+			local left = self._T.chargeBlowBurning[key]
+			if left == nil then return end
+			if not isvalid(target) then
+				self._T.chargeBlowBurning[key] = nil
+				return
+			end
+			local monster = target:GetComponent("script.Monster")
+			if monster ~= nil and monster.IsDead then
+				-- 죽은 시점에 바로 색을 되돌린다(리스폰된 몬스터가 붉게 물든 채 나오는 것 방지).
+				self._T.chargeBlowBurning[key] = nil
+				self:ClearChargeBlowTint(target)
+				return
+			end
+			-- dot.chargeblow.burn 공식이 전투력의 50%를 쓰므로, 절반을 넘겨 25%로 만든다.
+			self:DealChargeBlowDotDamage(target, combatPower * 0.5, "dot.chargeblow.burn")
+			left = left - 1
+			if left <= 0 then
+				self._T.chargeBlowBurning[key] = nil
+				-- 화상이 끝나면 서버에서 한 번 더 색을 되돌린다(클라 blink 종료 처리가 유실돼도 안전).
+				self:ClearChargeBlowTint(target)
+			else
+				self._T.chargeBlowBurning[key] = left
+				_TimerService:SetTimerOnce(tick, 1.0)
+			end
+		end
+		_TimerService:SetTimerOnce(tick, 1.0)
+		log("[Burn] 화상 부여 target=" .. tostring(target.Name) .. " 4초 전투력=" .. tostring(math.floor(burnCombatPower)))
+	end
+
 	@ExecSpace("Multicast")
 	method void PlayChargeBlowBurnVisual(Entity target, number duration)
-		-- 붉은색 ↔ 검붉은색을 0.15초 간격으로 번갈아 칠해 "반짝거리는" 화상 상태를 표현한다.
+		-- (요청 2026-07-28) 연한 빨간색 두 톤을 0.15초 간격으로 번갈아 칠해 화상 상태를 표현한다.
+		-- 예전 값(1.0,0.25,0.2 ↔ 0.45,0.05,0.05)은 몬스터가 거의 검붉게 죽어버려 너무 어두웠다.
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
 		local spr0 = target.SpriteRendererComponent
@@ -3082,13 +3161,16 @@ script PlayerAttack extends AttackComponent
 			local spr = target.SpriteRendererComponent
 			if not isvalid(spr) then return end
 			if _UtilLogic.ElapsedSeconds >= endTime then
-				self:ClearChargeBlowTint(target)
+				-- (버그 수정) 여기서 Multicast인 ClearChargeBlowTint를 부르면 "클라 → Multicast"라
+				-- 전달되지 않아 색이 영영 안 돌아왔다. 이 블록 자체가 이미 클라이언트이므로 직접 되돌린다.
+				spr.Color = Color(1, 1, 1, prevAlpha)
+				spr.PlayRate = 1
 				return
 			end
 			if bright then
-				spr.Color = Color(1.0, 0.25, 0.2, prevAlpha)
+				spr.Color = Color(1.0, 0.72, 0.68, prevAlpha)
 			else
-				spr.Color = Color(0.45, 0.05, 0.05, prevAlpha)
+				spr.Color = Color(1.0, 0.52, 0.47, prevAlpha)
 			end
 			bright = not bright
 			_TimerService:SetTimerOnce(blink, 0.15)
@@ -5222,6 +5304,9 @@ script PlayerAttack extends AttackComponent
 
 		local mult = math.max(0.1, math.min(atkMultiplier or 1.0, 3.0))
 		self._T.pendingMagicMissileCombatPower = combatPower
+		-- (요청) 매직 에로우(불) 토글일 때 명중 시 화상을 걸어야 한다. 구체가 도착한 뒤 판정하는
+		-- DealMagicMissileHit은 element를 인자로 받지 않으므로 시전 시점의 속성을 서버에 기억해둔다.
+		self._T.pendingMagicMissileElement = element
 
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		local worldPos = self.Entity.TransformComponent.WorldPosition
@@ -5404,6 +5489,10 @@ script PlayerAttack extends AttackComponent
 		end
 		if actuallyHit then
 			self:PlayMagicMissileHitEffect(target)
+			-- (요청) 매직 에로우(불) 토글이 켜진 매직 미사일은 20% 확률로 화상을 입힌다.
+			if (self._T.pendingMagicMissileElement or "") == "fire" and _UtilLogic:RandomDouble() < 0.2 then
+				self:ApplyElementalBurn(target, self._T.pendingMagicMissileCombatPower or 0)
+			end
 		end
 		log("PlayerAttack: DealMagicMissileHit target=" .. tostring(target.Name) .. " actuallyHit=" .. tostring(actuallyHit))
 	end
@@ -5627,6 +5716,36 @@ script PlayerAttack extends AttackComponent
 			end
 		end
 
+		-- 소환된 힐러(HealerSummon)도 회복 대상이다 - HP가 남아 있는(사망 상태가 아닌) 경우만.
+		local healerComps = map:GetChildComponentsByTypeName("script.HealerSummon", true)
+		for _, comp in ipairs(healerComps) do
+			---@type HealerSummon
+			local hlc = comp
+			if isvalid(hlc) and isvalid(hlc.Entity) and hlc.HealerHp > 0 then
+				local pos = hlc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if math.abs(dx) <= 3.6 and math.abs(dy) <= 3.6 then
+					table.insert(candidates, { entity = hlc.Entity, dist = math.abs(dx), kind = "healer" })
+				end
+			end
+		end
+
+		-- 소환된 용(SummonDragon)도 회복 대상이다 - 격추되지 않고 HP가 남아 있는 경우만.
+		local dragonComps = map:GetChildComponentsByTypeName("script.SummonDragon", true)
+		for _, comp in ipairs(dragonComps) do
+			---@type SummonDragon
+			local sd = comp
+			if isvalid(sd) and isvalid(sd.Entity) and sd.DragonHp > 0 then
+				local pos = sd.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if math.abs(dx) <= 3.6 and math.abs(dy) <= 3.6 then
+					table.insert(candidates, { entity = sd.Entity, dist = math.abs(dx), kind = "dragon" })
+				end
+			end
+		end
+
 		table.sort(candidates, function(a, b) return a.dist < b.dist end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
@@ -5661,6 +5780,10 @@ script PlayerAttack extends AttackComponent
 					self:ApplyHealToPlayer(t.entity, self._T.pendingHealCombatPower or 0)
 				elseif t.kind == "hero" then
 					self:ApplyHealToHero(t.entity, self._T.pendingHealCombatPower or 0)
+				elseif t.kind == "healer" then
+					self:ApplyHealToHealer(t.entity, self._T.pendingHealCombatPower or 0)
+				elseif t.kind == "dragon" then
+					self:ApplyHealToDragon(t.entity, self._T.pendingHealCombatPower or 0)
 				elseif t.kind == "undead" then
 					-- 이번 Attack() 호출은 이 대상 하나만 통과하도록 지정 (썬더볼트와 동일한 교차 히트 방지 패턴).
 					self._T.healCurrentUndeadTarget = t.entity
@@ -5682,6 +5805,60 @@ script PlayerAttack extends AttackComponent
 			end
 		end
 		log("PlayerAttack: AttackHeal 처리 완료 대상=" .. tostring(#targets))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackRestoration()
+		-- 리스토네이션(2차, 2026-07-28 신설, 원본 팩 skill/121.img/skill/1211010):
+		-- 캐릭터 몸에서 회복 이펙트를 1회 재생하고, (요청) 최대 HP의 10%씩 1초 간격으로 5회 =
+		-- 5초에 걸쳐 총 50%를 회복한다. 회복량은 힐과 같은 파란 데미지 스킨으로 매 초 표시된다.
+		-- 대상은 시전자 본인뿐이라 힐과 달리 범위 탐색이 없다. 쿨타임(10초)은 SkillManager가 관리한다.
+		self:StopBreather()
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" then
+			return
+		end
+		local pc = self.Entity.PlayerComponent
+		if not isvalid(pc) then return end
+
+		self:PlayRestorationEffect(self.Entity)
+
+		-- 재시전하면 이전 회복 예약은 무효화한다(쿨타임 10초 > 지속 5초라 겹칠 일은 없지만 안전장치).
+		self._T.restorationToken = (self._T.restorationToken or 0) + 1
+		local myToken = self._T.restorationToken
+		local TICKS = 5
+		local perTick = math.floor(pc.MaxHp * 0.1)
+		for i = 1, TICKS do
+			local idx = i
+			_TimerService:SetTimerOnce(function()
+				if self._T.restorationToken ~= myToken then return end
+				if not isvalid(self.Entity) then return end
+				local pcNow = self.Entity.PlayerComponent
+				if not isvalid(pcNow) or pcNow:IsDead() then return end
+				local newHp = math.min(pcNow.Hp + perTick, pcNow.MaxHp)
+				local actualHealed = newHp - pcNow.Hp
+				if actualHealed <= 0 then return end
+				pcNow.Hp = newHp
+				-- 회복량 표시는 힐과 같은 파란 데미지 스킨을 쓴다.
+				self:ShowHealDamageSkin(self.Entity, actualHealed)
+				log("PlayerAttack: 리스토네이션 " .. tostring(idx) .. "/" .. tostring(TICKS) .. "회 +"
+					.. tostring(actualHealed) .. " HP " .. tostring(math.floor(pcNow.Hp)) .. "/" .. tostring(math.floor(pcNow.MaxHp)))
+			end, (idx - 1) * 1.0)
+		end
+		log("PlayerAttack: 리스토네이션 시전 - 최대HP 10%(" .. tostring(perTick) .. ")씩 5초간 5회 회복 시작")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayRestorationEffect(Entity attacker)
+		-- 리스토네이션 시전 연출: 회복 이펙트를 캐릭터 몸(0,0,0)에 붙여 1회 재생 + 원본 팩 사용음.
+		-- (요청 2026-07-28) 이펙트 RUID 교체: 8d48b1dc(effect0) → 2cdfa538.
+		if not self:IsClient() then return end
+		if not isvalid(attacker) then return end
+		_SoundService:PlaySound("0dd3dfd6b97c4a689deac7f3fde133dc", 1.0)
+		local serial = _EffectService:PlayEffectAttached("2cdfa53899d2462cb051e958a70b4747", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 2.0)
 	end
 
 	@ExecSpace("Server")
@@ -5731,6 +5908,27 @@ script PlayerAttack extends AttackComponent
 		self:PlayHeroHealEffect(heroEntity)
 		self:ShowHealDamageSkin(heroEntity, actualHealed)
 		log("PlayerAttack: 용사 회복 +" .. tostring(actualHealed) .. " → HP " .. tostring(math.floor(hs.HeroHp)) .. "/" .. tostring(math.floor(hs.HeroMaxHp)))
+	end
+
+	@ExecSpace("Server")
+	method void ApplyHealToHealer(Entity healerEntity, number combatPower)
+		-- 소환된 힐러 회복: 용사(ApplyHealToHero)와 완전히 같은 공식/표현으로 HealerHp를 채운다.
+		if not isvalid(healerEntity) then return end
+		---@type HealerSummon
+		local hs = healerEntity:GetComponent("script.HealerSummon")
+		if not isvalid(hs) or hs.HealerHp <= 0 then return end
+		local baseHeal = combatPower * 0.10
+		local mult = 0.5 + _UtilLogic:RandomDouble() * 1.0
+		local healAmount = math.floor(baseHeal * mult)
+		if healAmount <= 0 then return end
+		local newHp = math.min(hs.HealerHp + healAmount, hs.HealerMaxHp)
+		local actualHealed = newHp - hs.HealerHp
+		if actualHealed <= 0 then return end
+		hs.HealerHp = newHp
+		hs:UpdateHpBar()
+		self:PlayHeroHealEffect(healerEntity)
+		self:ShowHealDamageSkin(healerEntity, actualHealed)
+		log("PlayerAttack: 힐러 회복 +" .. tostring(actualHealed) .. " → HP " .. tostring(math.floor(hs.HealerHp)) .. "/" .. tostring(math.floor(hs.HealerMaxHp)))
 	end
 
 	@ExecSpace("Multicast")
@@ -7986,7 +8184,7 @@ script PlayerAttack extends AttackComponent
 		self:StopBreather()
 		-- 드래곤 로어: 전방위 최대 20명(범위는 익스플로젼의 5배), 시전 뒤 1.5초 지연 폭발, 데미지 배율(1000~1300%).
 		-- 추가로 시전 즉시 2초짜리 스턴에 걸린다(모션 자체의 짧은 잠금과는 별개의 독립된 고정 길이 잠금 -
-		-- 공격속도 영향을 받지 않는다). 사용 즉시 현재 HP의 40%를 소모한다.
+		-- 공격속도 영향을 받지 않는다). 사용 즉시 최대 HP의 25%를 소모한다.
 		local currentState = self.Entity.StateComponent.CurrentStateName
 		if currentState == "DEAD" or currentState == "CLIMB" or currentState == "LADDER" then
 			return
@@ -7998,10 +8196,11 @@ script PlayerAttack extends AttackComponent
 		self._T.isDragonRoaring = true
 		self._T.pendingDragonRoarCombatPower = combatPower
 
-		-- 사용 즉시 현재 HP의 40%를 소모한다(스킬 사용 자체로 죽지 않도록 최소 1은 남긴다).
+		-- (요청 2026-07-28) 소모량 기준 변경: 현재 HP의 40% → **최대 HP의 25%**
+		-- (스킬 사용 자체로 죽지 않도록 최소 1은 남긴다 - 최대 HP 기준이라 현재 HP보다 많이 깎일 수 있다).
 		local pc = self.Entity.PlayerComponent
 		if isvalid(pc) then
-			local hpCost = math.floor(pc.Hp * 0.4)
+			local hpCost = math.floor(pc.MaxHp * 0.25)
 			pc.Hp = math.max(pc.Hp - hpCost, 1)
 			log("PlayerAttack: AttackDragonRoar HP 소모=" .. tostring(hpCost) .. " 남은Hp=" .. tostring(pc.Hp))
 		end
@@ -10813,6 +11012,174 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
+	method void AttackArcherSupport(number combatPower)
+		-- 궁병 지원(3차, 2026-07-28): 30초 동안 유저의 등 뒤 먼 곳(화면 밖)에서 아이스 샷/파이어 샷 화살이
+		-- 몬스터를 향해 총 15발(2초 간격, 얼음/불 교차) 날아온다. 화살이 꽂히면 아이스 샷 / 파이어 샷처럼
+		-- 그 일대를 속성 공격한다 - 범위 안 최대 6명이 각각 전투력의 200~300% 피해 + 속성 연출.
+		-- 화살 비주얼은 화살비 공용 ArrowRainArrow(9프레임 얼음 화살, 불은 붉은 틴트)를 재사용한다.
+		-- 재시전은 SkillManager의 2분 쿨타임이 막아주지만, 만약을 위해 토큰으로 이전 시전 예약을 무효화한다.
+		self._T.pendingArcherSupportCombatPower = combatPower
+		self._T.archerSupportToken = (self._T.archerSupportToken or 0) + 1
+		local myToken = self._T.archerSupportToken
+		-- (요청) 발수 15 → 30발(2배). 발사 시각도 균등 2초 간격이 아니라 랜덤으로 흩뿌려 지원 사격이
+		-- 기계적으로 째깍거리지 않게 한다 - 30초를 30칸으로 나눈 뒤 각 칸 안에서 다시 랜덤(칸 이탈 없이
+		-- 전체가 고르게 퍼지면서도 간격은 매번 달라진다).
+		local SHOT_COUNT = 30
+		local DURATION = 30.0
+		local SLOT = DURATION / SHOT_COUNT
+		for i = 1, SHOT_COUNT do
+			local isFire = (i % 2 == 0)
+			local fireAt = 0.3 + (i - 1) * SLOT + _UtilLogic:RandomDouble() * SLOT
+			_TimerService:SetTimerOnce(function()
+				if self._T.archerSupportToken ~= myToken then return end
+				if not isvalid(self.Entity) then return end
+				self:FireArcherSupportArrow(isFire)
+			end, fireAt)
+		end
+		log("PlayerAttack: 궁병 지원 시작 - 30초간 지원 사격 30발(랜덤 간격) combatPower=" .. tostring(combatPower))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FireArcherSupportArrow(boolean isFire)
+		-- 지원 화살 1발: 살아있는 몬스터 중 시전자 기준 넓은 범위(가로 ±10, 세로 ±5) 안에서 무작위 하나를 골라
+		-- (요청) 유저의 "뒤쪽 약간 위" - 화면 밖 보이지 않는 먼 곳에서 그 몬스터를 향해 날아온다.
+		-- 도착하면 그 자리에 아이스 샷 / 파이어 샷과 같은 범위 속성 공격이 터진다(DealArcherSupportHit).
+		-- 몬스터가 없으면 이번 발은 생략.
+		if not isvalid(self.Entity) then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		-- (요청) 조준 범위 확대 - 예전엔 "가장 가까운 6마리" 중에서만 골라 시전자 발밑에만 쏟아졌다.
+		-- 이제 캐릭터 기준 가로 ±10 / 세로 ±5(PC 화면 12.8×7.2보다 넓은 범위) 안의 몬스터 전체를
+		-- 후보로 두고 그 중 무작위로 고른다. 범위 안에 아무도 없으면 가까운 순 12마리로 폴백한다.
+		local RANGE_X = 10.0
+		local RANGE_Y = 5.0
+		local inRange = {}
+		local candidates = {}
+		for _, comp in ipairs(monsterComps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead and mc.Entity.Enable then
+				local pos = mc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - myPos.x
+				local dy = pos.y - myPos.y
+				table.insert(candidates, { entity = mc.Entity, dist = math.sqrt(dx * dx + dy * dy) })
+				if math.abs(dx) <= RANGE_X and math.abs(dy) <= RANGE_Y then
+					table.insert(inRange, mc.Entity)
+				end
+			end
+		end
+		if #candidates == 0 then
+			log("[ArcherSupport] 대상 없음 - 이번 발 생략")
+			return
+		end
+		local target = nil
+		if #inRange > 0 then
+			target = inRange[1 + math.floor(_UtilLogic:RandomDouble() * #inRange)]
+		else
+			table.sort(candidates, function(a, b) return a.dist < b.dist end)
+			local pickMax = math.min(#candidates, 12)
+			target = candidates[1 + math.floor(_UtilLogic:RandomDouble() * pickMax)].entity
+		end
+		if not isvalid(target) then return end
+		local tp = target.TransformComponent.WorldPosition
+
+		-- (요청) 발사 원점 = 유저 등 뒤 먼 곳(가로 16유닛, PC 화면 폭 12.8의 절반보다 훨씬 밖) + 약간 위(5유닛).
+		-- 좌우로 조금씩 흩어져 매번 같은 선을 그리지 않게 한다.
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local lookDirX = (isvalid(playerCtrl) and playerCtrl.LookDirectionX >= 0) and 1 or -1
+		local backX = -lookDirX * (16.0 + _UtilLogic:RandomDouble() * 2.0)
+		local startPos = Vector3(myPos.x + backX, myPos.y + 5.0 + _UtilLogic:RandomDouble() * 1.0, 0)
+		local aimY = tp.y + 0.5
+		local dx = tp.x - startPos.x
+		local dy = aimY - startPos.y
+		local dist = math.sqrt(dx * dx + dy * dy)
+		if dist < 0.0001 then dist = 0.0001 end
+
+		self._T.archerArrowSeq = (self._T.archerArrowSeq or 0) + 1
+		local arrow = _SpawnService:SpawnByModelId("arrowrainarrow", "archersupport_" .. tostring(self._T.archerArrowSeq), startPos, map)
+		if not isvalid(arrow) then
+			log_warning("[ArcherSupport] 화살 스폰 실패")
+			return
+		end
+		---@type ArrowRainArrow
+		local comp = arrow:GetComponent("script.ArrowRainArrow")
+		-- 먼 곳에서 오므로 화살비(2~4)보다 빠르게 날린다. (요청) 속도를 이전(22)의 2/3로 낮춤.
+		local ARROW_SPEED = 22.0 * (2.0 / 3.0)
+		if isvalid(comp) then
+			comp.Speed = ARROW_SPEED
+			comp.FallDistance = dist       -- 대상 위치에서 정확히 사라지게
+			comp.ArrowScale = 1.0
+			if isFire then
+				comp.TintR = 1.0
+				comp.TintG = 0.45
+				comp.TintB = 0.25
+			end
+			comp:Fire(dx, dy)
+		end
+
+		-- 화살이 도착하는 시점에 그 자리에서 범위 속성 공격이 터진다.
+		_TimerService:SetTimerOnce(function()
+			local cx, cy = tp.x, tp.y
+			if isvalid(target) then
+				local nowPos = target.TransformComponent.WorldPosition
+				cx, cy = nowPos.x, nowPos.y
+			end
+			self:DealArcherSupportHit(cx, cy, isFire)
+		end, dist / ARROW_SPEED)
+		log("[ArcherSupport] " .. (isFire and "불" or "얼음") .. " 화살 ← 등 뒤 ("
+			.. string.format("%.1f", startPos.x) .. ", " .. string.format("%.1f", startPos.y) .. ") → ("
+			.. string.format("%.1f", tp.x) .. ", " .. string.format("%.1f", tp.y) .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealArcherSupportHit(number cx, number cy, boolean isFire)
+		-- (요청) 지원 화살은 한 명만 때리는 게 아니라, 꽂힌 자리 일대를 속성 공격한다 - 아이스 샷 /
+		-- 파이어 샷의 광역 히트를 그대로 축소 재사용한다. 범위(FindShotAreaTargets: 가로 ±2.2, 세로 ±1.5)
+		-- 안의 몬스터 최대 6명이 각각 한 번씩 전투력의 200~300% 피해를 받고, 속성별 연출 + 상태이상이 붙는다.
+		--   얼음 화살 → 얼음 결정 + 착탄점 얼음 파편 낙하 + 4초 빙결(아이스 샷 본체와 동일)
+		--   불 화살   → 화염 폭발 + 착탄점 바닥 불길 + 20% 확률 화상(파이어 샷 본체와 동일)
+		-- (요청 반영) 처음에는 상태이상을 뺐었는데 "속성 효과가 안 들어온다"는 피드백으로 본체와 동일하게 맞춤.
+		local victims = self:FindShotAreaTargets(Vector2(cx, cy), 6)
+		local hitCount = 0
+		for _, victim in ipairs(victims) do
+			if isvalid(victim) then
+				self._T.archerSupportCurrentTarget = victim
+				local pos = victim.TransformComponent.WorldPosition
+				local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+				self:AttackShadowSafe(shape, "skill.archersupport", victim)
+				self._T.archerSupportCurrentTarget = nil
+				hitCount = hitCount + 1
+				---@type Monster
+				local monsterComp = victim:GetComponent("script.Monster")
+				if isFire then
+					self:PlayFireShotHitBurst(victim)
+					-- 불 속성: 파이어 샷과 같은 20% 확률 화상.
+					if _UtilLogic:RandomDouble() < 0.2 then
+						self:ApplyElementalBurn(victim, self._T.pendingArcherSupportCombatPower or 0)
+					end
+				else
+					self:SpawnIceShotHitEffect(victim)
+					-- 얼음 속성: 아이스 샷과 같은 4초 빙결(푸른 물듦 + 이동속도 50%). 죽었으면 걸지 않는다.
+					if isvalid(monsterComp) and not monsterComp.IsDead then
+						self:ApplyChargeBlowFreeze(victim, 4.0)
+					end
+				end
+			end
+		end
+		-- 착탄점 연출은 속성당 한 번만.
+		if isFire then
+			self:SpawnFireShotGroundFire(cx, cy)
+		else
+			self:SpawnIceShotFallingShards(cx, cy)
+		end
+		self:PlayIceShotHitSound(self.Entity)
+		log("[ArcherSupport] " .. (isFire and "불" or "얼음") .. " 착탄 광역 " .. tostring(hitCount) .. "명 at ("
+			.. string.format("%.2f", cx) .. ", " .. string.format("%.2f", cy) .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
 	method void AttackFireShot(number combatPower, number atkMultiplier)
 		-- 파이어 샷(3차): 아이스 샷과 같은 구조 - 몸쪽 화염 폭발 시전 이펙트와 함께 정면으로 탄환(ball)을
 		-- 딱 한 발 쏜다. 탄환이 도착한 지점에서 불화살비가 쏟아지고, 그 범위 안의 몬스터 최대 10명이 각각
@@ -11000,6 +11367,10 @@ script PlayerAttack extends AttackComponent
 				hitCount = hitCount + 1
 				-- 대상 몸의 화염 폭발(hit/0)은 맞은 각 대상에 붙인다.
 				self:PlayFireShotHitBurst(victim)
+				-- (요청) 불 속성 스킬 화상 - 파이어 샷은 20% 확률.
+				if _UtilLogic:RandomDouble() < 0.2 then
+					self:ApplyElementalBurn(victim, self._T.pendingFireShotCombatPower or 0)
+				end
 			end
 		end
 		-- 바닥 불길(tile 12개) + 떨어지는 불꽃 파편(special 15개)은 도착지점 한 곳에서 한 번만 낸다.
@@ -11887,6 +12258,21 @@ script PlayerAttack extends AttackComponent
 		-- 같은 지면이 여러 조각으로 나뉘어 있어도 밟고 있는 조각만 빼면 옆 조각/아래층에는 정상적으로 박힌다.
 		local rbForFh = self.Entity.RigidbodyComponent
 		local standingFh = isvalid(rbForFh) and rbForFh:GetCurrentFoothold() or nil
+		-- (버그 수정 2026-07-28) 공중(점프/낙하) 시전이면 GetCurrentFoothold가 nil이라 제외 목록이
+		-- 비어, 체인이 발밑 바로 아래 발판(방금 뛰어오른 그 지면)에 박혀 목표 지역까지 못 간다.
+		-- 공중일 때는 발밑 아래로 내리쏴 "바로 아래 발판"을 서 있는 발판처럼 취급해 제외한다.
+		if standingFh == nil and isvalid(fh) then
+			local downOrigin = Vector2(myPos.x, myPos.y + 0.1)
+			local downHits = fh:RaycastAll(downOrigin, Vector2(0, -1), 3.0)
+			local bestDownT = -1
+			for _, h in ipairs(downHits) do
+				local t = self:RayHitDistanceToFoothold(h, downOrigin, Vector2(0, -1), 3.0)
+				if t >= 0 and (bestDownT < 0 or t < bestDownT) then
+					bestDownT = t
+					standingFh = h
+				end
+			end
+		end
 		-- (요청) 캐릭터가 서 있는 바닥으로는 날리지 않는다. 같은 지면이 여러 발판 조각으로 이어져
 		-- 있으므로 Next/PreviousFootholdId 체인을 따라가 연결된 조각 전부를 제외 목록에 넣는다.
 		local excludedFh = {}
@@ -12299,6 +12685,20 @@ script PlayerAttack extends AttackComponent
 		local hitDist = -1
 		local rbForFh = self.Entity.RigidbodyComponent
 		local standingFh = isvalid(rbForFh) and rbForFh:GetCurrentFoothold() or nil
+		-- (버그 수정 2026-07-28) 공중(점프/낙하) 시전이면 GetCurrentFoothold가 nil이라 제외 목록이
+		-- 비어, 검이 발밑 바로 아래 발판에 박혀 목표 지역까지 못 간다(체인샷과 동일한 수정).
+		if standingFh == nil and isvalid(fh) then
+			local downOrigin = Vector2(myPos.x, myPos.y + 0.1)
+			local downHits = fh:RaycastAll(downOrigin, Vector2(0, -1), 3.0)
+			local bestDownT = -1
+			for _, h in ipairs(downHits) do
+				local t = self:RayHitDistanceToFoothold(h, downOrigin, Vector2(0, -1), 3.0)
+				if t >= 0 and (bestDownT < 0 or t < bestDownT) then
+					bestDownT = t
+					standingFh = h
+				end
+			end
+		end
 		local excludedFh = {}
 		if standingFh ~= nil and isvalid(fh) then
 			local startId = standingFh.Id
@@ -15632,6 +16032,59 @@ script PlayerAttack extends AttackComponent
 		log("[HeroSummon] 스폰 완료 seq=" .. tostring(self._T.heroSummonSeq) .. " playerLevel=" .. tostring(playerLevel))
 	end
 
+	-- ── 힐러 소환(3차) ───────────────────────────────────────────────────
+	-- 비숍 힐러를 아바타 NPC로 소환한다. AI/장비/힐·텔레포트는 script.HealerSummon이 담당하고,
+	-- 여기서는 스폰과 해제만 맡는다(공격 스킬이 없어 판정 파이프라인이 필요 없다).
+
+	@ExecSpace("ServerOnly")
+	method void SummonHealer(number playerLevel)
+		-- 힐러 소환: healersummon 모델(아바타 NPC)을 맵에 스폰. 기존 힐러가 있으면 교체한다.
+		local old = self._T.healerSummonEntity
+		if isvalid(old) then old:Destroy() end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then
+			log_warning("[HealerSummon] 소환 실패 - CurrentMap 없음")
+			return
+		end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		self._T.healerSummonSeq = (self._T.healerSummonSeq or 0) + 1
+		local healer = _SpawnService:SpawnByModelId("healersummon", "HealerSummon" .. tostring(self._T.healerSummonSeq), Vector3(myPos.x, myPos.y + 0.2, 0), map)
+		if not isvalid(healer) then
+			log_warning("[HealerSummon] 소환 실패(spawn nil)")
+			return
+		end
+		healer:AddComponent("script.HealerSummon")
+		---@type HealerSummon
+		local comp = healer:GetComponent("script.HealerSummon")
+		if isvalid(comp) then
+			-- AddComponent 직후에는 프로퍼티 대입만 한다(같은 프레임 메서드 호출은 _T 미초기화로
+			-- LEA-2007 위험 - 실제 초기화는 HealerSummon이 첫 ServerTick에서 지연 실행).
+			comp.OwnerEntity = self.Entity
+			comp.HealerLevel = math.max(1, math.floor(playerLevel * 2 / 3))
+			comp.Lifetime = 300
+			-- 힐러 HP = 주인 최대 HP의 2/3 (용사와 같은 규격 - 머리 위 HP바 표시용)
+			local ownerMaxHp = 50
+			if isvalid(self.Entity.PlayerComponent) then
+				ownerMaxHp = self.Entity.PlayerComponent.MaxHp or 50
+			end
+			comp.HealerMaxHp = math.max(1, math.floor(ownerMaxHp * 2 / 3))
+			comp.HealerHp = comp.HealerMaxHp
+		end
+		self._T.healerSummonEntity = healer
+		log("[HealerSummon] 스폰 완료 seq=" .. tostring(self._T.healerSummonSeq) .. " playerLevel=" .. tostring(playerLevel))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DismissHealer()
+		-- 힐러 소환 취소(버프 아이콘 우클릭): 소환된 힐러를 즉시 제거한다.
+		local healer = self._T.healerSummonEntity
+		if isvalid(healer) then
+			healer:Destroy()
+		end
+		self._T.healerSummonEntity = nil
+		log("PlayerAttack: 힐러 소환 취소(우클릭) - 힐러 제거")
+	end
+
 	-- ── 암행(1차 패시브) ─────────────────────────────────────────────
 	-- 스킬 1회 시전이 한 대상을 때리는 타수만큼 20% 확률로(TryProcElementalZones에서
 	-- 시전별 추적 대상 기준으로 굴림 - 다수 대상으로 퍼진 같은 줄은 1번만) 맞은 적 주변
@@ -15876,6 +16329,10 @@ script PlayerAttack extends AttackComponent
 		self:AttackFrom(Vector2(1.4, 2.0), Vector2(pos.x, pos.y + 0.7), "dot.firezone", CollisionGroups.HitBox)
 		self._T.inFireZoneTick = false
 		self._T.fireZoneDotTarget = nil
+		-- (요청) 불 속성 화상 - 불의 영역 화염 지대는 도트 1회당 10% 확률.
+		if _UtilLogic:RandomDouble() < 0.1 then
+			self:ApplyElementalBurn(target, combatPower)
+		end
 	end
 
 	method void TryProcElementalZones(Entity defender)
@@ -16393,6 +16850,107 @@ script PlayerAttack extends AttackComponent
 		self:AttackShadowSafe(shape, "skill.ridingdragon", target)
 	end
 
+	-- ── 용 소환(6마리) ───────────────────────────────────────────────────
+	-- 한 번 시전하면 서로 다른 용 6마리가 동시에 소환된다. 비행/궤도/공격/HP는 script.SummonDragon이
+	-- 담당하고, 여기서는 스폰·해제와 skill.summondragon 판정 파이프라인만 맡는다.
+
+	@ExecSpace("ServerOnly")
+	method void SummonSixDragons(number combatPower)
+		-- 용 6마리를 맵의 자식으로 스폰한다(각자 DragonIndex 1~6). 기존 용이 남아 있으면 먼저 정리한다.
+		self._T.pendingSummonDragonCombatPower = combatPower
+		self:DismissSixDragons()
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then
+			log_warning("[SummonDragon] 소환 실패 - CurrentMap 없음")
+			return
+		end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		-- 용 HP = 주인 최대 HP의 1/2(요청 스펙 - 2026-07-28 1/3에서 상향).
+		local ownerMaxHp = 50
+		if isvalid(self.Entity.PlayerComponent) then
+			ownerMaxHp = self.Entity.PlayerComponent.MaxHp or 50
+		end
+		local dragonHp = math.max(1, math.floor(ownerMaxHp / 2))
+		self._T.summonDragonSeq = (self._T.summonDragonSeq or 0) + 1
+		local seq = self._T.summonDragonSeq
+		local list = {}
+		for i = 1, 6 do
+			local idx = i
+			-- 처음부터 궤도 위치 근처에 뜨도록 6방향으로 벌려 스폰한다.
+			local ang = (idx - 1) * (math.pi * 2 / 6)
+			local sx = myPos.x + math.cos(ang) * 2.4
+			local sy = myPos.y + 1.0 + math.sin(ang) * 0.6
+			local d = _SpawnService:SpawnByModelId("summondragon", "SummonDragon" .. tostring(seq) .. "_" .. tostring(idx), Vector3(sx, sy, 0), map)
+			if isvalid(d) then
+				d:AddComponent("script.SummonDragon")
+				---@type SummonDragon
+				local comp = d:GetComponent("script.SummonDragon")
+				if isvalid(comp) then
+					-- AddComponent 직후에는 프로퍼티 대입만(같은 프레임 메서드 호출은 LEA-2007 위험).
+					comp.OwnerEntity = self.Entity
+					comp.Lifetime = 600           -- 지속 10분(요청 스펙 - 2026-07-28 5분에서 상향)
+					comp.DragonIndex = idx
+					comp.DragonMaxHp = dragonHp
+					comp.DragonHp = dragonHp
+				end
+				table.insert(list, d)
+			else
+				log_warning("[SummonDragon] " .. tostring(idx) .. "번 용 스폰 실패")
+			end
+		end
+		self._T.summonDragonEntities = list
+		log("[SummonDragon] 6마리 소환 완료 seq=" .. tostring(seq) .. " combatPower=" .. tostring(combatPower)
+			.. " 용HP=" .. tostring(dragonHp) .. " 실제=" .. tostring(#list) .. "마리")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DismissSixDragons()
+		-- 소환된 용을 전부 제거한다(재소환 교체 / 버프 아이콘 우클릭 취소 공용).
+		local list = self._T.summonDragonEntities or {}
+		local removed = 0
+		for _, d in ipairs(list) do
+			if isvalid(d) then
+				d:Destroy()
+				removed = removed + 1
+			end
+		end
+		self._T.summonDragonEntities = {}
+		if removed > 0 then
+			log("[SummonDragon] 소환 해제 - " .. tostring(removed) .. "마리 제거")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealSummonDragonHit(Entity target)
+		-- 용 공격 1타: 단일 대상 포인터로 걸러 skill.summondragon(전투력 200~300%) 판정.
+		if not isvalid(target) then return end
+		self._T.summonDragonCurrentTarget = target
+		local pos = target.TransformComponent.WorldPosition
+		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+		self:AttackShadowSafe(shape, "skill.summondragon", target)
+	end
+
+	@ExecSpace("Server")
+	method void ApplyHealToDragon(Entity dragonEntity, number combatPower)
+		-- 소환된 용 회복: 용사/힐러와 같은 공식(전투력의 5%~15%)으로 DragonHp를 채운다.
+		if not isvalid(dragonEntity) then return end
+		---@type SummonDragon
+		local sd = dragonEntity:GetComponent("script.SummonDragon")
+		if not isvalid(sd) or sd.DragonHp <= 0 then return end
+		local baseHeal = combatPower * 0.10
+		local mult = 0.5 + _UtilLogic:RandomDouble() * 1.0
+		local healAmount = math.floor(baseHeal * mult)
+		if healAmount <= 0 then return end
+		local newHp = math.min(sd.DragonHp + healAmount, sd.DragonMaxHp)
+		local actualHealed = newHp - sd.DragonHp
+		if actualHealed <= 0 then return end
+		sd.DragonHp = newHp
+		sd:UpdateHpBar()
+		self:PlayHeroHealEffect(dragonEntity)
+		self:ShowHealDamageSkin(dragonEntity, actualHealed)
+		log("PlayerAttack: 용 회복 +" .. tostring(actualHealed) .. " → HP " .. tostring(math.floor(sd.DragonHp)) .. "/" .. tostring(math.floor(sd.DragonMaxHp)))
+	end
+
 	@ExecSpace("Multicast")
 	method void PlayRidingDragonSummonEffect(Entity attacker)
 		-- (요청) 소환 시 1회 재생하는 이펙트. y는 캐릭터 발끝 높이(-0.45) - 트랜스폼 원점이 몸 중앙이라
@@ -16761,6 +17319,10 @@ script PlayerAttack extends AttackComponent
 		local pos = target.TransformComponent.WorldPosition
 		local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
 		self:AttackShadowSafe(shape, "skill.meteor", target)
+		-- (요청) 불 속성 스킬 화상 - 메테오는 30% 확률.
+		if _UtilLogic:RandomDouble() < 0.3 then
+			self:ApplyElementalBurn(target, self._T.pendingMeteorCombatPower or 0)
+		end
 	end
 
 	@ExecSpace("Multicast")

@@ -1,0 +1,774 @@
+@Component
+script HealerSummon extends Component
+
+	-- 힐러 소환(3차) 소환수. healersummon 모델(아바타 NPC: Rigidbody+Movement+AvatarRenderer+
+	-- CostumeManager+NameTag+HitComponent)을 맵의 자식으로 스폰한 뒤 이 컴포넌트를 붙인다
+	-- (PlayerAttack.SummonHealer). 구조는 용사 소환(HeroSummon)과 같은 규격을 그대로 따르되,
+	-- 성격이 정반대다.
+	--   * 직업은 항상 **비숍**(마법사 성직자 계열) 하나로 고정된다.
+	--   * 공격 스킬이 전혀 없다 - 가진 스킬은 **힐**과 **텔레포트** 둘뿐이다.
+	--   * **힐이 주력**이다: 본인이나 주인의 HP가 조금이라도 깎여 있으면 곧바로 힐을 쓴다(재사용 1.5초).
+	--   * **이동은 두 경우에만** 한다(요청 사양) - ① 주인이 주변(2.5유닛)에 없을 때,
+	--     ② 데미지를 입은 직후 2초(맞은 자리를 벗어나 주인 옆 0.6유닛까지 바짝 붙는다).
+	--     그 밖에는 제자리에 서서 주인을 바라보며 힐만 쓴다 - 배회/재배치/몬스터 회피 이동은 없다.
+	--   * 멀 때는 텔레포트로 한 번에 붙는다(평소 4유닛 / 피격 대피 중 2.5유닛 기준).
+	-- 이동은 서버 권한(용사와 동일). 아바타 모션은 상태머신 없이 클라이언트가 @Sync 값
+	-- (LocoState/MotionCmd)을 보고 body 엔티티에 ActionStateChangedEvent를 직접 보내 재생한다.
+
+	property Entity OwnerEntity = nil              -- 서버 전용(소환한 플레이어)
+	property number Lifetime = 300                 -- 서버 전용 수명(초)
+	property number HealerMaxHp = 100              -- 서버 전용: 최대 HP(주인 최대 HP의 2/3)
+	property number HealerHp = 100                 -- 서버 전용: 현재 HP
+	@Sync property number HealerLevel = 1          -- 힐러 레벨(플레이어 레벨의 2/3)
+	@Sync property string LocoState = "stand"      -- stand / walk / jump (이동 모션)
+	@Sync property string MotionCmd = ""           -- "seq|모션명|재생속도" - 1회성 스킬 모션 명령
+
+	-- ── 셋업(서버) ────────────────────────────────────────────────
+	-- SummonHealer는 AddComponent 직후 프로퍼티만 대입한다(용사/다크드래곤과 동일 패턴).
+	-- AddComponent와 같은 프레임에 메서드를 호출해 self._T를 만지면 [LEA-2007] '_T' nil이 나거나
+	-- @Sync 대입이 유실될 수 있어(실측), 실제 초기화는 첫 ServerTick에서 지연 실행한다.
+
+	@ExecSpace("ServerOnly")
+	method void InitServer()
+		-- 첫 서버 틱에서 1회 실행되는 지연 초기화(외형/네임태그/수명/HP바/피격연결).
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.nextHealAt = now + 1.0
+		self._T.nextTeleportAt = now + 1.0
+		-- 소환 직후 잠깐(1.5초)은 제자리에 정착해 있다가 움직이기 시작한다(발판 아래로 흘러내림 방지).
+		self._T.noChaseUntil = now + 1.5
+		self._T.nextJumpAt = now + 1.5
+		self:ApplyCostume()
+		local ntc = self.Entity.NameTagComponent
+		if isvalid(ntc) then
+			ntc.Name = self:MakeRandomName() .. "lv" .. tostring(math.floor(self.HealerLevel))
+		end
+		self._T.lifetimeEndAt = now + self.Lifetime
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then
+				log("[HealerSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)")
+				self.Entity:Destroy()
+			end
+		end, self.Lifetime)
+		self:SpawnHpBar()
+		-- 몬스터 공격 피격(HitEvent) 수신 - 런타임 AddComponent라 정적 @EventSender 대신 명시 연결.
+		self._T.hitEventHandler = self.Entity:ConnectEvent(HitEvent, self.OnHealerHit)
+		self:PlaySummonFx()
+		log("[HealerSummon] 소환 완료 level=" .. tostring(math.floor(self.HealerLevel))
+			.. " 직업=" .. self:GetJobName() .. " 전투력=" .. tostring(math.floor(self:GetCombatPower()))
+			.. " HP=" .. tostring(math.floor(self.HealerHp)) .. "/" .. tostring(math.floor(self.HealerMaxHp)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyCostume()
+		-- 비숍 외형: 용사와 같은 드롭 방어구 셋 + 마법사 무기(우드완드 - 실측 한손무기 카테고리) +
+		-- 랜덤 헤어/성형. 전부 서버 SetEquip.
+		local cm = self.Entity.CostumeManagerComponent
+		if not isvalid(cm) then return end
+		local hairs = {
+			"af5d7c460c314959b7062d9501d1aa90", "0018d872ea76464fa1c981d65753afe8",
+			"00199c1161e843f8b1f3d3b92b039b8b",
+		}
+		local faces = {
+			"fa3ba1e407a7476e938e60d6362b5a66", "002edb95ebe24b40856d19b9fc8ffe39",
+			"003566cae02441718a5c0ed26b356f6f",
+		}
+		cm:SetEquip(MapleAvatarItemCategory.Body, "3cf4cb29ae344577b9eed37e531688a4")
+		cm:SetEquip(MapleAvatarItemCategory.Hair, hairs[_UtilLogic:RandomIntegerRange(1, #hairs)])
+		cm:SetEquip(MapleAvatarItemCategory.Face, faces[_UtilLogic:RandomIntegerRange(1, #faces)])
+		cm:SetEquip(MapleAvatarItemCategory.Cap, "274b50c184c047d8abf1b520c958ce98")        -- 연두색 머리띠
+		cm:SetEquip(MapleAvatarItemCategory.Cape, "aa8d1e49ff93486986fbb0f9b16d9565")       -- 엔틱 벨벳 망토
+		cm:SetEquip(MapleAvatarItemCategory.Coat, "ae8d3590a96e48c3b7cd75d46ebd3f15")       -- 흰색 반팔티
+		cm:SetEquip(MapleAvatarItemCategory.Pants, "61f10ef0a6204e0ab6593bdf36fed3e5")      -- 파란 청바지
+		cm:SetEquip(MapleAvatarItemCategory.Glove, "2e58683f2f094f099a0813c36e278dd5")      -- 노가다 목장갑
+		cm:SetEquip(MapleAvatarItemCategory.Shoes, "202544d7095c42c5bfb3046619ab58cc")      -- 가죽 샌들
+		-- 우드완드: 비숍 계열 기본 무기(리소스 상 onehandedweapon - UIEquipInventoryManager 실측 기준).
+		cm:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, "061712eadf7d4357a6c306dfd5368860")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string MakeRandomName()
+		-- 랜덤 한글 1~5글자 이름(용사 소환과 동일 규격).
+		local syl = {
+			"라", "루", "리", "레", "로", "미", "나", "니", "도", "다", "한", "별", "솔", "윤", "채",
+			"호", "은", "가", "온", "슬", "유", "진", "서", "아", "무", "백", "청", "강", "빛", "결",
+		}
+		local n = _UtilLogic:RandomIntegerRange(1, 5)
+		local out = ""
+		for i = 1, n do
+			out = out .. syl[_UtilLogic:RandomIntegerRange(1, #syl)]
+		end
+		return out
+	end
+
+	-- ── 직업/스탯 계산 ────────────────────────────────────────────
+
+	method string GetJobName()
+		-- (요청) 직업은 레벨 구간과 무관하게 항상 비숍으로 소환된다.
+		return "비숍"
+	end
+
+	method number GetCombatPower()
+		-- 레벨에 맞는 전투력(프로젝트 공식: 전투력 10당 1레벨의 역산).
+		return self.HealerLevel * 10
+	end
+
+	---@type PlayerAttack
+	method any GetOwnerAttack()
+		-- 주인 플레이어의 PlayerAttack 컴포넌트(데미지스킨/이펙트 파이프라인 재사용).
+		if not isvalid(self.OwnerEntity) then return nil end
+		return self.OwnerEntity:GetComponent("script.PlayerAttack")
+	end
+
+	-- ── 프레임 틱 ────────────────────────────────────────────────
+
+	method void OnUpdate(number delta)
+		-- 서버=이동/AI, 클라이언트=아바타 모션 반영.
+		if self:IsServer() then
+			self:ServerTick(delta)
+		else
+			self:ClientTick(delta)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ServerTick(number delta)
+		if self._T.dying then return end
+		local owner = self.OwnerEntity
+		if not isvalid(owner) then
+			-- SummonHealer의 프로퍼티 대입이 아직 안 왔을 수 있어 2초까지는 기다렸다가 제거한다.
+			self._T.noOwnerTime = (self._T.noOwnerTime or 0) + delta
+			if self._T.noOwnerTime > 2.0 then
+				self._T.dying = true
+				self.Entity:Destroy()
+			end
+			return
+		end
+		-- 지연 초기화(AddComponent 동일 프레임 호출을 피한다 - 상단 주석 참고).
+		-- ⚠ 실측: OwnerEntity는 도착했는데 뒤이은 프로퍼티(HealerLevel/HealerMaxHp/HealerHp)는 아직
+		--   기본값인 채로 첫 틱이 도는 경우가 있었다(네임태그 lv1 / HP바 100/100로 굳어짐).
+		--   한 틱 더 기다렸다가 초기화해 대입이 모두 도착한 뒤의 값을 읽는다.
+		if not self._T.inited then
+			self._T.initTicks = (self._T.initTicks or 0) + 1
+			if self._T.initTicks < 2 then return end
+			self._T.inited = true
+			self:InitServer()
+		end
+		local tr = self.Entity.TransformComponent
+		local mv = self.Entity.MovementComponent
+		local rb = self.Entity.RigidbodyComponent
+		if not isvalid(tr) or not isvalid(mv) or not isvalid(rb) then return end
+		-- 주인이 다른 맵에 있으면 대기만 한다.
+		if owner.CurrentMap ~= self.Entity.CurrentMap then
+			mv:Stop()
+			self._T.moving = false
+			self:UpdateLoco(rb)
+			return
+		end
+		local now = _UtilLogic.ElapsedSeconds
+		local myPos = tr.WorldPosition
+		local ownerPos = owner.TransformComponent.WorldPosition
+		local odx = ownerPos.x - myPos.x
+		local ody = ownerPos.y - myPos.y
+		-- 주인과 아주 멀어지면(8유닛) 곁으로 즉시 복귀한다(용사와 동일 - 텔레포트 연출 포함).
+		if (odx * odx + ody * ody) > 64.0 then
+			mv:SetWorldPosition(Vector2(ownerPos.x, ownerPos.y + 0.3))
+			self._T.approachUntil = 0
+			self:PlayTeleportFx()
+			log("[HealerSummon] 주인과 멀어져 복귀 순간이동")
+			return
+		end
+		-- 소환 직후 정착 시간에는 움직이지 않는다.
+		if (self._T.noChaseUntil or 0) > now then
+			mv:Stop()
+			self._T.moving = false
+			self:UpdateLoco(rb)
+			return
+		end
+		-- 힐 시전(모션) 중에는 제자리에 멈춘다 - 방향도 시전 시작 시점 값으로 동결된다.
+		if (self._T.castLockUntil or 0) > now then
+			mv:Stop()
+			self._T.moving = false
+			self:UpdateLoco(rb)
+			return
+		end
+
+		-- (1) 이동은 딱 두 경우에만 한다(요청 사양) - 그 밖에는 제자리에 서서 힐만 쓴다.
+		--   ① 주인이 주변에 없을 때(허용 거리 2.5) → 주인 쪽으로 이동
+		--   ② 데미지를 입은 직후(대피 창 2초) → 맞은 자리를 벗어나 주인 바로 옆(0.6)까지 바짝 붙는다
+		-- 몬스터를 피해 돌아다니거나 공격 후 재배치하는 움직임은 없다.
+		local nearDist = 2.5
+		if (self._T.approachUntil or 0) > now then nearDist = 0.6 end
+		if math.abs(odx) > nearDist or math.abs(ody) > 1.2 then
+			self:ApproachOwnerTick(myPos, ownerPos, now, mv, rb)
+			self:ApplyFacingIfChanged(tr)
+			self:UpdateLoco(rb)
+			return
+		end
+
+		-- (2) 제자리: 멈춰 서서 주인을 바라본다.
+		mv:Stop()
+		self._T.moving = false
+		if math.abs(odx) > 0.2 then
+			local fdir = 1
+			if odx < 0 then fdir = -1 end
+			self._T.faceDir = fdir
+		end
+		self:ApplyFacingIfChanged(tr)
+
+		-- (3) 힐(주력): HP가 조금이라도 깎여 있으면 곧바로 쓴다(재사용 1.5초).
+		if self:NeedsHeal(owner) and (self._T.nextHealAt or 0) <= now then
+			local hdir = 1
+			if odx < 0 then hdir = -1 end
+			self:CastHeal(hdir, now)
+		end
+		self:UpdateLoco(rb)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApproachOwnerTick(Vector3 myPos, Vector3 ownerPos, number now, MovementComponent mv, RigidbodyComponent rb)
+		-- 주인 쪽으로 이동한다. ServerTick이 "주인이 주변에 없다" 또는 "방금 맞아서 대피 중이다"라고
+		-- 판단했을 때만 호출된다 - 힐러는 그 밖에는 스스로 돌아다니지 않는다(요청 사양).
+		local dx = ownerPos.x - myPos.x
+		local dy = ownerPos.y - myPos.y
+		local adx = math.abs(dx)
+		local dir = 1
+		if dx < 0 then dir = -1 end
+		-- 멀면 텔레포트로 한 번에 붙는다. 피격 대피 중에는 맞은 자리를 빨리 벗어나야 하므로
+		-- 더 짧은 거리(2.5)에서도 텔레포트를 쓴다.
+		local tpDist = 4.0
+		if (self._T.approachUntil or 0) > now then tpDist = 2.5 end
+		if adx > tpDist and (self._T.nextTeleportAt or 0) <= now then
+			if self:TryTeleport(dir, myPos, now) then return end
+		end
+		mv:MoveToDirection(Vector2(dir, 0), 0)
+		self._T.moving = true
+		self._T.faceDir = dir
+		-- 높이가 다르면 점프/아랫점프로 따라 올라가거나 내려간다.
+		if rb:IsOnGround() and (self._T.nextJumpAt or 0) <= now then
+			if dy > 0.6 and adx < 2.0 then
+				self._T.nextJumpAt = now + 1.0
+				mv:Jump()
+			elseif dy < -0.8 and adx < 2.4 then
+				self._T.nextJumpAt = now + 1.0
+				mv:DownJump()
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean TryTeleport(number dir, Vector3 myPos, number now)
+		-- 텔레포트(힐러가 가진 두 스킬 중 하나): 진행 방향으로 2.31유닛 떨어진 지점의 발판 위로
+		-- 한 번에 이동한다(플레이어 텔레포트와 같은 거리/연출). 착지할 발판이 없으면 실패(false).
+		-- ⚠ SetWorldPosition은 짧은 시간에 여러 번 나눠 부르면 몇 틱 뒤 원위치로 되돌아간다(실측) -
+		--   반드시 한 번만 호출한다.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return false end
+		local fh = map.FootholdComponent
+		if not isvalid(fh) then return false end
+		local targetX = myPos.x + dir * 2.31
+		local landing = self:FindLandingY(fh, targetX, myPos.y)
+		if landing == nil then return false end
+		local mv = self.Entity.MovementComponent
+		if not isvalid(mv) then return false end
+		self._T.nextTeleportAt = now + 1.2
+		mv:Stop()
+		mv:SetWorldPosition(Vector2(targetX, landing))
+		self._T.faceDir = dir
+		self:PlayTeleportFxAt(Vector3(myPos.x, myPos.y, 0))
+		log("[HealerSummon] 텔레포트 " .. tostring(myPos.x) .. " → " .. tostring(targetX))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method any FindLandingY(FootholdComponent fh, number x, number y)
+		-- 지정한 x에서 위/아래 1.2유닛 이내의 가장 가까운 발판 표면 y를 돌려준다(없으면 nil).
+		-- PlayerAttack.FindNearbyFootholdAtX와 같은 방식.
+		local upHit = fh:Raycast(Vector2(x, y), Vector2(0, 1), 1.2)
+		local downHit = fh:Raycast(Vector2(x, y), Vector2(0, -1), 1.2)
+		local pick = nil
+		if upHit ~= nil and downHit ~= nil then
+			if math.abs(upHit:GetYByX(x) - y) <= math.abs(downHit:GetYByX(x) - y) then
+				pick = upHit
+			else
+				pick = downHit
+			end
+		elseif upHit ~= nil then
+			pick = upHit
+		elseif downHit ~= nil then
+			pick = downHit
+		end
+		if pick == nil then return nil end
+		return pick:GetYByX(x) + 0.05
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFacingIfChanged(TransformComponent tr)
+		-- 좌우 반영: 아바타 NPC는 MoveToDirection으로 화면이 안 뒤집혀서(항상 왼쪽을 봄)
+		-- 몬스터 관례대로 Scale.x 부호 반전으로 미러링한다(기본=왼쪽=+1, 오른쪽=-1).
+		local face = self._T.faceDir or -1
+		local wantScaleX = 1
+		if face > 0 then wantScaleX = -1 end
+		if self._T.lastScaleX ~= wantScaleX then
+			self._T.lastScaleX = wantScaleX
+			tr.Scale = Vector3(wantScaleX, 1, 1)
+			self:SyncHpBarMirror(wantScaleX)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFacing(number dir)
+		-- 시전 시작 시점의 방향을 즉시 화면에 반영하고, 이후 시전 잠금 동안 동결된다.
+		self._T.faceDir = dir
+		local wantScaleX = 1
+		if dir > 0 then wantScaleX = -1 end
+		if self._T.lastScaleX ~= wantScaleX then
+			self._T.lastScaleX = wantScaleX
+			local tr = self.Entity.TransformComponent
+			if isvalid(tr) then tr.Scale = Vector3(wantScaleX, 1, 1) end
+			self:SyncHpBarMirror(wantScaleX)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateLoco(RigidbodyComponent rb)
+		-- 이동 모션 상태를 @Sync로 클라이언트에 알린다(변할 때만 대입).
+		local want = "stand"
+		if not rb:IsOnGround() then want = "jump"
+		elseif self._T.moving then want = "walk" end
+		if self.LocoState ~= want then
+			self.LocoState = want
+		end
+	end
+
+	-- ── 힐(서버) ─────────────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method boolean NeedsHeal(Entity owner)
+		-- 힐 조건(요청: 힐을 주력으로 자주 사용): 본인이나 주인의 HP가 **조금이라도 깎여 있으면** 바로 쓴다.
+		-- 둘 다 가득 차 있을 때만 쉰다(재사용 1.5초는 CastHeal이 관리).
+		if self.HealerMaxHp > 0 and self.HealerHp < self.HealerMaxHp then return true end
+		local pc = owner.PlayerComponent
+		if isvalid(pc) and not pc:IsDead() and pc.MaxHp > 0 and pc.Hp < pc.MaxHp then
+			return true
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastHeal(number dir, number now)
+		-- 힐 시전: 플레이어의 힐과 같은 모션(alert)/사운드/이펙트를 힐러 자신에게 재생하고,
+		-- 0.4초 뒤 본인 + (범위 안이면) 주인을 함께 회복시킨다.
+		-- (요청) 힐이 주력이라 재사용을 1.5초로 짧게 잡는다 - 시전 모션 잠금 0.85초가 끝나고
+		-- 곧바로 다음 힐이 나갈 수 있는 간격.
+		if self._T.dying then return end
+		self._T.castLockUntil = now + 0.85
+		self._T.nextHealAt = now + 1.5
+		self:ApplyFacing(dir)
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) then mv:Stop() end
+		self._T.moving = false
+		self:PlayMotion("alert", 1.0)
+		self:PlayHealCastFx()
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			if self._T.dying then return end
+			self:ApplyHealNow()
+		end, 0.4)
+		log("[HealerSummon] 힐 시전 (" .. self:GetJobName() .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyHealNow()
+		-- 실제 회복 처리: 본인은 항상, 주인은 좌우/위아래 3.6유닛 안에 있을 때 회복시킨다
+		-- (플레이어 힐의 FindHealTargets와 같은 범위/공식 - 전투력의 5%~15%).
+		local healedSelf = self:HealSelf()
+		local healedOwner = 0
+		local owner = self.OwnerEntity
+		if isvalid(owner) then
+			local myPos = self.Entity.TransformComponent.WorldPosition
+			local op = owner.TransformComponent.WorldPosition
+			if math.abs(op.x - myPos.x) <= 3.6 and math.abs(op.y - myPos.y) <= 3.6 then
+				healedOwner = self:HealOwner(owner)
+			end
+		end
+		log("[HealerSummon] 힐 발동 - 본인 +" .. tostring(healedSelf) .. " 주인 +" .. tostring(healedOwner)
+			.. " (본인 HP " .. tostring(math.floor(self.HealerHp)) .. "/" .. tostring(math.floor(self.HealerMaxHp)) .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer RollHealAmount()
+		-- 회복량: 플레이어 힐과 같은 공식(전투력의 10%를 기준으로 ±50% = 5%~15%).
+		local baseHeal = self:GetCombatPower() * 0.10
+		local mult = 0.5 + _UtilLogic:RandomDouble() * 1.0
+		return math.floor(baseHeal * mult)
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer HealSelf()
+		-- 본인 회복 + HP바 갱신 + 파란 힐 숫자.
+		-- (요청) 시전자 본인 머리 위에는 회복 이펙트를 띄우지 않는다 - 시전 이펙트(PlayHealCastFx)가
+		-- 이미 몸에서 재생되고 있어 겹쳐 보였다. 머리 위 이펙트는 회복받은 파티원에게만 재생한다.
+		local amount = self:RollHealAmount()
+		if amount <= 0 then return 0 end
+		local newHp = math.min(self.HealerHp + amount, self.HealerMaxHp)
+		local actual = math.floor(newHp - self.HealerHp)
+		if actual <= 0 then return 0 end
+		self.HealerHp = newHp
+		self:UpdateHpBar()
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if isvalid(pa) then pa:ShowHealDamageSkin(self.Entity, actual) end
+		return actual
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer HealOwner(Entity owner)
+		-- 주인(파티원) 회복 + 파란 힐 숫자 + 머리 위 회복 이펙트(e81f0ba3 - 요청 지정 리소스).
+		local pc = owner.PlayerComponent
+		if not isvalid(pc) or pc:IsDead() then return 0 end
+		local amount = self:RollHealAmount()
+		if amount <= 0 then return 0 end
+		local newHp = math.min(pc.Hp + amount, pc.MaxHp)
+		local actual = math.floor(newHp - pc.Hp)
+		if actual <= 0 then return 0 end
+		pc.Hp = newHp
+		self:PlayHealTargetFx(owner)
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if isvalid(pa) then pa:ShowHealDamageSkin(owner, actual) end
+		return actual
+	end
+
+	-- ── 머리 위 HP바(서버) ───────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHpBar()
+		-- 용사와 같은 규격: snipinggaugetext 모델(Bg/Fill/Pct)을 자식으로 스폰해 재사용한다.
+		-- Pct 텍스트는 대입하지 않아 빈 문자열(수치 숫자 미표시).
+		local bar = _SpawnService:SpawnByModelId("snipinggaugetext", "HealerHpBar", Vector3(0, 1.05, 0), self.Entity)
+		if not isvalid(bar) then
+			log_warning("[HealerSummon] HP바 스폰 실패")
+			return
+		end
+		local bg = bar:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			bg.SpriteRendererComponent.Color = Color(0.25, 0.25, 0.25, 0.8)
+			bg.SpriteRendererComponent.PlayRate = 0
+		end
+		local fill = bar:GetChildByName("Fill", false)
+		if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+			fill.SpriteRendererComponent.Color = Color(1, 0.3, 0.3, 1)
+			fill.SpriteRendererComponent.PlayRate = 0
+		end
+		self._T.hpBar = bar
+		self:UpdateHpBar()
+		log("[HealerSummon] HP바 표시 " .. tostring(math.floor(self.HealerHp)) .. "/" .. tostring(math.floor(self.HealerMaxHp)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateHpBar()
+		-- 채움 바 갱신: 왼쪽 끝 고정 + 가로 스케일 = HP 비율.
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		local fill = bar:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = 0
+		if self.HealerMaxHp > 0 then
+			ratio = math.max(0, math.min(1, self.HealerHp / self.HealerMaxHp))
+		end
+		fill.TransformComponent.Scale = Vector3(0.5 * ratio, 0.5, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlashHpBar()
+		-- 피격 순간 2회 깜빡임(용사와 동일 타임라인/토큰 패턴).
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		self._T.hpFlashToken = (self._T.hpFlashToken or 0) + 1
+		local tok = self._T.hpFlashToken
+		local bright = Color(1, 1, 1, 1)
+		local normal = Color(1, 0.3, 0.3, 1)
+		local function setFillColor(c)
+			-- 우클릭 취소(DismissHealer)로 즉시 파괴되면 이 타이머가 지워진 컴포넌트에서 돌아
+			-- [LEA-2007] '_T' nil이 날 수 있다(용 소환수에서 실측) - _T를 만지기 전에 생존 확인.
+			if not isvalid(self.Entity) then return end
+			if self._T == nil then return end
+			if self._T.hpFlashToken ~= tok then return end
+			if not isvalid(bar) then return end
+			local fill = bar:GetChildByName("Fill", false)
+			if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+				fill.SpriteRendererComponent.Color = c
+			end
+		end
+		setFillColor(bright)
+		local steps = {
+			{ at = 0.12, color = normal },
+			{ at = 0.20, color = bright },
+			{ at = 0.32, color = normal },
+		}
+		for _, s in ipairs(steps) do
+			local stepColor = s.color
+			_TimerService:SetTimerOnce(function()
+				setFillColor(stepColor)
+			end, s.at)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SyncHpBarMirror(number scaleX)
+		-- 루트 Scale.x(-1) 미러 시 HP바가 함께 뒤집혀 채움 기준이 널뛰지 않게 상쇄한다.
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		bar.TransformComponent.Scale = Vector3(scaleX, 1, 1)
+	end
+
+	method void OnHealerHit(HitEvent event)
+		-- 몬스터에게 맞음(서버에서 ConnectEvent로 연결됨): 0.5초 무적 게이트 후 HP 차감,
+		-- 그리고 **맞은 자리를 벗어나 주인 옆으로 대피한다**(2초 동안 허용 거리를 0.6으로 좁혀
+		-- 주인에게 바짝 붙는다 - 멀면 텔레포트). HP 0이면 소환 해제.
+		if self._T.dying then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.hitImmuneUntil or 0) > now then return end
+		self._T.hitImmuneUntil = now + 0.5
+		self.HealerHp = math.max(0, self.HealerHp - event.TotalDamage)
+		self:UpdateHpBar()
+		self:FlashHpBar()
+		if self.HealerHp <= 0 then
+			log("[HealerSummon] 피격 -" .. tostring(event.TotalDamage) .. " → HP 0")
+			self:UnsummonByDeath()
+			return
+		end
+		-- 맞은 자리를 벗어난다: 2초 동안 "주인 옆(0.6)까지 붙기" 모드로 바꿔 주인 쪽으로 대피시킨다
+		-- (ServerTick이 이 창 안에서는 허용 거리를 좁히고, 멀면 텔레포트를 쓴다).
+		-- 시전 잠금 중이었어도 대피가 우선이다.
+		self._T.castLockUntil = 0
+		self._T.approachUntil = math.max(self._T.approachUntil or 0, now + 2.0)
+		log("[HealerSummon] 피격 -" .. tostring(event.TotalDamage) .. " → HP " .. tostring(math.floor(self.HealerHp))
+			.. "/" .. tostring(math.floor(self.HealerMaxHp)) .. " - 주인 옆으로 대피")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UnsummonByDeath()
+		-- HP 0: 사망 모션(쓰러진 자세)으로 바꾸고 아무 것도 하지 않다가 8초 뒤 사라진다.
+		if self._T.dying then return end
+		self._T.dying = true
+		log("[HealerSummon] HP 0 - 사망 상태 진입(8초 후 소멸)")
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) then mv:Stop() end
+		self:PlayMotion("dead", 1.0)
+		self:PlaySoundFx("6e462a4ae44b4a518ea68fde456ea5c3")
+		if isvalid(self.OwnerEntity) and isvalid(self.OwnerEntity.PlayerComponent) then
+			self:NotifyUnsummoned(self.OwnerEntity.PlayerComponent.UserId)
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then
+				log("[HealerSummon] 사망 상태 종료 - 소환 해제")
+				self:PlayUnsummonFx()
+				self.Entity:Destroy(0.2)
+			end
+		end, 8.0)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyUnsummoned()
+		-- 주인 클라이언트: 우측 상단 힐러 소환 버프바를 즉시 내린다.
+		_HealerSummonBuffUI:HideBuff()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- 서버에서 연결한 피격 이벤트 해제.
+		if self._T.hitEventHandler then
+			self.Entity:DisconnectEvent(HitEvent, self._T.hitEventHandler)
+			self._T.hitEventHandler = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayMotion(string motionName, number rate)
+		-- 1회성 모션을 클라이언트에 명령(단일 @Sync 문자열이라 필드 간 도착 순서 문제가 없다).
+		self._T.motionSeq = (self._T.motionSeq or 0) + 1
+		self.MotionCmd = tostring(self._T.motionSeq) .. "|" .. motionName .. "|" .. tostring(rate)
+	end
+
+	-- ── 이펙트/사운드(멀티캐스트) ────────────────────────────────
+
+	@ExecSpace("Multicast")
+	method void PlaySummonFx()
+		-- 소환 시 1회: 힐 이펙트/사운드를 힐러 위치에서 재생한다.
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("26a8af1751324d2c9f14b1719a28d3c8", self.Entity, Vector3(0, 0.2, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
+		_SoundService:PlaySound("a1a425ae3c1c49afa068ee212676c5dc", 1.0)
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 2.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHealCastFx()
+		-- 힐 시전: 몸에서 힐 이펙트 1회 + 사용음(플레이어 힐과 같은 리소스).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		_SoundService:PlaySound("a1a425ae3c1c49afa068ee212676c5dc", 1.0)
+		_EffectService:PlayEffectAttached("26a8af1751324d2c9f14b1719a28d3c8", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHealTargetFx(Entity target)
+		-- 회복을 받은 **파티원**(주인) 머리 위 전용 이펙트 1회.
+		-- (요청) 시전 이펙트(26a8af17)가 아니라 e81f0ba3만 뜬다. 시전자 본인에게는 재생하지 않는다.
+		-- 높이/배치는 **기존 힐과 동일**하게 맞춘다(요청) - PlayerAttack.PlayHealTargetEffect와 같은
+		-- 오프셋 y=0.6 / 스케일 1 / 1초 뒤 제거. 처음엔 HitComponent 실측(ColliderOffset.y + BoxSize.y/2 =
+		-- 플레이어 기준 0.8)을 썼다가 "너무 위에 있다"는 피드백을 받아 기존 힐 기준으로 되돌렸다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached("e81f0ba3f2b545d7895b98b1cf9be879", target, Vector3(0, 0.6, 0), 0, Vector3(1, 1, 1), false, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayTeleportFx()
+		-- 주인 곁으로 복귀 순간이동할 때 1회(현재 위치 부착).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		_SoundService:PlaySound("4c1eb6001e9c47eda239cc58443b79cd", 1.0)
+		local serial = _EffectService:PlayEffectAttached("b34e818d784f4a3891c2d50e48ca559d", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 0.4)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayTeleportFxAt(Vector3 originPos)
+		-- 텔레포트: 사용음 + 떠난 자리에 남는 잔상 이펙트(플레이어 텔레포트와 같은 리소스/연출).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		_SoundService:PlaySound("4c1eb6001e9c47eda239cc58443b79cd", 1.0)
+		local serial = _EffectService:PlayEffect("b34e818d784f4a3891c2d50e48ca559d", self.Entity, originPos, 0, Vector3(1, 1, 1), false, {})
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 0.3)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayUnsummonFx()
+		-- 사라짐 연출: 현재 위치에 비부착으로 재생한다(부착하면 곧 이어지는 제거와 함께 끊긴다).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local pos = self.Entity.TransformComponent.WorldPosition
+		_EffectService:PlayEffect("b34e818d784f4a3891c2d50e48ca559d", self.Entity, Vector3(pos.x, pos.y + 0.3, 0), 0, Vector3(1, 1, 1), false, nil)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlaySoundFx(string soundRuid)
+		-- 범용 사운드 재생.
+		if not self:IsClient() then return end
+		if soundRuid == nil or soundRuid == "" then return end
+		_SoundService:PlaySound(soundRuid, 1.0)
+	end
+
+	-- ── 클라이언트 모션 반영 ─────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void ClientTick(number delta)
+		-- 사망 사운드 프리로드: 로드 전 첫 PlaySound는 무음으로 스킵될 수 있어 미리 올려둔다.
+		if not self._T.deathSndPreloaded then
+			self._T.deathSndPreloaded = true
+			_SoundService:LoadSound("6e462a4ae44b4a518ea68fde456ea5c3")
+		end
+		-- 사망 연출(용사와 동일): 쓰러진 자세가 작은 원(반경 0.048)을 그리며 맴돈다.
+		-- 자세 각도는 돌리지 않는다(위치 궤도만) - 용사에서 사용자가 실관찰로 확정한 연출.
+		if self._T.deadSpinBody ~= nil then
+			local sb = self._T.deadSpinBody
+			if isvalid(sb) then
+				local t = _UtilLogic.ElapsedSeconds - (self._T.deadSpinStart or 0)
+				local mirror = 1
+				local rootTr = self.Entity.TransformComponent
+				if isvalid(rootTr) and rootTr.Scale.x < 0 then mirror = -1 end
+				local deg = ((t * 150) % 360) * mirror
+				local rad = math.rad(deg)
+				local tr = sb.TransformComponent
+				tr.Position = Vector3(self._T.deadSpinBaseX + 0.048 * math.cos(rad), self._T.deadSpinBaseY + 0.048 * math.sin(rad), self._T.deadSpinBaseZ)
+			end
+			return
+		end
+		-- 스킬 모션 재생 중이 아니면 LocoState(stand/walk/jump)에 맞는 이동 클립을 body에 보낸다.
+		local ar = self.Entity.AvatarRendererComponent
+		if not isvalid(ar) then return end
+		local body = ar:GetBodyEntity()
+		if not isvalid(body) then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.motionLockUntil or 0) > now then return end
+		local want = self.LocoState
+		if self._T.lastLoco == want then return end
+		local ev = ActionStateChangedEvent()
+		if want == "walk" then
+			ev.CoreActionName = "walk1"
+			ev.PartsActionName = "walk1"
+			ev.PlayType = SpriteAnimClipPlayType.Loop
+		elseif want == "jump" then
+			ev.CoreActionName = "jump"
+			ev.PartsActionName = "jump"
+			ev.PlayType = SpriteAnimClipPlayType.Loop
+		else
+			ev.CoreActionName = "stand1"
+			ev.PartsActionName = "stand1"
+			ev.PlayType = SpriteAnimClipPlayType.ZigzagLoop
+		end
+		body:SendEvent(ev)
+		self._T.lastLoco = want
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- 1회성 모션 명령 도착 시 body에 재생. "seq|모션명|재생속도"
+		if name ~= "MotionCmd" then return end
+		local s = tostring(value or "")
+		if s == "" then return end
+		local parts = {}
+		for p in string.gmatch(s, "[^|]+") do
+			table.insert(parts, p)
+		end
+		local motion = parts[2]
+		if motion == nil or motion == "" then return end
+		if motion == "dead" then
+			-- 사망: 쓰러진(dead 0번 프레임 - 유일하게 보이는 프레임) 자세로 고정하고,
+			-- 아바타 루트를 작은 원 궤도로 맴돌게 한다(실제 회전은 ClientTick이 매 프레임 수행).
+			local dar = self.Entity.AvatarRendererComponent
+			if not isvalid(dar) then return end
+			local dbody = dar:GetBodyEntity()
+			if not isvalid(dbody) then return end
+			self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 9.0
+			self._T.lastLoco = nil
+			local ev2 = ActionStateChangedEvent("dead", "stand1", 0.001, SpriteAnimClipPlayType.Onetime, 0, 1)
+			dbody:SendEvent(ev2)
+			local spinRoot = dar:GetAvatarRootEntity()
+			if not isvalid(spinRoot) then spinRoot = dbody end
+			local btr = spinRoot.TransformComponent
+			self._T.deadSpinBody = spinRoot
+			self._T.deadSpinStart = _UtilLogic.ElapsedSeconds
+			self._T.deadSpinBaseX = btr.Position.x
+			self._T.deadSpinBaseY = btr.Position.y
+			self._T.deadSpinBaseZ = btr.Position.z
+			return
+		end
+		local ar = self.Entity.AvatarRendererComponent
+		if not isvalid(ar) then return end
+		local body = ar:GetBodyEntity()
+		if not isvalid(body) then return end
+		local rate = tonumber(parts[3]) or 1.0
+		local ev = ActionStateChangedEvent()
+		ev.CoreActionName = motion
+		ev.PartsActionName = motion
+		ev.PlayRate = rate
+		ev.PlayType = SpriteAnimClipPlayType.Onetime
+		self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 0.7 / math.max(rate, 0.001)
+		body:SendEvent(ev)
+		self._T.lastLoco = nil   -- 모션이 끝나면 이동 클립을 다시 적용하게 강제
+	end
+
+end
