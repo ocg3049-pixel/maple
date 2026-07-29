@@ -1,0 +1,115 @@
+@Component
+script HolyArrowProjectile extends Component
+
+	property number Speed = 6
+
+	property number MaxLifetime = 1.5
+
+	property number CombatPower = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다(엔젤레이와 동일한 구조).
+	property number CritRate = 50
+
+	-- 화살 하나가 관통 가능한 최대 대상 수. 홀리 에로우는 2차 스킬이라 아이언에로우와 같은 6명이다
+	-- (엔젤레이(4차) 10명의 하위 버전).
+	property integer MaxHitCount = 6
+
+	-- 쉐도우 파트너: true면 그림자 몫의 "시각 전용" 화살 - 판정(AttackFast) 없이 날아가기만 한다.
+	property boolean VisualOnly = false
+
+	-- 원본 전용(서버에서만 읽음): 쉐도우 파트너 버프 중에 발사됐는지 여부.
+	property boolean ShadowEchoOn = false
+
+	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID(PlayerAttack이 발사 시점에 채워준다).
+	property string DamageSkinRUID = ""
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화 (서버 전용 필드). 방향은 기본적으로 전방(+X)을 가리킨다.
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hitSet = {}
+			self._T.hitCount = 0
+			self._T.ballFrame = 1
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 방향 벡터를 받아 발사 시작. 홀리 에로우는 8방향 조준 없이 전방(dirY=0)으로만 나가지만,
+		-- 쉐도우 에코 공용 헬퍼(SpawnShadowEchoArrowProjectile)와 시그니처를 맞추기 위해 dirY도 받는다.
+		-- 화살 스프라이트는 원본 아트가 머리 -x 방향이라 +180도 보정한다(아이언에로우/엔젤레이와 동일).
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		local angleDeg = math.deg(math.atan(dirY, dirX)) + 180
+		self.Entity.TransformComponent.ZRotation = angleDeg
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHit(string defenderName)
+		return self._T.hitSet[defenderName] == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasReachedMaxHits()
+		return self._T.hitCount >= self.MaxHitCount
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkHit(string defenderName)
+		self._T.hitSet[defenderName] = true
+		self._T.hitCount = self._T.hitCount + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		self._T.lifetime = self._T.lifetime + delta
+		if self._T.lifetime >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		-- 최대 관통 수(6명)만큼 맞혔으면(직전 프레임에 기록됨) 더 이상 판정하지 않고 사라진다.
+		if self._T.hitCount >= self.MaxHitCount then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * delta, self._T.dirY * self.Speed * delta)
+
+		-- 화살 자체가 3프레임 애니메이션(ball0~2, 패딩 정렬본이라 크기 동일)이다. 정지 스프라이트라
+		-- SpriteRUID를 0.1초마다 순환 교체해 재생한다(@Sync 네이티브 필드라 클라이언트에 자동 반영).
+		local frame = (math.floor(self._T.lifetime / 0.1) % 3) + 1
+		if frame ~= self._T.ballFrame then
+			self._T.ballFrame = frame
+			local ballFrames = {
+				"d8275b5454a84af580d7dc865ae7ada0",
+				"f07b1a483b564ef590bd026dc36c4422",
+				"863eab6bbf1d486794ed8335f4f8c86d",
+			}
+			local spr = self.Entity.SpriteRendererComponent
+			if isvalid(spr) then
+				spr.SpriteRUID = ballFrames[frame]
+			end
+		end
+
+		-- 쉐도우 파트너의 그림자 몫(시각 전용) 화살은 판정 자체를 하지 않는다.
+		if self.VisualOnly then return end
+
+		---@type HolyArrowProjectileAttack
+		local ac = self.Entity:GetComponent("script.HolyArrowProjectileAttack")
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			-- 엔젤레이와 동일하게 세로로 긴 상자(가로 0.6 x 세로 1.2) 판정 - 경로보다 조금 위/아래의 적도 맞는다.
+			ac:AttackFast(BoxShape(Vector2(pos.x, pos.y), Vector2(0.6, 1.2), 0), "skill.holyarrow", CollisionGroups.HitBox)
+		end
+	end
+
+end

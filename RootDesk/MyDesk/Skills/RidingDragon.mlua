@@ -14,7 +14,13 @@ script RidingDragon extends Component
 	-- 리소스(요청 RUID): 이동/비행 af21747f · 제자리 2d932a6e · 공격1 0314573e(히트 b5798210) ·
 	--                    공격2 22c654ad(히트 f0f7c7dd) · 소멸 1b59436e
 
-	property Entity OwnerEntity = nil            -- 서버 전용(공격 대상 탐색/데미지 주체). 클라는 부모로 충분.
+	-- ⚠ **맵의 자식으로 스폰한다**(용 소환/바하뮤트와 동일). 플레이어의 자식으로 두면 텔레포트로
+	-- 주인이 워프할 때 자식인 드래곤도 **같이 순간이동해 버린다**(사용자 신고). 맵 자식이면 워프의
+	-- 영향을 받지 않아 제자리에 남았다가 평소 속도로 따라온다.
+	-- (탑승 중에는 follow=1.0으로 매 프레임 플레이어 위치에 스냅하므로, 맵 자식이어도 탈것답게
+	--  워프에 즉시 따라붙는다 - 의도된 동작.)
+	-- 맵 자식이라 클라가 부모로 주인을 알 수 없다 → 주인을 @Sync로 내려준다(첫 프레임 nil 가드 필요).
+	@Sync property Entity OwnerEntity = nil
 	property number Lifetime = 300               -- 서버 전용 수명(초). 요청 스펙 = 5분.
 	@Sync property string AtkState = ""          -- "" (평상시) | "atk1" | "atk2"
 	@Sync property boolean Riding = false        -- true면 플레이어가 탑승 중
@@ -34,6 +40,26 @@ script RidingDragon extends Component
 			end, 0.2)
 		end, self.Lifetime)
 		self:ScheduleAttack()
+		-- 맵 자식이라 주인이 사라져도 자동으로 정리되지 않는다(플레이어 자식이던 시절과 다른 점).
+		-- 주인이 없어지면 스스로 소멸한다.
+		self._T.ownerWatchId = _TimerService:SetTimerRepeat(function()
+			if not isvalid(self.Entity) then return end
+			if isvalid(self.OwnerEntity) then
+				self._T.noOwnerTime = 0
+				return
+			end
+			self._T.noOwnerTime = (self._T.noOwnerTime or 0) + 1.0
+			if self._T.noOwnerTime > 2.0 then
+				if self._T.ownerWatchId ~= nil then
+					_TimerService:ClearTimer(self._T.ownerWatchId)
+					self._T.ownerWatchId = nil
+				end
+				self:PlayVanishEffect()
+				_TimerService:SetTimerOnce(function()
+					if isvalid(self.Entity) then self.Entity:Destroy() end
+				end, 0.2)
+			end
+		end, 1.0)
 		log("[RidingDragon] 소환 - 수명 " .. tostring(self.Lifetime) .. "초")
 	end
 
@@ -88,7 +114,11 @@ script RidingDragon extends Component
 						if not isvalid(tt) then return end
 						if self.Warping or self.Riding then return end
 						self:PlayHitEffect(tt, hitRuid)
-						if isvalid(pa) then pa:DealRidingDragonHit(tt) end
+						if isvalid(pa) then
+							pa:DealRidingDragonHit(tt)
+							-- 드래곤 블러드(4차 버프)가 켜져 있으면 드래곤이 때릴 때마다 주인이 최대 HP의 3%를 회복한다.
+							pa:OnDragonAttackHeal()
+						end
 					end, (i - 1) * 0.08)
 				end
 			end
@@ -150,14 +180,24 @@ script RidingDragon extends Component
 		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
 	end
 
-	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		-- 서버/클라 양쪽에서 각자 할 정리를 한다(mlua는 같은 이름의 메서드를 두 번 정의할 수 없어
+		-- ExecSpace를 붙이지 않고 한 곳에서 분기한다).
+		if self:IsServer() then
+			-- 주인 감시 타이머 정리.
+			if self._T.ownerWatchId ~= nil then
+				_TimerService:ClearTimer(self._T.ownerWatchId)
+				self._T.ownerWatchId = nil
+			end
+			return
+		end
 		-- 탑승 중에 드래곤이 사라지면(5분 만료 등) 흔들림 오프셋이 남지 않게 아바타 위치를 되돌린다.
 		if self._T.rideBobApplied ~= true then return end
 		self._T.rideBobApplied = false
-		local parent = self.Entity.Parent
-		if not isvalid(parent) then return end
-		local ar = parent.AvatarRendererComponent
+		-- 맵 자식이라 부모가 플레이어가 아니다 → 주인은 @Sync OwnerEntity로 잡는다.
+		local owner = self.OwnerEntity
+		if not isvalid(owner) then return end
+		local ar = owner.AvatarRendererComponent
 		if not isvalid(ar) then return end
 		local avatarRoot = ar:GetAvatarRootEntity()
 		if isvalid(avatarRoot) and isvalid(avatarRoot.TransformComponent) then
@@ -181,16 +221,16 @@ script RidingDragon extends Component
 			return
 		end
 
-		local parent = self.Entity.Parent
-		local pw = (isvalid(parent) and isvalid(parent.TransformComponent))
-			and parent.TransformComponent.WorldPosition or tr.WorldPosition
+		-- 맵 자식이라 부모는 맵이다. 주인은 @Sync로 받은 OwnerEntity로 잡는다.
+		-- 아직 동기화가 안 왔거나(스폰 직후 몇 프레임) 주인이 사라졌으면 제자리에 머문다.
+		local owner = self.OwnerEntity
+		if not isvalid(owner) or not isvalid(owner.TransformComponent) then return end
+		local pw = owner.TransformComponent.WorldPosition
 
 		-- 플레이어가 바라보는 방향(탑승 중 드래곤 방향 / 따라다닐 때 뒤쪽 위치 계산에 쓴다).
 		local look = 1
-		if isvalid(parent) then
-			local ctrl = parent.PlayerControllerComponent
-			if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
-		end
+		local ctrl = owner.PlayerControllerComponent
+		if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
 
 		local targetWorld = nil
 		local follow = 0.0
@@ -237,15 +277,15 @@ script RidingDragon extends Component
 		local moveDist = math.sqrt((nx - cur.x) * (nx - cur.x) + (ny - cur.y) * (ny - cur.y))
 		local speed = (delta > 0) and (moveDist / delta) or 0
 		self._T.worldPos = Vector3(nx, ny, 0)
-		-- child라 Position은 부모(플레이어) 기준 로컬 좌표다.
-		tr.Position = Vector3(nx - pw.x, ny - pw.y, 0)
+		-- 맵 자식이라 로컬 == 월드(플레이어 자식이던 시절엔 부모 좌표를 빼야 했다).
+		tr.Position = Vector3(nx, ny, 0)
 
 		-- (요청) 탑승 중에는 드래곤의 비행 모션이 위아래로 살짝 출렁이므로, 캐릭터도 그 리듬에 맞춰
 		-- 조금씩 같이 흔들려야 자연스럽다. 단 "이미지만" 움직여야 하고 네임태그는 고정돼야 하므로,
 		-- 플레이어 엔티티가 아니라 아바타 루트 자식 엔티티의 로컬 y만 흔든다
 		-- (네임태그는 플레이어 엔티티에 붙어 있어 영향을 받지 않는다).
-		if isvalid(parent) then
-			local ar = parent.AvatarRendererComponent
+		do
+			local ar = owner.AvatarRendererComponent
 			if isvalid(ar) then
 				local avatarRoot = ar:GetAvatarRootEntity()
 				if isvalid(avatarRoot) and isvalid(avatarRoot.TransformComponent) then
@@ -279,7 +319,7 @@ script RidingDragon extends Component
 		end
 
 		-- 소유 클라만 실제 월드좌표를 서버로 보고한다(서버 TryAttack의 타겟팅 기준).
-		if isvalid(parent) and _UserService.LocalPlayer == parent then
+		if _UserService.LocalPlayer == owner then
 			self._T.reportTimer = (self._T.reportTimer or 0) + delta
 			if self._T.reportTimer >= 0.15 then
 				self._T.reportTimer = 0

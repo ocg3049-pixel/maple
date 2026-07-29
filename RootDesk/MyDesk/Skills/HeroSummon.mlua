@@ -20,6 +20,7 @@ script HeroSummon extends Component
 	@Sync property string HeroLine = "hero"      -- hero(히어로) / paladin(팔라딘) / darkknight(다크나이트)
 	@Sync property string LocoState = "stand"    -- stand / walk / jump (이동 모션)
 	@Sync property string MotionCmd = ""         -- "seq|모션명|재생속도" - 1회성 스킬 모션 명령
+	property integer HolyShell = 0                 -- 서버 전용: 홀리 매직쉘 잔여 방어 횟수(개체별)
 
 	-- ── 셋업(서버) ────────────────────────────────────────────────
 	-- SummonHero는 AddComponent 직후 프로퍼티(OwnerEntity/HeroLevel/HeroLine)만 대입한다
@@ -132,7 +133,25 @@ script HeroSummon extends Component
 
 	method number GetCombatPower()
 		-- 레벨에 맞는 전투력(프로젝트 공식: 전투력 10당 1레벨의 역산).
-		return self.HeroLevel * 10
+		-- 블레스(주인 시전) 활성 중이면 그만큼 전투력이 더해진다(스킬 데미지가 전투력 비례라 공마 +30과 동치).
+		return self.HeroLevel * 10 + (self._T.blessAtkBonus or 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyBlessBuff(integer atkBonus, number duration)
+		-- 블레스(주인이 걸어주는 2차 버프): 지속시간 동안 전투력 +atkBonus. 재사용 시 중첩 없이
+		-- 지속시간만 갱신한다(다른 버프들과 같은 토큰 패턴 - 이전 예약 만료를 무효화).
+		if self._T.dying then return end
+		self._T.blessToken = (self._T.blessToken or 0) + 1
+		local tok = self._T.blessToken
+		self._T.blessAtkBonus = atkBonus
+		_TimerService:SetTimerOnce(function()
+			if self._T.blessToken == tok then
+				self._T.blessAtkBonus = 0
+				log("[HeroSummon] 블레스 만료 - 전투력 원복")
+			end
+		end, duration)
+		log("[HeroSummon] 블레스 수령 - 전투력 +" .. tostring(atkBonus) .. " (" .. tostring(duration) .. "초)")
 	end
 
 	---@type PlayerAttack
@@ -566,6 +585,52 @@ script HeroSummon extends Component
 	method void NotifyUnsummoned()
 		-- 주인 클라이언트: 우측 상단 용사 소환 버프바를 즉시 내린다.
 		_HeroSummonBuffUI:HideBuff()
+	end
+
+	-- ── 홀리 매직쉘(4차 버프) 쉴드 ───────────────────────────────
+	-- 주인이 홀리 매직쉘을 시전하면 이 소환수에게도 10회짜리 쉴드가 걸린다(개체마다 각각 10회).
+	-- 실제 차단은 공격자 쪽 MonsterAttack.IsAttackTarget에서 ConsumeHolyShell()을 불러 처리한다
+	-- (방어자 IsHitTarget은 이 프로젝트의 몬스터 공격 경로에서 호출되지 않는다 - 가드/패링과 같은 이유).
+
+	@ExecSpace("ServerOnly")
+	method void GrantHolyShell(integer count)
+		-- 재시전하면 남은 개수와 무관하게 새로 count개로 채운다.
+		self.HolyShell = count
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean ConsumeHolyShell()
+		-- 쉴드가 남아 있으면 1개 소모하고 true(이번 공격 무시). 사망 상태면 쓰지 않는다.
+		-- (요청) 막아낸 뒤 **1.5초 무적** - 그 동안 들어오는 공격은 쉴드를 더 쓰지 않고 그냥 무시한다
+		-- (밀집 지역에서 한 번에 여러 대 맞아 쉴드가 순식간에 증발하는 것을 막는다).
+		if self._T.dying then return false end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.holyShellInvulnUntil or 0) >= now then return true end
+		if self.HolyShell <= 0 then return false end
+		self.HolyShell = self.HolyShell - 1
+		self._T.holyShellInvulnUntil = now + 1.5
+		self:PlayHolyShellFx(self.HolyShell)
+		log("[HolyShell] 용사 소환수 방어! 남은 쉴드 " .. tostring(self.HolyShell))
+		return true
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHolyShellFx(integer remain)
+		-- 쉴드 성공 연출: 막은 개체 몸에서 쉴드 이펙트 + "Guard" 표시 + 머리 위 남은 개수 숫자.
+		-- (피드백) 막을 때 사운드는 재생하지 않는다. 이펙트 높이도 0.2 → -0.1로 더 내렸다.
+		-- (플레이어 쪽 PlayerHit.PlayHolyShellBlockEffects와 같은 규격).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("ec0acf34d59043f695f43c55222a7b0e", self.Entity, Vector3(0, -0.1, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Alpha"] = 0.5 })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.2)
+		_DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+		_DamageSkinService:Play(
+			self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0,
+			{ remain }, DamageSkinTweenType.Default, false,
+			Vector2(0, 0.35), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
 	end
 
 	@ExecSpace("ServerOnly")

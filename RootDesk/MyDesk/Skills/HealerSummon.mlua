@@ -22,6 +22,7 @@ script HealerSummon extends Component
 	@Sync property number HealerLevel = 1          -- 힐러 레벨(플레이어 레벨의 2/3)
 	@Sync property string LocoState = "stand"      -- stand / walk / jump (이동 모션)
 	@Sync property string MotionCmd = ""           -- "seq|모션명|재생속도" - 1회성 스킬 모션 명령
+	property integer HolyShell = 0                 -- 서버 전용: 홀리 매직쉘 잔여 방어 횟수(개체별)
 
 	-- ── 셋업(서버) ────────────────────────────────────────────────
 	-- SummonHealer는 AddComponent 직후 프로퍼티만 대입한다(용사/다크드래곤과 동일 패턴).
@@ -110,6 +111,26 @@ script HealerSummon extends Component
 	method number GetCombatPower()
 		-- 레벨에 맞는 전투력(프로젝트 공식: 전투력 10당 1레벨의 역산).
 		return self.HealerLevel * 10
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyBlessBuff(integer atkBonus, number duration)
+		-- 블레스(주인이 걸어주는 2차 버프): 힐러는 공마 대신 **힐 회복효과 +10% + 힐 사용속도 10%
+		-- 단축**(재사용 1.5초 → 1.35초)으로 받는다(요청 사양). atkBonus 인자는 용사와 호출 규격을
+		-- 맞추기 위한 것으로 힐러는 쓰지 않는다. 재사용 시 중첩 없이 지속시간만 갱신(토큰 패턴).
+		if self._T.dying then return end
+		self._T.blessToken = (self._T.blessToken or 0) + 1
+		local tok = self._T.blessToken
+		self._T.blessHealMult = 1.1
+		self._T.blessCdMult = 0.9
+		_TimerService:SetTimerOnce(function()
+			if self._T.blessToken == tok then
+				self._T.blessHealMult = 1.0
+				self._T.blessCdMult = 1.0
+				log("[HealerSummon] 블레스 만료 - 힐 강화 원복")
+			end
+		end, duration)
+		log("[HealerSummon] 블레스 수령 - 힐 회복 +10%/사용속도 +10% (" .. tostring(duration) .. "초)")
 	end
 
 	---@type PlayerAttack
@@ -344,12 +365,59 @@ script HealerSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method boolean NeedsHeal(Entity owner)
-		-- 힐 조건(요청: 힐을 주력으로 자주 사용): 본인이나 주인의 HP가 **조금이라도 깎여 있으면** 바로 쓴다.
-		-- 둘 다 가득 차 있을 때만 쉰다(재사용 1.5초는 CastHeal이 관리).
+		-- 힐 조건(요청: 힐을 주력으로 자주 사용): 아군 중 **누구든** HP가 조금이라도 깎여 있으면 바로 쓴다.
+		-- 전부 가득 차 있을 때만 쉰다(재사용 1.5초는 CastHeal이 관리).
+		-- (피드백) 예전에는 본인과 주인만 봐서, 용사/용의 HP가 줄어도 힐을 쓰지 않았다 -
+		--   회복 대상(HealNearbySummons)과 같은 사거리(±3.6)의 소환수까지 함께 확인한다.
 		if self.HealerMaxHp > 0 and self.HealerHp < self.HealerMaxHp then return true end
 		local pc = owner.PlayerComponent
+		local myPos = self.Entity.TransformComponent.WorldPosition
 		if isvalid(pc) and not pc:IsDead() and pc.MaxHp > 0 and pc.Hp < pc.MaxHp then
-			return true
+			-- 주인은 사거리 안에 있을 때만 회복되므로, 판정도 같은 조건으로 맞춘다.
+			local op = owner.TransformComponent.WorldPosition
+			if math.abs(op.x - myPos.x) <= 3.6 and math.abs(op.y - myPos.y) <= 3.6 then
+				return true
+			end
+		end
+		return self:AnySummonNeedsHeal(myPos, owner)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean AnySummonNeedsHeal(Vector3 myPos, Entity owner)
+		-- 사거리(±3.6) 안에 HP가 깎인 아군 소환수(용사/용/다른 힐러)가 하나라도 있으면 true.
+		-- HealNearbySummons와 완전히 같은 대상/사거리 조건을 써야 "쓸 이유가 있는데 안 쓰거나,
+		-- 썼는데 아무도 안 차는" 어긋남이 생기지 않는다.
+		if not isvalid(owner) then return false end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return false end
+		local function inRange(e)
+			if not isvalid(e) then return false end
+			local p = e.TransformComponent.WorldPosition
+			return math.abs(p.x - myPos.x) <= 3.6 and math.abs(p.y - myPos.y) <= 3.6
+		end
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.HeroSummon", true)) do
+			---@type HeroSummon
+			local hs = comp
+			if isvalid(hs) and hs.OwnerEntity == owner and hs.HeroHp > 0
+				and hs.HeroHp < hs.HeroMaxHp and inRange(hs.Entity) then
+				return true
+			end
+		end
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.SummonDragon", true)) do
+			---@type SummonDragon
+			local sd = comp
+			if isvalid(sd) and sd.OwnerEntity == owner and sd.DragonHp > 0
+				and sd.DragonHp < sd.DragonMaxHp and inRange(sd.Entity) then
+				return true
+			end
+		end
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.HealerSummon", true)) do
+			---@type HealerSummon
+			local hl = comp
+			if isvalid(hl) and hl ~= self and hl.OwnerEntity == owner and hl.HealerHp > 0
+				and hl.HealerHp < hl.HealerMaxHp and inRange(hl.Entity) then
+				return true
+			end
 		end
 		return false
 	end
@@ -362,7 +430,8 @@ script HealerSummon extends Component
 		-- 곧바로 다음 힐이 나갈 수 있는 간격.
 		if self._T.dying then return end
 		self._T.castLockUntil = now + 0.85
-		self._T.nextHealAt = now + 1.5
+		-- 블레스 활성 중이면 힐 사용속도 10% 단축(재사용 1.5초 → 1.35초, blessCdMult).
+		self._T.nextHealAt = now + 1.5 * (self._T.blessCdMult or 1.0)
 		self:ApplyFacing(dir)
 		local mv = self.Entity.MovementComponent
 		if isvalid(mv) then mv:Stop() end
@@ -379,28 +448,79 @@ script HealerSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ApplyHealNow()
-		-- 실제 회복 처리: 본인은 항상, 주인은 좌우/위아래 3.6유닛 안에 있을 때 회복시킨다
-		-- (플레이어 힐의 FindHealTargets와 같은 범위/공식 - 전투력의 5%~15%).
+		-- 실제 회복 처리: 본인은 항상, 주인과 **다른 아군 소환수**는 좌우/위아래 3.6유닛 안에 있을 때
+		-- 회복시킨다(플레이어 힐의 FindHealTargets와 같은 범위/공식 - 전투력의 5%~15%).
+		-- (요청) 힐러의 힐도 유저의 힐과 마찬가지로 용사/용 등 HP를 가진 소환수를 회복시켜야 한다.
 		local healedSelf = self:HealSelf()
 		local healedOwner = 0
 		local owner = self.OwnerEntity
+		local myPos = self.Entity.TransformComponent.WorldPosition
 		if isvalid(owner) then
-			local myPos = self.Entity.TransformComponent.WorldPosition
 			local op = owner.TransformComponent.WorldPosition
 			if math.abs(op.x - myPos.x) <= 3.6 and math.abs(op.y - myPos.y) <= 3.6 then
 				healedOwner = self:HealOwner(owner)
 			end
 		end
+		local healedSummons = self:HealNearbySummons(myPos)
 		log("[HealerSummon] 힐 발동 - 본인 +" .. tostring(healedSelf) .. " 주인 +" .. tostring(healedOwner)
+			.. " 소환수 " .. tostring(healedSummons) .. "체"
 			.. " (본인 HP " .. tostring(math.floor(self.HealerHp)) .. "/" .. tostring(math.floor(self.HealerMaxHp)) .. ")")
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer HealNearbySummons(Vector3 myPos)
+		-- 사거리(좌우/위아래 3.6) 안의 아군 소환수를 회복시킨다 - 같은 주인이 소환한 것만 대상.
+		-- 회복 공식/연출은 유저의 힐이 쓰는 PlayerAttack 헬퍼를 그대로 재사용해 규격을 통일한다
+		-- (ApplyHealToHero / ApplyHealToDragon / ApplyHealToHealer). 자기 자신은 HealSelf가 이미 처리했다.
+		local owner = self.OwnerEntity
+		if not isvalid(owner) then return 0 end
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) then return 0 end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return 0 end
+		local cp = self:GetCombatPower()
+		local healed = 0
+		local function inRange(e)
+			if not isvalid(e) then return false end
+			local p = e.TransformComponent.WorldPosition
+			return math.abs(p.x - myPos.x) <= 3.6 and math.abs(p.y - myPos.y) <= 3.6
+		end
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.HeroSummon", true)) do
+			---@type HeroSummon
+			local hs = comp
+			if isvalid(hs) and hs.OwnerEntity == owner and hs.HeroHp > 0 and inRange(hs.Entity) then
+				pa:ApplyHealToHero(hs.Entity, cp)
+				healed = healed + 1
+			end
+		end
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.SummonDragon", true)) do
+			---@type SummonDragon
+			local sd = comp
+			if isvalid(sd) and sd.OwnerEntity == owner and sd.DragonHp > 0 and inRange(sd.Entity) then
+				pa:ApplyHealToDragon(sd.Entity, cp)
+				healed = healed + 1
+			end
+		end
+		-- 다른 힐러(2마리 이상 소환되는 구성은 없지만, 규격상 빠뜨리지 않는다). 자기 자신은 제외.
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.HealerSummon", true)) do
+			---@type HealerSummon
+			local hl = comp
+			if isvalid(hl) and hl ~= self and hl.OwnerEntity == owner and hl.HealerHp > 0 and inRange(hl.Entity) then
+				pa:ApplyHealToHealer(hl.Entity, cp)
+				healed = healed + 1
+			end
+		end
+		return healed
 	end
 
 	@ExecSpace("ServerOnly")
 	method integer RollHealAmount()
 		-- 회복량: 플레이어 힐과 같은 공식(전투력의 10%를 기준으로 ±50% = 5%~15%).
+		-- 블레스 활성 중이면 최종 회복량이 10% 증가한다(blessHealMult).
 		local baseHeal = self:GetCombatPower() * 0.10
 		local mult = 0.5 + _UtilLogic:RandomDouble() * 1.0
-		return math.floor(baseHeal * mult)
+		return math.floor(baseHeal * mult * (self._T.blessHealMult or 1.0))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -574,6 +694,52 @@ script HealerSummon extends Component
 	method void NotifyUnsummoned()
 		-- 주인 클라이언트: 우측 상단 힐러 소환 버프바를 즉시 내린다.
 		_HealerSummonBuffUI:HideBuff()
+	end
+
+	-- ── 홀리 매직쉘(4차 버프) 쉴드 ───────────────────────────────
+	-- 주인이 홀리 매직쉘을 시전하면 이 소환수에게도 10회짜리 쉴드가 걸린다(개체마다 각각 10회).
+	-- 실제 차단은 공격자 쪽 MonsterAttack.IsAttackTarget에서 ConsumeHolyShell()을 불러 처리한다
+	-- (방어자 IsHitTarget은 이 프로젝트의 몬스터 공격 경로에서 호출되지 않는다 - 가드/패링과 같은 이유).
+
+	@ExecSpace("ServerOnly")
+	method void GrantHolyShell(integer count)
+		-- 재시전하면 남은 개수와 무관하게 새로 count개로 채운다.
+		self.HolyShell = count
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean ConsumeHolyShell()
+		-- 쉴드가 남아 있으면 1개 소모하고 true(이번 공격 무시). 사망 상태면 쓰지 않는다.
+		-- (요청) 막아낸 뒤 **1.5초 무적** - 그 동안 들어오는 공격은 쉴드를 더 쓰지 않고 그냥 무시한다
+		-- (밀집 지역에서 한 번에 여러 대 맞아 쉴드가 순식간에 증발하는 것을 막는다).
+		if self._T.dying then return false end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.holyShellInvulnUntil or 0) >= now then return true end
+		if self.HolyShell <= 0 then return false end
+		self.HolyShell = self.HolyShell - 1
+		self._T.holyShellInvulnUntil = now + 1.5
+		self:PlayHolyShellFx(self.HolyShell)
+		log("[HolyShell] 힐러 소환수 방어! 남은 쉴드 " .. tostring(self.HolyShell))
+		return true
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHolyShellFx(integer remain)
+		-- 쉴드 성공 연출: 막은 개체 몸에서 쉴드 이펙트 + "Guard" 표시 + 머리 위 남은 개수 숫자.
+		-- (피드백) 막을 때 사운드는 재생하지 않는다. 이펙트 높이도 0.2 → -0.1로 더 내렸다.
+		-- (플레이어 쪽 PlayerHit.PlayHolyShellBlockEffects와 같은 규격).
+		if not self:IsClient() then return end
+		if not isvalid(self.Entity) then return end
+		local serial = _EffectService:PlayEffectAttached("ec0acf34d59043f695f43c55222a7b0e", self.Entity, Vector3(0, -0.1, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Alpha"] = 0.5 })
+		_TimerService:SetTimerOnce(function()
+			_EffectService:RemoveEffect(serial)
+		end, 1.2)
+		_DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+		_DamageSkinService:Play(
+			self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0,
+			{ remain }, DamageSkinTweenType.Default, false,
+			Vector2(0, 0.35), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
 	end
 
 	@ExecSpace("ServerOnly")

@@ -1,0 +1,164 @@
+@Component
+script HolyArrowProjectileAttack extends AttackComponent
+
+	-- 불의 영역/빙하지대 온히트 프록용 시전자 참조 - 발사 시점에 PlayerAttack이 넣어준다.
+	property Entity OwnerEntity = ""
+
+	method void OnAttack(Entity defender)
+		-- 시전자(PlayerAttack)의 불의 영역/빙하지대 공용 프록 판정으로 위임한다(엔젤레이와 동일).
+		-- 부모 OnAttack은 ExecSpace 미지정이라 어노테이션 없이 오버라이드한다(LEA-3014 방지).
+		if not self:IsServer() then return end
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if isvalid(pa) then
+			pa:TryProcElementalZones(defender)
+		end
+	end
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- 화살은 관통하며 여러 몬스터를 맞힐 수 있지만, 같은 몬스터를 한 발로 중복 타격하지 않도록
+		-- HolyArrowProjectile에 기록된 명중 목록(이름 기준)으로 필터링하고, 최대 관통 수(6명)를 넘으면
+		-- 판정 자체를 막는다(엔젤레이와 동일한 구조).
+		if isvalid(defender.PlayerComponent) then return false end
+		-- 아군 소환수(용사/힐러/용)는 판정에서 제외한다(아이언에로우에서 실측된 오폭 즉사 예방).
+		if defender:GetComponent("script.HeroSummon") ~= nil then return false end
+		if defender:GetComponent("script.HealerSummon") ~= nil then return false end
+		if defender:GetComponent("script.SummonDragon") ~= nil then return false end
+		---@type HolyArrowProjectile
+		local proj = self.Entity:GetComponent("script.HolyArrowProjectile")
+		if proj ~= nil and (proj:HasHit(defender.Name) or proj:HasReachedMaxHits()) then
+			return false
+		end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 홀리 에로우(2차): 대상당 전투력의 300%~400% 피해(2차 관통 스킬 규격 - 조정 가능).
+		-- 실제 명중이 확정된 시점(이 훅)에만 호출되므로 여기서 명중 기록.
+		-- 쉐도우 파트너의 "타수 2배"는 원본+보너스(원본의 55~65%) 합산·2줄 표시(엔젤레이와 동일).
+		---@type HolyArrowProjectile
+		local proj = self.Entity:GetComponent("script.HolyArrowProjectile")
+		local combatPower = 0
+		local echoOn = false
+		local critRate = 0.5
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			echoOn = proj.ShadowEchoOn
+			critRate = (proj.CritRate or 50) / 100
+			proj:MarkHit(defender.Name)
+		end
+		local mult = 3.0 + math.random() * (4.0 - 3.0)
+		local dmg = math.floor(combatPower * mult)
+		-- 크리티컬은 여기서 직접 굴리고 배율을 반환값에 바로 곱한다(아래 CalcCritical은 이중 적용 방지용 false).
+		local dmgIsCritical = _UtilLogic:RandomDouble() < critRate
+		if dmgIsCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		local bonus = 0
+		local bonusIsCritical = false
+		if echoOn then
+			bonus = math.floor(dmg * (0.55 + math.random() * 0.10))
+			bonusIsCritical = _UtilLogic:RandomDouble() < critRate
+			if bonusIsCritical then
+				bonus = math.floor(bonus * 2.0)
+			end
+		end
+		self:ShowHolyArrowDamageSkin(defender, dmg, bonus, dmgIsCritical, bonusIsCritical, self:GetProjectileDamageSkinId())
+		self:PlayHolyArrowHitEffect(defender)
+		self:PlayHolyArrowHitSound(defender)
+		local hitNo = 0
+		if proj ~= nil then hitNo = proj._T.hitCount or 0 end
+		log("[HolyArrow] hit " .. tostring(defender.Name) .. " dmg=" .. tostring(dmg + bonus) .. " (관통 " .. tostring(hitNo) .. "/6)")
+		return dmg + bonus
+	end
+
+	-- CalcDamage가 자체적으로 크리티컬을 굴리고 배율을 이미 반환값에 곱했으므로, 엔진이 여기서 또 true를
+	-- 반환하면 실제 적용 데미지가 표시값의 2배로 이중 적용된다. 항상 false를 반환해 이중 적용을 막는다.
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		return false
+	end
+
+	@ExecSpace("Client")
+	method void ShowHolyArrowDamageSkin(Entity target, integer damage, integer bonus, boolean damageIsCritical, boolean bonusIsCritical, string skinRuid)
+		-- 다른 스킬들과 동일한 기본 히트 데미지 스킨(RUID)을 재생해 룩앤필을 통일한다.
+		if not isvalid(target) then return end
+		_DamageSkinService:Play(
+			target, skinRuid, 0,
+			{ damage }, DamageSkinTweenType.Default, damageIsCritical,
+			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+		if bonus > 0 then
+			_DamageSkinService:Play(
+				target, skinRuid, 0,
+				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+				Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+			)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayHolyArrowHitEffect(Entity target)
+		-- 홀리 에로우 전용: 맞은 몬스터 몸에서 클래식 적중 이펙트(hit0~2, 프레임당 80ms)를 1회 재생한다.
+		-- 정지 스프라이트 3장이라 공용 스프라이트 페이드 엔티티(SpearBurstFadingEffect)를 프레임 교체
+		-- 방식으로 재사용한다. 패딩 정렬본(136x136)은 origin이 정확히 캔버스 중앙이라 위치 보정이 없다.
+		-- (요청) 히트 이펙트 투명도 75% - 엔젤레이와 동일.
+		-- (원본/RUID 대응표: msw-dev-tools/resources/홀리에로우/RUID.md)
+		if not isvalid(target) then return end
+		local frames = {
+			"8edf33f4b3b34ddcb14cb87a8c6cff12",
+			"93570ada189943b2a9ddb534fb487f81",
+			"064dd5feb22b4d1fb5bc139a479128c2",
+		}
+		local offsetY = 0.3
+		local hitComp = target.HitComponent
+		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
+		self._T.hitFxSeq = (self._T.hitFxSeq or 0) + 1
+		local fxName = "HolyArrowHitFx_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.hitFxSeq)
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", fxName, Vector3(0, offsetY, 0), target)
+		if not isvalid(fx) then return end
+		fx:AddComponent("script.SpearBurstFadingEffect")
+		---@type SpearBurstFadingEffect
+		local comp = fx:GetComponent("script.SpearBurstFadingEffect")
+		if isvalid(comp) then
+			comp.StartAlpha = 0.75
+			comp.EndAlpha = 0.0
+			-- 3프레임(0.08초 간격 = 0.24초)을 다 보여준 뒤 페이드가 시작되도록 잡는다.
+			comp.HoldDuration = 0.26
+			comp.TweenDuration = 0.15
+			comp.StartScale = 1.0
+			comp.EndScale = 1.0
+			comp.OrderInLayerValue = 6
+			comp.ClipRUID = frames[1]
+		end
+		for i = 2, 3 do
+			local idx = i
+			_TimerService:SetTimerOnce(function()
+				if isvalid(comp) then
+					comp.ClipRUID = frames[idx]
+				end
+			end, 0.08 * (idx - 1))
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(fx) then fx:Destroy() end
+		end, 0.5)
+	end
+
+	@ExecSpace("Client")
+	method void PlayHolyArrowHitSound(Entity target)
+		-- 홀리 에로우 적중음 - MSW 라이브러리 원본 팩(skill/230.img/skill/2301005)의 _audio/Hit 재사용.
+		if not isvalid(target) then return end
+		_SoundService:PlaySound("d21f05522bef4ffeae3045d7cdbafafe", 1.0)
+	end
+
+	method string GetProjectileDamageSkinId()
+		-- 발사한 플레이어의 현재 데미지 스킨(블리자드 중이면 얼음 스킨). 비어 있으면 기본 스킨으로 폴백.
+		---@type HolyArrowProjectile
+		local proj = self.Entity:GetComponent("script.HolyArrowProjectile")
+		if isvalid(proj) and proj.DamageSkinRUID ~= "" then
+			return proj.DamageSkinRUID
+		end
+		return "3271c3e79bf04ecba9a107d55495970d"
+	end
+
+end

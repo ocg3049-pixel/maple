@@ -8,7 +8,12 @@ script PhoenixSummon extends Component
 	-- 시퀀스: attack1(10~20프레임) 완주 → 사라짐(gone)+활강 히트 이펙트+타격(이펙트 4번째 프레임)
 	-- → 1초 뒤 → 처음 소환된 유저 뒤(홈)에서 attack1 6프레임부터 정방향 1회 재생하며 재등장.
 
-	property Entity OwnerEntity = nil            -- 서버 전용(공격 대상 탐색/데미지 주체). 클라는 부모로 충분.
+	-- ⚠ **맵의 자식으로 스폰한다**(용 소환/바하뮤트와 동일). 플레이어의 자식으로 두면 텔레포트로
+	-- 주인이 워프할 때 자식인 소환수도 **같이 순간이동해 버린다**(사용자 신고). 맵 자식이면 워프의
+	-- 영향을 받지 않아 제자리에 남았다가 평소 속도로 날아온다. 좌표 계산도 부모 로컬이 아니라
+	-- 월드로 한다(맵 루트가 원점이라 맵 로컬 == 월드).
+	-- 맵 자식이라 클라가 부모로 주인을 알 수 없다 → 주인을 @Sync로 내려준다(첫 프레임 nil 가드 필요).
+	@Sync property Entity OwnerEntity = nil
 	property number Lifetime = 600               -- 서버 전용 수명(초). 10분 버프.
 	@Sync property string Mode = "idle"          -- "idle"(주인 곁 부양) | "engage"(적에게 출격)
 	@Sync property number TargetX = 0            -- engage 목적지(적 위치, 서버가 0.5초마다 갱신)
@@ -52,7 +57,19 @@ script PhoenixSummon extends Component
 	method void CombatTick()
 		-- 0.5초마다: idle이면 주인 주변 사거리(7유닛) 스캔 → 적이 있으면 출격(engage).
 		-- engage면 대상 유효성 검사 + 목적지 갱신 + 도착했으면 공격.
-		if not isvalid(self.OwnerEntity) then return end
+		-- 맵 자식이라 주인이 사라져도 자동으로 정리되지 않는다(플레이어 자식이던 시절과 다른 점).
+		-- 주인이 없어지면 스스로 소멸한다.
+		if not isvalid(self.OwnerEntity) then
+			self._T.noOwnerTime = (self._T.noOwnerTime or 0) + 0.5
+			if self._T.noOwnerTime > 2.0 and isvalid(self.Entity) then
+				self:PlayVanishFx()
+				_TimerService:SetTimerOnce(function()
+					if isvalid(self.Entity) then self.Entity:Destroy() end
+				end, 0.4)
+			end
+			return
+		end
+		self._T.noOwnerTime = 0
 		---@type PlayerAttack
 		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
 		if not isvalid(pa) then return end
@@ -181,15 +198,15 @@ script PhoenixSummon extends Component
 		local sr = self.Entity.SpriteRendererComponent
 		if not isvalid(sr) then return end
 
-		local parent = self.Entity.Parent
-		local pw = (isvalid(parent) and isvalid(parent.TransformComponent))
-			and parent.TransformComponent.WorldPosition or tr.WorldPosition
+		-- 맵 자식이라 부모는 맵이다. 주인은 @Sync로 받은 OwnerEntity로 잡는다.
+		-- 아직 동기화가 안 왔거나(스폰 직후 몇 프레임) 주인이 사라졌으면 제자리에 머문다.
+		local owner = self.OwnerEntity
+		if not isvalid(owner) or not isvalid(owner.TransformComponent) then return end
+		local pw = owner.TransformComponent.WorldPosition
 
 		local look = 1
-		if isvalid(parent) then
-			local ctrl = parent.PlayerControllerComponent
-			if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
-		end
+		local ctrl = owner.PlayerControllerComponent
+		if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
 
 		-- 홈(소환) 위치: 캐릭터 뒤쪽 0.5, 위 0.8. 처음 생성/공격 후 재등장/평상시 부양의 기준점.
 		local homeX = pw.x - look * 0.5
@@ -254,11 +271,11 @@ script PhoenixSummon extends Component
 			speed = (delta > 0) and (moveDist / delta) or 0
 		end
 		self._T.worldPos = Vector3(nx, ny, 0)
-		-- child라 Position은 부모(플레이어) 기준 로컬 좌표다.
-		tr.Position = Vector3(nx - pw.x, ny - pw.y, 0)
+		-- 맵 자식이라 로컬 == 월드(플레이어 자식이던 시절엔 부모 좌표를 빼야 했다).
+		tr.Position = Vector3(nx, ny, 0)
 
 		-- 소유 클라만 실제 월드좌표를 서버로 보고(공격 도착 판정 기준).
-		if isvalid(parent) and _UserService.LocalPlayer == parent then
+		if _UserService.LocalPlayer == owner then
 			self._T.reportTimer = (self._T.reportTimer or 0) + delta
 			if self._T.reportTimer >= 0.15 then
 				self._T.reportTimer = 0

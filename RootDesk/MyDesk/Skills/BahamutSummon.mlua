@@ -1,0 +1,425 @@
+@Component
+script BahamutSummon extends Component
+
+	-- 바하뮤트(4차) 소환수.
+	--   1) 적에게 날아가지 않는다. 항상 주인 곁(뒤 위)에 머물면서 그 자리에서 브레스를 뿜어
+	--      주변의 적을 최대 6마리까지 한 번에 때린다.
+	--   2) 따라오는 방식이 등속 추종이 아니라 **임계감쇠 스프링(SmoothDamp)**이다.
+	--      주인이 갑자기 멀어져도 즉시 튀어가지 않고 서서히 가속했다가 도착하면서 감속한다
+	--      (요청 사양: "갑자기 따라오려 하지 않고 자연스럽게 따라올 것").
+	--   3) ⚠ **맵의 자식으로 스폰한다**(용 소환/SummonDragon과 동일, 프리져·피닉스와 다름).
+	--      플레이어의 자식으로 두면 텔레포트(서버 rb:SetWorldPosition 한 방)로 부모가 튈 때
+	--      자식도 **같이 순간이동해 버린다**. 맵 자식이면 주인이 워프해도 바하뮤트는 제자리에
+	--      남아 SmoothDamp로 천천히 날아온다(요청 사양). 좌표 계산도 부모 기준 로컬이 아니라
+	--      전부 월드 좌표로 한다(맵 루트가 원점이라 맵 로컬 == 월드).
+	--
+	-- 리소스는 구버전 클라 추출 클래식 바하뮤트 42프레임(계정 업로드).
+	-- 대응표: msw-dev-tools/resources/바하뮤트/RUID.md
+	-- 프레임 크기가 제각각이라 WZ origin에서 환산한 오프셋을 프레임마다 따로 얹는다.
+	-- (이 오프셋 때문에 위치 계산은 클라가 맡는다 - 프레임마다 값이 달라 서버가 알 수 없다.
+	--  HitComponent가 없어 피격 판정이 없으므로 클라 권한 이동이라도 문제되지 않는다.)
+
+	-- 맵 자식이라 클라가 부모로 주인을 알 수 없다 → 주인을 @Sync로 내려준다.
+	-- (AddComponent 직후 대입이라 클라 첫 프레임엔 nil일 수 있다 - 아래에서 nil 가드)
+	@Sync property Entity OwnerEntity = nil
+	property number Lifetime = 600               -- 서버 전용 수명(초). 10분.
+	@Sync property string AtkState = ""          -- "" | "atk"
+	@Sync property integer AtkSeq = 0            -- 공격 시작마다 +1. 클라가 모션 재시작 시점을 잡는 기준.
+	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
+	@Sync property boolean Dying = false         -- 수명 종료 → 소멸(die) 모션 재생 중
+
+	-- 공격 모션 규격(ori.txt 실측): attack1 = 18프레임 × 90ms = 1.62초.
+	-- 12번 프레임(마법진이 완성되며 터지는 순간)에 데미지가 들어간다 = 1.08초.
+	-- 소환 등장(summoned) 6프레임 × 120ms = 0.72초, 이동/제자리 150ms, die는 프레임별 딜레이.
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- 서버: 수명 타이머 + 0.5초 간격 전투 판단 루프.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self.Dying = true
+			_TimerService:SetTimerOnce(function()
+				if isvalid(self.Entity) then self.Entity:Destroy() end
+			end, 1.1)
+		end, self.Lifetime)
+		self._T.combatTimerId = _TimerService:SetTimerRepeat(function()
+			if not isvalid(self.Entity) then return end
+			self:CombatTick()
+		end, 0.5)
+		log("[Bahamut] 소환 - 수명 " .. tostring(self.Lifetime) .. "초")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- 전투 루프 타이머 정리.
+		if self._T.combatTimerId ~= nil then
+			_TimerService:ClearTimer(self._T.combatTimerId)
+			self._T.combatTimerId = nil
+		end
+	end
+
+	@ExecSpace("Server")
+	method void ReportBahamutPos(number x, number y)
+		-- 소유 클라가 계산한 실제 바하뮤트 월드좌표. 0.15초마다 갱신(프리져/피닉스와 동일한 보고 방식).
+		-- 이 엔티티는 이동을 클라가 계산하므로(HP가 없어 피격 판정이 없다) 서버 Transform은 스폰 당시
+		-- 로컬 좌표 그대로다 → 적 탐색 기준점으로 쓰려면 반드시 클라가 알려줘야 한다.
+		self._T.serverWorldPos = Vector2(x, y)
+	end
+
+	@ExecSpace("ServerOnly")
+	method Vector2 GetSearchCenter()
+		-- 적 탐색/타격의 기준점 = **바하뮤트 자신의 위치**(요청). 클라 보고가 아직 안 왔으면
+		-- 주인 위치로 대체한다.
+		local wp = self._T.serverWorldPos
+		if wp ~= nil then return wp end
+		if not isvalid(self.OwnerEntity) then
+			local sp = self.Entity.TransformComponent.WorldPosition
+			return Vector2(sp.x, sp.y)
+		end
+		local op = self.OwnerEntity.TransformComponent.WorldPosition
+		return Vector2(op.x, op.y)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CombatTick()
+		-- 0.5초마다: 주인 주변 반경 6.5 안에 적이 있으면 그 자리에서 브레스 모션을 시작한다.
+		-- (프리져/피닉스처럼 적에게 날아가지 않는다 - 바하뮤트는 주인 곁을 지키는 소환수)
+		if self.Dying then return end
+		-- 맵 자식이라 주인이 사라져도 자동으로 정리되지 않는다(플레이어 자식이던 시절과 다른 점).
+		-- 주인이 없어지면 스스로 소멸한다. 주인이 다른 맵에 있으면 공격만 쉰다.
+		if not isvalid(self.OwnerEntity) then
+			self._T.noOwnerTime = (self._T.noOwnerTime or 0) + 0.5
+			if self._T.noOwnerTime > 2.0 then
+				self.Dying = true
+				_TimerService:SetTimerOnce(function()
+					if isvalid(self.Entity) then self.Entity:Destroy() end
+				end, 1.1)
+			end
+			return
+		end
+		self._T.noOwnerTime = 0
+		if self.OwnerEntity.CurrentMap ~= self.Entity.CurrentMap then return end
+		if self.AtkState ~= "" then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if (self._T.nextAtkAt or 0) > now then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		-- (요청) 탐색 기준점은 주인이 아니라 **바하뮤트 자신**이다. 주인 기준으로 잡으면 바하뮤트가
+		-- 주인 뒤 1.1에 떠 있는 만큼 앞뒤 사거리가 비대칭이 되어 "공격 범위가 플레이어 앞쪽에
+		-- 맞춰져 있다"는 신고로 이어졌다. 이제 바라보는 쪽/등 뒤 모두 같은 6.5가 된다.
+		local center = self:GetSearchCenter()
+		local cands = pa:FindMonstersInRadius(center, 6.5, 6)
+		if #cands == 0 then return end
+
+		-- 바라보는 방향 = 잡힌 적들의 평균 x가 바하뮤트보다 오른쪽이면 오른쪽.
+		local sumX = 0
+		for _, m in ipairs(cands) do
+			sumX = sumX + m.TransformComponent.WorldPosition.x
+		end
+		self.FacingX = ((sumX / #cands) >= center.x) and 1 or -1
+		self.AtkSeq = self.AtkSeq + 1
+		self.AtkState = "atk"
+		self._T.nextAtkAt = now + 4.2
+
+		-- 데미지는 마법진이 터지는 12번 프레임(1.08초) 시점.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:DoBreath()
+		end, 1.08)
+		-- 모션 완주(18프레임 = 1.62초) 후 대기 상태로.
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self.AtkState == "atk" then self.AtkState = "" end
+		end, 1.62)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DoBreath()
+		-- 실제 타격. 예약 당시 목록이 아니라 **터지는 그 순간** 다시 훑어서 최대 6마리를 때린다
+		-- (1초 사이에 몬스터가 움직이거나 죽었을 수 있다 - 용 소환에서 얻은 교훈).
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		-- 타격 순간에도 기준점은 바하뮤트 자신(탐색과 동일).
+		local targets = pa:FindMonstersInRadius(self:GetSearchCenter(), 6.5, 6)
+		if #targets == 0 then
+			log("[Bahamut] 브레스 - 타격 시점에 대상 없음")
+			return
+		end
+		local hitCount = 0
+		for i, t in ipairs(targets) do
+			if isvalid(t) then
+				pa:DealBahamutHit(t)
+				self:PlayBahamutHitFx(t, i == 1)
+				hitCount = hitCount + 1
+			end
+		end
+		log("[Bahamut] 브레스 타격 " .. tostring(hitCount) .. "마리(최대 6)")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayBahamutHitFx(Entity target, boolean withSound)
+		-- 맞은 적 위에 바하뮤트 팩(skill/232.img/skill/2321003)의 hit/0 금색 마법진 폭발.
+		-- 타격음은 6마리를 동시에 때려도 한 번만(첫 대상에서만) 낸다.
+		if not self:IsClient() then return end
+		if not isvalid(target) then return end
+		local serial = _EffectService:PlayEffectAttached("598a38c6f7d747b9aedf97c18dad6dc7", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
+		if withSound then
+			_SoundService:PlaySound("154f797432104a0b9de86cdb7c9e7a6a", 1.0)
+		end
+		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 1.2)
+	end
+
+	method table GetSummonedFrames()
+		-- 등장 6프레임: { SpriteRUID, 앵커→이미지중심 x오프셋, y오프셋 }(월드유닛).
+		return {
+			{ "73ad3604b79c42ce9409fbaf30de4453", -0.190, 0.865 },
+			{ "f522d0a7e19448319894d0f5d9902417", -0.095, 0.860 },
+			{ "74be5f4344bf45979ae87dcd8cc6d6a2", -0.165, 0.850 },
+			{ "61a7319b0288406f80303fb0e6ae4e0b", -0.095, 0.845 },
+			{ "e71643acb2be4ab58a6b0e53af7be3d3", -0.040, 0.840 },
+			{ "0996e99f07f44d5fa346dcd4a0b3d933", 0.110, 0.795 },
+		}
+	end
+
+	method table GetFlyFrames()
+		-- 이동 6프레임.
+		return {
+			{ "d6fe03bd5cf64ed39fe5342c08492e32", 0.035, 0.905 },
+			{ "18f214270f2a4eaea398a07f897a929d", -0.010, 0.750 },
+			{ "4cba4639956a4ee4b5ca960da3fb49d0", -0.100, 0.760 },
+			{ "661a54c863124a58ae7397a04eb1ff2e", -0.075, 0.770 },
+			{ "a2b242bd9d0f4941b3eece0e4b61c6c2", -0.015, 0.760 },
+			{ "a2d3896a75c94b6f8c7bf71c10982178", 0.060, 0.790 },
+		}
+	end
+
+	method table GetStandFrames()
+		-- 제자리 6프레임(원본 12프레임 중 후반 6장은 전반과 동일해 6장만 반복한다).
+		return {
+			{ "56b30c245ba74e95b6cff98bf0589bf4", 0.085, 0.920 },
+			{ "41aa9e797db14f9ab4a073fed466b691", 0.040, 0.755 },
+			{ "87af8e06638d4602988e83c091642da2", -0.050, 0.755 },
+			{ "517932a2dcac4e7489c8477bddd1c544", -0.025, 0.765 },
+			{ "7cfc11cc5fda435bb54685a4074dcb51", 0.035, 0.765 },
+			{ "0f60840e17be428a9fab9f40c174bfab", 0.110, 0.805 },
+		}
+	end
+
+	method table GetAttackFrames()
+		-- 공격(브레스) 18프레임. 0번은 stand0과 같은 그림이라 RUID를 공유한다.
+		-- 1~10 = 입에 기를 모으는 구간, 11~14 = 마법진 완성·폭발, 15~17 = 마무리.
+		return {
+			{ "56b30c245ba74e95b6cff98bf0589bf4", 0.085, 0.920 },
+			{ "afacf4bb28d345c6819738f045744e0f", -0.220, 0.750 },
+			{ "a2968603f51747c4adbb075fd5d5753e", -0.260, 0.755 },
+			{ "e75dbda1d9b647c79b2f667557bff5a4", -0.195, 0.760 },
+			{ "299e84a1637b4974a14901b9e215888f", -0.095, 0.760 },
+			{ "1d6de88b112046bb9f94c086b58b2e67", -0.015, 0.805 },
+			{ "0be0d6e181bb4043bfabac7a14dc5f2f", -0.050, 0.920 },
+			{ "2acd876157e847329cb5c5d2a00ab628", -0.110, 0.750 },
+			{ "7a52e8e08b5745c8bb25203691cb2f39", -0.200, 0.750 },
+			{ "cf817d0c1786476bb2ee0d3492abf09c", -0.180, 0.760 },
+			{ "afb0276b6ab74a4ebbcebaa3bce2ba4b", -0.135, 0.760 },
+			{ "7dc0f0a054af4d60a3cb633b9f2ef1d2", -0.085, 0.805 },
+			{ "3dd5253453f8487d8099d72a94d189e2", -0.285, 0.880 },
+			{ "efe2df8f2bb84ef5a46697cb933bed5f", -0.340, 0.825 },
+			{ "1dba81a7faf2406ca6ba5b0011c0074a", -0.445, 0.880 },
+			{ "ddb4d23bac92475cb866f83245fff47c", -0.020, 0.765 },
+			{ "49b5687d7cca4d5bb615e3288e412f21", 0.035, 0.760 },
+			{ "dd4ed7fb74be44c688801d9f7d4ab3bd", 0.115, 0.800 },
+		}
+	end
+
+	method table GetDieFrames()
+		-- 소멸 6프레임. 프레임별 딜레이가 달라(100/100/120/130/140/300ms) 누적 시간표로 스텝한다.
+		return {
+			{ "f1689a5814974874836eb3824f3ed576", 0.085, 0.920 },
+			{ "1afa60a09a3d48d9bf02cdb64e622990", 0.040, 0.755 },
+			{ "f93a056cb91c44198b77253c86e2cd5f", -0.050, 0.755 },
+			{ "878a9bbf70014003ab8c8d20e551b101", -0.025, 0.810 },
+			{ "f07120bbac0444cf822dd9dcda1a95ae", 0.035, 0.875 },
+			{ "94aac94c92074c7e9b77021369162b5c", -0.045, 1.745 },
+		}
+	end
+
+	method integer GetDieFrameIndex(number elapsed)
+		-- die 클립의 누적 딜레이표에서 현재 프레임 인덱스(1-based)를 찾는다.
+		local acc = { 0.10, 0.20, 0.32, 0.45, 0.59, 0.89 }
+		for i = 1, 6 do
+			if elapsed < acc[i] then return i end
+		end
+		return 6
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 클라: 위치(임계감쇠 추종) + 프레임 교체 + 좌우 방향 + 페이드인.
+		local tr = self.Entity.TransformComponent
+		if not isvalid(tr) then return end
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+
+		-- 맵 자식이라 부모는 맵이다. 주인은 @Sync로 받은 OwnerEntity로 잡는다.
+		-- 아직 동기화가 안 왔거나(스폰 직후 몇 프레임) 주인이 사라졌으면 제자리에 머문다.
+		local owner = self.OwnerEntity
+		if not isvalid(owner) or not isvalid(owner.TransformComponent) then return end
+		local pw = owner.TransformComponent.WorldPosition
+
+		local look = 1
+		local ctrl = owner.PlayerControllerComponent
+		if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
+
+		-- 정위치(홈) = 주인 뒤쪽 1.1 / 위 0.75 + 완만한 부양.
+		-- ⚠ 여기서 정한 값에 프레임 오프셋(+0.7~0.9)이 더 얹혀서 화면상 높이가 된다.
+		-- 처음 1.6을 줬더니 실측 dy가 2.35까지 올라가 머리 위로 한참 떠버렸다 → 0.75로 낮춤.
+		self._T.bobT = (self._T.bobT or 0) + delta
+		local homeX = pw.x - look * 1.1
+		local homeY = pw.y + 0.75 + math.sin(self._T.bobT * 1.2) * 0.13
+
+		if self._T.posX == nil then
+			self._T.posX = homeX
+			self._T.posY = homeY
+			self._T.velX = 0
+			self._T.velY = 0
+		end
+
+		-- ⚠ 텔레포트 대응은 "델타를 같이 실어주기"가 아니라 **맵 자식으로 스폰**하는 것으로 푼다.
+		-- (플레이어 자식이던 시절엔 부모가 워프하면 자식도 같이 순간이동해 버려서, 델타를 실어
+		--  상대 위치를 유지시켰었다. 하지만 요청은 "용 소환처럼 천천히 따라오기"라 아예 부모를
+		--  맵으로 바꿔 워프의 영향을 받지 않게 했다 - 이제 주인이 워프해도 바하뮤트는 그 자리에
+		--  남고 아래 SmoothDamp로 서서히 날아간다.)
+
+		-- ── 자연스러운 추종(임계감쇠 SmoothDamp) ────────────────────────────────
+		-- 등속 추종(프리져/피닉스 방식)은 주인이 한 발짝만 움직여도 소환수가 즉시 같은 속도로
+		-- 끌려가 "붙어다니는" 느낌이 난다. 여기서는 스프링 가속도로 따라가므로
+		-- 멀어질수록 천천히 가속했다가 다가오면서 스스로 감속한다(오버슈트 없음).
+		local smoothTime = 0.55
+		local maxSpeed = 9.0
+		local omega = 2.0 / smoothTime
+		local xTerm = omega * delta
+		local expTerm = 1.0 / (1.0 + xTerm + 0.48 * xTerm * xTerm + 0.235 * xTerm * xTerm * xTerm)
+		local maxChange = maxSpeed * smoothTime
+
+		local changeX = self._T.posX - homeX
+		if changeX > maxChange then changeX = maxChange end
+		if changeX < -maxChange then changeX = -maxChange end
+		local baseX = self._T.posX - changeX
+		local tempX = (self._T.velX + omega * changeX) * delta
+		self._T.velX = (self._T.velX - omega * tempX) * expTerm
+		local nx = baseX + (changeX + tempX) * expTerm
+
+		local changeY = self._T.posY - homeY
+		if changeY > maxChange then changeY = maxChange end
+		if changeY < -maxChange then changeY = -maxChange end
+		local baseY = self._T.posY - changeY
+		local tempY = (self._T.velY + omega * changeY) * delta
+		self._T.velY = (self._T.velY - omega * tempY) * expTerm
+		local ny = baseY + (changeY + tempY) * expTerm
+
+		-- 맵 이동/텔레포트처럼 좌표가 통째로 튄 경우에만 즉시 복귀(추종이 아니라 재배치).
+		local gapX = homeX - nx
+		local gapY = homeY - ny
+		if (gapX * gapX + gapY * gapY) > 625 then
+			nx = homeX
+			ny = homeY
+			self._T.velX = 0
+			self._T.velY = 0
+		end
+
+		local moveDist = math.sqrt((nx - self._T.posX) ^ 2 + (ny - self._T.posY) ^ 2)
+		local speed = (delta > 0) and (moveDist / delta) or 0
+		self._T.posX = nx
+		self._T.posY = ny
+
+		-- 소유 클라만 실제 월드좌표를 서버에 보고한다(서버의 적 탐색 기준점).
+		if _UserService.LocalPlayer == owner then
+			self._T.reportTimer = (self._T.reportTimer or 0) + delta
+			if self._T.reportTimer >= 0.15 then
+				self._T.reportTimer = 0
+				self:ReportBahamutPos(nx, ny)
+			end
+		end
+
+		-- ── 프레임 선택 ─────────────────────────────────────────────────────────
+		if self._T.spawnClock == nil then self._T.spawnClock = _UtilLogic.ElapsedSeconds end
+		local sinceSpawn = _UtilLogic.ElapsedSeconds - self._T.spawnClock
+
+		-- 공격 모션은 AtkSeq가 바뀌는 순간 처음부터 다시 재생한다.
+		if self.AtkSeq ~= (self._T.lastAtkSeq or 0) then
+			self._T.lastAtkSeq = self.AtkSeq
+			self._T.atkT = 0
+		end
+
+		local frames
+		local idx = 1
+		if self.Dying then
+			if self._T.dieT == nil then self._T.dieT = 0 end
+			self._T.dieT = self._T.dieT + delta
+			frames = self:GetDieFrames()
+			idx = self:GetDieFrameIndex(self._T.dieT)
+		elseif sinceSpawn < 0.72 then
+			frames = self:GetSummonedFrames()
+			idx = math.floor(sinceSpawn / 0.12) + 1
+			if idx > 6 then idx = 6 end
+		elseif self.AtkState == "atk" then
+			self._T.atkT = (self._T.atkT or 0) + delta
+			frames = self:GetAttackFrames()
+			idx = math.floor(self._T.atkT / 0.09) + 1
+			if idx > 18 then idx = 18 end
+		else
+			-- 이동/제자리 전환은 히스테리시스로(부양 흔들림 때문에 매 프레임 클립이
+			-- 재시작돼 경직처럼 보이는 것을 막는다 - 프리져에서 실측된 함정).
+			if self._T.movingAnim then
+				if speed < 0.35 then self._T.movingAnim = false end
+			else
+				if speed > 0.9 then self._T.movingAnim = true end
+			end
+			self._T.loopT = (self._T.loopT or 0) + delta
+			frames = self._T.movingAnim and self:GetFlyFrames() or self:GetStandFrames()
+			idx = (math.floor(self._T.loopT / 0.15) % 6) + 1
+		end
+
+		local frame = frames[idx]
+		if frame == nil then return end
+
+		-- ── 방향 ───────────────────────────────────────────────────────────────
+		local face = look
+		if self.AtkState == "atk" then
+			face = self.FacingX
+		elseif speed > 0.6 then
+			local moved = nx - (self._T.prevX or nx)
+			if math.abs(moved) > 0.0008 then
+				self._T.faceMove = (moved > 0) and 1 or -1
+			end
+			face = self._T.faceMove or look
+		end
+		self._T.prevX = nx
+		local flipped = (face > 0)
+		sr.FlipX = flipped   -- 시트 원본이 왼쪽을 봄 → 오른쪽 볼 때만 Flip
+
+		-- ── 적용 ───────────────────────────────────────────────────────────────
+		local scale = 0.85
+		-- 좌우 반전하면 앵커 기준 x오프셋도 같이 뒤집힌다(안 뒤집으면 방향 바꿀 때 옆으로 튄다).
+		local offX = frame[2] * scale
+		if flipped then offX = -offX end
+		local offY = frame[3] * scale
+		-- 맵 자식이라 로컬 == 월드. (플레이어 자식이던 시절엔 부모 좌표를 빼야 했다)
+		tr.Position = Vector3(nx + offX, ny + offY, 0)
+		tr.Scale = Vector3(scale, scale, 1)
+		if sr.SpriteRUID ~= frame[1] then sr.SpriteRUID = frame[1] end
+		if sr.SortingLayer ~= "MapLayer0" then sr.SortingLayer = "MapLayer0" end
+		if sr.OrderInLayer ~= 3 then sr.OrderInLayer = 3 end
+
+		-- 페이드인 0.4초. 소멸 중에는 끝으로 갈수록 흐려진다.
+		if self._T.fadeStart == nil then self._T.fadeStart = _UtilLogic.ElapsedSeconds end
+		local alpha = math.min(1.0, math.max(0.0, (_UtilLogic.ElapsedSeconds - self._T.fadeStart) / 0.4))
+		if self.Dying then
+			local d = (self._T.dieT or 0)
+			if d > 0.45 then alpha = math.max(0.0, 1.0 - (d - 0.45) / 0.5) end
+		end
+		sr.Color = Color(1, 1, 1, alpha)
+	end
+
+end
