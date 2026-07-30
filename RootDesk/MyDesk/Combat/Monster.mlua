@@ -36,12 +36,125 @@ script Monster extends Component
     handler HandleHitEvent(HitEvent event)
         if self.IsDead then return end
         self.Hp = self.Hp - event.TotalDamage
+        -- 예약 데미지(ReserveDamage)로 미리 잡아둔 몫이 실제로 들어왔으므로 그만큼 덜어낸다.
+        -- 안 덜면 "Hp는 이미 줄었는데 예약은 그대로" 상태가 되어 아직 여유가 있는 몬스터까지
+        -- 치사 예약으로 오판해 대상 선정에서 빠진다.
+        self:ConsumeReservedDamage(event.TotalDamage)
         log("Monster: Hit! TotalDamage=" .. tostring(event.TotalDamage) .. " Hp=" .. tostring(self.Hp))
         self:PlayHitSound()
         if self.Hp <= 0 then
+            -- (요청) 럭키세븐/트리플/쿼드러플 스로우처럼 표창을 여러 발 던지는 스킬은 **마지막 발에만**
+            -- 죽어야 한다("hit 사운드를 온전히 다 들려주고 죽는 모션을 늦추기 위함").
+            -- 유예 창이 열려 있는 동안은 HP가 0 이하로 떨어져도 죽지 않고 1로 버틴다 - 그래서
+            -- 남은 표창들도 정상 피격으로 처리되어 타격음/타격 이펙트/데미지 숫자가 전부 나온다.
+            -- 마지막 표창이 유예를 해제한 뒤 때리므로 그 타격에 죽는다.
+            if self._T.deathDeferUntil ~= nil and _UtilLogic.ServerElapsedSeconds < self._T.deathDeferUntil then
+                self.Hp = 1
+                -- 이미 치명타를 받았다는 표시. 다음 공격의 대상 선정에서 제외해야, 곧 죽을 몬스터
+                -- 자리에 또 공격이 날아가 빈 자리에 데미지가 뜨는 일이 없다(IsDeathPending 참고).
+                self._T.pendingDeath = true
+                log("Monster: 사망 유예 중 - HP 1로 버팀 (남은 타격까지 대기)")
+                return
+            end
             self.Hp = 0
             self:Dead()
         end
+    end
+
+    -- 사망 유예: 지정 시간 동안은 HP가 0 이하가 되어도 죽지 않고 1로 버틴다.
+    -- 다중 타격 스킬이 "마지막 타에만 죽이기"를 구현할 때 쓴다. 마지막 타 직전에 ClearDeathDefer를
+    -- 호출해 유예를 풀어야 하며, 마지막 타가 유실되더라도 이 시간이 지나면 자동으로 풀린다(영구 무적 방지).
+    @ExecSpace("ServerOnly")
+    method void DeferDeath(number seconds)
+        -- 사망 유예 창을 지금부터 seconds 동안 연다(이미 열려 있으면 더 늦은 쪽으로 갱신).
+        local until_ = _UtilLogic.ServerElapsedSeconds + seconds
+        if self._T.deathDeferUntil == nil or self._T.deathDeferUntil < until_ then
+            self._T.deathDeferUntil = until_
+        end
+    end
+
+    -- 이미 치명타를 받아 "마지막 타에 죽기"만 기다리는 상태인지.
+    -- ⚠ 왜 필요한가: 스킬 쿨다운이 마지막 표창이 도달하기 전에 끝나서, 다음 시전이 이 몬스터를
+    --   여전히 살아있는(HP 1) 대상으로 잡아버렸다. 그 직후 몬스터가 죽으면 다음 시전의 표창들이
+    --   빈 자리로 날아가 데미지 숫자만 뜬다(신고: "죽은 몬스터 자리에 다음 공격을 하며 데미지가 뜬다").
+    --   → 대상 선정에서 이 상태를 죽은 것으로 취급한다.
+    --   유예 창이 만료되면(마지막 타 유실) 다시 정상 대상이 되어 영구 무적이 되지 않는다.
+    @ExecSpace("ServerOnly")
+    method boolean IsDeathPending()
+        -- 치명타를 받고 사망 유예 창 안에서 대기 중인지, 또는 **아직 도달하지 않은 공격의 예약
+        -- 데미지만으로 이미 죽는 것이 확정**됐는지(ReserveDamage 참고).
+        if self:IsLethalReserved() then return true end
+        if self._T.pendingDeath ~= true then return false end
+        if self._T.deathDeferUntil == nil then return false end
+        return _UtilLogic.ServerElapsedSeconds < self._T.deathDeferUntil
+    end
+
+    -- ── 예약 데미지(선고 데미지) ─────────────────────────────────────────────
+    -- (요청) 럭키세븐/트리플 스로우/쿼드러플 스로우처럼 **시전 시점에 대상 하나를 찍어놓고**
+    -- 표창을 날리는 단일 표적 스킬은, 표창이 도착하기 전에 다음 시전이 같은 몬스터를 다시 찍어
+    -- "이전 공격으로 이미 죽는 몬스터의 빈 자리"로 표창을 날리는 문제가 있었다.
+    --
+    -- ⚠ 기존 IsDeathPending(사망 유예)만으로는 못 막는다: 유예는 **첫 표창이 실제로 맞은 뒤**에야
+    --   열리는데, 시전~첫 표창 도달까지 0.4초 + 비행 시간의 공백이 있어 그 사이에 들어온 다음
+    --   시전은 몬스터를 여전히 멀쩡한 대상으로 본다.
+    -- → 시전하는 쪽(PlayerAttack.AttackStarThrow)이 이번 공격의 총 데미지를 **미리 굴려** 여기에
+    --   적어두고, `Hp - 예약 <= 0`이면 이 몬스터는 죽은 것으로 취급해 대상 선정에서 제외한다.
+    --
+    -- 예약은 (1) 실제 피격으로 그만큼 소진되거나(ConsumeReservedDamage), (2) 표창이 유실돼
+    -- 시간이 지나면 자동 만료된다 - 그래서 영구히 대상에서 빠지는 일이 없다.
+    @ExecSpace("ServerOnly")
+    method void ReserveDamage(integer amount, number seconds)
+        -- 아직 도달하지 않은 공격의 데미지를 예약해둔다(누적).
+        if self.IsDead then return end
+        if amount == nil or amount <= 0 then return end
+        local cur = self:GetReservedDamage()
+        self._T.reservedDamage = cur + amount
+        local until_ = _UtilLogic.ServerElapsedSeconds + ((seconds ~= nil and seconds > 0) and seconds or 3.0)
+        if self._T.reservedUntil == nil or self._T.reservedUntil < until_ then
+            self._T.reservedUntil = until_
+        end
+        log("Monster: 예약 데미지 " .. tostring(amount) .. " 등록 (누적=" .. tostring(self._T.reservedDamage)
+            .. " Hp=" .. tostring(self.Hp) .. " 치사예약=" .. tostring(self.Hp - self._T.reservedDamage <= 0) .. ")")
+    end
+
+    @ExecSpace("ServerOnly")
+    method integer GetReservedDamage()
+        -- 지금 유효한 예약 데미지 총량. 만료됐으면 0으로 정리하고 돌려준다.
+        if self._T.reservedDamage == nil then return 0 end
+        if self._T.reservedUntil == nil or _UtilLogic.ServerElapsedSeconds >= self._T.reservedUntil then
+            self._T.reservedDamage = nil
+            self._T.reservedUntil = nil
+            return 0
+        end
+        return self._T.reservedDamage
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ConsumeReservedDamage(integer amount)
+        -- 실제로 들어온 데미지만큼 예약을 덜어낸다.
+        local cur = self:GetReservedDamage()
+        if cur <= 0 then return end
+        local left = cur - ((amount ~= nil) and amount or 0)
+        if left <= 0 then
+            self._T.reservedDamage = nil
+            self._T.reservedUntil = nil
+        else
+            self._T.reservedDamage = left
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsLethalReserved()
+        -- 예약 데미지만으로 이번에 죽는 것이 확정된 상태인지.
+        local r = self:GetReservedDamage()
+        if r <= 0 then return false end
+        return (self.Hp - r) <= 0
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ClearDeathDefer()
+        -- 사망 유예를 즉시 해제한다(마지막 타가 들어가기 직전에 호출).
+        self._T.deathDeferUntil = nil
     end
 
     @ExecSpace("Multicast")
@@ -61,6 +174,10 @@ script Monster extends Component
     method void Dead()
         if self.IsDead then return end
         self.IsDead = true
+        self._T.pendingDeath = nil
+        self._T.deathDeferUntil = nil
+        self._T.reservedDamage = nil
+        self._T.reservedUntil = nil
         local sc = self.Entity.StateComponent
         if isvalid(sc) then
             sc:ChangeState("DEAD")
@@ -152,6 +269,10 @@ script Monster extends Component
     method void Respawn()
         self.IsDead = false
         self.Hp = self.MaxHp
+        self._T.pendingDeath = nil
+        self._T.deathDeferUntil = nil
+        self._T.reservedDamage = nil
+        self._T.reservedUntil = nil
         self.Entity.Enable = true
         self.Entity.Visible = true
         -- (버그 수정) 최초 배치 위치로 되돌린다. Body가 붙어 있으면 TransformComponent.Position 대입은

@@ -9,6 +9,7 @@ script ShadowPartnerVisual extends Component
 
 	property any parentStateHandler = nil
 	property any parentBodyHandler = nil
+	property any frameHandler = nil
 
 	method void OnBeginPlay()
 		self._T.age = 0
@@ -44,10 +45,49 @@ script ShadowPartnerVisual extends Component
 			end
 		end
 
+		-- 그림자 자신의 프레임 진행을 구독한다 - Onetime 모션을 마지막 프레임에서 멈추는 데 쓴다(아래 참고).
+		self.frameHandler = self.Entity:ConnectEvent(SpriteAnimPlayerChangeFrameEvent, self.OnShadowFrameChanged)
+
 		-- 리스너 연결 시점에 이미 대기 중이던 상태를 한 번 반영해 최초 활성화 직후에도 자세가 어긋나지 않게 한다.
 		if isvalid(sc) then
 			self:ApplyStateSprite(sc.CurrentStateName)
 		end
+	end
+
+	method void OnShadowFrameChanged(SpriteAnimPlayerChangeFrameEvent event)
+		-- (버그 수정) "쉐도우 파트너로 여러 스킬을 쓸 때 그림자 모션이 본체와 다르다(예: 더블스탭)"
+		-- 원인: 본체 아바타는 스킬 모션을 SpriteAnimClipPlayType.Onetime으로 재생해 한 번 재생 후
+		-- 마지막 자세에서 멈추는데, 그림자 쪽 SpriteRendererComponent에는 **재생 방식(Onetime/Loop)
+		-- 설정 자체가 없어** 클립이 계속 루프한다. 그래서 본체는 두 번 찌르고 멈추는데 그림자만
+		-- 계속 반복해 찌르는 것처럼 보였다.
+		-- 대응: 본체가 Onetime으로 보낸 모션은 마지막 프레임에 닿는 순간 그 프레임에 고정해 Onetime을 흉내낸다.
+		if self._T.oneShotPending ~= true then return end
+		local last = event.TotalFrameCount - 1
+		local endIdx = self._T.motionEndFrame or 2147483647
+		if endIdx < last then last = endIdx end
+		if last < 0 then return end
+		if event.FrameIndex < last then return end
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+		sr.StartFrameIndex = last
+		sr.EndFrameIndex = last
+		self._T.oneShotPending = false
+	end
+
+	method number GetParentStatePlayRate(string stateName)
+		-- 본체 아바타가 그 상태를 재생할 때 쓰는 PlayRate(예: MOVE=walk 1.68, ATTACK=attack 1.33).
+		-- AvatarStateAnimationComponent의 매핑표에서 직접 읽는다. 없으면 1.0.
+		local parent = self.Entity.Parent
+		if not isvalid(parent) then return 1.0 end
+		local asac = parent.AvatarStateAnimationComponent
+		if not isvalid(asac) then return 1.0 end
+		local sheet = asac.StateToAvatarBodyActionSheet
+		if sheet == nil then return 1.0 end
+		local elem = sheet[stateName]
+		if elem == nil then return 1.0 end
+		local rate = elem.PlayRate
+		if rate == nil or rate <= 0 then return 1.0 end
+		return rate
 	end
 
 	method void OnParentStateChange(StateChangeEvent event)
@@ -63,7 +103,8 @@ script ShadowPartnerVisual extends Component
 		-- 이질감이 있었다. SpriteRendererComponent에도 StartFrameIndex/EndFrameIndex/PlayRate가 있으므로
 		-- 본체에 보낸 이벤트의 값을 그대로 복사해, 그림자도 정확히 같은 프레임/같은 속도로 맞춘다.
 		-- (일반 스킬은 기본값(0 / 2147483647 / 1)이 그대로 넘어와 기존 동작과 동일하다.)
-		self:ApplyMotionSprite(event.CoreActionName, event.StartFrameIndex, event.EndFrameIndex, event.PlayRate)
+		self:ApplyMotionSprite(event.CoreActionName, event.StartFrameIndex, event.EndFrameIndex, event.PlayRate,
+			event.PlayType == SpriteAnimClipPlayType.Onetime)
 	end
 
 	method void ResetSpriteFrameControl()
@@ -78,6 +119,8 @@ script ShadowPartnerVisual extends Component
 
 	method void ApplyStateSprite(string stateName)
 		self:ResetSpriteFrameControl()
+		-- 상태 모션은 루프가 정상이므로 Onetime 고정 예약을 반드시 해제한다.
+		self._T.oneShotPending = false
 		local map = {
 			IDLE = "f4aba8c33f204125a231595006d84b4a",
 			MOVE = "74c3a6b4f33e481ebdd241d1cd92370e",
@@ -95,10 +138,14 @@ script ShadowPartnerVisual extends Component
 		local sr = self.Entity.SpriteRendererComponent
 		if isvalid(sr) then
 			sr.SpriteRUID = ruid
+			-- (버그 수정) "그림자 모션 속도가 본체와 다르다" - 상태 모션은 본체 아바타가 매핑표의
+			-- PlayRate로 재생하는데(MOVE=walk 1.68 등) 그림자는 ResetSpriteFrameControl이 1.0으로
+			-- 되돌려 눈에 띄게 느렸다. 본체와 같은 배속을 그대로 가져온다.
+			sr.PlayRate = self:GetParentStatePlayRate(stateName)
 		end
 	end
 
-	method void ApplyMotionSprite(string motionName, integer startFrameIdx, integer endFrameIdx, number playRate)
+	method void ApplyMotionSprite(string motionName, integer startFrameIdx, integer endFrameIdx, number playRate, boolean oneShot)
 		local map = {
 			proneStab = "06184b0d6c0446c6944827222843b399",
 			prone = "d41f649cd95341a29a1bdf24b629b6c1",
@@ -144,6 +191,10 @@ script ShadowPartnerVisual extends Component
 		sr.StartFrameIndex = startFrameIdx
 		sr.EndFrameIndex = endFrameIdx
 		sr.PlayRate = playRate
+		-- Onetime 모션이면 마지막 프레임에서 멈추도록 예약한다(OnShadowFrameChanged 참고).
+		-- 이미 한 프레임만 재생하는 포즈(Start == End)는 루프해도 정지 화면이라 흉내낼 필요가 없다.
+		self._T.motionEndFrame = endFrameIdx
+		self._T.oneShotPending = (oneShot == true) and (startFrameIdx ~= endFrameIdx)
 	end
 
 	method void OnUpdate(number delta)
@@ -165,6 +216,9 @@ script ShadowPartnerVisual extends Component
 	end
 
 	method void OnEndPlay()
+		if self.frameHandler then
+			self.Entity:DisconnectEvent(SpriteAnimPlayerChangeFrameEvent, self.frameHandler)
+		end
 		local parent = self.Entity.Parent
 		if isvalid(parent) then
 			if self.parentStateHandler then

@@ -34,8 +34,21 @@ script LuckySevenProjectileAttack extends AttackComponent
 		return __base:IsAttackTarget(defender, attackInfo)
 	end
 
+	method integer ApplyBackstabToDamage(integer dmg, Entity defender, string attackInfo)
+		-- (백스탭) 시전자가 대상이 바라보는 방향의 뒤쪽에 있으면 추가 데미지를 얹은 값을 돌려준다.
+		-- 판정과 배율(포인트 1당 +5%)은 시전자의 PlayerAttack 한 곳에서만 관리한다 - 투사체 스킬들이
+		-- 같은 규칙을 공유하고, ON/OFF·투자 포인트도 그쪽에만 있다.
+		if not isvalid(self.OwnerEntity) then return dmg end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return dmg end
+		return pa:ApplyBackstabBonus(dmg, self.OwnerEntity, defender, attackInfo)
+	end
+
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
-		-- 표창 1개당 전투력의 100%~150% 데미지.
+		-- 표창 1개당 전투력의 100%~150% 데미지(럭키세븐 기본 규격).
+		-- 배율은 투사체의 DamageRateMin/Max에서 읽는다 - 아대 기본공격 표창은 발사 시점에
+		-- 0.5/1.0(50%~100%)으로 낮춰 넣기 때문이다.
 		-- (기능 변경) 쉐도우 파트너의 "타수 2배"는 이 진짜 히트 하나 안에서 원본+보너스(원본의 55~65%)를
 		-- 합산해 적용하고, 표시는 OnHit이 원본/보너스를 서로 다른 위치의 2줄로 나눠 띄운다 - 그림자가
 		-- 던지는 에코 표창은 시각 전용(무데미지)이다.
@@ -44,13 +57,32 @@ script LuckySevenProjectileAttack extends AttackComponent
 		local combatPower = 0
 		local echoOn = false
 		local critRate = 0.5
+		local rateMin = 1.0
+		local rateMax = 1.5
 		if proj ~= nil then
 			combatPower = proj.CombatPower
 			echoOn = proj.ShadowEchoOn
 			critRate = (proj.CritRate or 50) / 100
+			rateMin = proj.DamageRateMin or 1.0
+			rateMax = proj.DamageRateMax or 1.5
 		end
-		local mult = 1.0 + math.random() * (1.5 - 1.0)
+		-- (요청) 단일 표적 스킬(럭키세븐/트리플/쿼드러플 스로우)은 **시전 시점에** 데미지를 확정한다.
+		-- 시전 시점에 굴린 값이 있으면 여기서 다시 굴리지 않고 그대로 쓴다 - 그 값으로 "이번 공격에
+		-- 대상이 죽는지"를 판정해 다음 공격의 대상 선정에서 제외했으므로(Monster.ReserveDamage),
+		-- 실제 적용 데미지가 그 판정과 어긋나면 안 된다.
+		if proj ~= nil and proj.PreRolled then
+			self._T.lastDamage = proj.PreDamage
+			self._T.lastBonus = proj.PreBonus
+			self._T.lastDamageIsCritical = proj.PreDamageCritical
+			self._T.lastBonusIsCritical = proj.PreBonusCritical
+			return proj.PreDamage + proj.PreBonus
+		end
+		-- math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 바로 아래 크리티컬 굴림이 같은 이유로
+		-- 이미 그렇게 하고 있고, 아대 기본공격은 연타라 짧은 간격 반복 호출이 럭키세븐보다 잦다.
+		local mult = rateMin + _UtilLogic:RandomDouble() * (rateMax - rateMin)
 		local dmg = math.floor(combatPower * mult)
+		-- (백스탭) 뒤통수에서 쏜 발이면 추가 데미지를 얹는다(크리티컬 배율보다 앞에서 적용).
+		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
 		-- (버그 수정) "각자 크리티컬 여부를 캐릭터 정보창의 크리티컬 확률로 독립 판단해야 한다" - 표창
 		-- 하나하나(1번째/2번째)가 이미 독립된 실제 Attack() 히트이므로, 이 히트에 대해서만 크리티컬을
 		-- 굴리고 배율을 반환값에 바로 곱한다(아래 CalcCritical은 엔진의 이중 배율 적용을 막기 위해 계속 false 반환).

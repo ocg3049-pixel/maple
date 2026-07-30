@@ -22,6 +22,9 @@ script BlizzardBgmDucker extends Logic
 		-- 중복 시전 시 진행 중이던 페이드는 새 값으로 갱신된다(타이머를 하나만 유지).
 		if not self:IsClient() then return end
 
+		-- 시간이 정해진 덕킹(블리자드/메테오)은 "유지 모드"(다크사이트)를 덮어쓴다. 이후 EndHoldDuck이
+		-- 들어와도 모드가 달라 아무 일도 하지 않으므로 이 덕킹이 끝까지 정상 재생된다.
+		self._T.duckMode = "timed"
 		self._T.fadeDown = math.max(fadeDownSeconds, 0.01)
 		self._T.hold = math.max(holdSeconds, 0.0)
 		self._T.fadeUp = math.max(fadeUpSeconds, 0.01)
@@ -41,8 +44,83 @@ script BlizzardBgmDucker extends Logic
 		log("[BlizzardBgmDucker] BGM 줄이기 시작 min=" .. tostring(minVolume) .. " hold=" .. tostring(holdSeconds))
 	end
 
+	method void StartHoldDuck(number fadeDownSeconds, number minVolume)
+		-- (다크사이트) 지속시간이 정해져 있지 않은 "유지 모드" - 맵 BGM을 서서히 줄인 뒤
+		-- EndHoldDuck이 불릴 때까지 그 음량을 계속 유지한다. 다크사이트 전용 BGM은 BGM 채널이
+		-- 아닌 일반 루프 사운드(PlayLoopSound)로 나가므로 이 덕킹에 함께 줄어들지 않는다.
+		if not self:IsClient() then return end
+
+		self._T.duckMode = "hold"
+		self._T.holdPhase = "down"
+		self._T.fadeDown = math.max(fadeDownSeconds, 0.01)
+		self._T.minVolume = minVolume
+		self._T.elapsed = 0.0
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self:Tick(delta)
+		end, 1 / 30)
+		log("[BlizzardBgmDucker] 유지 모드 BGM 줄이기 시작 min=" .. tostring(minVolume))
+	end
+
+	method void EndHoldDuck(number fadeUpSeconds)
+		-- (다크사이트) 유지 모드를 끝내고 원래 맵 BGM 음량으로 서서히 돌아간다. 그 사이 다른 스킬이
+		-- 시간형 덕킹을 시작해 채널을 가져갔으면(duckMode ~= "hold") 그 덕킹을 끊지 않고 무시한다.
+		if not self:IsClient() then return end
+		if self._T.duckMode ~= "hold" then return end
+		self._T.holdPhase = "up"
+		self._T.fadeUp = math.max(fadeUpSeconds, 0.01)
+		self._T.elapsed = 0.0
+		log("[BlizzardBgmDucker] 유지 모드 BGM 원복 시작")
+	end
+
+	method void TickHold(number delta)
+		-- 유지 모드 보간: BaseVolume → MinVolume(도달 후 계속 유지) → EndHoldDuck 호출 시 BaseVolume.
+		self._T.elapsed = self._T.elapsed + delta
+		local e = self._T.elapsed
+		local minV = self._T.minVolume
+		local baseV = self.BaseVolume
+
+		if self._T.holdPhase == "down" then
+			if e < self._T.fadeDown then
+				_SoundService:SetBGMVolume(baseV + (minV - baseV) * (e / self._T.fadeDown))
+			else
+				self._T.holdPhase = "hold"
+				_SoundService:SetBGMVolume(minV)
+			end
+			return
+		end
+		if self._T.holdPhase == "hold" then
+			_SoundService:SetBGMVolume(minV)
+			return
+		end
+		-- "up": 원래 음량까지 되돌리고 타이머를 정리한다.
+		local up = self._T.fadeUp or 0.01
+		if e < up then
+			_SoundService:SetBGMVolume(minV + (baseV - minV) * (e / up))
+			return
+		end
+		_SoundService:SetBGMVolume(baseV)
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+			self._T.timerId = nil
+		end
+		self._T.duckMode = "none"
+		log("[BlizzardBgmDucker] 유지 모드 BGM 원상복귀 완료")
+	end
+
 	method void Tick(number delta)
 		-- 경과 시간에 따라 BGM 음량을 BaseVolume → MinVolume → BaseVolume 으로 보간한다.
+		if self._T.duckMode == "hold" then
+			self:TickHold(delta)
+			return
+		end
 		self._T.elapsed = self._T.elapsed + delta
 		local e = self._T.elapsed
 		local down = self._T.fadeDown

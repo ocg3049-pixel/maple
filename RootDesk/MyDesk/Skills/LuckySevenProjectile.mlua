@@ -9,20 +9,51 @@ script LuckySevenProjectile extends Component
 
 	property number CombatPower = 0
 
+	-- 표창 1개가 주는 데미지의 전투력 대비 배율 범위. 기본값은 럭키세븐 규격(100%~150%).
+	-- 아대 기본공격이 던지는 표창은 발사 시점에 0.5/1.0(50%~100%)으로 낮춰 넣는다.
+	property number DamageRateMin = 1.0
+	property number DamageRateMax = 1.5
+
 	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcCritical/CalcDamage가
 	-- 서버에서 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 직접 읽을 수 없어, 발사한 플레이어가
 	-- SyncCritRate로 동기화해둔 값을 그대로 넘겨받는다.
 	property number CritRate = 50
 
-	-- 1/2 = 1번째/2번째 표창. ShowDamageSkin이 이 값으로 데미지 숫자가 뜨는 세로 위치를 정한다
-	-- (쉐도우 파트너 중에는 표창마다 원본+보너스 2줄씩, 총 4줄이 전부 겹치지 않게 나뉜다).
+	-- 몇 번째 표창인지(1부터). ShowDamageSkin이 이 값으로 데미지 숫자가 뜨는 세로 위치를 정한다
+	-- (쉐도우 파트너 중에는 표창마다 원본+보너스 2줄씩 나뉜다).
 	property integer HitIndex = 0
+
+	-- (트리플/쿼드러플 스로우) 이 시전이 던지는 표창 총 개수. 데미지 숫자 줄 수와 세로 배치가
+	-- 이 값으로 정해진다(럭키세븐 2발 → 2줄/쉐도우 4줄, 트리플 3발 → 3줄/6줄, 쿼드러플 4발 → 4줄/8줄).
+	property integer TotalShots = 2
+
+	-- 명중 시 재생할 타격 이펙트 animationclip RUID. 스킬마다 다르다(기본값은 럭키세븐 것).
+	property string HitEffectRUID = "458e72f0720a4584a9a7fc3642b6e601"
+
+	-- true면 대상에 맞지 않고 끝났을 때(허공 투척) 데미지 숫자를 띄우지 않고 조용히 사라진다.
+	-- 럭키세븐은 "대상이 먼저 죽어도 표창 2개 분의 숫자가 항상 떠야 한다"가 사양이라 false를 유지하고,
+	-- 아대 기본공격의 **애초에 대상이 없는** 허공 투척만 true로 켠다(허공에 숫자가 뜨면 안 된다).
+	property boolean SilentOnMiss = false
 
 	-- 쉐도우 파트너: true면 그림자 몫의 "시각 전용" 표창 - 데미지/데미지 스킨/히트 이펙트 없이
 	-- 원본을 따라 날아가기만 한다(그림자 스킬 이펙트는 직접적인 데미지를 주지 않는다는 요청).
 	-- 클라이언트의 부착 이펙트(OnSyncProperty)를 투명도 70%로 재생해야 하므로 @Sync로 내린다.
 	@Sync
 	property boolean VisualOnly = false
+
+	-- (요청) "단일 타게팅 스킬은 스킬 사용 시점에 대상과 데미지를 바로 정한다."
+	-- PlayerAttack.AttackStarThrow가 시전 시점에 표창 N발 몫을 미리 굴려 발마다 넣어준다.
+	-- PreRolled=true면 LuckySevenProjectileAttack.CalcDamage가 새로 굴리지 않고 이 값을 그대로 쓴다.
+	--
+	-- ⚠ 왜 미리 굴려야 하는가: 시전 시점에 "이번 공격으로 대상이 죽는다"를 판정해 다음 공격의
+	--   대상 선정에서 제외(Monster.ReserveDamage)하려면, 그 판정에 쓴 데미지가 **실제로 들어가는
+	--   데미지와 동일**해야 한다. 히트 시점에 다시 굴리면 예측보다 적게 나와 죽는다고 선고한
+	--   몬스터가 살아남는 어긋남이 생긴다.
+	property boolean PreRolled = false
+	property integer PreDamage = 0
+	property integer PreBonus = 0
+	property boolean PreDamageCritical = false
+	property boolean PreBonusCritical = false
 
 	-- 원본 표창 전용(서버에서만 읽음): 쉐도우 파트너 버프 중에 발사됐는지 여부.
 	-- 히트 시 원본+보너스(타수 2배) 합산·2줄 표시와 히트 이펙트 시간차 2배 재생에 쓰인다.
@@ -32,6 +63,21 @@ script LuckySevenProjectile extends Component
 	-- 블리자드처럼 스킨을 한시적으로 바꾸는 연출이 이 투사체의 수동 데미지 표시에도 적용되게 하려면
 	-- 하드코딩된 기본 스킨 대신 이 값을 써야 한다(비어 있으면 기본 스킨으로 폴백).
 	property string DamageSkinRUID = ""
+
+	-- (표창+) 던질 표창으로 고른 번호(1~9). PlayerAttack이 발사 시점에 채워준다.
+	-- 클라이언트가 "날아가는 모습"을 이 값으로 정하므로 @Sync로 내린다.
+	@Sync
+	property integer SkinIndex = 1
+
+	-- (표창+) 날아가는 방향. 진행 방향으로 눕히는 데 쓴다.
+	-- FlyDirX < 0 이면 왼쪽으로 던진 것, FlyAngle은 진행 방향 각도(-180~180도, atan2 전 범위).
+	-- ⚠ 예전엔 FlipX를 **진행 방향과 반대로** 걸고(클립 기본이 왼쪽인데 왼쪽 비행에 flip을 켰다)
+	--   기울기도 |dx| 기준으로 계산해서, 좌우도 각도도 맞지 않았다(신고: "오른쪽으로 던지면 반대로 보인다",
+	--   "각도가 안 바뀐다"). 반대로 FlipX를 아예 빼고 회전만 쓰면 오른쪽 비행이 180도 회전이 되어
+	--   **위아래가 뒤집힌다**(신고: "오른쪽으로 날릴 때 이미지 위아래가 바뀐다").
+	--   → 좌우는 FlipX, 기울기는 회전. 구체적인 합성 규칙은 ApplyFlyVisual 주석에 실측값으로 적어뒀다.
+	@Sync property number FlyDirX = 1
+	@Sync property number FlyAngle = 0
 
 	@Sync
 	property boolean Fired = false
@@ -43,31 +89,227 @@ script LuckySevenProjectile extends Component
 			self._T.target = nil
 			self._T.hit = false
 		end
+		-- 클라이언트가 엔티티를 이미 Fired=true 상태로 받는 경우(스폰과 같은 프레임에 발사)는
+		-- 변경 이벤트(OnSyncProperty)가 오지 않으므로 여기서 한 번 확인해 재생한다.
+		if self:IsClient() then
+			self:ApplyFlyVisual()
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnSyncProperty(string name, any value)
-		-- 서버 Fire() 호출로 Fired가 true가 되는 순간, 표창 스프라이트를 엔티티에 부착 재생한다
-		if name == "Fired" and self.Fired then
-			-- 그림자 몫(시각 전용) 표창은 투명도 70%로 재생해 원본과 구분되면서도 같은 모습이 되게 한다.
-			local opts = {}
-			if self.VisualOnly then
-				opts["Alpha"] = 0.7
+		-- 서버 Fire() 호출로 Fired가 true가 되는 순간, 표창 스프라이트를 엔티티에 부착 재생한다.
+		-- ⚠ Fired와 SkinIndex는 같은 프레임에 내려가므로 **도착 순서가 보장되지 않는다**.
+		--   Fired만 보고 재생하면 SkinIndex가 아직 기본값(1)일 때 엉뚱한 표창이 날아갈 수 있어,
+		--   두 프로퍼티 어느 쪽이 와도 같은 함수를 태워 순서에 상관없이 올바른 표창이 되게 한다.
+		if name == "Fired" or name == "SkinIndex" or name == "FlyDirX" or name == "FlyAngle" then
+			-- ⚠ FlyDirX/FlyAngle이 Fired보다 늦게 도착하면, 이미 재생을 시작해 잠가둔 탓에 좌우 반전과
+			--   기울기가 영영 반영되지 않았다(실측 신고: "오른쪽으로 던질 때 좌우가 반대", "각도가 안 바뀜").
+			--   방향 정보가 새로 오면 이전 이펙트를 지우고 올바른 값으로 다시 재생한다.
+			if (name == "FlyDirX" or name == "FlyAngle") and self._T.flyStarted then
+				if self._T.effectSerial ~= nil and self._T.effectSerial ~= 0 then
+					_EffectService:RemoveEffect(self._T.effectSerial)
+					self._T.effectSerial = nil
+				end
+				self._T.flyStarted = false
 			end
+			self:ApplyFlyVisual()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyFlyVisual()
+		-- (표창+) 고른 표창 종류에 맞는 비행 클립을 재생한다. 한 번만 재생한다.
+		-- 전용 비행 클립이 없는 종류(토피/일비)는 여기서 아무것도 재생하지 않고,
+		-- 서버가 띄운 회전 동반 엔티티(SpawnSpinVisualIfNeeded)가 아이콘을 돌리며 대신 보여준다.
+		if not self.Fired then return end
+		if self._T.flyStarted then return end
+		self._T.flyStarted = true
+		-- 그림자 몫(시각 전용) 표창은 투명도 70%로 재생해 원본과 구분되면서도 같은 모습이 되게 한다.
+		local opts = {}
+		if self.VisualOnly then
+			opts["Alpha"] = 0.7
+		end
+		-- (요청) "오른쪽으로 던질 때 좌우가 반대", "몬스터 위치에 따라 날아가는 각도가 바뀌어야 한다",
+		--        "오른쪽으로 날릴 때 이미지 위아래가 바뀐다".
+		--
+		-- info.head = 클립이 아무 회전 없이 기본으로 향하는 각도(0 = 오른쪽, 180 = 왼쪽. 실측값 - 9종 전부 180).
+		--
+		-- ⚠ 회전만으로 좌우를 뒤집으면 안 된다: 180도 회전은 좌우 반전 + **위아래 반전**이라 아트가
+		--   뒤집혀 보인다(신고 내용). 좌우는 반드시 FlipX(거울)로, 기울기만 회전으로 준다.
+		-- ⚠ 합성 순서 실측: FlipX를 켜면 아트가 향하는 기준이 0도(오른쪽)로 바뀌고, zRotation은 그 기준에서
+		--   **반시계 양수**로 그대로 더해진다(flip=true·rot=45 → 우상향 45도로 확인).
+		--   FlipX가 꺼져 있으면 기준이 head이고 렌더 방향 = head + zRotation이다(rot=180 → 오른쪽, -90 → 위).
+		--   => 진행 방향과 같은 쪽을 보게 만든 뒤(flip) 남은 기울기만 회전으로 주면 |회전|이 항상 작아
+		--      위아래가 뒤집히는 일이 없다.
+		local info = _ShurikenLibrary:Get(self.SkinIndex)
+		local goingRight = (self.FlyDirX >= 0)
+		local nativeRight = ((info.head or 0) == 0)
+		opts["FlipX"] = (goingRight ~= nativeRight)
+		local zrot = goingRight and self.FlyAngle or (self.FlyAngle - 180)
+		-- -180~180으로 정규화(왼쪽 비행에서 -355 같은 값이 나와 로그가 읽기 어려워지는 것만 정리).
+		while zrot > 180 do zrot = zrot - 360 end
+		while zrot < -180 do zrot = zrot + 360 end
+		if info.fly ~= "" then
 			self._T.effectSerial = _EffectService:PlayEffectAttached(
-				"551dec3dbf5e4a9f8eae6c9933f41bf2", self.Entity,
-				Vector3(0, 0, 0), 0, Vector3(1, 1, 1), true, opts
+				info.fly, self.Entity,
+				Vector3(0, 0, 0), zrot, Vector3(1, 1, 1), true, opts
 			)
 		end
+		log("[Shuriken] 비행 표창 " .. tostring(self.SkinIndex) .. "번(" .. tostring(info.name)
+			.. ") FlyAngle=" .. tostring(self.FlyAngle) .. " head=" .. tostring(info.head or 0)
+			.. " flipX=" .. tostring(opts["FlipX"]) .. " zrot=" .. tostring(zrot)
+			.. " visualOnly=" .. tostring(self.VisualOnly))
 	end
 
 	@ExecSpace("ServerOnly")
 	method void Fire(Entity target, Vector3 fallbackPos)
 		-- 대상을 향해 발사 시작 (단일 고정 표적 - 이후 OnUpdate에서 계속 추적).
 		-- 비행 중 대상이 죽어서 사라지면 캐스팅 시점에 저장해둔 마지막 위치(fallbackPos)로 계속 날아간다.
+		-- ⚠ 대상이 없을 때는 이 메서드를 부르지 말고 FireNoTarget을 쓸 것 (아래 주석 참고).
 		self._T.target = target
+		self:BeginFly(fallbackPos)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FireNoTarget(Vector3 fallbackPos)
+		-- 대상 없이 정해진 지점(허공)으로만 날아가는 발사.
+		-- ⚠ 왜 별도 진입점인가: Entity 타입 파라미터에 nil을 넘기면 호출이 조용히 실패해
+		--   Fired가 영영 true가 되지 않았고, 그래서 "대상 없는 곳을 공격하면 표창이 아예 안 보인다"는
+		--   신고가 나왔다(실측). 대상이 없을 때는 Entity를 아예 넘기지 않는 경로로 우회한다.
+		self._T.target = nil
+		self:BeginFly(fallbackPos)
+	end
+
+	-- ⚠ 몬스터는 죽어도 **엔티티가 파괴되지 않는다** - Enable=false로 숨겼다가 RespawnDelay 뒤
+	--   Respawn()으로 최초 배치 위치에 되살린다(Combat/Monster.mlua). 그래서 `isvalid(target)`은
+	--   죽은 뒤에도 계속 true다. 이걸 그대로 추적하면 비행 중인 표창이 **부활 지점까지 따라가서
+	--   되살아난 몬스터를 때리고 타격 이펙트까지 씌운다**(신고: "죽었던 몬스터가 hit 이펙트를 달고
+	--   부활한다"). 표창을 여러 발 던지는 트리플/쿼드러플에서 특히 잘 걸린다.
+	--   → 죽은 순간 추적을 끊고, 캐스팅 시점에 저장한 지점으로만 날아가게 한다.
+	-- 다중 표창의 "마지막 타에만 죽기" 처리. 대상 몬스터의 사망 유예 창을 열고/닫는다.
+	@ExecSpace("ServerOnly")
+	method void ApplyDeathDefer()
+		-- 마지막 발이 아니면 유예를 열고(HP 1로 버팀), 마지막 발이면 풀어서 이 타격에 죽게 한다.
+		local mc = self._T.targetMonster
+		if mc == nil or not isvalid(mc) then return end
+		local shots = (self.TotalShots ~= nil and self.TotalShots > 0) and self.TotalShots or 1
+		if self.HitIndex > 0 and self.HitIndex < shots then
+			-- 다음 표창이 도달할 때까지만 버티면 된다(발사 간격 0.07~0.1초 + 비행 시간차).
+			-- 넉넉히 0.8초를 주되 매 타격마다 갱신되고, 마지막 발이 유실돼도 이 시간이면 자동 해제된다.
+			mc:DeferDeath(0.8)
+		else
+			mc:ClearDeathDefer()
+		end
+	end
+
+	-- 마지막 표창이 명중하지 못하고(사거리/수명) 사라지는 경우에도 유예를 풀어준다
+	-- (안 풀면 대상이 최대 0.8초 동안 HP 1로 안 죽는 상태가 남는다).
+	@ExecSpace("ServerOnly")
+	method void ReleaseDeathDefer()
+		-- 사망 유예를 해제한다.
+		local mc = self._T.targetMonster
+		if mc == nil or not isvalid(mc) then return end
+		mc:ClearDeathDefer()
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsTargetGone()
+		-- 대상이 사라졌거나 **죽었는지**(부활 대기 중 포함).
+		local t = self._T.target
+		if not isvalid(t) then return true end
+		if not t.Enable then return true end
+		local mc = self._T.targetMonster
+		if mc ~= nil and isvalid(mc) and mc.IsDead then return true end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method Vector3 GetAimPos(Vector3 fallbackPos)
+		-- 지금 조준해야 할 지점. 대상이 살아있으면 **발밑이 아니라 던진 높이만큼 올린 곳**을 노린다
+		-- (요청: "몬스터의 타격점이 몬스터 발 아래 있어 표창이 어색한 쪽으로 날아간다").
+		-- 대상이 죽었거나 사라졌으면 추적을 끊고 캐스팅 시점에 저장해둔 지점으로 계속 날아간다
+		-- (이미 같은 높이로 맞춰져 있다).
+		if self:IsTargetGone() then
+			if self._T.target ~= nil then
+				self._T.target = nil
+				self._T.targetDied = true
+			end
+			return fallbackPos
+		end
+		if isvalid(self._T.target) then
+			local tp = self._T.target.TransformComponent.Position
+			return Vector3(tp.x, tp.y + _ShurikenLibrary:GetThrowHeight(), tp.z)
+		end
+		return fallbackPos
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginFly(Vector3 fallbackPos)
+		-- Fire / FireNoTarget 공통 본체 - 진행 방향을 계산해 클라이언트에 내리고 비행을 시작한다.
 		self._T.fallbackPos = fallbackPos
+		-- 사망 감지에 쓸 몬스터 컴포넌트를 여기서 한 번만 잡아둔다(IsTargetGone 참고 - 매 프레임
+		-- GetComponent를 피한다).
+		if isvalid(self._T.target) then
+			self._T.targetMonster = self._T.target:GetComponent("script.Monster")
+		end
+		local aim = self:GetAimPos(fallbackPos)
+		if aim ~= nil then
+			local myPos = self.Entity.TransformComponent.Position
+			local dx = aim.x - myPos.x
+			local dy = aim.y - myPos.y
+			self.FlyDirX = (dx < 0) and -1 or 1
+			-- 진행 방향 각도를 그대로(-180~180도) 담는다. 좌우 반전 없이 이 각도만으로 눕힌다.
+			self.FlyAngle = math.deg(math.atan(dy, dx))
+		end
 		self.Fired = true
+		self:SpawnSpinVisualIfNeeded()
+		log("[Shuriken] Fire skin=" .. tostring(self.SkinIndex)
+			.. " dirX=" .. tostring(self.FlyDirX) .. " angle=" .. tostring(self.FlyAngle)
+			.. " hasTarget=" .. tostring(isvalid(self._T.target)))
+	end
+
+	-- (표창+) 전용 비행 클립이 없는 표창(토피/일비)은 아이콘을 직접 회전시키며 날려야 한다는 요청.
+	-- ⚠ 표창 투사체 모델에는 SpriteRendererComponent가 없다(실측 - 비행 모습을 전부 PlayEffectAttached로
+	--   처리하는 모델이다). 그래서 스프라이트를 가진 공용 이펙트 모델을 하나 띄워 따라다니게 하고,
+	--   서버에서 위치·회전을 매 틱 갱신한다(회전을 클라에서 돌리면 서버 트랜스폼 동기화에 덮인다).
+	--
+	-- ⚠ 이 호스트 모델에는 script.SpearBurstFadingEffect가 **기본으로 붙어 있지 않다**(실측 -
+	--   GetComponent가 nil을 돌려준다. 그 컴포넌트는 쓰는 쪽에서 AddComponent해 붙이는 구조다).
+	--   그래서 스프라이트는 우리 SpinningShuriken이 클라이언트에서 직접 입힌다(확대 대조로 렌더 확인).
+	@ExecSpace("ServerOnly")
+	method void SpawnSpinVisualIfNeeded()
+		-- 회전형 표창이면 아이콘을 들고 따라다닐 동반 엔티티를 띄운다.
+		local info = _ShurikenLibrary:Get(self.SkinIndex)
+		if not info.spin then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local pos = self.Entity.TransformComponent.WorldPosition
+		local ent = _SpawnService:SpawnByModelId("spearburstfadingeffect", "shuriken_spin", pos, map)
+		if not isvalid(ent) then return end
+		-- 아이콘 스프라이트의 중심이 엔티티 원점에서 어긋난 양(피벗이 좌하단이라 생기는 값, 실측).
+		-- 이걸 회전시켜 빼주지 않으면 회전축이 모서리라 "제자리 회전"이 아니라 원을 그리며 돈다.
+		self._T.spinOx = info.ox or 0
+		self._T.spinOy = info.oy or 0
+		-- 스프라이트는 **클라이언트에서** 입혀야 한다(서버에서 네이티브 SpriteRUID를 써도 반영되지 않는다).
+		ent:AddComponent("script.SpinningShuriken")
+		---@type SpinningShuriken
+		local sv = ent:GetComponent("script.SpinningShuriken")
+		if sv ~= nil then sv.IconRUID = info.icon end
+		-- 안전장치: 어떤 경로로도 정리되지 않는 경우가 있어(실측 - 맵에 동반 엔티티 4개가 쌓여 있었다)
+		-- 표창 최대 수명보다 조금 뒤에 스스로 사라지게 못을 박아둔다.
+		ent:Destroy(self.MaxLifetime + 0.5)
+		self._T.spinEnt = ent
+		self._T.spinAngle = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearSpinVisual()
+		-- 동반 회전 엔티티 정리(명중/수명 종료 시).
+		if isvalid(self._T.spinEnt) then
+			self._T.spinEnt:Destroy()
+		end
+		self._T.spinEnt = nil
 	end
 
 	@ExecSpace("ServerOnly")
@@ -82,19 +324,34 @@ script LuckySevenProjectile extends Component
 		
 		self._T.lifetime = self._T.lifetime + delta
 		if self._T.lifetime >= self.MaxLifetime then
+			-- 명중하지 못하고 사라지는 경우 - 대상이 사망 유예 상태로 남지 않게 풀어준다.
+			self:ReleaseDeathDefer()
+			self:ClearSpinVisual()
 			_EntityService:Destroy(self.Entity)
 			return
+		end
+
+		-- 회전형 표창: 동반 엔티티를 표창 위치에 붙이고 계속 돌린다(초당 2바퀴).
+		-- ⚠ 아이콘 피벗이 좌하단이라 ZRotation만 주면 스프라이트가 원점 둘레를 도는 것처럼 보인다
+		--   ("제자리 회전이 아니라 이동하며 도는 것 같다"는 신고). 스프라이트 중심 오프셋(ox,oy)을
+		--   같은 각도로 돌려서 위치에서 빼주면 중심이 표창 위치에 고정된 채 제자리에서만 돈다.
+		if isvalid(self._T.spinEnt) then
+			local p = self.Entity.TransformComponent.WorldPosition
+			self._T.spinAngle = ((self._T.spinAngle or 0) + 720 * delta) % 360
+			local th = math.rad(self._T.spinAngle)
+			local ox = self._T.spinOx or 0
+			local oy = self._T.spinOy or 0
+			local rx = ox * math.cos(th) - oy * math.sin(th)
+			local ry = ox * math.sin(th) + oy * math.cos(th)
+			self._T.spinEnt.TransformComponent.WorldPosition = Vector3(p.x - rx, p.y - ry, p.z)
+			self._T.spinEnt.TransformComponent.ZRotation = self._T.spinAngle
 		end
 		
 		-- 대상이 살아있으면 계속 추적하고, 죽어서 사라졌으면 캐스팅 시점에 저장된 마지막 위치로 계속 날아간다
 		-- (럭키세븐은 항상 표창 2개 분의 데미지 표시가 나가야 하므로, 대상 소멸 여부와 무관하게 끝까지 도달시킨다).
-		local aimPos = nil
-		if isvalid(self._T.target) then
-			aimPos = self._T.target.TransformComponent.Position
-		elseif self._T.fallbackPos ~= nil then
-			aimPos = self._T.fallbackPos
-		end
+		local aimPos = self:GetAimPos(self._T.fallbackPos)
 		if aimPos == nil then
+			self:ClearSpinVisual()
 			_EntityService:Destroy(self.Entity)
 			return
 		end
@@ -124,6 +381,7 @@ script LuckySevenProjectile extends Component
 		-- OnHit()이 중복 호출되어 데미지 스킨이 표창 1개당 2번씩(총 4줄) 뜨던 버그가 있었다.
 		if self._T.hit then return end
 		self._T.hit = true
+		self:ClearSpinVisual()
 
 		-- 쉐도우 파트너의 그림자 몫(시각 전용) 표창: 직접적인 데미지를 주지 않는다는 요청 -
 		-- 데미지 판정/데미지 스킨/히트 이펙트 전부 없이 도달 지점에서 조용히 사라진다.
@@ -141,7 +399,16 @@ script LuckySevenProjectile extends Component
 		local damageIsCritical = false
 		local bonusIsCritical = false
 		local landedRealHit = false
-		if ac ~= nil and isvalid(target) then
+		-- ⚠ 대상이 비행 중에 죽었으면 **판정을 아예 하지 않는다**. 몬스터는 죽어도 엔티티가 남아 있고
+		--   잠시 뒤 최초 배치 위치로 부활하는데(Monster.Respawn), 그 자리가 죽은 자리와 비슷하면
+		--   남은 표창의 AttackFrom이 되살아난 몬스터를 때려 "죽었던 몬스터가 hit 이펙트를 달고
+		--   부활"하는 것처럼 보였다(신고). 숫자만 표시 경로로 띄우고 판정/타격 이펙트는 건너뛴다.
+		if ac ~= nil and isvalid(target) and self._T.targetDied ~= true then
+			-- (요청) 표창을 여러 발 던지는 스킬은 **마지막 발에만** 죽어야 한다
+			-- ("hit 사운드를 온전히 다 들려주고 죽는 모션을 늦추기 위함").
+			-- 마지막이 아니면 대상의 사망을 유예해 HP 1로 버티게 하고, 마지막 발이면 유예를 풀어 죽게 한다.
+			-- ⚠ 반드시 AttackFrom(실제 데미지 적용) **전에** 해야 한다.
+			self:ApplyDeathDefer()
 			local hitList = ac:AttackFrom(
 				Vector2(self.HitRadius * 2, self.HitRadius * 2),
 				pos:ToVector2(),
@@ -156,6 +423,22 @@ script LuckySevenProjectile extends Component
 				bonusIsCritical = ac._T.lastBonusIsCritical or false
 			end
 		end
+		if not landedRealHit and self.SilentOnMiss then
+			-- 애초에 대상이 없어 허공으로 던진 표창: 도달 지점에서 조용히 사라진다(숫자/이펙트 없음).
+			log("[Shuriken] 허공 투척 표창 도달 - 표시 없이 소멸")
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+		if self._T.targetDied == true then
+			-- 비행 중에 대상이 죽은 표창: **아무 표시도 하지 않고** 사라진다.
+			-- 예전엔 "럭키세븐은 표창 개수만큼 숫자가 항상 떠야 한다"는 사양 때문에 표시용 데미지를
+			-- 계산해 띄웠는데, 지금은 사망 유예(Monster.DeferDeath)가 "마지막 타에만 죽기"를 보장하므로
+			-- 한 시전의 모든 표창이 살아있는 대상에 정상으로 꽂힌다 - 이 경로는 다른 원인으로 대상이
+			-- 먼저 죽은 예외 상황뿐이고, 그때 빈 자리에 숫자가 뜨는 게 문제였다(신고).
+			log("[Shuriken] 비행 중 대상 사망 - 표시 없이 소멸")
+			_EntityService:Destroy(self.Entity)
+			return
+		end
 		if not landedRealHit then
 			-- 대상이 먼저 죽어서 사라진 경우: 실제 타격 판정은 없지만, 럭키세븐은 표창 분의
 			-- 데미지 숫자가 항상 떠야 하므로 동일한 공식으로 표시용 데미지만 계산해 보여준다.
@@ -164,42 +447,70 @@ script LuckySevenProjectile extends Component
 			-- 크리티컬을 항상 false로 고정해서 결과적으로 2번째 줄만 크리티컬이 거의 안 뜨는 것처럼
 			-- 보였다"는 신고 - 실제 판정이 없다는 이유로 크리티컬 자체를 꺼둔 것이 원인. 실제 히트와
 			-- 동일하게 CritRate로 독립적으로 굴려 배율을 반영한다(실 데미지에는 영향 없는 표시 전용 값).
-			local critRate = (self.CritRate or 50) / 100
-			local mult = 1.0 + math.random() * (1.5 - 1.0)
-			damage = math.floor(self.CombatPower * mult)
-			damageIsCritical = _UtilLogic:RandomDouble() < critRate
-			if damageIsCritical then
-				damage = math.floor(damage * 2.0)
-			end
-			if self.ShadowEchoOn then
-				bonus = math.floor(damage * (0.55 + math.random() * 0.10))
-				bonusIsCritical = _UtilLogic:RandomDouble() < critRate
-				if bonusIsCritical then
-					bonus = math.floor(bonus * 2.0)
+			-- 시전 시점에 이미 확정해둔 값이 있으면 그것을 그대로 보여준다(재굴림 금지).
+			if self.PreRolled then
+				damage = self.PreDamage
+				bonus = self.PreBonus
+				damageIsCritical = self.PreDamageCritical
+				bonusIsCritical = self.PreBonusCritical
+			else
+				local critRate = (self.CritRate or 50) / 100
+				local mult = 1.0 + math.random() * (1.5 - 1.0)
+				damage = math.floor(self.CombatPower * mult)
+				damageIsCritical = _UtilLogic:RandomDouble() < critRate
+				if damageIsCritical then
+					damage = math.floor(damage * 2.0)
+				end
+				if self.ShadowEchoOn then
+					bonus = math.floor(damage * (0.55 + math.random() * 0.10))
+					bonusIsCritical = _UtilLogic:RandomDouble() < critRate
+					if bonusIsCritical then
+						bonus = math.floor(bonus * 2.0)
+					end
 				end
 			end
 		end
 
-		self:ShowDamageSkin(damage, bonus, self.HitIndex, damageIsCritical, bonusIsCritical, (self.DamageSkinRUID ~= "") and self.DamageSkinRUID or "3271c3e79bf04ecba9a107d55495970d")
-		self:ShowHitEffect(pos.x, pos.y, pos.z, self.ShadowEchoOn)
+		self:ShowDamageSkin(damage, bonus, self.HitIndex, damageIsCritical, bonusIsCritical, (self.DamageSkinRUID ~= "") and self.DamageSkinRUID or "3271c3e79bf04ecba9a107d55495970d", self.TotalShots)
+		-- 대상이 죽은 뒤 도달한 표창은 **타격 이펙트를 재생하지 않는다**. 그 자리에 몬스터가 부활하면
+		-- 이펙트가 되살아난 몬스터 위에서 터져 "hit 이펙트를 달고 부활"하는 것처럼 보인다(신고).
+		-- 데미지 숫자는 럭키세븐 사양대로 계속 띄운다.
+		if self._T.targetDied ~= true then
+			self:ShowHitEffect(pos.x, pos.y, pos.z, self.ShadowEchoOn, self.HitEffectRUID)
+		else
+			log("[Shuriken] 대상이 죽은 뒤 도달 - 숫자만 표시, 타격 이펙트 생략")
+		end
 		_EntityService:Destroy(self.Entity)
 	end
 
 	@ExecSpace("Client")
-	method void ShowDamageSkin(integer damage, integer bonus, integer hitIndex, boolean damageIsCritical, boolean bonusIsCritical, string skinRuid)
+	method void ShowDamageSkin(integer damage, integer bonus, integer hitIndex, boolean damageIsCritical, boolean bonusIsCritical, string skinRuid, integer totalShots)
 		-- (버그 수정) 예전엔 기본 히트 스킨 RUID가 여기 하드코딩돼 있어서, 블리자드처럼 스킨을 한시적으로
 		-- 바꾸는 연출이 표창(다중 타격)에는 적용되지 않았다 - 발사 시점의 스킨을 인자로 받아 그대로 쓴다.
 		-- 대상 엔티티가 이미 사라졌을 수도 있으므로(먼저 죽은 경우) 항상 유효한 표창 자신(self.Entity)에 앵커링한다.
+		local shots = (totalShots ~= nil and totalShots > 0) and totalShots or 2
 		local offsetY = -0.2
 		local bonusGap = 0.15
-		if bonus > 0 then
-			-- (기능 수정) 표창 2발이 각각 원본+보너스 2줄씩 총 4줄이 될 때 기존 간격(0.15)이 좁다는
-			-- 피드백 - "1->2줄" 간격(0.3)과 동일한 단위로 4줄 전체를 -0.45/-0.15/0.15/0.45로
-			-- 재배치한다(버프가 없을 때의 2줄 배치 -0.2/0.15는 그대로 유지).
-			offsetY = (hitIndex == 2) and 0.15 or -0.45
-			bonusGap = 0.3
+		if shots <= 2 then
+			-- 럭키세븐(2발)과 아대 기본공격(1발)은 기존 배치를 그대로 유지한다(숫자 위치가 바뀌지 않도록).
+			if bonus > 0 then
+				-- 표창 2발이 각각 원본+보너스 2줄씩 총 4줄일 때는 "1->2줄" 간격(0.3)과 같은 단위로
+				-- -0.45/-0.15/0.15/0.45로 배치한다(버프가 없을 때의 2줄 배치 -0.2/0.15는 유지).
+				offsetY = (hitIndex == 2) and 0.15 or -0.45
+				bonusGap = 0.3
+			else
+				if hitIndex == 2 then offsetY = 0.15 end
+			end
 		else
-			if hitIndex == 2 then offsetY = 0.15 end
+			-- (트리플/쿼드러플 스로우) 3발·4발은 줄 수가 3/6, 4/8줄로 늘어난다 -
+			-- 전체 줄을 0.3 간격으로 화면 중앙 기준 대칭 배치한다.
+			--   버프 없음: k = hitIndex,        총 lines = shots
+			--   쉐도우 중: k = hitIndex*2 - 1,  총 lines = shots * 2 (원본 바로 위에 보너스)
+			local gap = 0.3
+			local lines = (bonus > 0) and (shots * 2) or shots
+			local k = (bonus > 0) and (hitIndex * 2 - 1) or hitIndex
+			offsetY = (k - (lines + 1) / 2) * gap
+			bonusGap = gap
 		end
 		-- (버그 수정) "각자 크리티컬 여부를 독립적으로 판단해야 한다" - 하드코딩된 false 대신 CalcDamage가
 		-- 독립적으로 굴린 결과를 그대로 전달한다.
@@ -219,12 +530,15 @@ script LuckySevenProjectile extends Component
 	end
 
 	@ExecSpace("Client")
-	method void ShowHitEffect(number px, number py, number pz, boolean echo)
-		-- 타격시 몬스터 위치에서 나오는 모션 + 타격음 (skill/400.img/skill/4001344 리소스팩의 hit/0, _audio/Hit)
+	method void ShowHitEffect(number px, number py, number pz, boolean echo, string hitRuid)
+		-- 타격시 몬스터 위치에서 나오는 모션 + 타격음. 타격 이펙트는 스킬마다 달라서 인자로 받는다
+		-- (럭키세븐 = skill/400.img/skill/4001344의 hit/0, 트리플/쿼드러플 스로우는 각자 팩의 hit/0).
+		-- 타격음은 세 스킬 모두 럭키세븐과 같다는 요청.
 		local mapEnt = self.Entity.CurrentMap
 		if not isvalid(mapEnt) then return end
+		local ruid = (hitRuid ~= nil and hitRuid ~= "") and hitRuid or "458e72f0720a4584a9a7fc3642b6e601"
 		_EffectService:PlayEffect(
-			"458e72f0720a4584a9a7fc3642b6e601", mapEnt,
+			ruid, mapEnt,
 			Vector3(px, py, pz), 0, Vector3(1, 1, 1), false
 		)
 		_SoundService:PlaySound("48c2f4049db54b3b88b9144320d3d41a", 1.0)
@@ -234,7 +548,7 @@ script LuckySevenProjectile extends Component
 			_TimerService:SetTimerOnce(function()
 				if not isvalid(mapEnt) then return end
 				_EffectService:PlayEffect(
-					"458e72f0720a4584a9a7fc3642b6e601", mapEnt,
+					ruid, mapEnt,
 					Vector3(px, py, pz), 0, Vector3(1, 1, 1), false, { ["Alpha"] = 0.7 }
 				)
 				log("[LuckySeven] 그림자 히트이펙트 발동(0.25초 지연) pos=(" .. tostring(px) .. "," .. tostring(py) .. ")")

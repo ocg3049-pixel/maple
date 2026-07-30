@@ -16,6 +16,8 @@ script BlizzardScreenDim extends Logic
 		_UILogic:SetSiblingIndex(ent.UITransformComponent, 0)
 		self.dimSprite.Color = Color(0, 0, 0, 0)
 		ent.Enable = false
+		-- "timed"(블리자드/메테오/제네시스) ↔ "hold"(다크사이트) 두 사용 방식을 구분하는 모드.
+		self._T.dimMode = "none"
 	end
 
 	method Entity GetDimEntity()
@@ -36,6 +38,9 @@ script BlizzardScreenDim extends Logic
 		local ent = self:GetDimEntity()
 		if not isvalid(ent) then return end
 
+		-- 시간이 정해진 트윈(블리자드/메테오/제네시스)은 "유지 모드"(다크사이트)를 덮어쓴다.
+		-- 이후 EndHoldDim이 들어와도 모드가 다르므로 아무 일도 하지 않아 이 트윈이 끝까지 재생된다.
+		self._T.dimMode = "timed"
 		self._T.fadeIn = math.max(fadeInSeconds, 0.01)
 		self._T.hold = math.max(holdSeconds, 0.0)
 		self._T.fadeOut = math.max(fadeOutSeconds, 0.01)
@@ -62,10 +67,105 @@ script BlizzardScreenDim extends Logic
 		log("[BlizzardScreenDim] 어두워짐 시작 hold=" .. tostring(holdSeconds) .. " maxAlpha=" .. tostring(maxAlpha))
 	end
 
+	method void StartHoldDim(number fadeInSeconds, number maxAlpha, number r, number g, number b)
+		-- (다크사이트) 지속시간이 정해져 있지 않은 "유지 모드" - 서서히 어두워진 뒤 EndHoldDim이
+		-- 불릴 때까지 그 밝기를 계속 유지한다. 시간이 정해진 StartDim/StartDimTinted와 같은
+		-- 오버레이 스프라이트 하나를 공유하되, 모드 플래그로 서로를 침범하지 않게 구분한다.
+		if not self:IsClient() then return end
+		local ent = self:GetDimEntity()
+		if not isvalid(ent) then return end
+
+		self._T.dimMode = "hold"
+		self._T.holdPhase = "in"
+		self._T.fadeIn = math.max(fadeInSeconds, 0.01)
+		self._T.maxAlpha = maxAlpha
+		self._T.elapsed = 0.0
+		self._T.dimR = r
+		self._T.dimG = g
+		self._T.dimB = b
+
+		ent.Enable = true
+		_UILogic:SetSiblingIndex(ent.UITransformComponent, 0)
+		self.dimSprite.Color = Color(r, g, b, 0)
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self:Tick(delta)
+		end, 1 / 60)
+		log("[BlizzardScreenDim] 유지 모드 어두워짐 시작 maxAlpha=" .. tostring(maxAlpha))
+	end
+
+	method void EndHoldDim(number fadeOutSeconds)
+		-- (다크사이트) 유지 모드를 끝내고 서서히 밝아진다. 그 사이 다른 스킬이 시간형 트윈을
+		-- 시작해 오버레이를 가져갔으면(dimMode ~= "hold") 그 트윈을 끊지 않도록 아무 일도 하지 않는다.
+		if not self:IsClient() then return end
+		if self._T.dimMode ~= "hold" then return end
+		local ent = self:GetDimEntity()
+		if not isvalid(ent) then return end
+		self._T.holdPhase = "out"
+		self._T.fadeOut = math.max(fadeOutSeconds, 0.01)
+		self._T.elapsed = 0.0
+		-- 아직 다 어두워지지 않은 상태에서 풀릴 수도 있으므로, 지금 알파에서부터 밝아지게 한다.
+		self._T.holdOutFrom = self.dimSprite.Color.a
+		log("[BlizzardScreenDim] 유지 모드 밝아짐 시작 from=" .. tostring(self._T.holdOutFrom))
+	end
+
+	method void TickHold(number delta)
+		-- 유지 모드 보간: 0 → maxAlpha(도달 후 계속 유지) → EndHoldDim 호출 시 0.
+		local ent = self:GetDimEntity()
+		if not isvalid(ent) then return end
+		self._T.elapsed = self._T.elapsed + delta
+		local e = self._T.elapsed
+		local dr = self._T.dimR or 0
+		local dg = self._T.dimG or 0
+		local db = self._T.dimB or 0
+		local maxA = self._T.maxAlpha or 0
+
+		if self._T.holdPhase == "in" then
+			local alpha = maxA
+			if e < self._T.fadeIn then
+				alpha = maxA * (e / self._T.fadeIn)
+			else
+				self._T.holdPhase = "hold"
+			end
+			self.dimSprite.Color = Color(dr, dg, db, alpha)
+			return
+		end
+		if self._T.holdPhase == "hold" then
+			self.dimSprite.Color = Color(dr, dg, db, maxA)
+			return
+		end
+		-- "out": 밝아짐 완료 시 타이머 정리 후 오버레이를 끈다.
+		local fadeOut = self._T.fadeOut or 0.01
+		local from = self._T.holdOutFrom or maxA
+		if e < fadeOut then
+			self.dimSprite.Color = Color(dr, dg, db, from * (1.0 - e / fadeOut))
+			return
+		end
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+			self._T.timerId = nil
+		end
+		self._T.dimMode = "none"
+		self.dimSprite.Color = Color(dr, dg, db, 0)
+		ent.Enable = false
+		log("[BlizzardScreenDim] 유지 모드 밝아짐 완료")
+	end
+
 	method void Tick(number delta)
 		-- 경과 시간에 따라 알파를 0 → maxAlpha → 0 으로 보간한다.
 		local ent = self:GetDimEntity()
 		if not isvalid(ent) then return end
+		if self._T.dimMode == "hold" then
+			self:TickHold(delta)
+			return
+		end
 		self._T.elapsed = self._T.elapsed + delta
 		local e = self._T.elapsed
 		local fadeIn = self._T.fadeIn
