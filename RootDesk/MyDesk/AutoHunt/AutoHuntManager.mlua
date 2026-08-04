@@ -5,6 +5,8 @@ script AutoHuntManager extends Logic
 	-- 용도(버프/소환수/광역/단일)에 맞게 알아서 골라 쓴다.
 	-- · 이동: 클라 권한. 자동 이동 중에만 PlayerController를 끈다(입력 0이 이동을 덮는 문제) - 정지/OFF 시 복구.
 	-- · 위/아래 발판 대상은 점프/다운점프로 따라간다. 걷기/정지 모션은 StateComponent WALK/IDLE로 맞춘다.
+	-- · 동선은 하강 순환: 위(SpawnLocation)에서 시작해 아래층 적이 3배 이상 가까우면 다운점프로
+	--   내려가며 사냥하고, 맨아래에서 사냥감이 끊기면 SpawnLocation으로 복귀해 다시 내려온다.
 	-- · 공격/버프 시전은 전부 실제 버튼 경로(UseSkillInSlot)라 모션·쿨다운·위력 배율이 수동과 동일하다.
 	property boolean autoOn = false
 	property any keyHandler = nil
@@ -277,8 +279,10 @@ script AutoHuntManager extends Logic
 		end
 		local target = self._T.target
 		if target == nil or not isvalid(target) then
-			-- (P2) 몬스터가 없어도 버프/소환수 유지는 계속하고, 그 외에는 배회하며 리젠을 기다린다
+			-- (P2) 몬스터가 없어도 버프/소환수 유지는 계속하고, 그 외에는 배회하며 리젠을 기다린다.
+			-- (요청) 맨아래 층에서 잡을 대상이 없으면(남은 적이 위층뿐이거나 전멸) 위로 복귀한다.
 			if not self:TryUtilityCast(now) then
+				if self:TryBottomReturn(now, player) then return end
 				self:WanderTick(now, player, delta)
 			end
 			return
@@ -325,6 +329,9 @@ script AutoHuntManager extends Logic
 		-- 오인해 허공에 파워스트라이크/슬래시블러스트를 발동했다. 같은 층(|dy|<1.2)일 때만 공격하고,
 		-- 스킬 실판정(반경 1.5)보다 안쪽인 유클리드 1.15 이내까지 붙어야 공격한다 (헛빵 방지).
 		if dist > 1.15 or math.abs(dy) >= 1.2 then
+			-- (요청) 맨아래 층에서 남은 적이 수평으로 꽤 멀면(8유닛↑) 걸어가지 않고 위로 복귀해
+			-- 위에서부터 다시 내려오며 잡는다 (하강 순환 동선).
+			if math.abs(dx) >= 8.0 and self:TryBottomReturn(now, player) then return end
 			-- 접근. 5초 넘게 사거리에 못 들면 이 대상을 3초간 제외하고 재선정한다.
 			if (now - (self._T.chaseStart or now)) > 5.0 then
 				if self._T.banned == nil then self._T.banned = {} end
@@ -457,14 +464,26 @@ script AutoHuntManager extends Logic
 			end
 		end
 		if cbKey == nil then return false end
-		-- 연계에 쓸 비-빛 속성 모드 최대 2종 + 끝나면 주력(디바인 차지)으로 복귀
-		local elems = {}
+		-- (요청) 연계 사슬 순서 고정: 불(스윙)→얼음(스티그마)→전기(저지먼트). 연계는
+		-- "불 필드+얼음 차지 블로우 → 화상 저주 장판(20초)"과 "얼음 필드+전기 차지 블로우 →
+		-- 감전 장판(20초)" 두 쌍뿐이라, 이 순서로만 시전해야 매 스텝의 필드가 다음 스텝에
+		-- 소모된다. 기존처럼 슬롯 순서(임의)로 뽑으면 전기→불 같은 연계 불가 조합이 나와
+		-- 필드만 깔리고 안 터지는 "연계 없는 허공 공격"이 됐다. 얼음이 없으면 어떤 필드도
+		-- 소모될 수 없으므로 시퀀스를 시작하지 않는다 (끝나면 주력 디바인 차지로 복귀).
 		local divineKey = nil
+		local byName = {}
 		for _, s in ipairs(self._T.slotChargemodes) do
 			if s.name == "디바인 차지" then divineKey = s.key
-			elseif #elems < 2 then table.insert(elems, s) end
+			else byName[s.name] = s end
 		end
-		if #elems == 0 then return false end
+		local fireS = byName["디바인 스윙 강화"]
+		local iceS = byName["디바인 스티그마 강화"]
+		local elecS = byName["디바인 저지먼트 강화"]
+		if iceS == nil or (fireS == nil and elecS == nil) then return false end
+		local elems = {}
+		if fireS ~= nil then table.insert(elems, fireS) end
+		table.insert(elems, iceS)
+		if elecS ~= nil then table.insert(elems, elecS) end
 		local steps = {}
 		for _, s in ipairs(elems) do
 			table.insert(steps, { key = s.key, name = s.name, hold = false })
@@ -745,8 +764,11 @@ script AutoHuntManager extends Logic
 		local pp = player.TransformComponent.WorldPosition
 		local now = _UtilLogic.ElapsedSeconds
 
-		-- 1차: 같은 층(|dy|<1.5) 후보의 최근접 수평 거리 - "같은 층 가까운 곳에 적이 있나" 판정
+		-- 1차: 같은 층(|dy|<1.5) 후보의 최근접 수평 거리 - "같은 층 가까운 곳에 적이 있나" 판정.
+		-- 같은 패스에서 아래층(1.1유닛 이상 아래) 최근접 후보도 함께 찾는다 (하강 순환용).
 		local sameLayerNearest = nil
+		local belowBest = nil
+		local belowBestDist = 0
 		for _, comp in ipairs(comps) do
 			if isvalid(comp) and comp.IsDead ~= true then
 				local e = comp.Entity
@@ -755,14 +777,30 @@ script AutoHuntManager extends Logic
 					if self._T.banned ~= nil then banUntil = self._T.banned[e] end
 					if banUntil == nil or banUntil <= now then
 						local wp = e.TransformComponent.WorldPosition
-						if math.abs(wp.y - pp.y) < 1.5 then
+						local relY = wp.y - pp.y
+						if math.abs(relY) < 1.5 then
 							local dxA = math.abs(wp.x - pp.x)
 							if sameLayerNearest == nil or dxA < sameLayerNearest then
 								sameLayerNearest = dxA
 							end
+						elseif relY <= -1.1 then
+							local dxB = wp.x - pp.x
+							local dB = math.sqrt(dxB * dxB + relY * relY)
+							if belowBest == nil or dB < belowBestDist then
+								belowBest = e
+								belowBestDist = dB
+							end
 						end
 					end
 				end
+			end
+		end
+		-- (요청) 하강 우선 규칙: 같은 층 적의 수평 거리가 아래층 적까지 거리의 3배 이상이면
+		-- 멀리 걸어가는 대신 아래층 적을 대상으로 삼아 다운점프로 내려간다.
+		-- 같은 층에 적이 아예 없을 때도 아래층 적이 있으면 그쪽으로 내려간다.
+		if belowBest ~= nil then
+			if sameLayerNearest == nil or sameLayerNearest >= belowBestDist * 3.0 then
+				return belowBest
 			end
 		end
 		-- (요청) 같은 층 가까운 곳(4유닛 내)에 적이 없으면 위아래 적의 페널티를 크게 완화해
@@ -806,6 +844,48 @@ script AutoHuntManager extends Logic
 			end
 		end
 		return best
+	end
+
+	-- (요청) 하강 순환 복귀: 맨아래 층(발밑에 더 이상 발판이 없음)에서 사냥감이 끊기면
+	-- 아랫점프로 떨어지는 대신(엔진이 맨아래 관통 낙하를 막음) 맵의 SpawnLocation(맨 위)으로
+	-- 순간이동해 위에서부터 다시 내려오며 사냥한다 - 사다리 없이 아래로만 내려가는 동선.
+	-- SpawnLocation이 없는 맵에서는 아무것도 하지 않는다. 복귀했으면 true.
+	@ExecSpace("ClientOnly")
+	method boolean TryBottomReturn(number now, Entity player)
+		if (self._T.nextBottomReturn or 0) > now then return false end
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return false end
+		local map = player.CurrentMap
+		if not isvalid(map) then return false end
+		local spawnE = map:GetChildByName("SpawnLocation", true)
+		if not isvalid(spawnE) then return false end
+		local fh = map.FootholdComponent
+		if not isvalid(fh) then return false end
+		-- 발밑 0.3유닛 아래에서 아래로 8유닛 레이캐스트 - 발판이 잡히면 아직 맨아래가 아니다.
+		-- 예외: 이 맵은 전폭 바닥 0.6 위에 선반 발판이 겹쳐 있어, 선반 위에 서 있어도
+		-- 바로 아래(1유닛 이내) 바닥이 진짜 맨아래(그 밑에 발판 없음)면 맨아래로 취급한다.
+		local pp = player.TransformComponent.WorldPosition
+		local below = fh:Raycast(Vector2(pp.x, pp.y - 0.3), Vector2(0, -1), 8.0)
+		if below ~= nil then
+			local by = below:GetYByX(pp.x)
+			if (pp.y - by) > 1.0 then return false end
+			local below2 = fh:Raycast(Vector2(pp.x, by - 0.3), Vector2(0, -1), 8.0)
+			if below2 ~= nil then return false end
+		end
+		self._T.nextBottomReturn = now + 4.0
+		-- 순간이동은 검증된 패턴대로 1회만 호출한다 (SetWorldPosition 반복 호출은 되돌림 버그).
+		local sp = spawnE.TransformComponent.WorldPosition
+		rb:SetWorldPosition(Vector2(sp.x, sp.y + 0.2))
+		rb:PositionReset()
+		self._T.target = nil
+		self._T.nextScan = 0
+		self._T.holdMoveUntil = now + 0.4
+		local sc = player.StateComponent
+		if isvalid(sc) and sc.CurrentStateName == "MOVE" then
+			sc:ChangeState("IDLE")
+		end
+		log("[AutoHunt] 맨아래 도달 - 위 스폰 지점으로 복귀 (" .. string.format("%.1f, %.1f", sp.x, sp.y) .. ")")
+		return true
 	end
 
 	@ExecSpace("ClientOnly")

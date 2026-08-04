@@ -3453,6 +3453,13 @@ script SkillManager extends Logic
 			-- 디바인 4종으로 정해둔 현재 속성의 전용 아트로 바뀐다.
 			-- 연타 방지용 공용 게이트(skillOnCooldown)만 파워스트라이크와 같은 값으로 건다 - 이건
 			-- 화면에 표시되는 재사용 대기시간이 아니라 모든 공격 스킬이 쓰는 공용 연타 제한이다.
+			-- (요청 개편 2026-08-04) 디바인 속성을 하나도 투자하지 않았으면 차지 블로우 자체를 쓸 수 없다.
+			local cbModeNow = self:GetEffectiveChargeBlowMode()
+			if cbModeNow == 0 then
+				_UIToast:ShowMessage("디바인 속성 스킬을 배워야 차지 블로우를 쓸 수 있습니다.")
+				log("[SkillManager] 차지 블로우: 디바인 속성 미투자 - 사용 불가")
+				return
+			end
 			if self._T.skillOnCooldown then return end
 			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
 			self._T.skillOnCooldown = true
@@ -3461,7 +3468,6 @@ script SkillManager extends Logic
 			end, 0.75 * atkMult)
 			-- (개편) 데미지 = 파스 공식 × 차지 블로우 위력 배율(pendingSkillPowerMult가 이미 적용)
 			-- × 현재 속성의 강화 스킬 보너스(분배 1pt당 +2%, 마스터 +40%).
-			local cbModeNow = self:GetEffectiveChargeBlowMode()
 			local enhBonus = 1.0
 			if cbModeNow == 1 then enhBonus = 1 + 0.02 * self:GetHeroSkillLevelByName("디바인 스티그마 강화")
 			elseif cbModeNow == 2 then enhBonus = 1 + 0.02 * self:GetHeroSkillLevelByName("디바인 스윙 강화")
@@ -4242,13 +4248,13 @@ script SkillManager extends Logic
 			log("[SkillManager] 아이언 월 사용! (Lv." .. tostring(iwLv) .. " 피해 -" .. tostring(iwPct) .. "% 지속 " .. tostring(iwDur) .. "초)")
 		elseif slot.name == "속성필드" then
 			-- 속성필드(팔라딘 3차 버프): 지속 60초+분배당 20초, 필드 10초+2분배당 1초.
-			-- 시전 모션(약 1.85초) 동안 다른 행동 불가 - 클라 이동/스킬 잠금.
+			-- (요청) 시전 모션 단축: 2단 홀드 폐지 - 모션(약 0.75초) 동안만 클라 이동/스킬 잠금(0.7초).
 			local atkMult = _CharInfoManager:GetAttackSpeedMultiplier()
 			self._T.skillOnCooldown = true
 			_TimerService:SetTimerOnce(function()
 				self._T.skillOnCooldown = false
-			end, 1.4)
-			self._T.actionLockUntil = _UtilLogic.ElapsedSeconds + 1.4
+			end, 0.7)
+			self._T.actionLockUntil = _UtilLogic.ElapsedSeconds + 0.7
 			local efLv = math.max(1, self:GetHeroSkillLevelByName("속성필드"))
 			local efDur = 60 + 20 * (efLv - 1)
 			local efZoneDur = 10 + math.floor(efLv / 2)
@@ -4264,7 +4270,7 @@ script SkillManager extends Logic
 						if isvalid(playerEF.MovementComponent) then playerEF.MovementComponent:Stop() end
 						_TimerService:SetTimerOnce(function()
 							if isvalid(pccEF) then pccEF.Enable = true end
-						end, 1.4)
+						end, 0.7)
 					end
 					if self._T.efDirLockTimer ~= nil then _TimerService:ClearTimer(self._T.efDirLockTimer) end
 					self._T.efDirLockTimer = _TimerService:SetTimerRepeat(function()
@@ -4275,7 +4281,7 @@ script SkillManager extends Logic
 							_TimerService:ClearTimer(self._T.efDirLockTimer)
 							self._T.efDirLockTimer = nil
 						end
-					end, 1.4)
+					end, 0.7)
 				end
 			end
 			self:RequestFireElementalField(efDur, efZoneDur, atkMult)
@@ -6233,21 +6239,38 @@ script SkillManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
-	method integer GetEffectiveChargeBlowMode()
-		-- 실제로 차지 블로우에 실릴 속성. 디바인 4종을 아직 한 번도 쓰지 않았으면(모드 0) 요청대로
-		-- 디바인 차지 → 디바인 스윙 강화 → 디바인 저지먼트 강화 → 디바인 스티그마 강화 순으로 기본값을
-		-- 정한다. "아직 스킬을 보유하지 않았을 경우"를 건너뛰어야 하는데, 이 게임엔 스킬 학습 시스템이
-		-- 따로 없어 보유 여부의 유일한 신호가 "퀵슬롯에 배정되어 있는가"다 - 그걸로 판단한다.
-		-- (나중에 진짜 학습 시스템이 생기면 이 판정만 그쪽으로 갈아끼우면 된다.)
-		local mode = self._T.chargeBlowMode or 0
-		if mode > 0 then return mode end
-		local order = { 4, 2, 3, 1 }   -- 차지 → 스윙 강화 → 저지먼트 강화 → 스티그마 강화
+	method integer GetDefaultChargeBlowMode()
+		-- (요청 개편 2026-08-04) 기본 속성 규칙. 보유 신호는 스킬 포인트 투자(1pt 이상)다.
+		--   ① 4종 전부 투자했으면 디바인 차지(4)가 기본.
+		--   ② 아니면 저지먼트 강화(3) → 스티그마 강화(1) → 스윙 강화(2) → 디바인 차지(4) 순으로
+		--      투자된 첫 속성이 기본. (디바인 차지만 투자한 경우도 그 속성으로 나간다.)
+		--   ③ 아무 속성도 투자하지 않았으면 0 - 차지 블로우 사용 불가.
 		local names = { "디바인 스티그마 강화", "디바인 스윙 강화", "디바인 저지먼트 강화", "디바인 차지" }
-		for _, m in ipairs(order) do
-			if self:FindBarPosForSkillName(names[m]) ~= "" then return m end
+		local lv = {}
+		for m = 1, 4 do
+			lv[m] = self:GetHeroSkillLevelByName(names[m])
 		end
-		-- 넷 다 없으면 목록 첫 번째(디바인 차지)를 기본으로 쓴다.
-		return 4
+		if lv[1] >= 1 and lv[2] >= 1 and lv[3] >= 1 and lv[4] >= 1 then return 4 end
+		local order = { 3, 1, 2, 4 }   -- 저지먼트 → 스티그마 → 스윙 → 차지
+		for _, m in ipairs(order) do
+			if lv[m] >= 1 then return m end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetEffectiveChargeBlowMode()
+		-- 실제로 차지 블로우에 실릴 속성.
+		--   ① 직접 고른 속성(chargeBlowMode)이 있고 그 속성이 아직 투자 상태면 그대로 쓴다.
+		--   ② 안 골랐거나 고른 속성의 포인트를 전부 회수했으면 기본 속성 규칙으로 떨어진다
+		--      (GetDefaultChargeBlowMode - 4종 전부 투자 시 디바인 차지, 아니면 저지먼트→스티그마→스윙).
+		--   ③ 아무 속성도 투자하지 않았으면 0 - 차지 블로우 사용 불가.
+		local mode = self._T.chargeBlowMode or 0
+		if mode > 0 then
+			local names = { "디바인 스티그마 강화", "디바인 스윙 강화", "디바인 저지먼트 강화", "디바인 차지" }
+			if self:GetHeroSkillLevelByName(names[mode]) >= 1 then return mode end
+		end
+		return self:GetDefaultChargeBlowMode()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -7236,8 +7259,9 @@ script SkillManager extends Logic
 	-- spendable이 아닌 스킬(기능·타직업 비투자형)은 항상 허용.
 	@ExecSpace("ClientOnly")
 	method boolean IsSkillUsableByInvestment(string skillName)
-		-- 디바인 강화 3종은 "속성 선택 토글"이라 미투자여도 사용/배정 가능(강화 보너스만 투자 비례).
-		if self:IsChargeBlowModeSkill(skillName) then return true end
+		-- (요청 개편 2026-08-04) 디바인 4종도 이제 투자해야 사용/배정 가능 - "찍은 속성만 쓸 수 있다".
+		-- (기존의 "토글이라 미투자여도 허용" 예외를 제거. 차지 블로우의 속성 요구는 UseSkillInSlot의
+		-- 차지 블로우 분기에서 GetEffectiveChargeBlowMode()==0으로 별도 판정한다.)
 		local s = self:FindSkillByName(skillName)
 		if s == nil or s.spendable ~= true then return true end
 		return math.floor(tonumber(s.level) or 0) >= 1

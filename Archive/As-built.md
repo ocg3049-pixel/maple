@@ -17,7 +17,7 @@
 | 영속 저장 | @Logic | `Persistence/CharacterPersistence.mlua` | 자체 텍스트 포맷(줄+탭) — TableToString 중첩 불가 때문 |
 | 상점/포탈/드랍 | @Logic·@Component | `Shop/PotionShopManager` · `Portal/*` · `Item/*` | ⚠️ PotionShopManager에 레거시 별도 메소 저장소 있음 — 인벤창 열 때 실제 메소를 1000으로 덮은 전적(수정됐는지 ⚠️confirm) |
 | 맵 | .map | `map/` — map01 · monsterzone 등 | MapleTile(0). 사냥터 티어 구조는 미구현 (M1 Phase 3 대상) |
-| 자동사냥 (M2 P1) | @Logic | `AutoHunt/AutoHuntManager.mlua` | F7 토글. ClientOnly OnUpdate: 0.3s 대상 캐시(같은 높이 우선·5s 타임아웃 제외) → 접근(**PlayerController 비활성 필수** — 입력 0이 이동을 덮음, 정지 시 복구) + **걷기 모션 ChangeState("MOVE")**(플레이어 이동 상태명 MOVE — "WALK"는 LEA-3005) + 위/아래 발판 점프/다운점프 → 방향 보정 → **스킬바 전체 용도별 로테이션**(GetSkillRole 분류표: buff 270s 유지/summon 290s/aoe 주변 3마리↑/single, 미분류="manual" 미사용). 배회/자동 물약은 P2 미착수 |
+| 자동사냥 (M2 P1) | @Logic | `AutoHunt/AutoHuntManager.mlua` | F7 토글. ClientOnly OnUpdate: 0.3s 대상 캐시(같은 높이 우선·5s 타임아웃 제외) → 접근(**PlayerController 비활성 필수** — 입력 0이 이동을 덮음, 정지 시 복구) + **걷기 모션 ChangeState("MOVE")**(플레이어 이동 상태명 MOVE — "WALK"는 LEA-3005) + 위/아래 발판 점프/다운점프 → 방향 보정 → **스킬바 전체 용도별 로테이션**(GetSkillRole 분류표: buff 270s 유지/summon 290s/aoe 주변 3마리↑/single, 미분류="manual" 미사용). **하강 순환 동선**(2026-08-04): monsterzone SpawnLocation을 맨 위 전폭 발판(0, 7.65)으로 이동, 같은 층 적 x거리가 아래층 적 거리의 3배↑면 아래층 대상 선택→다운점프 하강, 맨아래(발밑 레이캐스트 무발판, 0.6 선반 위도 아래 바닥이 맨아래면 포함) + 대상 없음/x거리 8유닛↑이면 SpawnLocation으로 순간이동 복귀(`rb:SetWorldPosition` 1회+`PositionReset`, 쿨 4s, SpawnLocation 없는 맵은 미동작) |
 
 ## Standing issues & handoff rules   (update in place — never re-append)
 | Issue / rule | Workaround / rule | Count | First → last seen |
