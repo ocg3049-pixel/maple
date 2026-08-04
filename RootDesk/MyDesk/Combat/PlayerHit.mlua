@@ -114,11 +114,21 @@ script PlayerHit extends HitComponent
     end
 
     @ExecSpace("ServerOnly")
-    method void StartGuardParry()
+    method void StartGuardParry(integer guardLv)
         -- 가드(패링) 스킬 사용: 지금부터 1.2초간 패링 창이 열린다. 이 사이에 들어오는 공격은
         -- CheckGuardBlock(공격자 쪽 IsAttackTarget에서 호출)이 무시시키고 2초 무적으로 전환한다.
+        -- (개편) 성공 시 감소율 = 5% × 분배 포인트 (마스터 10 = 50%) - 레벨을 함께 기억한다.
+        self._T.guardSkillLv = math.max(1, math.min(guardLv or 1, 10))
         self._T.guardParryUntil = _UtilLogic.ElapsedSeconds + 1.2
-        log("[PlayerHit] 가드 패링 창 오픈(1.2초)")
+        log("[PlayerHit] 가드 패링 창 오픈(1.2초, Lv." .. tostring(self._T.guardSkillLv) .. ")")
+    end
+
+    -- (자동사냥) 서버가 자동 가드 판정에 쓰는 상태 동기화 - 자동사냥 토글/가드 투자 레벨.
+    @ExecSpace("ServerOnly")
+    method void SetAutoHuntGuardState(boolean autoOn, integer guardLv)
+        self._T.autoHuntOn = autoOn
+        self._T.guardSkillLv = math.max(0, math.min(guardLv or 0, 10))
+        log("[PlayerHit] 자동 가드 상태: auto=" .. tostring(autoOn) .. " 가드 Lv." .. tostring(self._T.guardSkillLv))
     end
 
     @ExecSpace("ServerOnly")
@@ -139,12 +149,12 @@ script PlayerHit extends HitComponent
     end
 
     @ExecSpace("ServerOnly")
-    method void StartPowerGuard(number duration)
-        -- 파워가드(2차 버프) 사용: 지금부터 duration초간 "받는 피해 30% 회복" 창이 열린다.
-        -- 스탯 버프(공격력 +10)는 CharInfoManager가 클라에서 처리하지만, 피해 회복은 서버 피격
-        -- 파이프라인(OnHit)에서 일어나야 하므로 서버에 별도 타임스탬프를 둔다(가드 패링과 같은 방식).
+    method void StartPowerGuard(number duration, integer healPct)
+        -- (스킬 효과 개편) 파워가드 사용: duration초간 "피격 1초 후부터 3초에 걸쳐 입은 피해의
+        -- healPct%를 3틱으로 회복"하는 창이 열린다. 스탯 버프(공격력 +10)는 클라(CharInfoManager) 처리.
         self._T.powerGuardUntil = _UtilLogic.ElapsedSeconds + duration
-        log("[PlayerHit] 파워가드 창 오픈(" .. tostring(duration) .. "초) - 받는 피해 30% 회복")
+        self._T.powerGuardHealPct = healPct
+        log("[PlayerHit] 파워가드 창 오픈(" .. tostring(duration) .. "초) - 피격 후 지연 회복 " .. tostring(healPct) .. "%")
     end
 
     @ExecSpace("ServerOnly")
@@ -155,19 +165,71 @@ script PlayerHit extends HitComponent
         local now = _UtilLogic.ElapsedSeconds
         -- ② 패링 성공 후 2초 무적 버프 중이면 계속 무시.
         if (self._T.guardInvulnUntil or 0) >= now then return true end
+        -- (자동사냥) 데미지를 입을 타이밍에 25% 확률로 가드가 자동 발동한다 - 가드 투자 1pt 이상 +
+        -- 자동 가드 쿨타임(30 - (분배-1)초) 준비 상태일 때만. 발동하면 아래 패링 성공 분기를 그대로 탄다.
+        if self._T.autoHuntOn == true and (self._T.guardSkillLv or 0) >= 1
+            and (self._T.autoGuardReadyAt or 0) <= now and (self._T.guardParryUntil or 0) < now then
+            if _UtilLogic:RandomDouble() < 0.25 then
+                -- (요청) 자동 발동 = 곧바로 이번 공격을 패링하는 성공이므로, 수동 가드의 "성공 시
+                -- 쿨타임 5초 단축"을 그대로 반영해 다음 자동 가드까지 5초만 기다린다.
+                self._T.autoGuardReadyAt = now + 5.0
+                self._T.guardParryUntil = now + 0.1
+                log("[PlayerHit] 자동 가드 발동(25%) - 성공 단축 반영, 다음 자동 가드까지 5초")
+            end
+        end
         -- ① 패링 창(1초) 안에 공격이 들어오면: 그 공격을 무시하고 2초 무적 시작 + 클라이언트에 성공 통지.
         if (self._T.guardParryUntil or 0) >= now then
             self._T.guardParryUntil = 0            -- 패링은 1회 소모
             self._T.guardInvulnUntil = now + 2.0
+            -- (개편) 가드 성공 시 10초간 받는 피해 (5% × 분배 포인트) 감소 버프 (판정: ApplyDamageReduction)
+            self._T.guardShieldUntil = now + 10.0
+            self._T.guardShieldPct = 5 * math.max(1, self._T.guardSkillLv or 1)
             local pc = self.Entity.PlayerComponent
             if isvalid(pc) then
                 _SkillManager:NotifyGuardParrySuccess(pc.UserId)
             end
             self:PlayGuardSuccessEffects()
-            log("[PlayerHit] 가드 패링 성공! 2초 무적 시작")
+            log("[PlayerHit] 가드 패링 성공! 2초 무적 + 10초 피해 " .. tostring(self._T.guardShieldPct) .. "% 감소")
             return true
         end
         return false
+    end
+
+    -- (팔라딘) 받는 피해 감소 합산 - MonsterAttack.CalcDamage가 호출한다.
+    -- 가드 성공 버프(10초, 50%)와 아이언 월(2%/pt)이 곱연산으로 겹친다. 최소 1.
+    @ExecSpace("ServerOnly")
+    method integer ApplyDamageReduction(integer damage)
+        local now = _UtilLogic.ElapsedSeconds
+        local factor = 1.0
+        if (self._T.guardShieldUntil or 0) >= now then
+            -- (개편) 감소율 = 5% × 가드 분배 포인트 (마스터 10 = 50%)
+            factor = factor * (1 - (self._T.guardShieldPct or 5) / 100)
+        end
+        if (self._T.ironWallUntil or 0) >= now then
+            factor = factor * (1 - (self._T.ironWallReducePct or 0) / 100)
+        end
+        if factor >= 1.0 then return damage end
+        return math.max(1, math.floor(damage * factor))
+    end
+
+    -- (팔라딘 2차) 아이언 월: duration초간 받는 피해를 reducePct% 감소시킨다.
+    @ExecSpace("ServerOnly")
+    method void StartIronWall(number duration, integer reducePct)
+        self._T.ironWallUntil = _UtilLogic.ElapsedSeconds + duration
+        self._T.ironWallReducePct = reducePct
+        log("[PlayerHit] 아이언 월 " .. tostring(duration) .. "초 - 받는 피해 " .. tostring(reducePct) .. "% 감소")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CancelIronWall()
+        self._T.ironWallUntil = 0
+        log("[PlayerHit] 아이언 월 취소")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CancelGuardShield()
+        self._T.guardShieldUntil = 0
+        log("[PlayerHit] 가드 피해 감소 버프 취소")
     end
 
     @ExecSpace("Multicast")
@@ -176,11 +238,29 @@ script PlayerHit extends HitComponent
         -- Multicast는 서버도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
         if not self:IsClient() then return end
         if not isvalid(self.Entity) then return end
-        _SoundService:PlaySound("299081e8a23d4f09b9e9858b94662cb2", 1.0)
-        -- (요청) 이펙트를 캐릭터 몸쪽에 붙이고(y 0.35→0.2), 투명도 70%(Alpha 0.7), 크기 2/3로 재생한다.
-        _EffectService:PlayEffectAttached("d7852ad775ea4db8ac46a11c3735b9e1", self.Entity, Vector3(0, 0.2, 0), 0, Vector3(2 / 3, 2 / 3, 1), false, { ["Alpha"] = 0.7 })
+        -- (팔라딘 개편) 가드 성공 사운드/이펙트 교체 - 사운드 e1dacc28···, 이펙트는 기존 베리어 대신 fd0e7aeb···
+        _SoundService:PlaySound("e1dacc286f764f13bc578bcdb2d1ec1e", 1.0)
+        -- (피드백) 방패 이펙트 높이: -0.3 (사용자 지정값)
+        _EffectService:PlayEffectAttached("fd0e7aeb826f4a5486af1a03dfbf592e", self.Entity, Vector3(0, -0.3, 0), 0, Vector3(1, 1, 1), false)
         -- 엔진 데미지 스킨의 "Guard" 텍스트(피격 스킨 RUID 기반) - 데미지 숫자 대신 Guard가 뜬다.
         _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        -- (팔라딘 개편) 머리 위 상태 아이콘(29dc0219···)을 감소 버프 지속(10초) 동안 루프 표시.
+        -- 재가드로 갱신되면 기존 아이콘을 지우고 새로 건다(토큰으로 옛 제거 타이머 무효화).
+        self._T.guardHeadToken = (self._T.guardHeadToken or 0) + 1
+        local headTok = self._T.guardHeadToken
+        if self._T.guardHeadSerial ~= nil then
+            _EffectService:RemoveEffect(self._T.guardHeadSerial)
+            self._T.guardHeadSerial = nil
+        end
+        -- (피드백) 머리 위 아이콘 높이: 0 (사용자 지정값)
+        self._T.guardHeadSerial = _EffectService:PlayEffectAttached("29dc0219becf49a9b3ef6fadfb888350", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), true)
+        _TimerService:SetTimerOnce(function()
+            if self._T.guardHeadToken ~= headTok then return end
+            if self._T.guardHeadSerial ~= nil then
+                _EffectService:RemoveEffect(self._T.guardHeadSerial)
+                self._T.guardHeadSerial = nil
+            end
+        end, 10)
     end
 
     -- ── 홀리 매직쉘(4차 버프) ────────────────────────────────────────
@@ -337,19 +417,25 @@ script PlayerHit extends HitComponent
 
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
 
-        -- (요청) 파워가드 버프 중이면 받은 피해의 30%를 회복한다. __base:OnHit이 이미 Hp를 깎았으므로
-        -- 그 뒤에 회복분을 되돌린다. 표시는 힐 스킬과 동일한 데미지 스킨(ShowHealDamageSkin, 힐 RUID).
+        -- (스킬 효과 개편) 파워가드 버프 중이면 즉시가 아니라 "피격 1초 후부터 3초에 걸쳐 3틱"으로
+        -- 입은 피해의 healPct%(기본 10% + 분배당 1%)를 회복한다. 표시는 힐 데미지 스킨.
         if (self._T.powerGuardUntil or 0) >= _UtilLogic.ElapsedSeconds and damage > 0 then
-            local pc = self.Entity.PlayerComponent
-            if isvalid(pc) then
-                local heal = math.floor(damage * 0.3)
-                if heal > 0 then
-                    pc.Hp = math.min(pc.Hp + heal, pc.MaxHp)
-                    ---@type PlayerAttack
-                    local pa = self.Entity:GetComponent("script.PlayerAttack")
-                    if isvalid(pa) then pa:ShowHealDamageSkin(self.Entity, heal) end
-                    log("[PlayerHit] 파워가드 피해 회복: 받은 피해 " .. tostring(damage) .. " -> +" .. tostring(heal) .. " HP")
+            local totalHeal = math.floor(damage * (self._T.powerGuardHealPct or 10) / 100)
+            if totalHeal > 0 then
+                local tickHeal = math.max(1, math.floor(totalHeal / 3))
+                local ent = self.Entity
+                for tick = 1, 3 do
+                    _TimerService:SetTimerOnce(function()
+                        if not isvalid(ent) then return end
+                        local pcT = ent.PlayerComponent
+                        if not isvalid(pcT) or pcT.Hp <= 0 then return end
+                        pcT.Hp = math.min(pcT.Hp + tickHeal, pcT.MaxHp)
+                        ---@type PlayerAttack
+                        local paT = ent:GetComponent("script.PlayerAttack")
+                        if isvalid(paT) then paT:ShowHealDamageSkin(ent, tickHeal) end
+                    end, tick)   -- 1초 뒤부터 1초 간격 3틱 (= 3초에 걸쳐)
                 end
+                log("[PlayerHit] 파워가드 지연 회복 예약: 피해 " .. tostring(damage) .. " -> 총 +" .. tostring(totalHeal) .. " HP (3틱)")
             end
         end
 

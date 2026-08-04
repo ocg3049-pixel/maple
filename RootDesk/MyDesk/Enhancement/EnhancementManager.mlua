@@ -23,6 +23,9 @@ script EnhancementManager extends Logic
 	property integer scrollSelectedSlot = 0   -- 주문서 탭 선택 슬롯 (1-8, 0=미선택)
 	property string enhanceTargetItemStr = ""  -- 대상 아이템 전체 문자열
 	property string enhanceTargetSrcTab  = ""  -- 대상 아이템이 위치한 인벤 탭 키
+	-- (신규) 장착 중인 장비를 대상으로 올린 경우 그 장비 슬롯(1~9). 0이면 인벤 아이템 대상(기존 경로).
+	-- 강화/주문서/큐브 결과 반영과 파괴가 이 값으로 인벤·장비창 중 올바른 쪽에 기록된다.
+	property integer enhanceTargetEquipSlot = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
@@ -116,8 +119,14 @@ script EnhancementManager extends Logic
 			local function tabHandler(e)
 				if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EnhanceWindow", e.TouchPoint) then return end
 				log("[Enhance] 탭 클릭 idx=" .. tostring(capturedIdx))
-				if capturedIdx == 4 and self._T.tabPotDisabled then return end
-				if capturedIdx == 5 and self._T.tabAddDisabled then return end
+				-- (Phase 3) 미부여 아이템이 올라가 있으면 잠금 대신 "메소로 부여" 제안을 띄운다
+				local isDisabled = (capturedIdx == 4 and self._T.tabPotDisabled) or (capturedIdx == 5 and self._T.tabAddDisabled)
+				if isDisabled then
+					if self.enhanceTargetItemStr ~= "" then
+						self:ShowGrantPotentialDialog(capturedIdx)
+					end
+					return
+				end
 				self:SelectTab(capturedIdx)
 			end
 			-- TabBG 스프라이트에 RaycastTarget=true + UITouchReceiveComponent 연결
@@ -211,9 +220,16 @@ script EnhancementManager extends Logic
 		end
 		log("[Enhance] 큐브 UI 와이어링 완료")
 
-		-- 강화 슬롯 hover → 아이템 설명창 / 더블클릭 → ClearTarget
-		local targetBG = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG")
+		-- 강화 슬롯 hover → 아이템 설명창 / 클릭 → 클릭-클릭 배정 / 더블클릭 → ClearTarget
+		-- (버그 수정) TargetSlotBG 루트는 UITransform만 있는 컨테이너라 터치가 전혀 오지 않았다 -
+		-- 실제 보이는 슬롯 박스인 자식 SPR(TargetSlotBG/SlotBG)에 RaycastTarget+UITouchReceive를 붙여
+		-- 와이어링한다 (탭 버튼 TabBG와 동일 패턴).
+		local targetBG = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/SlotBG")
 		if isvalid(targetBG) then
+			targetBG.SpriteGUIRendererComponent.RaycastTarget = true
+			if not isvalid(targetBG:GetComponent("MOD.Core.UITouchReceiveComponent")) then
+				targetBG:AddComponent("MOD.Core.UITouchReceiveComponent")
+			end
 			self._T.lastTargetClickTime = 0
 			targetBG:ConnectEvent(UITouchEnterEvent, function(e)
 				if not _UIClickArbiter:IsTopmostAt("/ui/DefaultGroup/EnhanceWindow", e.TouchPoint) then return end
@@ -227,6 +243,21 @@ script EnhancementManager extends Logic
 			targetBG:ConnectEvent(UITouchDownEvent, function(e)
 				if e.TouchId ~= -1 then return end
 				if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EnhanceWindow", e.TouchPoint) then return end
+				-- (신규) 클릭-클릭 배정: 장비창/인벤에서 클릭해 둔 아이템이 있으면 이 슬롯에 대상으로 올린다.
+				local pick = _UIEquipInventoryManager:ConsumeEnhancePick()
+				if pick.win ~= nil then
+					if pick.win == "equip" then
+						self:SetEnhanceTargetFromEquip(pick.slot)
+					else
+						local ps = _UIEquipInventoryManager:GetInven(pick.slot)
+						if ps ~= "" then
+							self:SetEnhanceTarget(_UIEquipInventoryManager:ParseName(ps), _UIEquipInventoryManager:ParseInvenRUID(ps), pick.slot)
+						end
+					end
+					-- 배정 직후의 클릭이 더블클릭 해제로 오인되지 않게 타임스탬프를 리셋한다
+					self._T.lastTargetClickTime = 0
+					return
+				end
 				local t = _UtilLogic.ElapsedSeconds
 				if t - self._T.lastTargetClickTime < 0.5 then
 					self:ClearTarget()
@@ -235,7 +266,7 @@ script EnhancementManager extends Logic
 					self._T.lastTargetClickTime = t
 				end
 			end)
-			log("[Enhance] TargetSlotBG hover/더블클릭 연결")
+			log("[Enhance] TargetSlotBG hover/클릭배정/더블클릭 연결")
 		end
 
 		-- 주문서 탭: 주문서 슬롯 8개 + 사용하기 버튼 와이어링 (탭 버튼과 동일 패턴)
@@ -385,15 +416,20 @@ script EnhancementManager extends Logic
 			-- (원작 개편) P 단축키도 버튼과 동일하게 확인 다이얼로그를 거친다.
 			if self:IsWindowOpen() then self:ShowEnhanceConfirm() end
 		elseif event.key == KeyboardKey.Space then
-			-- 스페이스바 = 확인 클릭: 다이얼로그가 열려있으면 확인, 스타포스 탭이면 강화하기 버튼과 동일
+			-- 스페이스바: 다이얼로그가 열려있으면 확인(모드 공통 처리), 스타포스 탭이면
+			-- (Phase 2 연타 UX) 확인 다이얼로그를 생략하고 즉시 강화한다 - 버튼/P키는 기존 확인 유지.
 			if not self:IsWindowOpen() then return end
 			if self:IsConfirmDialogOpen() then
 				log("[Enhance] Space → 확인")
-				self:HideEnhanceConfirm()
-				self:DoEnhance()
+				self:AcceptConfirmDialog()
 			elseif self.currentTab == 1 then
-				log("[Enhance] Space → 강화하기")
-				self:ShowEnhanceConfirm()
+				log("[Enhance] Space → 즉시 강화(연타)")
+				self:DoEnhance()
+			elseif self.currentTab == 4 or self.currentTab == 5 then
+				-- (요청) 잠재/에디셔널 탭도 스타포스처럼 Space 연타로 즉시 재설정 (버튼과 동일 경로 -
+				-- 선택된 재화 탭(메소/큐브) 기준으로 소모·확률 처리까지 그대로)
+				log("[Enhance] Space → 즉시 재설정(연타) tab=" .. tostring(self.currentTab))
+				self:OnResetBtnTouch(self.currentTab)
 			end
 		elseif event.key == KeyboardKey.Tab then
 			-- Tab = 탭 순환 (잠긴 탭은 건너뜀)
@@ -473,6 +509,8 @@ script EnhancementManager extends Logic
 			txt.TextComponent.Text = tostring(cost) .. " 메소\n\n강화를 시도하시겠습니까?"
 		end
 		self._T.confirmInfoOnly = false
+		self._T.pendingRebuySlot = nil   -- (Phase 2) 모드 혼선 방지 - 강화 확인 모드로 초기화
+		self._T.pendingGrantTab = nil
 		dlg.Enable = true
 	end
 
@@ -487,6 +525,23 @@ script EnhancementManager extends Logic
 			txt.TextComponent.Text = "해당 아이템을 사용할 수 없는 아이템입니다."
 		end
 		self._T.confirmInfoOnly = true
+		self._T.pendingRebuySlot = nil
+		self._T.pendingGrantTab = nil
+		dlg.Enable = true
+	end
+
+	-- (신규) 강화 불가 부위 안내 전용 다이얼로그 - 큐브용 안내(ShowItemUnusableDialog)와 문구만 다르다.
+	@ExecSpace("ClientOnly")
+	method void ShowEnhanceBlockedDialog()
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		if not isvalid(dlg) then return end
+		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
+		if isvalid(txt) then
+			txt.TextComponent.Text = "강화 불가 아이템입니다."
+		end
+		self._T.confirmInfoOnly = true
+		self._T.pendingRebuySlot = nil
+		self._T.pendingGrantTab = nil
 		dlg.Enable = true
 	end
 
@@ -496,18 +551,112 @@ script EnhancementManager extends Logic
 		if isvalid(dlg) then dlg.Enable = false end
 	end
 
+	-- (Phase 2) 확인 다이얼로그 "확인"의 공통 처리 - 모드 우선순위: 안내 전용 → 재구매 → 강화 확인.
+	@ExecSpace("ClientOnly")
+	method void AcceptConfirmDialog()
+		self:HideEnhanceConfirm()
+		-- 안내 전용(사용 불가/강화 불가) 다이얼로그였다면 닫기만 한다.
+		if self._T.confirmInfoOnly then
+			self._T.confirmInfoOnly = false
+			return
+		end
+		-- 재구매 제안 다이얼로그였다면 구매를 실행한다.
+		local rebuySlot = self._T.pendingRebuySlot
+		if rebuySlot ~= nil and rebuySlot > 0 then
+			self._T.pendingRebuySlot = nil
+			self:DoRebuy(rebuySlot)
+			return
+		end
+		-- (Phase 3) 잠재 부여 제안 다이얼로그였다면 메소 부여를 실행한다.
+		local grantTab = self._T.pendingGrantTab
+		if grantTab ~= nil and grantTab > 0 then
+			self._T.pendingGrantTab = nil
+			self:DoGrantPotential(grantTab)
+			return
+		end
+		self:DoEnhance()
+	end
+
+	-- (Phase 3) 미부여 아이템에 "메소 20,000으로 잠재능력 부여" 제안 다이얼로그 -
+	-- 잠재능력 부여 주문서의 메소 단일화 대체 경로 (드랍 주문서는 보너스로 공존).
+	@ExecSpace("ClientOnly")
+	method void ShowGrantPotentialDialog(integer tabIdx)
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		if not isvalid(dlg) then return end
+		local kindName = (tabIdx == 4) and "잠재능력" or "에디셔널 잠재능력"
+		local grantCost = self:GetBalancePrice("grant_potential", 20000)
+		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
+		if isvalid(txt) then
+			txt.TextComponent.Text = kindName .. " 부여: " .. tostring(grantCost) .. " 메소\n\n부여하시겠습니까?"
+		end
+		self._T.confirmInfoOnly = false
+		self._T.pendingRebuySlot = nil
+		self._T.pendingGrantTab = tabIdx
+		dlg.Enable = true
+	end
+
+	-- (Phase 3) 메소 20,000으로 잠재능력(탭4)/에디셔널(탭5) 부여 - 레어 1등급 + 옵션 3개 롤.
+	@ExecSpace("ClientOnly")
+	method void DoGrantPotential(integer tabIdx)
+		local cost = self:GetBalancePrice("grant_potential", 20000)
+		if _UIEquipInventoryManager.meso < cost then
+			self:AppendLog("메소 부족! (" .. tostring(cost) .. "원 필요)")
+			return
+		end
+		local s = self.enhanceTargetItemStr
+		if s == "" then return end
+
+		local fields = {}
+		local pos = 1
+		while true do
+			local j, _ = string.find(s, "|", pos, true)
+			if j then fields[#fields+1] = string.sub(s, pos, j-1); pos = j+1
+			else fields[#fields+1] = string.sub(s, pos); break end
+		end
+		while #fields < 16 do fields[#fields+1] = "" end
+
+		local flagIdx  = (tabIdx == 4) and 7 or 8
+		local gradeIdx = (tabIdx == 4) and 9 or 13
+		local opt1Idx  = (tabIdx == 4) and 10 or 14
+		local slotIdx  = tonumber(fields[3]) or 0
+		local isWeapon = (slotIdx == 6)
+		local isPot    = (tabIdx == 4)
+
+		fields[flagIdx]      = "1"
+		fields[gradeIdx]     = "1"
+		fields[opt1Idx]      = self:GetRandomOption(1, isPot, isWeapon)
+		fields[opt1Idx + 1]  = self:GetRandomOption(1, isPot, isWeapon)
+		fields[opt1Idx + 2]  = self:GetRandomOption(1, isPot, isWeapon)
+
+		local newStr = table.concat(fields, "|")
+		self.enhanceTargetItemStr = newStr
+
+		-- 원본 위치 반영 (장착 중 장비 대상이면 장비창, 아니면 인벤 탭 - 기존 패턴)
+		if self.enhanceTargetEquipSlot > 0 then
+			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, newStr)
+			_CharacterPersistence:MarkDirty("grant_potential")
+		else
+			local srcTab = self.enhanceTargetSrcTab
+			if srcTab == "" then srcTab = "equip" end
+			_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newStr
+		end
+		_UIEquipInventoryManager:RefreshUI()
+
+		_UIEquipInventoryManager:AddMeso(-cost)
+		self:UpdateMesoDisplay()
+
+		self:UpdateTabDisabledState()
+		self:SelectTab(tabIdx)
+		self:AppendLog(((tabIdx == 4) and "잠재능력" or "에디셔널") .. " 부여 완료 (" .. tostring(cost) .. " 메소)")
+		log("[Enhance] 잠재 부여 tab=" .. tostring(tabIdx) .. " → " .. fields[opt1Idx] .. " / " .. fields[opt1Idx + 1] .. " / " .. fields[opt1Idx + 2])
+	end
+
 	@ExecSpace("ClientOnly")
 	method void OnConfirmOk(UITouchDownEvent e)
 		if e.TouchId ~= -1 then return end
 		if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EnhanceWindow", e.TouchPoint) then return end
 		log("[Enhance] 확인 다이얼로그: 확인")
-		self:HideEnhanceConfirm()
-		-- 안내 전용(사용 불가 아이템) 다이얼로그였다면 강화를 실행하지 않고 닫기만 한다.
-		if self._T.confirmInfoOnly then
-			self._T.confirmInfoOnly = false
-			return
-		end
-		self:DoEnhance()
+		self:AcceptConfirmDialog()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -515,6 +664,9 @@ script EnhancementManager extends Logic
 		if e.TouchId ~= -1 then return end
 		if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EnhanceWindow", e.TouchPoint) then return end
 		log("[Enhance] 확인 다이얼로그: 취소")
+		-- (Phase 2/3) 취소 시 모드 리셋 - 재구매/부여 제안을 닫으면 실행하지 않는다.
+		self._T.pendingRebuySlot = nil
+		self._T.pendingGrantTab = nil
 		self:HideEnhanceConfirm()
 	end
 
@@ -554,8 +706,9 @@ script EnhancementManager extends Logic
 		local hasTarget = self.enhanceTargetRUID ~= ""
 		local blocked = hasTarget and ((tabIdx == 4 and self._T.tabPotDisabled) or (tabIdx == 5 and self._T.tabAddDisabled))
 		if blocked then
-			self:ShowItemUnusableDialog()
-			log("[Enhance] OpenWindowWithTab 차단(미개방 잠재능력): tab=" .. tostring(tabIdx))
+			-- (Phase 3) 미부여 아이템이면 "메소로 부여" 제안으로 대체
+			self:ShowGrantPotentialDialog(tabIdx)
+			log("[Enhance] OpenWindowWithTab: 미부여 → 메소 부여 제안 tab=" .. tostring(tabIdx))
 			return
 		end
 		self:SelectTab(tabIdx)
@@ -597,11 +750,64 @@ script EnhancementManager extends Logic
 		if isvalid(w) then w.Enable = false end
 		self:ClearTarget()
 		self:HideEnhanceConfirm()
+		-- 클릭-클릭 대기 선택도 함께 폐기 (창을 닫으면 선택 상태가 남지 않게)
+		local discard = _UIEquipInventoryManager:ConsumeEnhancePick()
+	end
+
+	-- (Phase 1) 강화 대상 6부위 판정 (GDD §2): 상의(3)·신발(5)·무기(6)·모자(7)·망토(8)·장갑(9)만 허용.
+	-- 얼굴(1)·머리(2)·하의(4)와 잠금 칸(10~25 - 개방 시 이 표에 추가)은 강화 불가.
+	@ExecSpace("ClientOnly")
+	method boolean IsEnhanceableSlot(number slotIdx)
+		return slotIdx == 3 or slotIdx == 5 or slotIdx == 6
+			or slotIdx == 7 or slotIdx == 8 or slotIdx == 9
 	end
 
 	-- ─── 강화 대상 설정 (더블클릭 / 드래그 드롭 공통) ────────────────────
 	@ExecSpace("ClientOnly")
 	method void SetEnhanceTarget(string name, string ruid, number invenIdx)
+		-- (Phase 1) 강화 대상 6부위 제한: 아이템 문자열 3번째 필드(slotIdx)로 판정하고,
+		-- 허용 외 부위는 기존 "사용 불가 아이템" 안내 다이얼로그를 띄운 뒤 등록하지 않는다.
+		local candidate = _UIEquipInventoryManager:GetInven(invenIdx)
+		if candidate ~= "" then
+			local slotIdx = 0
+			local fcount = 0
+			local fpos = 1
+			while true do
+				local fj, _ = string.find(candidate, "|", fpos, true)
+				fcount += 1
+				if fcount == 3 then
+					local fieldStr = fj and string.sub(candidate, fpos, fj - 1) or string.sub(candidate, fpos)
+					slotIdx = math.floor(tonumber(fieldStr) or 0)
+					break
+				end
+				if fj == nil then break end
+				fpos = fj + 1
+			end
+			if not self:IsEnhanceableSlot(slotIdx) then
+				self:ShowEnhanceBlockedDialog()
+				log("[Enhance] 강화 불가 부위 거부: " .. name .. " slotIdx=" .. tostring(slotIdx))
+				return
+			end
+		else
+			-- 인벤 문자열이 비어 있으면 장착 중 아이템 경로 - RUID로 장착 슬롯(1~9)을 찾아 같은 기준으로 판정
+			for i = 1, 9 do
+				local eq = _UIEquipInventoryManager:GetEquip(i)
+				if eq ~= "" and _UIEquipInventoryManager:ParseRUID(eq) == ruid then
+					if not self:IsEnhanceableSlot(i) then
+						self:ShowEnhanceBlockedDialog()
+						log("[Enhance] 강화 불가 부위 거부(장착 중): " .. name .. " slot=" .. tostring(i))
+						return
+					end
+					break
+				end
+			end
+		end
+
+		-- 새 대상 등록: 인벤 아이템 경로이므로 장착 대상 표시는 해제하고,
+		-- 클릭-클릭 대기 중이던 선택(있다면)은 폐기해 이후 대상 슬롯 클릭이 옛 선택을 되살리지 않게 한다
+		self.enhanceTargetEquipSlot = 0
+		local discard = _UIEquipInventoryManager:ConsumeEnhancePick()
+
 		self.enhanceTargetName = name
 		self.enhanceTargetRUID = ruid
 		self.enhanceTargetInvenIdx = invenIdx
@@ -617,11 +823,20 @@ script EnhancementManager extends Logic
 			self.enhanceLevel = 0
 		end
 
-		-- 슬롯 아이콘 및 이름 업데이트
+		self:ApplyEnhanceTargetUI()
+
+		self:AppendLog("대상: " .. name)
+		log("[Enhance] 대상 설정: " .. name .. " 인벤=" .. tostring(invenIdx))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyEnhanceTargetUI()
+		-- 강화 대상 슬롯 영역 공용 갱신 - self.enhanceTargetName/RUID/enhanceLevel을 읽어
+		-- 아이콘/이름/별/스타포스 탭/탭 비활성화를 일괄 반영한다 (인벤 등록·재구매 자동 등록 공용).
 		local icon = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/TargetIcon")
 		if isvalid(icon) then
 			local spr = icon.SpriteGUIRendererComponent
-			spr.ImageRUID = "thumbnail://" .. ruid
+			spr.ImageRUID = "thumbnail://" .. self.enhanceTargetRUID
 			spr.Color = Color(1, 1, 1, 1)
 		end
 
@@ -634,7 +849,7 @@ script EnhancementManager extends Logic
 		local nameLabel = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetNameLabel")
 		if isvalid(nameLabel) then
 			nameLabel.Enable = true
-			nameLabel.TextComponent.Text = name
+			nameLabel.TextComponent.Text = self.enhanceTargetName
 		end
 
 		local starEnt = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/StarLabel")
@@ -649,9 +864,59 @@ script EnhancementManager extends Logic
 
 		-- 탭 비활성화 갱신 및 큐브 UI 갱신
 		self:UpdateTabDisabledState()
+	end
 
-		self:AppendLog("대상: " .. name)
-		log("[Enhance] 대상 설정: " .. name .. " 인벤=" .. tostring(invenIdx))
+	-- (신규) 장착 중인 장비(장비창 슬롯 1~9)를 강화 대상으로 올린다 - 클릭-클릭 배정 경로.
+	-- 인벤 경로(SetEnhanceTarget)와 달리 invenIdx 대신 enhanceTargetEquipSlot에 장비 슬롯을 기억해,
+	-- 강화/주문서/큐브 결과와 파괴가 장비창 문자열(SetEquipStr)에 직접 반영된다.
+	@ExecSpace("ClientOnly")
+	method void SetEnhanceTargetFromEquip(number equipSlot)
+		local s = _UIEquipInventoryManager:GetEquip(equipSlot)
+		if s == "" then return end
+		if not self:IsEnhanceableSlot(equipSlot) then
+			self:ShowEnhanceBlockedDialog()
+			log("[Enhance] 강화 불가 부위 거부(장착 중): slot=" .. tostring(equipSlot))
+			return
+		end
+
+		local name = _UIEquipInventoryManager:ParseName(s)
+		local ruid = _UIEquipInventoryManager:ParseRUID(s)
+		self.enhanceTargetName = name
+		self.enhanceTargetRUID = ruid
+		self.enhanceTargetInvenIdx = 0
+		self.enhanceTargetEquipSlot = equipSlot
+		self.enhanceTargetItemStr = s
+		self.enhanceTargetSrcTab  = ""
+		self.enhanceLevel = _UIEquipInventoryManager:ParseStars(s)
+
+		-- 슬롯 아이콘 및 이름 업데이트 (SetEnhanceTarget과 동일한 표시 갱신)
+		local icon = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/TargetIcon")
+		if isvalid(icon) then
+			local spr = icon.SpriteGUIRendererComponent
+			spr.ImageRUID = "thumbnail://" .. ruid
+			spr.Color = Color(1, 1, 1, 1)
+		end
+		local placeholder = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/PlaceholderIcon")
+		if isvalid(placeholder) then placeholder.Enable = false end
+		local prompt = _EntityService:GetEntityByPath(self.pathSlotArea .. "/SlotPromptText")
+		if isvalid(prompt) then prompt.Enable = false end
+		local nameLabel = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetNameLabel")
+		if isvalid(nameLabel) then
+			nameLabel.Enable = true
+			nameLabel.TextComponent.Text = name
+		end
+		local starEnt = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/StarLabel")
+		if isvalid(starEnt) then
+			starEnt.TextComponent.Text = _UIEquipInventoryManager:GetStarText(self.enhanceLevel)
+		end
+
+		if self.currentTab == 1 then
+			self:UpdateStarforceUI(self.enhanceLevel)
+		end
+		self:UpdateTabDisabledState()
+
+		self:AppendLog("대상: " .. name .. " (장착 중)")
+		log("[Enhance] 대상 설정(장착 중): " .. name .. " 장비슬롯=" .. tostring(equipSlot))
 	end
 
 	-- 강화창이 열린 상태로 대상 아이템에 외부 변화(잠재능력/에디셔널 주문서 성공 등)가 생겼을 때
@@ -710,13 +975,15 @@ script EnhancementManager extends Logic
 		-- 사이드바 보유 메소 표시 갱신 (원작 개편)
 		self:UpdateMesoDisplay()
 
-		local roll = _UtilLogic:RandomDouble()
-		log("[Enhance] roll=" .. tostring(roll))
+		-- (Phase 2) 구간표 기반 4분기 판정: 성공 / 유지 / 하락(-1성) / 파괴 (GDD §4.2)
+		local band = self:GetStarforceBand(self.enhanceLevel)
+		local roll = _UtilLogic:RandomDouble() * 100
+		log("[Enhance] roll=" .. tostring(roll) .. " band s/k/d/x=" .. tostring(band.success) .. "/" .. tostring(band.keep) .. "/" .. tostring(band.drop) .. "/" .. tostring(band.destroy))
 
 		local starEnt = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/StarLabel")
 
-		if roll < 0.6 then
-			-- 성공 (60%)
+		if roll < band.success then
+			-- 성공: +1성
 			self.enhanceLevel = self.enhanceLevel + 1
 			self:UpdateInvenItemStars(self.enhanceLevel)
 			if isvalid(starEnt) then
@@ -725,48 +992,145 @@ script EnhancementManager extends Logic
 			self:UpdateStarforceUI(self.enhanceLevel)
 			self:AppendLog("성공! +" .. tostring(self.enhanceLevel) .. "강")
 			log("[Enhance] 강화 성공: " .. self.enhanceTargetName .. " +" .. tostring(self.enhanceLevel) .. "강")
-		elseif roll < 0.8 then
-			-- 실패 (20%)
+		elseif roll < band.success + band.keep then
+			-- 유지: 수치 변화 없음
 			self:AppendLog("실패. 수치 유지.")
 			log("[Enhance] 강화 실패 - 유지")
+		elseif roll < band.success + band.keep + band.drop then
+			-- (신규) 하락: -1성 (하한 0)
+			self.enhanceLevel = math.max(0, self.enhanceLevel - 1)
+			self:UpdateInvenItemStars(self.enhanceLevel)
+			if isvalid(starEnt) then
+				starEnt.TextComponent.Text = _UIEquipInventoryManager:GetStarText(self.enhanceLevel)
+			end
+			self:UpdateStarforceUI(self.enhanceLevel)
+			self:AppendLog("실패! 1단계 하락 → +" .. tostring(self.enhanceLevel) .. "강")
+			log("[Enhance] 강화 실패 - 하락 → +" .. tostring(self.enhanceLevel) .. "강")
 		else
-			-- 파괴 (20%)
+			-- 파괴: 아이템 소멸 후 기본 장비 재구매 제안 (Phase 2 재구매 루프)
+			local destroyedSlot = self:GetTargetFieldNum(3)
 			self:DestroyTarget()
 			self:AppendLog("실패! 아이템 파괴됨")
-			log("[Enhance] 강화 실패 - 파괴")
+			log("[Enhance] 강화 실패 - 파괴 (부위 slotIdx=" .. tostring(destroyedSlot) .. ")")
+			if self:IsEnhanceableSlot(destroyedSlot) then
+				self:ShowRebuyDialog(destroyedSlot)
+			end
 		end
+	end
+
+	-- (Phase 2) 파괴 직후 기본 장비 재구매 제안 다이얼로그. 방어구 10,000 / 무기 50,000 메소 -
+	-- "파괴의 아픔은 재구매비가 아니라 쌓은 성·잠재의 소멸"이라는 설계라 값은 싸게 유지한다 (GDD §4.2).
+	@ExecSpace("ClientOnly")
+	method void ShowRebuyDialog(number slotIdx)
+		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+		if not isvalid(dlg) then return end
+		local cost = (slotIdx == 6) and self:GetBalancePrice("rebuy_weapon", 50000) or self:GetBalancePrice("rebuy_armor", 10000)
+		local partName = _UIEquipInventoryManager:GetEquipTypeBySlot(slotIdx)
+		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
+		if isvalid(txt) then
+			txt.TextComponent.Text = partName .. " 파괴!\n기본 장비 재구매: " .. tostring(cost) .. " 메소\n구매하시겠습니까?"
+		end
+		self._T.confirmInfoOnly = false
+		self._T.pendingRebuySlot = slotIdx
+		self._T.pendingGrantTab = nil
+		dlg.Enable = true
+	end
+
+	-- (Phase 2) 재구매 실행: 메소 차감 + 부위별 기본(0성·무잠재) 장비를 장비 탭에 지급.
+	@ExecSpace("ClientOnly")
+	method void DoRebuy(number slotIdx)
+		local cost = (slotIdx == 6) and self:GetBalancePrice("rebuy_weapon", 50000) or self:GetBalancePrice("rebuy_armor", 10000)
+		if _UIEquipInventoryManager.meso < cost then
+			self:AppendLog("메소 부족! (" .. tostring(cost) .. "원 필요)")
+			log("[Enhance] 재구매 실패 - 메소 부족")
+			return
+		end
+		local grantedIdx = _UIEquipInventoryManager:GrantBasicEquipBySlot(slotIdx)
+		if grantedIdx <= 0 then
+			self:AppendLog("인벤토리(장비 탭)가 가득 찼습니다.")
+			log("[Enhance] 재구매 실패 - 인벤 가득")
+			return
+		end
+		_UIEquipInventoryManager:AddMeso(-cost)
+		self:UpdateMesoDisplay()
+		self:AppendLog("기본 장비 재구매 완료 (" .. tostring(cost) .. " 메소)")
+		-- (요청) 재구매한 장비를 강화 대상 슬롯에 바로 올린다 - 파괴 → 재구매 → 즉시 재강화 루프
+		self:SetEnhanceTargetFromRebuy(grantedIdx)
+		log("[Enhance] 재구매 완료 slotIdx=" .. tostring(slotIdx) .. " cost=" .. tostring(cost) .. " → 강화 대상 자동 등록 (인벤 " .. tostring(grantedIdx) .. ")")
+	end
+
+	-- (신규) 재구매 직후 자동 등록: 방금 장비 탭 invenIdx에 지급된 기본 장비를 강화 대상으로 올린다.
+	-- SetEnhanceTarget과 달리 탭을 "equip"으로 고정해 읽는다 - 재구매 시점의 활성 탭과 무관하게 동작.
+	@ExecSpace("ClientOnly")
+	method void SetEnhanceTargetFromRebuy(number invenIdx)
+		local s = _UIEquipInventoryManager:GetTabItem("equip", invenIdx)
+		if s == "" then return end
+		self.enhanceTargetEquipSlot = 0
+		local discard = _UIEquipInventoryManager:ConsumeEnhancePick()
+		self.enhanceTargetName = _UIEquipInventoryManager:ParseName(s)
+		self.enhanceTargetRUID = _UIEquipInventoryManager:ParseRUID(s)
+		self.enhanceTargetInvenIdx = invenIdx
+		self.enhanceTargetItemStr = s
+		self.enhanceTargetSrcTab = "equip"
+		self.enhanceLevel = _UIEquipInventoryManager:ParseStars(s)
+		self:ApplyEnhanceTargetUI()
+		self:AppendLog("대상: " .. self.enhanceTargetName .. " (재구매 자동 등록)")
 	end
 
 	-- ─── 인벤 업데이트 ────────────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void UpdateInvenItemStars(number newStars)
 		-- 잠재능력 등 추가 필드 보존: stars(4번째) 필드만 교체
+		-- (신규) 장착 중 장비가 대상이면 장비창 문자열에 직접 반영한다 (스탯·레벨 즉시 갱신).
+		if self.enhanceTargetEquipSlot > 0 then
+			local es = _UIEquipInventoryManager:GetEquip(self.enhanceTargetEquipSlot)
+			if es == "" then return end
+			local efields = {}
+			for part in string.gmatch(es, "[^|]+") do efields[#efields+1] = part end
+			efields[4] = tostring(newStars)
+			local newStr = table.concat(efields, "|")
+			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, newStr)
+			self.enhanceTargetItemStr = newStr
+			_UIEquipInventoryManager:RefreshUI()
+			_CharacterPersistence:MarkDirty("enhance_equip")
+			return
+		end
+		-- (버그 수정) 옛 코드가 "활성 탭 + 상한 20칸" 기준이라 ① 인벤 21번째 이후 슬롯의 아이템은
+		-- 강화 결과가 조용히 유실됐고(신발 미반영 신고) ② 강화 중 탭을 바꾸면 엉뚱한 탭에 기록됐다.
+		-- 잠재 부여 경로와 동일하게 등록 시점 탭(enhanceTargetSrcTab)에 고정하고 탭 전체 128칸을 허용한다.
 		local idx = self.enhanceTargetInvenIdx
-		if idx < 1 or idx > 20 then return end
-		local s = _UIEquipInventoryManager:GetInven(idx)
+		if idx < 1 or idx > 128 then return end
+		local srcTab = self.enhanceTargetSrcTab
+		if srcTab == "" then srcTab = "equip" end
+		local s = _UIEquipInventoryManager:GetTabItem(srcTab, idx)
 		if s == "" then return end
 		local fields = {}
 		for part in string.gmatch(s, "[^|]+") do fields[#fields+1] = part end
 		fields[4] = tostring(newStars)
-		_UIEquipInventoryManager:SetInvenStr(idx, table.concat(fields, "|"))
+		_UIEquipInventoryManager:SetTabItem(srcTab, idx, table.concat(fields, "|"))
 		_UIEquipInventoryManager:RefreshUI()
+		_CharacterPersistence:MarkDirty("enhance_inven")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void UpdateInvenItemName(string newName)
 		-- 잠재능력 등 추가 필드 보존: name(1번째) 필드만 교체
+		-- (버그 수정) 스타포스 반영과 동일 - 등록 시점 탭 고정 + 128칸 (옛 "활성 탭 + 20칸" 제거)
 		local idx = self.enhanceTargetInvenIdx
-		if idx < 1 or idx > 20 then return end
-		local s = _UIEquipInventoryManager:GetInven(idx)
+		if idx < 1 or idx > 128 then return end
+		local srcTab = self.enhanceTargetSrcTab
+		if srcTab == "" then srcTab = "equip" end
+		local s = _UIEquipInventoryManager:GetTabItem(srcTab, idx)
 		if s ~= "" then
 			local fields = {}
 			for part in string.gmatch(s, "[^|]+") do fields[#fields+1] = part end
 			fields[1] = newName
-			_UIEquipInventoryManager:SetInvenStr(idx, table.concat(fields, "|"))
+			_UIEquipInventoryManager:SetTabItem(srcTab, idx, table.concat(fields, "|"))
 			_UIEquipInventoryManager:RefreshUI()
 		else
 			local ruid = self.enhanceTargetRUID
-			for i = 1, 7 do
+			-- (Phase 1) 장착 슬롯 순회를 활성 9칸으로 확장 (망토8/장갑9 장착 중 강화 대응)
+			for i = 1, 9 do
 				local eq = _UIEquipInventoryManager:GetEquip(i)
 				if eq ~= "" and _UIEquipInventoryManager:ParseRUID(eq) == ruid then
 					local eqFields = {}
@@ -782,14 +1146,28 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void DestroyTarget()
+		-- (신규) 장착 중 장비가 대상이면 장비창에서 직접 파괴한다 (외형·스탯·레벨 즉시 반영).
+		if self.enhanceTargetEquipSlot > 0 then
+			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, "")
+			_DecoWindowManager:ApplyAppearance()
+			_UIEquipInventoryManager:RefreshUI()
+			_CharacterPersistence:MarkDirty("enhance_destroy")
+			log("[Enhance] 장착 장비 슬롯 " .. tostring(self.enhanceTargetEquipSlot) .. " 파괴")
+			self:ClearTarget()
+			return
+		end
 		local idx = self.enhanceTargetInvenIdx
 		local ruid = self.enhanceTargetRUID
-		if idx >= 1 and idx <= 20 then
-			local s = _UIEquipInventoryManager:GetInven(idx)
+		-- (버그 수정) 스타포스 반영과 동일 - 등록 시점 탭 고정 + 128칸 (옛 "활성 탭 + 20칸" 제거)
+		local srcTabD = self.enhanceTargetSrcTab
+		if srcTabD == "" then srcTabD = "equip" end
+		if idx >= 1 and idx <= 128 then
+			local s = _UIEquipInventoryManager:GetTabItem(srcTabD, idx)
 			if s ~= "" then
-				_UIEquipInventoryManager:SetInvenStr(idx, "")
+				_UIEquipInventoryManager:SetTabItem(srcTabD, idx, "")
 			else
-				for i = 1, 7 do
+				-- (Phase 1) 장착 슬롯 순회를 활성 9칸으로 확장 (망토8/장갑9 장착 중 파괴 대응)
+				for i = 1, 9 do
 					local eq = _UIEquipInventoryManager:GetEquip(i)
 					if eq ~= "" and _UIEquipInventoryManager:ParseRUID(eq) == ruid then
 						_UIEquipInventoryManager:SetEquipStr(i, "")
@@ -799,6 +1177,7 @@ script EnhancementManager extends Logic
 				end
 			end
 			_UIEquipInventoryManager:RefreshUI()
+			_CharacterPersistence:MarkDirty("enhance_destroy")
 		end
 		self:ClearTarget()
 	end
@@ -955,8 +1334,9 @@ script EnhancementManager extends Logic
 		end
 
 		local slotIdx = math.floor(tonumber(fields[3]) or 0)
-		if slotIdx < 1 or slotIdx > 7 then
-			self:SetScrollLog("장비 아이템에만 사용할 수 있습니다.")
+		-- (Phase 1) 주문서도 강화 6부위 판정으로 통일 (기존 1~7 범위 검사 대체)
+		if not self:IsEnhanceableSlot(slotIdx) then
+			self:SetScrollLog("강화 가능한 장비(모자/상의/망토/장갑/신발/무기)에만 사용할 수 있습니다.")
 			return
 		end
 		local upgrade = math.floor(tonumber(fields[6]) or 0)
@@ -995,10 +1375,15 @@ script EnhancementManager extends Logic
 		local newStr = table.concat(fields, "|")
 		self.enhanceTargetItemStr = newStr
 
-		-- 인벤 원본 탭에 반영
-		local srcTab = self.enhanceTargetSrcTab
-		if srcTab == "" then srcTab = "equip" end
-		_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newStr
+		-- 원본 위치에 반영 - (신규) 장착 중 장비 대상이면 장비창, 아니면 인벤 원본 탭
+		if self.enhanceTargetEquipSlot > 0 then
+			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, newStr)
+			_CharacterPersistence:MarkDirty("enhance_scroll")
+		else
+			local srcTab = self.enhanceTargetSrcTab
+			if srcTab == "" then srcTab = "equip" end
+			_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newStr
+		end
 		_UIEquipInventoryManager:RefreshUI()
 
 		-- 대상 이름 라벨 갱신 ("이름+N")
@@ -1057,10 +1442,12 @@ script EnhancementManager extends Logic
 			statsEnt.TextComponent.Text = self:GetStarforceStatText(level)
 		end
 
-		-- 강화 확률 텍스트
+		-- 강화 확률 텍스트 - (Phase 2) 구간표 기반 4항목 표시
 		local rateEnt = _EntityService:GetEntityByPath(sfPath .. "/RateText")
 		if isvalid(rateEnt) then
-			rateEnt.TextComponent.Text = "성공 60% | 유지 20% | 파괴 20%"
+			local band = self:GetStarforceBand(level)
+			rateEnt.TextComponent.Text = "성공 " .. tostring(band.success) .. "% | 유지 " .. tostring(band.keep)
+				.. "% | 하락 " .. tostring(band.drop) .. "% | 파괴 " .. tostring(band.destroy) .. "%"
 		end
 
 		-- 사용 재화
@@ -1089,21 +1476,107 @@ script EnhancementManager extends Logic
 		end
 	end
 
+	-- (Phase 2) 스타포스 구간표 (GDD §4.2) - 현재 성 수 기준 성공/유지/하락/파괴 %와 회당 비용(메소).
+	-- "저구간은 값싸고 거의 성공 / 고구간은 하락·파괴 지옥, 20~30성 = 최상위 성취"가 설계 의도.
+	-- (Phase 5) Balance/StarforceTable.csv가 진실의 원천 - 없거나 손상이면 아래 하드코딩 폴백.
 	@ExecSpace("ClientOnly")
-	method integer GetStarforceCost(integer level)
-		if level < 5 then return 10
-		elseif level < 10 then return 25
-		elseif level < 15 then return 50
-		else return 100
+	method table GetStarforceBand(integer level)
+		-- CSV 로드 (최초 1회 캐싱): minStar 오름차순 밴드 목록
+		if self._T.sfBands == nil then
+			local bands = nil
+			local ok, ds = pcall(function() return _DataService:GetTable("StarforceTable") end)
+			if ok and ds ~= nil then
+				local n = ds:GetRowCount()
+				if n >= 3 then
+					bands = {}
+					for i = 1, n do
+						table.insert(bands, {
+							minStar = math.floor(tonumber(ds:GetCell(i, "minStar")) or 0),
+							success = tonumber(ds:GetCell(i, "success")) or 0,
+							keep    = tonumber(ds:GetCell(i, "keep")) or 0,
+							drop    = tonumber(ds:GetCell(i, "drop")) or 0,
+							destroy = tonumber(ds:GetCell(i, "destroy")) or 0,
+							cost    = tonumber(ds:GetCell(i, "cost")) or 0,
+						})
+					end
+					log("[Enhance] StarforceTable CSV 로드 완료 (" .. tostring(n) .. "구간)")
+				end
+			end
+			self._T.sfBands = bands or false   -- false = 폴백 사용 표시
+		end
+		if self._T.sfBands ~= false and self._T.sfBands ~= nil then
+			local best = nil
+			for _, b in ipairs(self._T.sfBands) do
+				if level >= b.minStar and (best == nil or b.minStar > best.minStar) then
+					best = b
+				end
+			end
+			if best ~= nil then
+				return { success = best.success, keep = best.keep, drop = best.drop, destroy = best.destroy, cost = best.cost }
+			end
+		end
+		-- (재보정 v3) 성공 60% 전 구간 고정 + 하락 제거 - 긴장은 파괴 확률 상승만으로 만든다.
+		-- 파괴는 5성부터(v2 유지), 비용도 v2 유지. CSV와 동일 값.
+		if level < 5 then return { success = 60, keep = 40, drop = 0, destroy = 0,  cost = 300 }
+		elseif level < 10 then return { success = 60, keep = 35, drop = 0, destroy = 5,  cost = 1000 }
+		elseif level < 12 then return { success = 60, keep = 32, drop = 0, destroy = 8,  cost = 2500 }
+		elseif level < 15 then return { success = 60, keep = 30, drop = 0, destroy = 10, cost = 5000 }
+		elseif level < 17 then return { success = 60, keep = 28, drop = 0, destroy = 12, cost = 12000 }
+		elseif level < 20 then return { success = 60, keep = 25, drop = 0, destroy = 15, cost = 30000 }
+		elseif level < 22 then return { success = 60, keep = 20, drop = 0, destroy = 20, cost = 90000 }
+		elseif level < 25 then return { success = 60, keep = 15, drop = 0, destroy = 25, cost = 250000 }
+		elseif level < 30 then return { success = 60, keep = 10, drop = 0, destroy = 30, cost = 600000 }
+		elseif level < 40 then return { success = 60, keep = 5,  drop = 0, destroy = 35, cost = 2000000 }
+		else return { success = 60, keep = 0, drop = 0, destroy = 40, cost = 6000000 }
 		end
 	end
 
+	@ExecSpace("ClientOnly")
+	method integer GetStarforceCost(integer level)
+		-- (Phase 2) 비용은 구간표 단일 출처로 위임한다 (기존 호출부 호환 유지)
+		return math.floor(self:GetStarforceBand(level).cost)
+	end
+
+	-- (Phase 5) 밸런스 가격 조회 - Balance/ShopPrice.csv의 key 행을 읽고, 없으면 기본값.
+	@ExecSpace("ClientOnly")
+	method integer GetBalancePrice(string priceKey, integer defaultPrice)
+		if self._T.shopPrices == nil then
+			local prices = nil
+			local ok, ds = pcall(function() return _DataService:GetTable("ShopPrice") end)
+			if ok and ds ~= nil then
+				local n = ds:GetRowCount()
+				if n >= 1 then
+					prices = {}
+					for i = 1, n do
+						local k = ds:GetCell(i, "key")
+						local v = tonumber(ds:GetCell(i, "price"))
+						if k ~= nil and k ~= "" and v ~= nil then prices[k] = math.floor(v) end
+					end
+					log("[Enhance] ShopPrice CSV 로드 완료 (" .. tostring(n) .. "행)")
+				end
+			end
+			self._T.shopPrices = prices or false
+		end
+		if self._T.shopPrices ~= false and self._T.shopPrices ~= nil then
+			local v = self._T.shopPrices[priceKey]
+			if v ~= nil then return v end
+		end
+		return defaultPrice
+	end
+
 	-- ─── 초기화 ───────────────────────────────────────────────────────────
+	@ExecSpace("ClientOnly")
+	method boolean HasEnhanceTarget()
+		-- 강화 대상이 슬롯에 올라가 있는지 (인벤 경로/장착 경로 공통) - 인벤 이동 잠금 등이 참조한다.
+		return self.enhanceTargetEquipSlot > 0 or self.enhanceTargetInvenIdx > 0
+	end
+
 	@ExecSpace("ClientOnly")
 	method void ClearTarget()
 		self.enhanceTargetName = ""
 		self.enhanceTargetRUID = ""
 		self.enhanceTargetInvenIdx = 0
+		self.enhanceTargetEquipSlot = 0
 		self.enhanceLevel = 0
 		self.enhanceTargetItemStr = ""
 		self.enhanceTargetSrcTab  = ""
@@ -1393,7 +1866,28 @@ script EnhancementManager extends Logic
 		if isvalid(mesoTxt) then mesoTxt.TextComponent.FontColor = Color(1,1,1,1) end
 		if isvalid(cubeTxt) then cubeTxt.TextComponent.FontColor = Color(0.50, 0.56, 0.62, 1) end
 
+		-- (버그 수정) 사용 재화 비용 표시 - MesoCostText가 어디서도 채워지지 않아 "- 메소"로 남던 것.
+		local costTxt = _EntityService:GetEntityByPath(cPath .. "/MesoPanel/MesoCostText")
+		if isvalid(costTxt) then
+			local cost = (tabIdx == 4) and self:GetBalancePrice("reset_potential", 100000) or self:GetBalancePrice("reset_additional", 150000)
+			costTxt.TextComponent.Text = self:FormatMesoComma(cost) .. " 메소"
+		end
+
 		if tabIdx == 4 then self.potCurrencyTab = 1 else self.addCurrencyTab = 1 end
+	end
+
+	-- 1000 단위 콤마 표기 (예: 100000 → "100,000")
+	@ExecSpace("ClientOnly")
+	method string FormatMesoComma(number amount)
+		local s = tostring(math.floor(amount))
+		local out = ""
+		local len = string.len(s)
+		for i = 1, len do
+			out = out .. string.sub(s, i, i)
+			local remain = len - i
+			if remain > 0 and remain % 3 == 0 then out = out .. "," end
+		end
+		return out
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1425,21 +1919,37 @@ script EnhancementManager extends Logic
 			self:ShowItemUnusableDialog()
 			return
 		end
-		local selectedSlot = (tabIdx == 4) and self.potSelectedSlot or self.addSelectedSlot
-		if selectedSlot == 0 then
-			log("[Cube] 큐브 미선택")
-			return
-		end
+		-- (Phase 3) 재화 탭 분기: 메소 탭이면 큐브 없이 메소로 재설정한다 (잠재 10만/에디 15만,
+		-- 확률은 레드큐브/에디셔널큐브와 동일). 큐브 탭이면 기존 큐브 소모 방식.
+		local currTab = (tabIdx == 4) and self.potCurrencyTab or self.addCurrencyTab
+		local usingMeso = (currTab == 1)
+		local cubeRUID = ""
+		local consumeIdx = 0
+		local mesoCost = 0
+		if usingMeso then
+			mesoCost = (tabIdx == 4) and self:GetBalancePrice("reset_potential", 100000) or self:GetBalancePrice("reset_additional", 150000)
+			if _UIEquipInventoryManager.meso < mesoCost then
+				log("[Cube] 메소 부족 (" .. tostring(mesoCost) .. "원 필요)")
+				return
+			end
+			cubeRUID = (tabIdx == 4) and "b2300eda46f3445e9b1c6e774a2ee95a" or "af5404f4c8fc4ec78ccc1a57446f69db"
+		else
+			local selectedSlot = (tabIdx == 4) and self.potSelectedSlot or self.addSelectedSlot
+			if selectedSlot == 0 then
+				log("[Cube] 큐브 미선택")
+				return
+			end
 
-		local cubeSlots = (tabIdx == 4) and self._T.potCubeSlots or self._T.addCubeSlots
-		if not cubeSlots or not cubeSlots[selectedSlot] then
-			log("[Cube] 슬롯 데이터 없음")
-			return
-		end
+			local cubeSlots = (tabIdx == 4) and self._T.potCubeSlots or self._T.addCubeSlots
+			if not cubeSlots or not cubeSlots[selectedSlot] then
+				log("[Cube] 슬롯 데이터 없음")
+				return
+			end
 
-		local cubeInfo   = cubeSlots[selectedSlot]
-		local cubeRUID   = cubeInfo.ruid
-		local consumeIdx = cubeInfo.consumeSlot
+			local cubeInfo = cubeSlots[selectedSlot]
+			cubeRUID   = cubeInfo.ruid
+			consumeIdx = cubeInfo.consumeSlot
+		end
 
 		local s = self.enhanceTargetItemStr
 		if s == "" then return end
@@ -1490,34 +2000,44 @@ script EnhancementManager extends Logic
 		local newItemStr = table.concat(fields, "|")
 		self.enhanceTargetItemStr = newItemStr
 
-		-- 인벤 탭에 반영
-		local srcTab = self.enhanceTargetSrcTab
-		if srcTab == "" then srcTab = "equip" end
-		_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newItemStr
+		-- 원본 위치에 반영 - (신규) 장착 중 장비 대상이면 장비창, 아니면 인벤 탭
+		if self.enhanceTargetEquipSlot > 0 then
+			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, newItemStr)
+			_CharacterPersistence:MarkDirty("enhance_cube")
+		else
+			local srcTab = self.enhanceTargetSrcTab
+			if srcTab == "" then srcTab = "equip" end
+			_UIEquipInventoryManager._T.tabData[srcTab][self.enhanceTargetInvenIdx] = newItemStr
+		end
 		_UIEquipInventoryManager:RefreshUI()
 
-		-- 큐브 1개 소비
-		local cd = _UIEquipInventoryManager._T.tabData["consume"][consumeIdx] or ""
-		if cd ~= "" then
-			local cf = {}
-			local cp = 1
-			while true do
-				local cj, _ = string.find(cd, "|", cp, true)
-				if cj then cf[#cf+1] = string.sub(cd, cp, cj-1); cp = cj+1
-				else cf[#cf+1] = string.sub(cd, cp); break end
-			end
-			while #cf < 7 do cf[#cf+1] = "0" end
-			local cnt = (tonumber(cf[7]) or 0) - 1
-			if cnt <= 0 then
-				_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = ""
-			else
-				cf[7] = tostring(cnt)
-				_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = table.concat(cf, "|")
+		-- 재화 소모: 메소 재설정이면 메소 차감, 큐브 재설정이면 큐브 1개 소비
+		if usingMeso then
+			_UIEquipInventoryManager:AddMeso(-mesoCost)
+			self:UpdateMesoDisplay()
+		else
+			local cd = _UIEquipInventoryManager._T.tabData["consume"][consumeIdx] or ""
+			if cd ~= "" then
+				local cf = {}
+				local cp = 1
+				while true do
+					local cj, _ = string.find(cd, "|", cp, true)
+					if cj then cf[#cf+1] = string.sub(cd, cp, cj-1); cp = cj+1
+					else cf[#cf+1] = string.sub(cd, cp); break end
+				end
+				while #cf < 7 do cf[#cf+1] = "0" end
+				local cnt = (tonumber(cf[7]) or 0) - 1
+				if cnt <= 0 then
+					_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = ""
+				else
+					cf[7] = tostring(cnt)
+					_UIEquipInventoryManager._T.tabData["consume"][consumeIdx] = table.concat(cf, "|")
+				end
 			end
 		end
 
 		self:RefreshCubeContent(tabIdx)
-		log("[Cube] 리셋 완료 grade=" .. tostring(newGrade) .. " " .. opt1 .. " / " .. opt2 .. " / " .. opt3)
+		log("[Cube] 리셋 완료 (" .. (usingMeso and ("메소 " .. tostring(mesoCost)) or "큐브") .. ") grade=" .. tostring(newGrade) .. " " .. opt1 .. " / " .. opt2 .. " / " .. opt3)
 	end
 
 	-- ─── 큐브 리셋: 확률 테이블 ─────────────────────────────────────────────
@@ -1582,172 +2102,77 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method string GetRandomOption(integer grade, boolean isPotential, boolean isWeapon)
+		-- (Phase 3 전면 교체 - GDD §4.3) 미구현 잡옵(HP/MP 회복·상태이상·이동/점프·방어력·미스틱도어 등)
+		-- 전부 제거. 남는 옵션군 7종: 주스탯(플랫/%) · 올스탯 · 공/마(플랫/%) · 데미지% · 방어율 무시% ·
+		-- 보스 몬스터 데미지%(무기 전용) · 크리티컬 확률/데미지% · 스킬 쿨타임 감소(레전드리).
+		-- 무기/방어구 공통 풀 + 무기만 보스뎀 추가. 에디셔널은 잠재의 절반 수치.
 		local opts
 
 		if isPotential then
-			-- ── 잠재능력 ──────────────────────────────────────────────────────
-			if isWeapon then
-				-- 무기 잠재능력 (무기 잠재능력확률.txt 기준)
-				if grade <= 1 then
-					opts = {
-						"STR +12","DEX +12","INT +12","LUK +12",
-						"최대 HP +120","최대 MP +120","공격력 +12","마력 +12",
-						"STR +3%","DEX +3%","INT +3%","LUK +3%",
-						"공격력 +3%","마력 +3%","크리티컬 확률 +4%","데미지 +3%",
-						"올스탯 +5",
-						"공격 시 20% 확률로 240의 HP 회복",
-						"공격 시 20% 확률로 120의 MP 회복",
-						"공격 시 20% 확률로 6레벨 중독효과 적용",
-						"공격 시 10% 확률로 2레벨 기절효과 적용",
-						"공격 시 20% 확률로 2레벨 슬로우효과 적용",
-						"공격 시 20% 확률로 3레벨 암흑효과 적용",
-						"공격 시 10% 확률로 2레벨 빙결효과 적용",
-						"공격 시 10% 확률로 2레벨 봉인효과 적용",
-						"몬스터 방어율 무시 +15%",
-					}
-				elseif grade == 2 then
-					opts = {
-						"STR +6%","DEX +6%","INT +6%","LUK +6%",
-						"최대 HP +6%","최대 MP +6%","공격력 +6%","마력 +6%",
-						"크리티컬 확률 +8%","데미지 +6%","올스탯 +3%",
-						"공격 시 20% 확률로 360의 HP 회복",
-						"공격 시 20% 확률로 180의 MP 회복",
-						"몬스터 방어율 무시 +15%",
-					}
-				elseif grade == 3 then
-					opts = {
-						"STR +9%","DEX +9%","INT +9%","LUK +9%",
-						"공격력 +9%","마력 +9%","크리티컬 확률 +9%","데미지 +9%",
-						"올스탯 +6%","몬스터 방어율 무시 +30%","보스 몬스터 데미지 +30%",
-					}
-				else
-					opts = {
-						"STR +12%","DEX +12%","INT +12%","LUK +12%",
-						"공격력 +12%","마력 +12%","크리티컬 확률 +12%","데미지 +12%",
-						"올스탯 +9%","공격력 +32","마력 +32",
-						"몬스터 방어율 무시 +35%","몬스터 방어율 무시 +40%",
-						"보스 몬스터 데미지 +35%","보스 몬스터 데미지 +40%",
-					}
-				end
+			if grade <= 1 then
+				opts = {
+					"STR +6","DEX +6","INT +6","LUK +6","올스탯 +3","공격력 +3","마력 +3",
+					"STR +2%","DEX +2%","INT +2%","LUK +2%","공격력 +2%","마력 +2%",
+					"데미지 +2%","몬스터 방어율 무시 +2%",
+				}
+			elseif grade == 2 then
+				opts = {
+					"STR +12","DEX +12","INT +12","LUK +12","올스탯 +6","공격력 +6","마력 +6",
+					"STR +4%","DEX +4%","INT +4%","LUK +4%","공격력 +4%","마력 +4%",
+					"데미지 +4%","몬스터 방어율 무시 +4%","크리티컬 확률 +4%",
+				}
+			elseif grade == 3 then
+				opts = {
+					"올스탯 +9","공격력 +9","마력 +9",
+					"STR +7%","DEX +7%","INT +7%","LUK +7%","공격력 +7%","마력 +7%",
+					"데미지 +7%","몬스터 방어율 무시 +7%","크리티컬 확률 +7%","크리티컬 데미지 +7%",
+				}
+				-- (요청 복원) 보스 몬스터 데미지는 구버전 유효 옵션 수치(30/35/40%)로 - 무기 전용,
+				-- 보스 판정 도입 전까지는 상태창 데미지%에 그대로 합산되는 유효 옵션이다
+				if isWeapon then table.insert(opts, "보스 몬스터 데미지 +30%") end
 			else
-				-- 비무기 잠재능력 (모자 잠재능력확률.txt 기준)
-				if grade <= 1 then
-					opts = {
-						"STR +12","DEX +12","INT +12","LUK +12",
-						"최대 HP +120","최대 MP +120","방어력 +120",
-						"STR +3%","DEX +3%","INT +3%","LUK +3%",
-						"최대 HP +3%","최대 MP +3%","방어력 +3%","올스탯 +5",
-					}
-				elseif grade == 2 then
-					opts = {
-						"STR +6%","DEX +6%","INT +6%","LUK +6%",
-						"최대 HP +6%","최대 MP +6%","방어력 +6%","올스탯 +3%",
-					}
-				elseif grade == 3 then
-					opts = {
-						"STR +9%","DEX +9%","INT +9%","LUK +9%",
-						"최대 HP +9%","최대 MP +9%","올스탯 +6%",
-						"피격 시 5% 확률로 데미지의 20% 무시",
-						"피격 시 5% 확률로 데미지의 40% 무시",
-						"HP 회복 아이템 및 회복 스킬 효율 +30%",
-						"<쓸만한 미스틱 도어> 스킬 사용 가능",
-					}
-				else
-					opts = {
-						"STR +12%","DEX +12%","INT +12%","LUK +12%",
-						"최대 HP +12%","최대 MP +12%","올스탯 +9%",
-						"피격 시 10% 확률로 데미지의 20% 무시",
-						"피격 시 10% 확률로 데미지의 40% 무시",
-						"스킬 재사용 대기시간 -1초","스킬 재사용 대기시간 -2초",
-						"<쓸만한 어드밴스드 블레스> 스킬 사용 가능",
-					}
+				opts = {
+					"올스탯 +12","공격력 +12","마력 +12",
+					"STR +10%","DEX +10%","INT +10%","LUK +10%","공격력 +10%","마력 +10%",
+					"데미지 +10%","몬스터 방어율 무시 +10%","크리티컬 확률 +10%","크리티컬 데미지 +10%",
+					"스킬 재사용 대기시간 -1초",
+				}
+				if isWeapon then
+					table.insert(opts, "보스 몬스터 데미지 +35%")
+					table.insert(opts, "보스 몬스터 데미지 +40%")
 				end
 			end
 		else
-			-- ── 에디셔널 잠재능력 ─────────────────────────────────────────────
-			if isWeapon then
-				-- 무기 에디셔널 (무기 에디셔널확률표.txt 기준)
-				if grade <= 1 then
-					opts = {
-						"최대 HP +100","최대 MP +100","이동속도 +6","점프력 +6","방어력 +100",
-						"STR +12","DEX +12","INT +12","LUK +12","공격력 +12","마력 +12",
-						"최대 HP +2%","최대 MP +2%",
-						"STR +3%","DEX +3%","INT +3%","LUK +3%",
-						"공격력 +3%","마력 +3%","크리티컬 확률 +4%","데미지 +3%","올스탯 +5",
-					}
-				elseif grade == 2 then
-					opts = {
-						"최대 HP +5%","최대 MP +5%","공격력 +6%","마력 +6%",
-						"크리티컬 확률 +6%",
-						"STR +6%","DEX +6%","INT +6%","LUK +6%",
-						"데미지 +6%","올스탯 +3%",
-						"공격 시 3% 확률로 53의 HP 회복",
-						"공격 시 3% 확률로 53의 MP 회복",
-						"몬스터 방어율 무시 +3%",
-					}
-				elseif grade == 3 then
-					opts = {
-						"최대 HP +8%","최대 MP +8%","공격력 +9%","마력 +9%",
-						"크리티컬 확률 +9%",
-						"STR +9%","DEX +9%","INT +9%","LUK +9%",
-						"데미지 +9%","올스탯 +6%",
-						"캐릭터 기준 9레벨 당 STR +1","캐릭터 기준 9레벨 당 DEX +1",
-						"캐릭터 기준 9레벨 당 INT +1","캐릭터 기준 9레벨 당 LUK +1",
-						"공격 시 15% 확률로 95의 HP 회복",
-						"공격 시 15% 확률로 95의 MP 회복",
-						"몬스터 방어율 무시 +4%","보스 몬스터 데미지 +12%",
-					}
-				else
-					opts = {
-						"최대 HP +11%","최대 MP +11%","공격력 +12%","마력 +12%",
-						"크리티컬 확률 +12%",
-						"STR +12%","DEX +12%","INT +12%","LUK +12%",
-						"데미지 +12%","올스탯 +9%",
-						"캐릭터 기준 9레벨 당 STR +2","캐릭터 기준 9레벨 당 DEX +2",
-						"캐릭터 기준 9레벨 당 INT +2","캐릭터 기준 9레벨 당 LUK +2",
-						"공격력 +32","마력 +32",
-						"몬스터 방어율 무시 +5%","보스 몬스터 데미지 +18%",
-					}
-				end
+			-- 에디셔널: 잠재의 절반 수치 (반올림)
+			if grade <= 1 then
+				opts = {
+					"STR +3","DEX +3","INT +3","LUK +3","올스탯 +2","공격력 +2","마력 +2",
+					"STR +1%","DEX +1%","INT +1%","LUK +1%","공격력 +1%","마력 +1%",
+					"데미지 +1%","몬스터 방어율 무시 +1%",
+				}
+			elseif grade == 2 then
+				opts = {
+					"STR +6","DEX +6","INT +6","LUK +6","올스탯 +3","공격력 +3","마력 +3",
+					"STR +2%","DEX +2%","INT +2%","LUK +2%","공격력 +2%","마력 +2%",
+					"데미지 +2%","몬스터 방어율 무시 +2%","크리티컬 확률 +2%",
+				}
+			elseif grade == 3 then
+				opts = {
+					"올스탯 +5","공격력 +5","마력 +5",
+					"STR +4%","DEX +4%","INT +4%","LUK +4%","공격력 +4%","마력 +4%",
+					"데미지 +4%","몬스터 방어율 무시 +4%","크리티컬 확률 +4%","크리티컬 데미지 +4%",
+				}
+				if isWeapon then table.insert(opts, "보스 몬스터 데미지 +15%") end
 			else
-				-- 비무기 에디셔널 (모자 에디셔널확률표.txt 기준)
-				if grade <= 1 then
-					opts = {
-						"STR +10","DEX +10","INT +10","LUK +10",
-						"최대 HP +100","최대 MP +100","이동속도 +6","점프력 +6",
-						"공격력 +10","마력 +10","방어력 +100",
-						"STR +2%","DEX +2%","INT +2%","LUK +2%",
-						"최대 HP +2%","최대 MP +2%","방어력 +2%","올스탯 +3",
-					}
-				elseif grade == 2 then
-					opts = {
-						"STR +14","DEX +14","INT +14","LUK +14",
-						"최대 HP +180","최대 MP +180","이동속도 +8","점프력 +8",
-						"공격력 +11","마력 +11","방어력 +120",
-						"STR +4%","DEX +4%","INT +4%","LUK +4%",
-						"최대 HP +5%","최대 MP +5%","방어력 +4%","올스탯 +2%",
-					}
-				elseif grade == 3 then
-					opts = {
-						"STR +18","DEX +18","INT +18","LUK +18",
-						"최대 HP +300","최대 MP +300","공격력 +14","마력 +14",
-						"STR +6%","DEX +6%","INT +6%","LUK +6%",
-						"최대 HP +8%","최대 MP +8%","올스탯 +5%",
-						"캐릭터 기준 9레벨 당 STR +1","캐릭터 기준 9레벨 당 DEX +1",
-						"캐릭터 기준 9레벨 당 INT +1","캐릭터 기준 9레벨 당 LUK +1",
-						"HP 회복 아이템 및 회복 스킬 효율 +20%",
-					}
-				else
-					opts = {
-						"STR +20","DEX +20","INT +20","LUK +20",
-						"최대 HP +360","최대 MP +360","공격력 +16","마력 +16",
-						"STR +8%","DEX +8%","INT +8%","LUK +8%",
-						"최대 HP +11%","최대 MP +11%","크리티컬 데미지 +1%","올스탯 +6%",
-						"캐릭터 기준 9레벨 당 STR +2","캐릭터 기준 9레벨 당 DEX +2",
-						"캐릭터 기준 9레벨 당 INT +2","캐릭터 기준 9레벨 당 LUK +2",
-						"HP 회복 아이템 및 회복 스킬 효율 +30%",
-						"스킬 재사용 대기시간 -1초","메소 획득량 +5%","아이템 드롭률 +5%",
-					}
+				opts = {
+					"올스탯 +6","공격력 +6","마력 +6",
+					"STR +5%","DEX +5%","INT +5%","LUK +5%","공격력 +5%","마력 +5%",
+					"데미지 +5%","몬스터 방어율 무시 +5%","크리티컬 확률 +5%","크리티컬 데미지 +5%",
+					"스킬 재사용 대기시간 -1초",
+				}
+				if isWeapon then
+					table.insert(opts, "보스 몬스터 데미지 +18%")
+					table.insert(opts, "보스 몬스터 데미지 +20%")
 				end
 			end
 		end

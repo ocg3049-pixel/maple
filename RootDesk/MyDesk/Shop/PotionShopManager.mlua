@@ -19,30 +19,10 @@ script PotionShopManager extends Logic
     property Entity closeBtnEntity = ""
 
     method void OnBeginPlay()
-        if self:IsServer() then
-            self:ConnectEvent(UserEnterEvent, self.OnUserEnter)
-            _TimerService:SetTimerOnce(self.CheckExistingPlayers, 0.5)
-        end
+        -- (Phase 3 메소 단일화) 포션샵 전용 메소(PotionShopMeso 스토리지)를 폐기하고
+        -- 실제 보유 메소(UIEquipInventoryManager.meso)로 구매한다 - 서버 초기화 불필요.
         if self:IsClient() then
             self:ClientInit()
-        end
-    end
-
-    @ExecSpace("ServerOnly")
-    method void CheckExistingPlayers()
-        local mapsEnt = _EntityService:GetEntityByPath("/maps")
-        if not isvalid(mapsEnt) then return end
-        for _, map in ipairs(mapsEnt.Children:ToTable()) do
-            if not isvalid(map) then continue end
-            for _, child in ipairs(map.Children:ToTable()) do
-                if isvalid(child) and isvalid(child.PlayerComponent) then
-                    local userId = tostring(child.PlayerComponent.UserId)
-                    if userId ~= "" then
-                        self:InitMesoForUser(userId)
-                        return
-                    end
-                end
-            end
         end
     end
 
@@ -78,25 +58,9 @@ script PotionShopManager extends Logic
 
     -- ===== 서버 =====
 
-    @ExecSpace("ServerOnly")
-    method void OnUserEnter(UserEnterEvent event)
-        local userId = event.UserId
-        if userId == nil or userId == "" then return end
-        self:InitMesoForUser(userId)
-    end
-
-    @ExecSpace("ServerOnly")
-    method void InitMesoForUser(string userId)
-        if self._T.mesoInitialized then return end
-        self._T.mesoInitialized = true
-        local store = _DataStorageService:GetGlobalDataStorage("PotionShopMeso")
-        store:SetAndWait("meso_" .. userId, tostring(self.DEFAULT_MESO))
-        self.PlayerMeso = self.DEFAULT_MESO
-        log("[Shop] 초기화: " .. userId .. " 메소=" .. tostring(self.PlayerMeso))
-    end
-
     @ExecSpace("Server")
     method void RequestBuyPotion()
+        -- (Phase 3) 메소 검사·차감은 클라이언트(OnBuyClicked)에서 실메소로 수행됨 - 서버는 지급만 한다.
         local userId = senderUserId
         if userId == nil or userId == "" then return end
         self:ProcessBuyPotionServer(userId)
@@ -115,27 +79,8 @@ script PotionShopManager extends Logic
             return
         end
 
-        local store = _DataStorageService:GetGlobalDataStorage("PotionShopMeso")
-        local _, saved = store:GetAndWait("meso_" .. userId)
-        local meso = tonumber(saved)
-        if meso == nil then
-            meso = self.DEFAULT_MESO
-            store:SetAndWait("meso_" .. userId, tostring(meso))
-            self.PlayerMeso = meso
-        end
-
-        if meso < self.POTION_PRICE then
-            self:NotifyMessage("메소가 부족합니다! (현재: " .. meso .. ")", userId)
-            return
-        end
-
-        meso = meso - self.POTION_PRICE
-        store:SetAndWait("meso_" .. userId, tostring(meso))
-        self.PlayerMeso = meso
-
         _ItemService:CreateItem(PotionItem, "PotionItem", inv)
-        log("[Shop] 포션 구매: " .. userId .. " 메소=" .. meso)
-        self:NotifyPurchaseDone(meso, userId)
+        log("[Shop] 포션 지급: " .. userId)
         self:NotifyPotionAdded(userId)
     end
 
@@ -198,15 +143,12 @@ script PotionShopManager extends Logic
         end
     end
 
-    @ExecSpace("Client")
-    method void NotifyPurchaseDone(integer meso)
-        -- 이 포션샵 전용 메소(PotionShopMeso 스토리지)는 실제 보유 메소(UIEquipInventoryManager.meso)와
-        -- 별개 시스템이다. 과거에는 여기서 본 메소까지 덮어썼는데, 인벤토리 창을 열 때마다 SyncInvenMeso가
-        -- 이 함수를 호출해 실제 메소가 1000(DEFAULT_MESO)으로 리셋되는 버그의 원인이었다 - 샵 팝업 자체
-        -- 표시만 갱신한다.
+    @ExecSpace("ClientOnly")
+    method void UpdateShopMesoText()
+        -- (Phase 3) 샵 팝업의 소지 메소 표시 = 실제 보유 메소 (이중 메소 시스템 폐기)
         local mesoText = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/text_meso")
         if isvalid(mesoText) and isvalid(mesoText.TextComponent) then
-            mesoText.TextComponent.Text = "소지 메소: " .. tostring(meso)
+            mesoText.TextComponent.Text = "소지 메소: " .. tostring(_UIEquipInventoryManager.meso)
         end
     end
 
@@ -277,26 +219,6 @@ script PotionShopManager extends Logic
         self:OpenShopUI()
     end
 
-    @ExecSpace("Server")
-    method void RequestMesoRefresh()
-        local userId = senderUserId
-        if userId == nil or userId == "" then return end
-        self:ProcessMesoRefreshServer(userId)
-    end
-
-    @ExecSpace("ServerOnly")
-    method void ProcessMesoRefreshServer(string userId)
-        local store = _DataStorageService:GetGlobalDataStorage("PotionShopMeso")
-        local _, saved = store:GetAndWait("meso_" .. userId)
-        local meso = tonumber(saved)
-        if meso == nil then
-            meso = self.DEFAULT_MESO
-            store:SetAndWait("meso_" .. userId, tostring(meso))
-        end
-        self.PlayerMeso = meso
-        self:NotifyPurchaseDone(meso, userId)
-    end
-
     @ExecSpace("ClientOnly")
     method void OpenShopUI()
         local shopGroup = _EntityService:GetEntityByPath("/ui/ShopGroup")
@@ -308,11 +230,8 @@ script PotionShopManager extends Logic
         shopGroup.Enable = true
         _UIEquipInventoryManager:PushWin("/ui/ShopGroup")
 
-        local mesoText = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/text_meso")
-        if isvalid(mesoText) and isvalid(mesoText.TextComponent) then
-            mesoText.TextComponent.Text = "소지 메소: " .. tostring(self.PlayerMeso)
-        end
-        self:RequestMesoRefresh()
+        -- (Phase 3) 표시 메소 = 실제 보유 메소
+        self:UpdateShopMesoText()
 
         if self.buyBtnHandler == nil then
             local buyBtn = _EntityService:GetEntityByPath("/ui/ShopGroup/ShopPopup/btn_buy")
@@ -349,7 +268,14 @@ script PotionShopManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnBuyClicked()
+        -- (Phase 3 메소 단일화) 실제 보유 메소로 검사·차감 후 서버에 지급만 요청한다.
+        if _UIEquipInventoryManager.meso < self.POTION_PRICE then
+            log("[Shop] 메소 부족! (" .. tostring(self.POTION_PRICE) .. "원 필요, 현재 " .. tostring(_UIEquipInventoryManager.meso) .. ")")
+            return
+        end
+        _UIEquipInventoryManager:AddMeso(-self.POTION_PRICE)
         self:RequestBuyPotion()
+        self:UpdateShopMesoText()
     end
 
     @ExecSpace("ClientOnly")

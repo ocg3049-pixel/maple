@@ -1,0 +1,109 @@
+@Logic
+script RegionTierLogic extends Logic
+
+	-- (Phase 3, GDD §4.4) 사냥터 티어 시스템.
+	-- 몬스터 스펙(레벨·HP)은 전 지역 동일하고, 지역이 좋을수록 "마리당 메소"만 커진다 -
+	-- 성장 페이싱은 [티어 개방 레벨 게이트] × [티어별 메소 수입] vs [강화 비용]의 경제 균형으로만 제어.
+	-- 맵→티어 배정은 MapPortalSystem의 3지역 체인 인덱스 기반 (Phase3 문서의 배정표 참고).
+	-- 수치는 v1 하드코딩 - Phase 5에서 RegionTier.csv로 이관 예정.
+
+	-- 티어 번호 → { openLevel = 개방 레벨, meso = 마리당 기본 메소 }
+	@ExecSpace("ServerOnly")
+	method table GetTierInfo(integer tier)
+		-- (Phase 5) Balance/RegionTier.csv가 진실의 원천 - 없거나 손상이면 하드코딩 폴백 (GDD §4.4 티어표)
+		if self._T.tierRows == nil then
+			local rows = nil
+			local ok, ds = pcall(function() return _DataService:GetTable("RegionTier") end)
+			if ok and ds ~= nil then
+				local n = ds:GetRowCount()
+				if n >= 3 then
+					rows = {}
+					for i = 1, n do
+						local t = math.floor(tonumber(ds:GetCell(i, "tier")) or 0)
+						if t >= 1 then
+							rows[t] = {
+								openLevel = math.floor(tonumber(ds:GetCell(i, "openLevel")) or 1),
+								meso = math.floor(tonumber(ds:GetCell(i, "meso")) or 1),
+							}
+						end
+					end
+					log("[RegionTier] RegionTier CSV 로드 완료 (" .. tostring(n) .. "티어)")
+				end
+			end
+			self._T.tierRows = rows or false
+		end
+		if self._T.tierRows ~= false and self._T.tierRows ~= nil then
+			local row = self._T.tierRows[math.max(1, math.min(11, tier))]
+			if row ~= nil then return { openLevel = row.openLevel, meso = row.meso } end
+		end
+		if tier <= 1 then return { openLevel = 1,   meso = 50 }
+		elseif tier == 2 then return { openLevel = 15,  meso = 90 }
+		elseif tier == 3 then return { openLevel = 25,  meso = 160 }
+		elseif tier == 4 then return { openLevel = 35,  meso = 280 }
+		elseif tier == 5 then return { openLevel = 50,  meso = 500 }
+		elseif tier == 6 then return { openLevel = 65,  meso = 900 }
+		elseif tier == 7 then return { openLevel = 80,  meso = 1600 }
+		elseif tier == 8 then return { openLevel = 100, meso = 2800 }
+		elseif tier == 9 then return { openLevel = 120, meso = 5000 }
+		elseif tier == 10 then return { openLevel = 140, meso = 9000 }
+		else return { openLevel = 160, meso = 16000 }
+		end
+	end
+
+	-- 맵 이름 → 티어. 로비는 지역 시작 티어, 미등록 맵(마을/테스트존 등)은 T1(게이트 없음).
+	@ExecSpace("ServerOnly")
+	method integer GetTierForMap(string mapName)
+		if mapName == "hunting01" then return 1 end
+		if mapName == "hunting02" then return 4 end
+		if mapName == "hunting03" then return 8 end
+		local ri = _MapPortalSystem:GetMapRegion(mapName)
+		local mi = _MapPortalSystem:GetMapChainIndex(mapName)
+		if ri == 1 then
+			-- region1 (15맵): 1~5 T1 / 6~10 T2 / 11~15 T3
+			if mi <= 5 then return 1 elseif mi <= 10 then return 2 else return 3 end
+		elseif ri == 2 then
+			-- region2 (48맵): 12개 단위로 T4~T7
+			if mi <= 12 then return 4 elseif mi <= 24 then return 5 elseif mi <= 36 then return 6 else return 7 end
+		elseif ri == 3 then
+			-- region3 (24맵): 8개 단위로 T8~T10
+			if mi <= 8 then return 8 elseif mi <= 16 then return 9 else return 10 end
+		end
+		return 1
+	end
+
+	-- 몬스터 처치 시 메소 드랍량: 티어 기본값 ±20% 랜덤.
+	@ExecSpace("ServerOnly")
+	method integer RollMesoForMap(string mapName)
+		local info = self:GetTierInfo(self:GetTierForMap(mapName))
+		local mult = 0.8 + _UtilLogic:RandomDouble() * 0.4
+		return math.max(1, math.floor(info.meso * mult))
+	end
+
+	-- 서버가 아는 플레이어 레벨: 클라가 0.5초마다 보고하는 MaxHp(=50+레벨×10)의 역산.
+	-- (인벤·전투력이 클라 전용이라 서버는 이 채널로만 레벨을 안다 - UIMyInfoManager.ApplyLevelHp 참고)
+	@ExecSpace("ServerOnly")
+	method integer GetServerLevelOf(Entity player)
+		if not isvalid(player) then return 0 end
+		local pc = player.PlayerComponent
+		if not isvalid(pc) then return 0 end
+		return math.max(0, math.floor(((pc.MaxHp or 50) - 50) / 10))
+	end
+
+	-- 티어 개방 게이트: 통과면 true. 차단이면 false + 해당 클라이언트에 토스트 안내.
+	-- MaxHp 보고가 아직 안 온 로그인 직후(레벨 0)는 T1만 통과 - 상위 티어는 보고 후 자연 통과.
+	@ExecSpace("ServerOnly")
+	method boolean CheckMapEntry(Entity player, string destMapName)
+		local tier = self:GetTierForMap(destMapName)
+		if tier <= 1 then return true end
+		local needLevel = self:GetTierInfo(tier).openLevel
+		local level = self:GetServerLevelOf(player)
+		if level >= needLevel then return true end
+		local pc = player.PlayerComponent
+		if isvalid(pc) then
+			_UIToast:ShowMessage("레벨 " .. tostring(needLevel) .. "부터 입장할 수 있는 사냥터입니다. (현재 Lv." .. tostring(level) .. ")", pc.UserId)
+		end
+		log("[RegionTier] 입장 차단: " .. destMapName .. " (T" .. tostring(tier) .. ", 필요 Lv." .. tostring(needLevel) .. ", 현재 Lv." .. tostring(level) .. ")")
+		return false
+	end
+
+end

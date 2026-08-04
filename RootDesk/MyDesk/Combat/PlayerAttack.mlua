@@ -261,20 +261,26 @@ script PlayerAttack extends AttackComponent
 		            self:AttackClawThrow()
 		            return
 		        end
-		        -- Calculate frontal box in the direction the player is looking
+		        -- (버그 수정) 판정이 모션 시작과 동시에 나가 스윙의 타격 프레임보다 데미지가 먼저 들어갔다 -
+		        -- 스윙 임팩트 시점(0.3초)으로 판정을 지연시킨다. 방향은 시전 순간 값을 캡처해 지연 중
+		        -- 뒤도는 입력에 판정 방향이 끌려가지 않게 한다.
 		        local playerCtrl = self.Entity.PlayerControllerComponent
-		        local worldPos = self.Entity.TransformComponent.WorldPosition
-		        local attackOffset = Vector2(
-		            worldPos.x + 0.5 * playerCtrl.LookDirectionX,
-		            worldPos.y + 0.5
-		        )
-		        -- 기본 공격(Control)은 단일 대상 공격이다 - 몬스터가 밀집한 구역에서 AttackFast의 박스 판정이
-		        -- 여러 마리를 동시에 맞히는 문제가 있어, 판정 전에 가장 가까운 몬스터 하나만 골라
-		        -- IsAttackTarget에서 그 대상만 통과시킨다 (파워스트라이크와 동일한 FindNearestMonster 재사용).
-		        self._T.normalAttackTarget = self:FindNearestMonster(Vector2(worldPos.x, worldPos.y), 1.5)
-		        self._T.shape = BoxShape(attackOffset, Vector2.one, 0)
-		        self:AttackFastShadowSafe(self._T.shape, nil, self._T.normalAttackTarget)
-		        log("PlayerAttack: AttackNormal at x=" .. tostring(attackOffset.x) .. " y=" .. tostring(attackOffset.y))
+		        local capturedDirX = isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1
+		        _TimerService:SetTimerOnce(function()
+		            if not isvalid(self.Entity) then return end
+		            local worldPos = self.Entity.TransformComponent.WorldPosition
+		            local attackOffset = Vector2(
+		                worldPos.x + 0.5 * capturedDirX,
+		                worldPos.y + 0.5
+		            )
+		            -- 기본 공격(Control)은 단일 대상 공격이다 - 몬스터가 밀집한 구역에서 AttackFast의 박스 판정이
+		            -- 여러 마리를 동시에 맞히는 문제가 있어, 판정 전에 가장 가까운 몬스터 하나만 골라
+		            -- IsAttackTarget에서 그 대상만 통과시킨다 (파워스트라이크와 동일한 FindNearestMonster 재사용).
+		            self._T.normalAttackTarget = self:FindNearestMonster(Vector2(worldPos.x, worldPos.y), 1.5)
+		            self._T.shape = BoxShape(attackOffset, Vector2.one, 0)
+		            self:AttackFastShadowSafe(self._T.shape, nil, self._T.normalAttackTarget)
+		            log("PlayerAttack: AttackNormal(임팩트 지연) at x=" .. tostring(attackOffset.x) .. " y=" .. tostring(attackOffset.y))
+		        end, 0.3)
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
@@ -808,13 +814,16 @@ script PlayerAttack extends AttackComponent
 		            return math.floor(combatPower * mult)
 		        elseif attackInfo == "dot.chargeblow.burn" then
 		            -- 차지 블로우(디바인 스윙 강화) 화상: 3초마다 전투력의 50%(12초간 4회). 공격속도 영향 없음.
-		            return math.floor((self._T.pendingChargeBlowBurnPower or 0) * 0.5)
+		            -- (속성 증폭) 중첩 연계 데미지 배율(1 + 0.1×투자pt) 적용.
+		            return math.floor((self._T.pendingChargeBlowBurnPower or 0) * 0.5 * self:GetElementalAmpFactor())
 		        elseif attackInfo == "dot.chargeblow.shock" then
-		            -- 차지 블로우(디바인 저지먼트 강화) 잔류 장판: 0.4초마다 전투력의 500%, 총 3회.
-		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * 5.0)
+		            -- (개편) 속성 연계 장판 공통 사양: 20초 동안 2초마다 전투력의 200%~400%. 속성 증폭 배율 적용.
+		            local linkMult = 2.0 + _UtilLogic:RandomDouble() * 2.0
+		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * linkMult * self:GetElementalAmpFactor())
 		        elseif attackInfo == "dot.chargeblow.curse" then
-		            -- 화상 저주(화상 중인 적을 얼음으로 타격): 3초마다 전투력의 100%, 20초간.
-		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * 1.0)
+		            -- (개편) 속성 연계 장판 공통 사양: 20초 동안 2초마다 전투력의 200%~400%. 속성 증폭 배율 적용.
+		            local linkMult = 2.0 + _UtilLogic:RandomDouble() * 2.0
+		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * linkMult * self:GetElementalAmpFactor())
 		        elseif attackInfo == "dot.firezone" then
 		            -- 불의 영역 화염 지대: 2초마다 전투력의 200%~300%, 10초간.
 		            local mult = 2.0 + _UtilLogic:RandomDouble() * 1.0
@@ -829,16 +838,19 @@ script PlayerAttack extends AttackComponent
 		            local mult = 0.5 + math.random() * (1.5 - 0.5)
 		            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.powerstrike.final" then
-		            -- 파이널어택: 파워스트라이크와 동일한 공식에 15%~30% 추가 데미지를 곱한다.
+		            -- 파이널어택: 파워스트라이크와 동일한 공식에 추가 데미지를 곱한다.
+		            -- (스킬 효과 개편) 추가 배율 15%~30%가 투자 레벨(0.6~1.0 위력 곡선)에 비례해 커진다.
 		            local combatPower = self._T.pendingFinalCombatPower or 0
 		            local mult = 0.5 + math.random() * (3.0 - 1.0)
-		            local bonus = 1.15 + math.random() * (1.30 - 1.15)
+		            local faM = 0.6 + 0.4 * math.min(1, math.max(1, self._T.faSkillLv or 0) / 20)
+		            local bonus = 1 + (0.15 + math.random() * (0.30 - 0.15)) * faM
 		            return math.floor(combatPower * mult * bonus * self:GetChargeBlowDamageFactor(defender))
 		        elseif attackInfo == "skill.slashblast.final" then
-		            -- 파이널어택: 슬래쉬블래스트와 동일한 공식에 15%~30% 추가 데미지를 곱한다.
+		            -- 파이널어택: 슬래쉬블래스트와 동일한 공식에 추가 데미지를 곱한다(레벨 비례 - 위와 동일).
 		            local combatPower = self._T.pendingFinalSlashCombatPower or 0
 		            local mult = 0.5 + math.random() * (1.5 - 0.5)
-		            local bonus = 1.15 + math.random() * (1.30 - 1.15)
+		            local faM = 0.6 + 0.4 * math.min(1, math.max(1, self._T.faSkillLv or 0) / 20)
+		            local bonus = 1 + (0.15 + math.random() * (0.30 - 0.15)) * faM
 		            return math.floor(combatPower * mult * bonus)
 		        elseif attackInfo == "skill.doublestab" then
 		            -- 전투력의 100%~260% 사이 랜덤 (매 타격마다 새로 굴림). math.random() 대신
@@ -1018,9 +1030,10 @@ script PlayerAttack extends AttackComponent
 			            local mult = 5.0 + _UtilLogic:RandomDouble() * (7.0 - 5.0)
 			            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.archersupport" then
-			            -- 궁병 지원: 지원 화살 한 발당 전투력의 200%~300%(30초간 총 15발인 지속 스킬 규격).
+			            -- (개편) 궁병 지원: 화살당 전투력의 500~600% + 분배당 최소/최대 +50%p (마스터 20).
 			            local combatPower = self._T.pendingArcherSupportCombatPower or 0
-			            local mult = 2.0 + _UtilLogic:RandomDouble() * (3.0 - 2.0)
+			            local lvBonus = 0.5 * ((self._T.archerSupportLv or 1) - 1)
+			            local mult = (5.0 + lvBonus) + _UtilLogic:RandomDouble() * 1.0
 			            return math.floor(combatPower * mult)
 		        end
 		        return 50
@@ -1134,7 +1147,9 @@ script PlayerAttack extends AttackComponent
 		        -- 이 값은 파이널어택(TryTriggerFinalAttack → NotifyFinalMotionEnded)까지 그대로 유지돼
 		        -- 추가타 궤적도 같은 속성으로 나가고, 다음 일반 파워스트라이크에서 0으로 되돌아간다.
 		        self._T.chargeBlowMode = chargeMode
-		
+		        -- (속성필드) 버프 지속 중 차지 블로우(속성 1~3)를 쓰면 시전 지역에 속성 필드를 남긴다.
+		        if chargeMode > 0 then self:TrySpawnElementalFieldZone(chargeMode) end
+
 		        -- 공격속도 배율: 클라이언트(CharInfoManager)가 소비한 "공격 속도의 비약" 단계로 계산해 넘겨준 값.
 		        -- combatPower와 같은 이유로 클라이언트에서 계산해 RPC로 전달한다(서버에는 인벤토리 상태가 없음).
 		        -- 1보다 작을수록 빠름(모션/딜레이 단축). 비정상적으로 극단적인 값이 오는 경우를 대비해 안전 범위로 clamp한다.
@@ -1173,6 +1188,8 @@ script PlayerAttack extends AttackComponent
 		        if isvalid(self.Entity.MovementComponent) then
 		            self.Entity.MovementComponent:Stop()
 		        end
+		        -- (버그 수정) 모션 중 착지/피격에 스윙이 끊기지 않도록 상태 몸동작 매핑을 빼둔다 (RestoreControl에서 복구)
+		        self:BeginSwingMotionGuard()
 		
 		        -- 스킬 사용 사운드 재생
 		        self:PlaySkillUseSound(self.Entity)
@@ -1223,6 +1240,8 @@ script PlayerAttack extends AttackComponent
 		        -- 가능한 버그가 있었다. 이 메서드 안에서 직접(동기적으로) 호출하면 항상 컨트롤 복구 다음에 실행되어
 		        -- 순서가 보장된다.
 		        self:TryTriggerFinalAttack("powerstrike", self._T.pendingCombatPower, self._T.pendingAtkMultiplier, self._T.pendingWeaponClass or "twohand")
+		        -- 모션 가드 복구 (파이널어택이 방금 재잠금했다면 EndSwingMotionGuard가 알아서 건너뛴다)
+		        self:EndSwingMotionGuard()
 		        -- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		        -- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
 		        -- (버그 수정) "파워스트라이크 사용 후 파이널어택이 발동하면 숨고르기 때문에 파이널어택
@@ -1232,6 +1251,25 @@ script PlayerAttack extends AttackComponent
 		        if not self._T.isPowerStriking then
 		            self:PlayBreather(self.Entity, self._T.pendingDirX or 1)
 		        end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginSwingMotionGuard()
+		        -- (버그 수정) 파워스트라이크/슬래시블러스트(+파이널어택) 모션 중 착지(FALL→IDLE)·피격(HIT) 등
+		        -- 상태 전환이 stand/hit 클립을 내려보내 스윙이 끊기는 문제 - 브랜디쉬와 동일한 해법으로
+		        -- 시전 동안 상태 몸동작 매핑 5종을 빼고(SuppressBrandishStateMotions) 모션 가드를 켠다.
+		        -- 복구는 EndSwingMotionGuard - 각 Restore 지점에서 호출된다.
+		        self:SuppressBrandishStateMotions()
+		        self:SetBrandishMotionGuard(true)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EndSwingMotionGuard()
+		        -- 파이널어택으로 재잠금된 상태면(isPowerStriking/isSlashBlasting true) 아직 복구하지 않는다 -
+		        -- 파이널 모션의 가드는 그 복구 지점(RestoreFinalControl/RestoreSlashBlastFinalControl)에서 푼다.
+		        if self._T.isPowerStriking or self._T.isSlashBlasting then return end
+		        self:RestoreBrandishStateMotions()
+		        self:SetBrandishMotionGuard(false)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1273,6 +1311,8 @@ script PlayerAttack extends AttackComponent
 		        if isvalid(self.Entity.MovementComponent) then
 		            self.Entity.MovementComponent:Stop()
 		        end
+		        -- (버그 수정) 모션 중 착지/피격에 스윙이 끊기지 않도록 상태 몸동작 매핑을 빼둔다 (RestoreSlashBlastControl에서 복구)
+		        self:BeginSwingMotionGuard()
 		
 		        -- 스킬 사용과 동시에 플레이어 몸쪽에서 발현되는 시작 이펙트 + 전용 사용 사운드
 		        -- (요청) 몸쪽 캐스트 이펙트: 원본 4프레임 스파클 애니메이션(SpawnSlashBlastCastEffect).
@@ -1326,6 +1366,8 @@ script PlayerAttack extends AttackComponent
 		        -- 실행한다. 파워스트라이크와 동일한 이유(별도 동일-딜레이 타이머의 실행 순서 레이스 방지)로 이 메서드
 		        -- 안에서 직접 호출한다.
 		        self:TryTriggerFinalAttack("slashblast", self._T.pendingSlashCombatPower, self._T.pendingSlashMult, self._T.pendingSlashWeaponClass or "twohand")
+		        -- 모션 가드 복구 (파이널어택이 방금 재잠금했다면 EndSwingMotionGuard가 알아서 건너뛴다)
+		        self:EndSwingMotionGuard()
 		        -- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		        -- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
 		        -- (버그 수정) 파워스트라이크와 동일한 이유로, 파이널어택이 방금 발동했다면(isSlashBlasting이
@@ -2307,8 +2349,11 @@ script PlayerAttack extends AttackComponent
 		        -- 레이스 컨디션이 있었다.
 		        -- CharInfoManager.GetAttackSpeedMultiplier()의 공식(0.9^(단계-5), 1단계 오를 때마다 이전 대비 10%씩 단축·복리)과
 		        -- 동일하게, 현재 배율(atkMultiplier)에 0.9^4를 곱해 "현재 단계+4단계"의 배율을 구한다.
-		        -- (기능 변경) "파이널어택 발동확률을 60%로 바꿔달라"는 요청으로 30%->60% 상향.
-		        if math.random() >= 0.6 then return end
+		        -- (스킬 효과 개편) 발동 확률 = 투자 레벨 비례 5% → 50% (마스터 20). 레벨은 클라가
+		        -- SetSkillEffectLevels로 동기화한 값(faSkillLv)을 쓴다 - 미동기/미투자면 최저 5%.
+		        local faLv = math.min(20, math.max(1, self._T.faSkillLv or 0))
+		        local faChance = (5 + 45 * (faLv - 1) / 19) / 100
+		        if _UtilLogic:RandomDouble() >= faChance then return end
 		        -- (기능 추가) "맞을 타겟이 없으면 파이널어택이 발동하지 않게 해달라"는 요청 - 확률은
 		        -- 통과했더라도 실제로 때릴 대상이 근처에 없으면(헛스윙) 모션/잠금/쿨다운 등 아무 부수효과도
 		        -- 일으키지 않고 조용히 취소한다.
@@ -2395,6 +2440,8 @@ script PlayerAttack extends AttackComponent
 		        if isvalid(self.Entity.MovementComponent) then
 		            self.Entity.MovementComponent:Stop()
 		        end
+		        -- (버그 수정) 파이널 모션도 착지/피격에 끊기지 않게 가드 유지 (RestoreFinalControl에서 복구)
+		        self:BeginSwingMotionGuard()
 
 		        self:PlaySkillUseSound(self.Entity)
 		        -- (요청) 차지 블로우로 시작된 연계라면 파워스트라이크 팩의 시전 시작 이펙트를 쓰지 않는다.
@@ -2423,6 +2470,8 @@ script PlayerAttack extends AttackComponent
 		        if isvalid(playerCtrl) and self._T.pendingFinalWasControllerEnabled then
 		            playerCtrl.Enable = true
 		        end
+		        -- 파이널 모션 종료 - 모션 가드 복구
+		        self:EndSwingMotionGuard()
 		        -- (기능 추가) "파이널 어택 모션까지 끝나면 숨고르기를 하게 해달라"는 요청 - 원래 스킬
 		        -- (RestoreControl)에서는 파이널 어택이 발동한 경우 숨고르기를 건너뛰지만(파이널 어택
 		        -- 모션을 가리지 않기 위해), 파이널 어택 자신의 모션이 끝나는 이 시점에는 정상적으로
@@ -2520,6 +2569,8 @@ script PlayerAttack extends AttackComponent
 		        if isvalid(self.Entity.MovementComponent) then
 		            self.Entity.MovementComponent:Stop()
 		        end
+		        -- (버그 수정) 파이널 모션도 착지/피격에 끊기지 않게 가드 유지 (RestoreSlashBlastFinalControl에서 복구)
+		        self:BeginSwingMotionGuard()
 
 		        -- (요청) 몸쪽 캐스트 이펙트(원본 4프레임 스파클) + 전용 사용 사운드.
 		        self:SpawnSlashBlastCastEffect(dirX)
@@ -2553,6 +2604,8 @@ script PlayerAttack extends AttackComponent
 		        if isvalid(playerCtrl) and self._T.pendingFinalSlashWasControllerEnabled then
 		            playerCtrl.Enable = true
 		        end
+		        -- 파이널 모션 종료 - 모션 가드 복구
+		        self:EndSwingMotionGuard()
 		        -- (기능 추가) "파이널 어택 모션까지 끝나면 숨고르기를 하게 해달라"는 요청 - 파워스트라이크와
 		        -- 동일한 이유로, 파이널 어택 자신의 모션이 끝나는 이 시점에는 정상적으로 숨고르기를 시작한다.
 		        self:PlayBreather(self.Entity, self._T.pendingFinalSlashDirX or 1)
@@ -3485,7 +3538,9 @@ script PlayerAttack extends AttackComponent
 
 	method boolean IsTargetBurning(Entity target)
 		-- 차지 블로우(불) 화상이 진행 중인 대상인지. 얼음으로 때렸을 때의 "화상 저주" 판정에 쓰인다.
+		-- (속성필드) 불 필드 위의 대상은 화상 상태로 간주한다 - 실제 화상 없이도 중첩 연계 발동.
 		if not isvalid(target) then return false end
+		if self:IsPosInElemField(target.TransformComponent.WorldPosition, 2) then return true end
 		local burning = self._T.chargeBlowBurning
 		if burning == nil then return false end
 		return burning[target.Path] ~= nil
@@ -3493,12 +3548,185 @@ script PlayerAttack extends AttackComponent
 
 	method boolean IsTargetFrozen(Entity target)
 		-- 얼음 속성으로 빙결 중인 대상인지. 전기 속성의 2배 데미지 판정에 쓰인다.
+		-- (속성필드) 얼음 필드 위의 대상은 빙결 상태로 간주한다.
 		if not isvalid(target) then return false end
+		if self:IsPosInElemField(target.TransformComponent.WorldPosition, 1) then return true end
 		local frozen = self._T.chargeBlowFrozen
 		if frozen == nil then return false end
 		local until_ = frozen[target.Path]
 		if until_ == nil then return false end
 		return _UtilLogic.ElapsedSeconds < until_
+	end
+
+	-- ── 속성필드(팔라딘 3차 버프) ─────────────────────────────────────
+	-- 버프 지속 중 차지 블로우를 쓰면 시전 지역에 그 속성의 필드가 생기고, 필드 위의 대상은
+	-- 그 속성 상태(화상/빙결)를 보유한 것으로 간주돼 중첩 연계가 발동한다. 허공 공격도 연계된다.
+
+	-- (mode: 1=얼음 2=불 3=전기) 위치가 해당 속성 필드 안인지 (서버 전용 - _T.elemFields 조회)
+	method boolean IsPosInElemField(Vector3 pos, integer mode)
+		local fields = self._T.elemFields
+		if fields == nil then return false end
+		local now = _UtilLogic.ElapsedSeconds
+		for _, f in ipairs(fields) do
+			if f.mode == mode and f.expire > now
+				and math.abs(pos.x - f.x) <= 1.6 and math.abs(pos.y - f.y) <= 1.2 then
+				return true
+			end
+		end
+		return false
+	end
+
+	-- 속성 증폭(패시브, 마스터 10): 중첩 연계 데미지 배율 = 1 + 0.1×투자pt
+	method number GetElementalAmpFactor()
+		return 1 + 0.1 * (self._T.elemAmpLv or 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AttackElementalField(number duration, number zoneDuration, number atkMultiplier)
+		-- 속성필드 버프 시전: swingO2 1프레임에 머무르다(느린 재생) 이펙트 13프레임(1.3초)부터
+		-- 나머지 모션을 재생한다. 모션이 끝날 때까지 조작 잠금(이동 중 시전해도 안 끊김 - 클라도 잠금).
+		local currentState = self.Entity.StateComponent.CurrentStateName
+		if currentState == "DEAD" then return end
+		self:StopBreather()
+		self._T.elemFieldBuffUntil = _UtilLogic.ElapsedSeconds + duration
+		self._T.elemFieldZoneDur = zoneDuration
+		self._T.elemFieldToken = (self._T.elemFieldToken or 0) + 1
+		local mult = math.max(0.1, math.min(atkMultiplier or 1.0, 3.0))
+		local playerCtrl = self.Entity.PlayerControllerComponent
+		local dirX = isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1
+		local wasEnabled = isvalid(playerCtrl) and playerCtrl.Enable
+		if isvalid(playerCtrl) then playerCtrl.Enable = false end
+		if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+		-- 1단계: swingO2를 느린 배율(6배)로 재생 - 첫 프레임 구간에 머무르는 효과
+		self:PlayAttackMotion(self.Entity, "swingO2", dirX, 6.0)
+		self:PlayElementalFieldCastFx(self.Entity)
+		-- 2단계: (피드백) 0.8초(이펙트 8프레임) 시점부터 정상 속도로 나머지 모션(2·3프레임 위주) 재생
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:PlayAttackMotion(self.Entity, "swingO2", dirX, 0.7)
+		end, 0.8)
+		-- 조작 잠금 해제: 0.8 + 후반 모션(0.65×0.7) + 여유 = 1.4초
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			local pcc2 = self.Entity.PlayerControllerComponent
+			if isvalid(pcc2) and wasEnabled then pcc2.Enable = true end
+			self:PlayBreather(self.Entity, dirX)
+		end, 1.4)
+		log("[ElemField] 속성필드 버프 시작 " .. tostring(duration) .. "초 (필드 지속 " .. tostring(zoneDuration) .. "초)")
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayElementalFieldCastFx(Entity caster)
+		-- 시전 이펙트(1de1c87a) - 캐릭터에 부착 재생.
+		-- (피드백) 캐릭터를 가리지 않게 아바타와 같은 SortingLayer(MapLayer0)에서 OrderInLayer 3(<4)으로
+		-- 뒤에 깔고, 높이를 낮춤(0.0). 우향 시전 시 x +0.3 보정(좌측 기준 클립 이질감 제거).
+		if not self:IsClient() then return end
+		if not isvalid(caster) then return end
+		local efDirX = 1
+		local efPcc = caster.PlayerControllerComponent
+		if isvalid(efPcc) then efDirX = efPcc.LookDirectionX end
+		local efXOff = (efDirX > 0) and 0.3 or 0
+		_EffectService:PlayEffectAttached("1de1c87ae2ed443184844dc0ea1e831e", caster, Vector3(efXOff, 0.0, 0), 0, Vector3(1, 1, 1), false, { ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 3 })
+	end
+
+	-- (버프 아이콘 우클릭 취소) 속성필드 버프 조기 종료.
+	@ExecSpace("ServerOnly")
+	method void CancelElementalField()
+		self._T.elemFieldBuffUntil = 0
+		log("[ElemField] 속성필드 버프 취소(우클릭)")
+	end
+
+	-- 차지 블로우 시전 시(버프 활성 + 속성 1~3) 시전자 위치에 속성 필드를 남긴다.
+	@ExecSpace("ServerOnly")
+	method void TrySpawnElementalFieldZone(integer mode)
+		if mode < 1 or mode > 3 then return end
+		if (self._T.elemFieldBuffUntil or 0) < _UtilLogic.ElapsedSeconds then return end
+		-- (피드백) 필드는 캐릭터 조금 앞쪽(바라보는 방향 +1.1)에 생성한다.
+		local pos = self.Entity.TransformComponent.WorldPosition
+		local pccF = self.Entity.PlayerControllerComponent
+		local fDirX = isvalid(pccF) and pccF.LookDirectionX or 1
+		local fx = pos.x + 1.1 * fDirX
+		local dur = self._T.elemFieldZoneDur or 10
+		if self._T.elemFields == nil then self._T.elemFields = {} end
+		self._T.elemFieldNextId = (self._T.elemFieldNextId or 0) + 1
+		local fieldId = self._T.elemFieldNextId
+		table.insert(self._T.elemFields, { id = fieldId, x = fx, y = pos.y, mode = mode, expire = _UtilLogic.ElapsedSeconds + dur })
+		self:PlayElementalFieldZoneFx(fieldId, Vector3(fx, pos.y, 0), mode, dur)
+		log("[ElemField] 속성 필드 생성 mode=" .. tostring(mode) .. " (" .. tostring(dur) .. "초) x=" .. string.format("%.2f", fx))
+	end
+
+	-- (요청) 속성 필드는 한 번 연계에 쓰이면 사라진다 - 해당 위치의 필드를 목록에서 제거하고
+	-- 모든 클라이언트의 필드 비주얼도 내린다. 소모했으면 true.
+	@ExecSpace("ServerOnly")
+	method boolean ConsumeElemFieldAt(Vector3 pos, integer mode)
+		local fields = self._T.elemFields
+		if fields == nil then return false end
+		local now = _UtilLogic.ElapsedSeconds
+		for i, f in ipairs(fields) do
+			if f.mode == mode and f.expire > now
+				and math.abs(pos.x - f.x) <= 1.6 and math.abs(pos.y - f.y) <= 1.2 then
+				table.remove(fields, i)
+				self:RemoveElementalFieldZoneFx(f.id)
+				log("[ElemField] 속성 필드 소모(연계 발동) mode=" .. tostring(mode))
+				return true
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("Multicast")
+	method void RemoveElementalFieldZoneFx(integer fieldId)
+		if not self:IsClient() then return end
+		local serials = self._T.elemFieldFxSerials
+		if serials == nil then return end
+		local serial = serials[fieldId]
+		if serial ~= nil then
+			_EffectService:RemoveEffect(serial)
+			serials[fieldId] = nil
+		end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayElementalFieldZoneFx(integer fieldId, Vector3 pos, integer mode, number duration)
+		-- 필드 비주얼: 속성별 클립을 투명도 50%로 duration 동안 루프 재생. 연계 소모 시
+		-- RemoveElementalFieldZoneFx(fieldId)가 조기 제거할 수 있도록 시리얼을 id별로 기억한다.
+		-- ⚠ 얼음 필드 클립 RUID 미지정(사용자 전달 누락) - 임시로 전기 클립을 사용 중. RUID를 받으면 교체.
+		if not self:IsClient() then return end
+		local ruid = "fd8d94ac1de548958b8467a4131659cb"          -- 3=전기
+		if mode == 2 then ruid = "256171c083234b5db66fac1cab2d20d5" end  -- 불
+		if mode == 1 then ruid = "fd8d94ac1de548958b8467a4131659cb" end  -- 얼음(임시: 전기 클립)
+		-- (버그 수정) PlayEffect 2번째 인자는 instigator Entity - 생략해 인자가 밀려 필드가 안 보였다.
+		local serial = _EffectService:PlayEffect(ruid, self.Entity, pos, 0, Vector3(1, 1, 1), true, { ["Alpha"] = 0.5, ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 1 })
+		if self._T.elemFieldFxSerials == nil then self._T.elemFieldFxSerials = {} end
+		self._T.elemFieldFxSerials[fieldId] = serial
+		_TimerService:SetTimerOnce(function()
+			local serials = self._T.elemFieldFxSerials
+			if serials ~= nil and serials[fieldId] ~= nil then
+				_EffectService:RemoveEffect(serials[fieldId])
+				serials[fieldId] = nil
+			end
+		end, duration)
+	end
+
+	-- 허공 차지 블로우 연계: 판정에 아무도 안 맞았어도 시전자가 상반 속성 필드 위면 중첩 결과물을 남긴다.
+	@ExecSpace("ServerOnly")
+	method void TryElementalFieldAirLink(integer hitCount)
+		if hitCount > 0 then return end
+		local mode = self._T.chargeBlowMode or 0
+		if mode <= 0 then return end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		if mode == 1 and self:IsPosInElemField(myPos, 2) then
+			-- 얼음 차지 블로우 + 불 필드 → 화상 저주 장판(시전자 위치). 사용한 필드는 소모된다.
+			self:SpawnChargeBlowCurseZoneFor(self.Entity, self._T.pendingCombatPower or 0)
+			self:ConsumeElemFieldAt(myPos, 2)
+			log("[ElemField] 허공 연계: 불 필드 + 얼음 → 화상 저주")
+		elseif mode == 3 and self:IsPosInElemField(myPos, 1) then
+			-- 전기 차지 블로우 + 얼음 필드 → 감전 장판(시전자 위치). 사용한 필드는 소모된다.
+			self:PlayChargeBlowShockHitEffect(self.Entity)
+			self:SpawnChargeBlowShockZone(self.Entity)
+			self:ConsumeElemFieldAt(myPos, 1)
+			log("[ElemField] 허공 연계: 얼음 필드 + 전기 → 감전 장판")
+		end
 	end
 
 	method number GetChargeBlowDamageFactor(Entity defender)
@@ -3511,7 +3739,8 @@ script PlayerAttack extends AttackComponent
 		if mode == 3 and self:IsTargetFrozen(defender) then
 			if self._T.chargeBlowShockHits == nil then self._T.chargeBlowShockHits = {} end
 			table.insert(self._T.chargeBlowShockHits, defender)
-			return 2.0
+			-- (속성 증폭) 빙결 2배 보정도 중첩 연계 데미지 - 증폭 배율 적용 (마스터 10 = 4배)
+			return 2.0 * self:GetElementalAmpFactor()
 		end
 		return 1.0
 	end
@@ -3525,12 +3754,16 @@ script PlayerAttack extends AttackComponent
 		for _, t in ipairs(targets) do
 			self:ApplyChargeBlowStatus(t)
 		end
+		-- (속성필드) 허공 공격(명중 0명)이어도 시전자가 상반 속성 필드 위면 중첩 연계를 발동한다.
+		self:TryElementalFieldAirLink(#targets)
 		local shockHits = self._T.chargeBlowShockHits
 		if shockHits ~= nil then
 			for _, t in ipairs(shockHits) do
 				if isvalid(t) then
 					self:PlayChargeBlowShockHitEffect(t)
 					self:SpawnChargeBlowShockZone(t)
+					-- (속성필드) 빙결 연계가 얼음 필드 유래였다면 그 필드는 1회 소모로 사라진다.
+					self:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 1)
 				end
 			end
 			self._T.chargeBlowShockHits = {}
@@ -3544,9 +3777,12 @@ script PlayerAttack extends AttackComponent
 		local mode = self._T.chargeBlowMode or 0
 		if mode <= 0 then return end
 		if mode == 1 then
-			-- (요청) 화상에 걸린 적을 얼음으로 때리면 "화상 저주"가 걸린다 - 그 자리에 20초짜리 저주
-			-- 장판을 남기고 3초마다 전투력의 100%를 입힌다. 빙결 여부(50% 확률)와는 별개로 항상 발동한다.
-			if self:IsTargetBurning(target) then self:SpawnChargeBlowCurseZone(target) end
+			-- (요청) 화상에 걸린 적을 얼음으로 때리면 "화상 저주"가 걸린다 - 연계 장판을 남긴다.
+			-- (속성필드) 연계가 필드 유래였다면 그 불 필드는 1회 소모로 사라진다.
+			if self:IsTargetBurning(target) then
+				self:SpawnChargeBlowCurseZone(target)
+				self:ConsumeElemFieldAt(target.TransformComponent.WorldPosition, 2)
+			end
 			-- (요청) 빙결 지속시간 통일: 3초 → 4초.
 			if _UtilLogic:RandomDouble() < 0.5 then self:ApplyChargeBlowFreeze(target, 4.0) end
 		elseif mode == 2 then
@@ -3878,7 +4114,7 @@ script PlayerAttack extends AttackComponent
 		local radiusX = 1.2
 		local radiusY = 1.2
 		self:PlayChargeBlowCurseZoneEffect(Vector3(pos.x, pos.y, 0), 20.0)
-		local ticksLeft = 6          -- 20초 동안 3초 간격
+		local ticksLeft = 10         -- (개편) 연계 장판 공통 사양: 20초 동안 2초 간격
 		local tick
 		tick = function()
 			if ticksLeft <= 0 then return end
@@ -3895,9 +4131,9 @@ script PlayerAttack extends AttackComponent
 					end
 				end
 			end
-			_TimerService:SetTimerOnce(tick, 3.0)
+			_TimerService:SetTimerOnce(tick, 2.0)
 		end
-		_TimerService:SetTimerOnce(tick, 3.0)
+		_TimerService:SetTimerOnce(tick, 2.0)
 		log("[ChargeBlow] 화상 저주 장판 생성 x=" .. string.format("%.2f", pos.x) .. " y=" .. string.format("%.2f", pos.y))
 	end
 
@@ -3944,7 +4180,7 @@ script PlayerAttack extends AttackComponent
 		local radiusX = 1.2
 		local radiusY = 1.2
 		self:PlayChargeBlowShockZoneEffect(Vector3(pos.x, pos.y, 0))
-		local ticksLeft = 3
+		local ticksLeft = 10         -- (개편) 연계 장판 공통 사양: 20초 동안 2초 간격
 		local tick
 		tick = function()
 			if ticksLeft <= 0 then return end
@@ -3961,9 +4197,9 @@ script PlayerAttack extends AttackComponent
 					end
 				end
 			end
-			_TimerService:SetTimerOnce(tick, 0.4)
+			_TimerService:SetTimerOnce(tick, 2.0)
 		end
-		_TimerService:SetTimerOnce(tick, 0.4)
+		_TimerService:SetTimerOnce(tick, 2.0)
 		log("[ChargeBlow] 전기 장판 생성 x=" .. string.format("%.2f", pos.x) .. " y=" .. string.format("%.2f", pos.y))
 	end
 
@@ -6867,11 +7103,9 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void AttackRestoration()
-		-- 리스토네이션(2차, 2026-07-28 신설, 원본 팩 skill/121.img/skill/1211010):
-		-- 캐릭터 몸에서 회복 이펙트를 1회 재생하고, (요청) 최대 HP의 10%씩 1초 간격으로 5회 =
-		-- 5초에 걸쳐 총 50%를 회복한다. 회복량은 힐과 같은 파란 데미지 스킨으로 매 초 표시된다.
-		-- 대상은 시전자 본인뿐이라 힐과 달리 범위 탐색이 없다. 쿨타임(10초)은 SkillManager가 관리한다.
+	method void AttackRestoration(integer healPctPerSec)
+		-- 리스토네이션(2차, 개편): 캐릭터 몸에서 회복 이펙트를 1회 재생하고, 5초 동안 1초마다
+		-- 최대 HP의 (분배 포인트 × 1%)씩 회복한다 (마스터 10 = 초당 10%). 쿨타임(30초)은 SkillManager 관리.
 		self:StopBreather()
 		local currentState = self.Entity.StateComponent.CurrentStateName
 		if currentState == "DEAD" then
@@ -6882,11 +7116,12 @@ script PlayerAttack extends AttackComponent
 
 		self:PlayRestorationEffect(self.Entity)
 
-		-- 재시전하면 이전 회복 예약은 무효화한다(쿨타임 10초 > 지속 5초라 겹칠 일은 없지만 안전장치).
+		-- 재시전하면 이전 회복 예약은 무효화한다(안전장치).
 		self._T.restorationToken = (self._T.restorationToken or 0) + 1
 		local myToken = self._T.restorationToken
 		local TICKS = 5
-		local perTick = math.floor(pc.MaxHp * 0.1)
+		local pct = math.max(1, math.min(healPctPerSec or 1, 10))
+		local perTick = math.max(1, math.floor(pc.MaxHp * pct / 100))
 		for i = 1, TICKS do
 			local idx = i
 			_TimerService:SetTimerOnce(function()
@@ -6904,7 +7139,7 @@ script PlayerAttack extends AttackComponent
 					.. tostring(actualHealed) .. " HP " .. tostring(math.floor(pcNow.Hp)) .. "/" .. tostring(math.floor(pcNow.MaxHp)))
 			end, (idx - 1) * 1.0)
 		end
-		log("PlayerAttack: 리스토네이션 시전 - 최대HP 10%(" .. tostring(perTick) .. ")씩 5초간 5회 회복 시작")
+		log("PlayerAttack: 리스토네이션 시전 - 최대HP " .. tostring(pct) .. "%(" .. tostring(perTick) .. ")씩 5초간 5회 회복 시작")
 	end
 
 	@ExecSpace("Multicast")
@@ -7265,7 +7500,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void AttackComboAttack(number atkMultiplier)
+	method void AttackComboAttack(number atkMultiplier, number durationSec)
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		self:StopBreather()
 		-- 콤보 어택(3차 버프, 30분): 시전 이펙트(skill/1111.img/skill/11111001의 effect 클립) +
@@ -7304,7 +7539,8 @@ script PlayerAttack extends AttackComponent
 
 		self._T.comboAttackToken = (self._T.comboAttackToken or 0) + 1
 		local myToken = self._T.comboAttackToken
-		local duration = 1800 -- 30분
+		-- (스킬 효과 개편) 지속시간은 클라(SkillManager)가 투자 레벨로 계산해 넘긴다 (2분 → 마스터 10분)
+		local duration = math.max(30, durationSec or 120)
 		self._T.comboAttackActive = true
 
 		local userId = self.Entity.PlayerComponent.UserId
@@ -7314,7 +7550,7 @@ script PlayerAttack extends AttackComponent
 			if self._T.comboAttackToken ~= myToken then return end
 			self._T.comboAttackActive = false
 			self:ClearComboOrbs()
-			log("[ComboAttack] 버프 종료(30분 경과)")
+			log("[ComboAttack] 버프 종료(지속시간 경과)")
 		end, duration)
 		log("[ComboAttack] 버프 시작 duration=" .. tostring(duration))
 	end
@@ -7756,6 +7992,10 @@ script PlayerAttack extends AttackComponent
 		-- 스킬이라, 그 판정 자체가 다시 구슬을 채워버리면 소모한 의미가 없어진다. 패닉 판정(Attack)이
 		-- 진행 중인 구간(AttackPanic~RestorePanicControl 사이, isPanicking=true)에는 구슬 획득을 건너뛴다.
 		if self._T.isPanicking then return end
+		-- (버그 수정) 코마도 패닉과 같은 "구슬 전량 소모" 스킬인데 이 가드가 없었다 - 코마 자체 판정
+		-- (다중 최대 15히트)이 구슬을 되채워 곧바로 재시전 가능해지는 "코마 연속 사용"의 원인.
+		-- 패닉과 동일하게 시전 구간(isComaAttacking=true)에는 구슬 획득을 건너뛴다.
+		if self._T.isComaAttacking then return end
 		if not self._T.comboAttackActive then return end
 		if not isvalid(defender) then return end
 		local now = _UtilLogic.ElapsedSeconds
@@ -7763,11 +8003,11 @@ script PlayerAttack extends AttackComponent
 			return
 		end
 		self._T.lastComboStackTime = now
-		-- (기능 추가) "히트 시 50% 확률로 구슬이 생기게 해달라"는 요청 - 매 히트마다 확정 지급하던 것을
-		-- 절반 확률로 바꾼다. math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 이 파일에서 이미
-		-- 실측 확인된 버그(스피어 버스터 등 여러 히트가 0.1~0.2초 간격으로 잇따라 호출되면 math.random()이
-		-- 같은 값을 두 번 반환)를 피하기 위해서다.
-		if _UtilLogic:RandomDouble() >= 0.5 then return end
+		-- (스킬 효과 개편) 구슬 획득 확률 = 10% + 콤보 투자 1%/pt (최대 40%). math.random() 대신
+		-- _UtilLogic:RandomDouble()을 쓴다 - 여러 히트가 잇따르면 math.random()이 같은 값을 반환하는
+		-- 실측 버그 회피(이 파일에 문서화).
+		local gainChance = math.min(40, 10 + (self._T.comboSkillLv or 0)) / 100
+		if _UtilLogic:RandomDouble() >= gainChance then return end
 		-- (기능 추가) "어드밴스드 콤보(4차 패시브)가 있으면 여기서 다시 확률로 구슬 1개가 아니라
 		-- 2개가 한번에 찬다"는 요청. (버그 수정) 패시브 스킬은 파이널어택(2차 패시브 - TryTriggerFinalAttack
 		-- 참고)과 동일하게 스킬바 슬롯 배정과 무관하게 항상 적용되는 효과다 - "패시브는 클릭-클릭으로
@@ -7825,7 +8065,9 @@ script PlayerAttack extends AttackComponent
 		-- 다만 궤도 슬롯은 ComboOrb.mlua에 5칸(2π/5 간격)으로 고정되어 있어 구슬 엔티티 자체는
 		-- 여전히 최대 5개만 스폰한다 - 6번째부터는 새 구슬을 만들지 않고, 기존 구슬 중 하나(그리고
 		-- 6번째가 되는 순간 가운데 큰 원)를 분홍색으로 전환해 6~10콤보를 표시한다.
-		if self.ComboOrbCount >= 10 then return end
+		-- (스킬 효과 개편) 구슬 상한 = 투자 레벨 기반(GetComboOrbCap: 콤보 5레벨당 +1 최대 5,
+		-- 어드콤 1레벨부터 6번째(빨간 구슬) 개방·5레벨당 +1 최대 10)
+		if self.ComboOrbCount >= self:GetComboOrbCap() then return end
 		local idx = self.ComboOrbCount + 1
 		self.ComboOrbCount = idx
 
@@ -7845,7 +8087,7 @@ script PlayerAttack extends AttackComponent
 				self._T.comboOrbEntities = self._T.comboOrbEntities or {}
 				table.insert(self._T.comboOrbEntities, fx)
 			end
-			log("[ComboAttack] 콤보 구슬 +1 → " .. tostring(idx) .. "/10 (데미지 +" .. tostring(idx * 20) .. "%)")
+			log("[ComboAttack] 콤보 구슬 +1 → " .. tostring(idx) .. "/" .. tostring(self:GetComboOrbCap()))
 		else
 			-- 6번째부터는 새 구슬 엔티티 없이, (idx-5)번째 기존 구슬을 분홍으로 전환한다.
 			-- 6번째가 되는 순간(처음 분홍이 등장하는 시점) 가운데 큰 원도 함께 분홍으로 바뀐다.
@@ -7853,7 +8095,7 @@ script PlayerAttack extends AttackComponent
 				self:SetComboOrbCenterPink()
 			end
 			self:UpgradeComboOrbToPink(idx - 5)
-			log("[ComboAttack] 콤보 구슬 +1 → " .. tostring(idx) .. "/10 (분홍 전환 " .. tostring(idx - 5) .. "/5, 데미지 +" .. tostring(idx * 20) .. "%)")
+			log("[ComboAttack] 콤보 구슬 +1 → " .. tostring(idx) .. "/" .. tostring(self:GetComboOrbCap()) .. " (빨간 구슬 전환 " .. tostring(idx - 5) .. ")")
 		end
 	end
 
@@ -7922,13 +8164,38 @@ script PlayerAttack extends AttackComponent
 		self._T.comboOrbCenterEntity = nil
 	end
 
+	-- (스킬 효과 개편) 클라이언트(SkillManager.SyncSkillEffectsToServer)가 투자 레벨을 넘겨준다 -
+	-- 파이널어택 발동 확률 / 콤보·어드콤(구슬 상한·획득 확률·구슬당 데미지) / 브랜디쉬 대상 수가 참조.
+	@ExecSpace("ServerOnly")
+	method void SetSkillEffectLevels(integer faLv, integer comboLv, integer advLv, integer brandishLv, integer elemAmpLv)
+		self._T.faSkillLv = faLv
+		self._T.comboSkillLv = comboLv
+		self._T.advComboSkillLv = advLv
+		self._T.brandishSkillLv = brandishLv
+		self._T.elemAmpLv = elemAmpLv
+		log("[PlayerAttack] 스킬 효과 레벨 동기화 FA=" .. tostring(faLv) .. " 콤보=" .. tostring(comboLv)
+			.. " 어드콤=" .. tostring(advLv) .. " 브랜디쉬=" .. tostring(brandishLv) .. " 속성증폭=" .. tostring(elemAmpLv))
+	end
+
+	-- 콤보/어드콤 투자 레벨 기반 최대 구슬 수: 콤보 = 1+floor(lv/5) 최대 5 / 어드콤 1레벨부터 +1, 5레벨마다 +1 (최대 10)
+	method integer GetComboOrbCap()
+		local comboLv = math.max(1, self._T.comboSkillLv or 0)
+		local advLv = self._T.advComboSkillLv or 0
+		local cap = math.min(5, 1 + math.floor(comboLv / 5))
+		if advLv >= 1 then
+			cap = cap + math.min(5, 1 + math.floor(advLv / 5))
+		end
+		return math.min(10, cap)
+	end
+
 	method integer ApplyComboAttackBonus(integer damage)
-		-- 콤보 어택 버프 보너스: 구슬 1개당 +20%(최대 10개 = +200%). CalcDamage의 모든 분기 반환값에
-		-- 일괄 적용된다. 부모 훅(CalcDamage)에서 호출되므로 ExecSpace 어노테이션 없이 선언한다.
+		-- (스킬 효과 개편) 구슬 1개당 데미지 = 콤보 투자 2%/pt + 어드콤 투자 2%/pt (구 +20% 고정 대체).
+		-- CalcDamage의 모든 분기 반환값에 일괄 적용된다. 부모 훅에서 호출되므로 ExecSpace 없이 선언.
 		if not self._T.comboAttackActive then return damage end
 		local count = self.ComboOrbCount or 0
 		if count <= 0 then return damage end
-		return math.floor(damage * (1 + 0.2 * count))
+		local perOrb = 0.02 * math.max(1, self._T.comboSkillLv or 0) + 0.02 * (self._T.advComboSkillLv or 0)
+		return math.floor(damage * (1 + perOrb * count))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -8221,13 +8488,42 @@ script PlayerAttack extends AttackComponent
 
 		if not isvalid(self.Entity) then return end
 		local worldPos = self.Entity.TransformComponent.WorldPosition
-		-- 사용범위는 드래곤로어와 동일(FindDragonRoarTargets 재사용) - 전방위, 가까운 대상부터 정렬,
-		-- 최대 15명까지.
-		local targets = self:FindDragonRoarTargets(Vector2(worldPos.x, worldPos.y), 15)
+		-- 사거리는 소모한 콤보 구슬 수(1~10)에 비례한다 - 구슬 1개면 좁게(가로 ±3.0/세로 ±1.5),
+		-- 10개면 드래곤로어와 동일한 최대 범위(±15.0/±7.5)까지 선형 증가. 전방위, 가까운 순 최대 15명.
+		local orbCount = math.max(1, math.min(self._T.pendingComaOrbCount or 1, 10))
+		local halfW = 3.0 + (15.0 - 3.0) * (orbCount - 1) / 9
+		local halfH = halfW * 0.5
+		local targets = self:FindComaTargets(Vector2(worldPos.x, worldPos.y), 15, halfW, halfH)
 		for _, t in ipairs(targets) do
 			self:DealComaHit(t)
 		end
-		log("PlayerAttack: AttackComa targets=" .. tostring(#targets))
+		log("PlayerAttack: AttackComa targets=" .. tostring(#targets) .. " orbCount=" .. tostring(orbCount) .. " halfW=" .. string.format("%.1f", halfW))
+	end
+
+	method table FindComaTargets(Vector2 fromPos, integer maxCount, number halfW, number halfH)
+		-- FindDragonRoarTargets와 같은 구조이지만 판정 범위를 인자로 받는다 - 코마의 구슬 수 비례 사거리 전용.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return {} end
+		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local candidates = {}
+		for _, comp in ipairs(monsterComps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local pos = mc.Entity.TransformComponent.WorldPosition
+				local dx = pos.x - fromPos.x
+				local dy = pos.y - fromPos.y
+				if math.abs(dx) <= halfW and math.abs(dy) <= halfH then
+					table.insert(candidates, { entity = mc.Entity, dist = math.sqrt(dx * dx + dy * dy) })
+				end
+			end
+		end
+		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		local result = {}
+		for i = 1, math.min(#candidates, maxCount) do
+			table.insert(result, candidates[i].entity)
+		end
+		return result
 	end
 
 	-- 대상 하나에게만 코마 데미지를 적중시킨다(드래곤로어/익스플로젼과 동일한 단일 대상 패턴 - 밀집
@@ -8508,6 +8804,53 @@ script PlayerAttack extends AttackComponent
 			end
 		end
 		log("[PlayerAttack] 블레스 발동 - 버프받은 소환수 " .. tostring(buffed) .. "명")
+	end
+
+	-- (팔라딘 2차) 아이언 월 시전 - 파워가드와 동일한 공용 버프 시전(alert2 숨고르기 모션 + 조작잠금 +
+	-- 사운드 3fe5f0b6···)을 태우고 이펙트를 재생한다.
+	@ExecSpace("ServerOnly")
+	method void AttackIronWall(number atkMultiplier)
+		self:CastBuffMotion("3fe5f0b67992400d93c244a88f42731c", atkMultiplier, nil)
+		self:PlayIronWallEffects(self.Entity)
+	end
+
+	-- 아이언 월 이펙트 - 시전자 본인에게 effect 클립(fe52cf2e), 힐 범위(±3.6) 안의
+	-- 소환수(용사/힐러)에게 affected 클립(e9c90ecd)을 재생한다. 클라 전체에서 재생(Multicast).
+	-- 사운드는 AttackIronWall의 CastBuffMotion이 재생하므로 여기서는 재생하지 않는다.
+	@ExecSpace("Multicast")
+	method void PlayIronWallEffects(Entity caster)
+		if not self:IsClient() then return end
+		if not isvalid(caster) then return end
+		-- 클립이 좌측 기준으로 그려져 있어 오른쪽을 보고 쓰면 어긋나 보임 - 우향일 때 x +0.3 보정.
+		local iwDirX = 1
+		local iwPcc = caster.PlayerControllerComponent
+		if isvalid(iwPcc) then iwDirX = iwPcc.LookDirectionX end
+		local iwXOff = (iwDirX > 0) and 0.3 or 0
+		-- (피드백 4차 실측 보정) y=0.3은 목 시작·-0.25는 너무 낮음 - 중간값 0.0에서 발 시작.
+		_EffectService:PlayEffectAttached("fe52cf2e9f9e4f059cfb4fb3856aecf9", caster, Vector3(iwXOff, 0.0, 0), 0, Vector3(1, 1, 1), false)
+		local map = caster.CurrentMap
+		if not isvalid(map) then return end
+		local myPos = caster.TransformComponent.WorldPosition
+		local heroComps = map:GetChildComponentsByTypeName("script.HeroSummon", true)
+		for _, comp in ipairs(heroComps) do
+			local e = comp.Entity
+			if isvalid(e) then
+				local pos = e.TransformComponent.WorldPosition
+				if math.abs(pos.x - myPos.x) <= 3.6 and math.abs(pos.y - myPos.y) <= 3.6 then
+					_EffectService:PlayEffectAttached("e9c90ecd65224980b56903dba89ef856", e, Vector3(0, 0.5, 0), 0, Vector3(1, 1, 1), false)
+				end
+			end
+		end
+		local healerComps = map:GetChildComponentsByTypeName("script.HealerSummon", true)
+		for _, comp in ipairs(healerComps) do
+			local e = comp.Entity
+			if isvalid(e) then
+				local pos = e.TransformComponent.WorldPosition
+				if math.abs(pos.x - myPos.x) <= 3.6 and math.abs(pos.y - myPos.y) <= 3.6 then
+					_EffectService:PlayEffectAttached("e9c90ecd65224980b56903dba89ef856", e, Vector3(0, 0.5, 0), 0, Vector3(1, 1, 1), false)
+				end
+			end
+		end
 	end
 
 	method table BuildBlessFrames()
@@ -12600,13 +12943,14 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void AttackArcherSupport(number combatPower)
-		-- 궁병 지원(3차, 2026-07-28): 30초 동안 유저의 등 뒤 먼 곳(화면 밖)에서 아이스 샷/파이어 샷 화살이
-		-- 몬스터를 향해 총 15발(2초 간격, 얼음/불 교차) 날아온다. 화살이 꽂히면 아이스 샷 / 파이어 샷처럼
-		-- 그 일대를 속성 공격한다 - 범위 안 최대 6명이 각각 전투력의 200~300% 피해 + 속성 연출.
+	method void AttackArcherSupport(number combatPower, integer skillLv)
+		-- 궁병 지원: 30초 동안 유저의 등 뒤 먼 곳(화면 밖)에서 아이스 샷/파이어 샷 화살이
+		-- 몬스터를 향해 날아온다. 화살이 꽂히면 그 일대를 속성 공격한다.
+		-- (개편) 화살당 데미지 = 전투력 500~600% + 분배당 최소/최대 +50%p (마스터 20).
 		-- 화살 비주얼은 화살비 공용 ArrowRainArrow(9프레임 얼음 화살, 불은 붉은 틴트)를 재사용한다.
 		-- 재시전은 SkillManager의 2분 쿨타임이 막아주지만, 만약을 위해 토큰으로 이전 시전 예약을 무효화한다.
 		self._T.pendingArcherSupportCombatPower = combatPower
+		self._T.archerSupportLv = math.max(1, math.min(skillLv or 1, 20))
 		self._T.archerSupportToken = (self._T.archerSupportToken or 0) + 1
 		local myToken = self._T.archerSupportToken
 		-- (요청) 발수 15 → 30발(2배). 발사 시각도 균등 2초 간격이 아니라 랜덤으로 흩뿌려 지원 사격이
@@ -14311,37 +14655,55 @@ script PlayerAttack extends AttackComponent
 			end
 		end
 		local function nearestHitAlong(ndx, ndy)
-			local best = -1
+			-- (요청) 너무 가까운 벽 바로 뒤에 적당한 거리의 벽이 또 있으면 그 벽을 목표로 한다 -
+			-- 같은 방향에서 1.5유닛 이상 떨어진 벽을 우선하고, 그런 벽이 없을 때만 가까운 벽(0.15~)을 쓴다.
+			local bestFar = -1
+			local bestNear = -1
 			local hits = fh:RaycastAll(origin, Vector2(ndx, ndy), FLASH_MAX_RANGE)
 			for _, h in ipairs(hits) do
 				if excludedFh[h.Id] ~= true then
 					local t = self:RayHitDistanceToFoothold(h, origin, Vector2(ndx, ndy), FLASH_MAX_RANGE)
-					if t >= 0.15 and (best < 0 or t < best) then
-						best = t
+					if t >= 1.5 then
+						if bestFar < 0 or t < bestFar then bestFar = t end
+					elseif t >= 0.15 then
+						if bestNear < 0 or t < bestNear then bestNear = t end
 					end
 				end
 			end
-			return best
+			if bestFar >= 0 then return bestFar end
+			return bestNear
 		end
 		if isvalid(fh) and noAim then
-			local bestT = -1
-			local bestDx = dirX
-			local bestDy = dirY
+			-- (요청) 방향 자동 선택도 "적당한 거리(1.5유닛↑)의 벽이 있는 방향"을 우선하고,
+			-- 그런 방향이 하나도 없을 때만 아무 벽이나 가장 가까운 방향을 쓴다.
+			local bestFarT, bestFarDx, bestFarDy = -1, dirX, dirY
+			local bestAnyT, bestAnyDx, bestAnyDy = -1, dirX, dirY
 			for i = 0, 47 do
 				local a = i * (7.5 * math.pi / 180.0)
 				local ndx = math.cos(a)
 				local ndy = math.sin(a)
 				local t = nearestHitAlong(ndx, ndy)
-				if t >= 0 and (bestT < 0 or t < bestT) then
-					bestT = t
-					bestDx = ndx
-					bestDy = ndy
+				if t >= 0 then
+					if t >= 1.5 and (bestFarT < 0 or t < bestFarT) then
+						bestFarT = t
+						bestFarDx = ndx
+						bestFarDy = ndy
+					end
+					if bestAnyT < 0 or t < bestAnyT then
+						bestAnyT = t
+						bestAnyDx = ndx
+						bestAnyDy = ndy
+					end
 				end
 			end
-			if bestT >= 0 then
-				hitDist = bestT
-				dirX = bestDx
-				dirY = bestDy
+			if bestFarT >= 0 then
+				hitDist = bestFarT
+				dirX = bestFarDx
+				dirY = bestFarDy
+			elseif bestAnyT >= 0 then
+				hitDist = bestAnyT
+				dirX = bestAnyDx
+				dirY = bestAnyDy
 			end
 		elseif isvalid(fh) then
 			hitDist = nearestHitAlong(dirX, dirY)
@@ -17150,7 +17512,10 @@ script PlayerAttack extends AttackComponent
 		-- 탐색하면 그 사이 다가온 다른 몬스터까지 맞는다.
 		local worldPos = self.Entity.TransformComponent.WorldPosition
 		local dirX = self._T.pendingBrandishDirX or 1
-		local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, 6, 2.5, 1.0)
+		-- (스킬 효과 개편) 최대 대상 수 = 투자 레벨 비례 (1~9레벨 4명 / 10~19레벨 6명 / 20레벨+ 8명)
+		local bLv = self._T.brandishSkillLv or 0
+		local maxTargets = 4 + 2 * math.min(2, math.floor(bLv / 10))
+		local targets = self:FindSlashBlastTargets(Vector2(worldPos.x, worldPos.y), dirX, maxTargets, 2.5, 1.0)
 		self._T.brandishTargets = targets
 		for _, t in ipairs(targets) do
 			if isvalid(t) then
@@ -19395,16 +19760,19 @@ script PlayerAttack extends AttackComponent
 		-- 시전자 본인 클라이언트만: 서서히 밝아지고 맵 BGM으로 서서히 복귀한다.
 		if not self:IsClient() then return end
 		_SoundService:StopSound("732c8aeac0624d21bdcfc89bc6244105")
+		-- (버그 수정) 맵 BGM 복귀는 **연막 여부와 무관하게 항상** 먼저 한다. 연막은 화면 오버레이만
+		-- 쓰고 BGM 덕킹은 전혀 건드리지 않는데, 예전에는 아래 연막 분기에서 그대로 return 해버려
+		-- EndHoldDuck을 건너뛰었다 - 연막 안에서 다크사이트를 켰다 끄면 맵 BGM이 10%에 영구히 묶였다.
+		_BlizzardBgmDucker:EndHoldDuck(2.5)
 		-- (요청) 연막 안에서 다크사이트를 쓰고 풀렸을 때, 연막이 아직 남아 있으면 화면 효과를
 		-- 연막 것으로 되돌린다. 두 스킬이 같은 "유지 모드" 오버레이 하나를 공유하기 때문에
 		-- 그냥 EndHoldDim만 하면 연막이 남아 있는데도 화면이 말끔해진다.
 		if self:IsSmokeScreenActive() then
 			_BlizzardScreenDim:StartHoldDim(0.5, 0.55, 0.45, 0.45, 0.50)
-			log("[DarkSight] 해제 - 연막이 아직 남아 있어 화면을 연막 효과로 되돌린다")
+			log("[DarkSight] 해제 - 연막이 아직 남아 있어 화면을 연막 효과로 되돌린다(맵 BGM은 복귀)")
 			return
 		end
 		_BlizzardScreenDim:EndHoldDim(2.0)
-		_BlizzardBgmDucker:EndHoldDuck(2.5)
 		log("[DarkSight] 화면 밝아짐 + 맵 BGM 복귀 시작")
 	end
 
@@ -20283,9 +20651,13 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void CancelComboAttack()
-		-- 콤보 어택 취소: 활성 플래그만 내린다(자연 만료 타이머도 같은 일을 하므로 늦게 와도 무해).
+		-- 콤보 어택 취소: 자연 만료(AttackComboAttack 타이머 본문)와 동일하게 구슬 이펙트까지 정리한다.
+		-- (버그 수정) 플래그만 내리고 ClearComboOrbs를 빼먹어 캐릭터 주변 회전 구슬이 남던 문제.
+		-- 토큰도 올려 예약된 만료 타이머가 뒤늦게 중복 실행되지 않게 한다.
+		self._T.comboAttackToken = (self._T.comboAttackToken or 0) + 1
 		self._T.comboAttackActive = false
-		log("PlayerAttack: 콤보 어택 취소(우클릭)")
+		self:ClearComboOrbs()
+		log("PlayerAttack: 콤보 어택 취소(우클릭) - 구슬 정리")
 	end
 
 	@ExecSpace("ServerOnly")

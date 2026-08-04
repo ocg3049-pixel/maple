@@ -1,0 +1,11 @@
+const { UIBuilder } = require("/Users/florence/Desktop/.claude/skills/msw-ui-system/scripts/msw_ui_builder.cjs");
+const b = UIBuilder.load("ui/DefaultGroup.ui");
+const rows = b.listEntities().filter((e) => (e.path || "").indexOf("/BuffBar/HealerSummonIcon") >= 0);
+for (const r of rows) console.log(JSON.stringify(r));
+const findings = b.validate();
+console.log("validate findings:", findings.length);
+for (const f of findings.slice(0, 10)) console.log(JSON.stringify(f));
+const e = b.find("BuffBar/HealerSummonIcon");
+console.log("root componentNames:", e.componentNames, "enable:", e.jsonString.enable);
+const t = b.find("BuffBar/HealerSummonIcon/Text");
+console.log("text componentNames:", t.componentNames);
