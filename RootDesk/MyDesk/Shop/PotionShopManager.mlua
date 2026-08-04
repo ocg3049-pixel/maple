@@ -8,10 +8,6 @@ script PotionShopManager extends Logic
 
     @Sync property integer PlayerMeso = 0
 
-    property integer healTimerId = 0
-    property integer healTickCount = 0
-    property string healUserId = ""
-
     property any touchHandler = nil
     property any buyBtnHandler = nil
     property any closeBtnHandler = nil
@@ -28,9 +24,12 @@ script PotionShopManager extends Logic
 
     method void OnEndPlay()
         if self:IsServer() then
-            if self.healTimerId ~= 0 then
-                _TimerService:ClearTimer(self.healTimerId)
-                self.healTimerId = 0
+            -- (멀티 수정) 힐 세션이 유저별 테이블로 분리됨 - 전부 정리
+            if self._T.heal ~= nil then
+                for _, rec in pairs(self._T.heal) do
+                    if rec.timerId ~= 0 then _TimerService:ClearTimer(rec.timerId) end
+                end
+                self._T.heal = {}
             end
         end
         if self:IsClient() then
@@ -93,13 +92,18 @@ script PotionShopManager extends Logic
 
     @ExecSpace("ServerOnly")
     method void ProcessUsePotionServer(string userId)
-        if self.healTimerId ~= 0 then
+        -- (멀티 수정) 힐 세션을 유저별로 분리한다 - 예전엔 월드 전역 단일 세션(healTimerId 하나)이라
+        -- 한 명이 포션을 쓰면 힐 10초 동안 같은 월드의 다른 모든 플레이어 포션이 거부됐다.
+        if self._T.heal == nil then self._T.heal = {} end
+        if self._T.heal[userId] ~= nil then
             self:NotifyMessage("이미 포션 효과가 진행 중입니다!", userId)
             return
         end
-        self.healUserId = userId
-        self.healTickCount = 0
-        self.healTimerId = _TimerService:SetTimerRepeat(self.DoHealTick, 2.0)
+        local rec = { tick = 0, timerId = 0 }
+        self._T.heal[userId] = rec
+        rec.timerId = _TimerService:SetTimerRepeat(function()
+            self:DoHealTickFor(userId)
+        end, 2.0)
         log("[Shop] 포션 사용: " .. userId)
     end
 
@@ -121,25 +125,27 @@ script PotionShopManager extends Logic
     end
 
     @ExecSpace("ServerOnly")
-    method void DoHealTick()
-        self.healTickCount = self.healTickCount + 1
-        local userId = self.healUserId
+    method void DoHealTickFor(string userId)
+        -- 유저별 힐 틱 (2초 간격 5회, 틱당 HP +10).
+        local heal = self._T.heal
+        if heal == nil then return end
+        local rec = heal[userId]
+        if rec == nil then return end
+        rec.tick = rec.tick + 1
 
         local playerEntity = self:FindPlayerByUserId(userId)
         if isvalid(playerEntity) then
             local pc = playerEntity.PlayerComponent
             local newHp = math.min((pc.Hp or 0) + 10, (pc.MaxHp or 50))
             pc.Hp = newHp
-            log("[Shop] 힐 " .. self.healTickCount .. "/5: HP=" .. newHp)
+            log("[Shop] 힐 " .. rec.tick .. "/5: HP=" .. newHp .. " (" .. userId .. ")")
             self:NotifyHealEffect(userId)
         end
 
-        if self.healTickCount >= 5 then
-            _TimerService:ClearTimer(self.healTimerId)
-            self.healTimerId = 0
-            self.healTickCount = 0
-            self.healUserId = ""
-            log("[Shop] 힐 완료")
+        if rec.tick >= 5 then
+            _TimerService:ClearTimer(rec.timerId)
+            heal[userId] = nil
+            log("[Shop] 힐 완료: " .. userId)
         end
     end
 
@@ -165,19 +171,10 @@ script PotionShopManager extends Logic
 
     @ExecSpace("Client")
     method void NotifyHealEffect()
-        local mapsEnt = _EntityService:GetEntityByPath("/maps")
-        if not isvalid(mapsEnt) then return end
-        local playerEntity = nil
-        for _, map in ipairs(mapsEnt.Children:ToTable()) do
-            if not isvalid(map) then continue end
-            for _, child in ipairs(map.Children:ToTable()) do
-                if isvalid(child) and isvalid(child.PlayerComponent) then
-                    playerEntity = child
-                    break
-                end
-            end
-            if isvalid(playerEntity) then break end
-        end
+        -- (멀티 수정) 이 RPC는 힐 대상 유저의 클라이언트로만 오므로 내 캐릭터가 곧 대상이다.
+        -- 예전처럼 맵을 순회해 "첫 번째 PlayerComponent"를 집으면 같은 맵에 여러 명일 때
+        -- 남의 캐릭터 머리 위에 힐 숫자가 떴다.
+        local playerEntity = _UserService.LocalPlayer
         if not isvalid(playerEntity) then return end
 
         _DamageSkinService:Play(
@@ -192,6 +189,22 @@ script PotionShopManager extends Logic
     end
 
     -- ===== 클라이언트 =====
+
+    @ExecSpace("ClientOnly")
+    method boolean TryUsePotion()
+        -- (유실 방지) 포션 사용의 공용 진입점: 힐이 진행 중이면 false를 돌려주고 아무것도 하지
+        -- 않는다 - 호출부는 false면 아이템을 소모하지 말 것. 예전엔 클라가 아이템부터 지우고
+        -- 서버에 요청했는데, 서버가 "이미 진행 중"으로 거부하면 포션만 사라졌다(자동사냥 경로는
+        -- 자체 시간창으로 회피하고 있었고, 수동 사용 2곳이 무방비였다).
+        local now = _UtilLogic.ElapsedSeconds
+        if (self._T.healBusyUntil or 0) > now then
+            log("[Shop] 포션 사용 불가 - 힐 진행 중")
+            return false
+        end
+        self._T.healBusyUntil = now + 10.5   -- 힐 5틱(2초 간격) + 여유 (AutoHunt와 동일 창)
+        self:RequestUsePotion()
+        return true
+    end
 
     @ExecSpace("ClientOnly")
     method void ClientInit()

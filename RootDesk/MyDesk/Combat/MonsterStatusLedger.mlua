@@ -1,0 +1,141 @@
+@Logic
+script MonsterStatusLedger extends Logic
+
+	-- 몬스터 공유 상태이상 장부 (서버 전용 @Logic).
+	-- 빙결 감속(InputSpeed 반감)과 스턴(AI/이동 정지)은 "몬스터의" 상태인데, 기존에는 각
+	-- 공격자(PlayerAttack 인스턴스)의 _T에 흩어져 있어 여러 명이 같은 몬스터에 겹쳐 걸면
+	-- ① 반감이 0.25배로 중첩되거나 복구 순서에 따라 영구 0.5배로 고착(빙결),
+	-- ② 나중 스턴이 먼저 스턴의 복구 타이머에 조기 해제(스턴)되는 경쟁이 있었다.
+	-- 여기서는 몬스터 Path를 키로 원상태+최종 만료시각을 1벌만 기록하고, 마지막 만료에만
+	-- 1회 복구한다. 복구는 "성공할 때까지" 재시도 - 상태이상 중 몬스터가 죽으면 복구 시점에
+	-- 엔티티가 잠시 무효라, 리스폰 후에라도 복구해 영구 잔류를 막는다 (PlayerAttack의
+	-- TEST17/TEST21 실측 패턴 이관: 조기 발화 시 재예약, 무효 시 1초 간격 재시도).
+
+	-- ── 빙결 감속 (이동속도 50%) ──────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method void ApplySlow(Entity target, number duration)
+		-- 몬스터당 1회만 InputSpeed를 반감하고, 겹치면(누가 걸었든) 만료 시각만 max로 연장한다.
+		if not isvalid(target) then return end
+		if self._T.slow == nil then self._T.slow = {} end
+		local key = target.Path
+		local now = _UtilLogic.ElapsedSeconds
+		local rec = self._T.slow[key]
+		if rec ~= nil then
+			if now + duration > rec.untilTime then rec.untilTime = now + duration end
+			return
+		end
+		local movement = target.MovementComponent
+		local base = nil
+		if isvalid(movement) then
+			base = movement.InputSpeed
+			movement.InputSpeed = base * 0.5
+		end
+		self._T.slow[key] = { base = base, untilTime = now + duration }
+		self:ScheduleSlowRestore(key, target, duration, 45)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleSlowRestore(string key, Entity target, number delay, integer retriesLeft)
+		-- 감속 복구 타이머 예약 (내부용).
+		_TimerService:SetTimerOnce(function()
+			self:TrySlowRestore(key, target, retriesLeft)
+		end, delay)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TrySlowRestore(string key, Entity target, integer retriesLeft)
+		-- 만료 시각 이후에만, 대상이 유효할 때만 원속도로 복구한다. 연장돼 있으면 재예약.
+		local slow = self._T.slow
+		if slow == nil then return end
+		local rec = slow[key]
+		if rec == nil then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if rec.untilTime > now then
+			self:ScheduleSlowRestore(key, target, (rec.untilTime - now) + 0.05, retriesLeft)
+			return
+		end
+		local mv = nil
+		if isvalid(target) then mv = target.MovementComponent end
+		if not isvalid(target) or not isvalid(mv) then
+			if retriesLeft > 0 then
+				self:ScheduleSlowRestore(key, target, 1.0, retriesLeft - 1)
+			else
+				slow[key] = nil
+			end
+			return
+		end
+		if rec.base ~= nil then mv.InputSpeed = rec.base end
+		slow[key] = nil
+	end
+
+	-- ── 스턴 (AI/이동 정지) ──────────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method void ApplyStun(Entity target, number duration)
+		-- 몬스터당 1회만 AI(추적/배회)와 이동을 끄고, 겹치면 만료 시각만 max로 연장한다.
+		-- 기존 "각자 Enable 스냅샷→각자 복구" 방식은 나중 스턴의 스냅샷이 false로 찍혀
+		-- 먼저 스턴의 복구가 나중 스턴까지 조기 해제하는 문제가 있었다.
+		if not isvalid(target) then return end
+		if self._T.stun == nil then self._T.stun = {} end
+		local key = target.Path
+		local now = _UtilLogic.ElapsedSeconds
+		local rec = self._T.stun[key]
+		if rec ~= nil then
+			if now + duration > rec.untilTime then rec.untilTime = now + duration end
+			return
+		end
+		local aiChase = target.AIChaseComponent
+		local wasChase = isvalid(aiChase) and aiChase.Enable
+		if isvalid(aiChase) then aiChase.Enable = false end
+		local aiWander = target.AIWanderComponent
+		local wasWander = isvalid(aiWander) and aiWander.Enable
+		if isvalid(aiWander) then aiWander.Enable = false end
+		local movement = target.MovementComponent
+		local wasMove = isvalid(movement) and movement.Enable
+		if isvalid(movement) then
+			movement:Stop()
+			movement.Enable = false
+		end
+		self._T.stun[key] = { untilTime = now + duration, chase = wasChase, wander = wasWander, move = wasMove }
+		self:ScheduleStunRestore(key, target, duration, 20)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleStunRestore(string key, Entity target, number delay, integer retriesLeft)
+		-- 스턴 복구 타이머 예약 (내부용).
+		_TimerService:SetTimerOnce(function()
+			self:TryStunRestore(key, target, retriesLeft)
+		end, delay)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryStunRestore(string key, Entity target, integer retriesLeft)
+		-- 만료 시각 이후에만 복구. 연장돼 있으면 재예약, 대상 무효면 1초 간격 재시도.
+		local stun = self._T.stun
+		if stun == nil then return end
+		local rec = stun[key]
+		if rec == nil then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if rec.untilTime > now then
+			self:ScheduleStunRestore(key, target, (rec.untilTime - now) + 0.05, retriesLeft)
+			return
+		end
+		if not isvalid(target) then
+			if retriesLeft > 0 then
+				self:ScheduleStunRestore(key, target, 1.0, retriesLeft - 1)
+			else
+				stun[key] = nil
+			end
+			return
+		end
+		local aiChase = target.AIChaseComponent
+		if isvalid(aiChase) and rec.chase == true then aiChase.Enable = true end
+		local aiWander = target.AIWanderComponent
+		if isvalid(aiWander) and rec.wander == true then aiWander.Enable = true end
+		local movement = target.MovementComponent
+		if isvalid(movement) and rec.move == true then movement.Enable = true end
+		stun[key] = nil
+	end
+
+end

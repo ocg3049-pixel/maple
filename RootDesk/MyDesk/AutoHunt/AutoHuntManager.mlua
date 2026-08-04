@@ -71,8 +71,9 @@ script AutoHuntManager extends Logic
 		for i = 1, 128 do
 			local s = _UIEquipInventoryManager:GetTabItem("consume", i)
 			if s ~= "" and string.find(s, "HP포션", 1, true) == 1 then
+				-- (유실 방지) 수동 사용과 공용 게이트(TryUsePotion)로 통일 - 수락 시에만 아이템 소모.
+				if not _PotionShopManager:TryUsePotion() then return end
 				self._T.potionHealUntil = now + 10.5   -- 힐 5틱(2초 간격) + 여유
-				_PotionShopManager:RequestUsePotion()
 				_UIEquipInventoryManager:SetTabItem("consume", i, "")
 				_UIEquipInventoryManager:RefreshUI()
 				log("[AutoHunt] 자동 HP포션 사용 (HP " .. tostring(hp) .. "/" .. tostring(maxHp) .. ")")
@@ -718,12 +719,30 @@ script AutoHuntManager extends Logic
 		_SkillManager:UseSkillInSlot(pick.key)
 	end
 
+	-- (성능) 클라 몬스터 목록 0.3초 캐시: FindTarget(0.3초 주기) + 공격 틱의 Count 2회가 저마다
+	-- 맵 전체 재귀 스캔을 돌려 클라당 초당 ~7회 순회가 쌓였다 - 한 목록을 셋이 공유한다
+	-- (죽은 몬스터는 각 사용처의 IsDead 검사가 걸러낸다).
+	@ExecSpace("ClientOnly")
+	method table GetMonsterComps(Entity player)
+		local now = _UtilLogic.ElapsedSeconds
+		if self._T.monComps ~= nil and (now - (self._T.monCompsAt or -99)) < 0.3 then
+			return self._T.monComps
+		end
+		local map = player.CurrentMap
+		local comps = nil
+		if isvalid(map) then
+			comps = map:GetChildComponentsByTypeName("script.Monster", true)
+		end
+		if comps == nil then comps = {} end
+		self._T.monComps = comps
+		self._T.monCompsAt = now
+		return comps
+	end
+
 	-- 바라보는 방향(dir) 전방 distX유닛 직선상(같은 높이)의 살아있는 몬스터 수 - 돌진 각 판정용.
 	@ExecSpace("ClientOnly")
 	method integer CountMonstersInFront(Entity player, Vector3 pp, number dir, number distX)
-		local map = player.CurrentMap
-		if not isvalid(map) then return 0 end
-		local comps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local comps = self:GetMonsterComps(player)
 		if comps == nil then return 0 end
 		local count = 0
 		for _, comp in ipairs(comps) do
@@ -743,9 +762,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method integer CountNearbyMonsters(Entity player, Vector3 pp, number radius)
-		local map = player.CurrentMap
-		if not isvalid(map) then return 0 end
-		local comps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local comps = self:GetMonsterComps(player)
 		if comps == nil then return 0 end
 		local count = 0
 		for _, comp in ipairs(comps) do
@@ -766,10 +783,8 @@ script AutoHuntManager extends Logic
 	method Entity FindTarget(Entity player)
 		-- 현재 맵에서 살아있는 최근접 몬스터. 같은 높이(|dy|<1.5)를 우선하고,
 		-- 추적 타임아웃으로 제외된 대상은 제외 시간이 지날 때까지 건너뛴다.
-		local map = player.CurrentMap
-		if not isvalid(map) then return nil end
-		local comps = map:GetChildComponentsByTypeName("script.Monster", true)
-		if comps == nil then return nil end
+		local comps = self:GetMonsterComps(player)
+		if comps == nil or #comps == 0 then return nil end
 		local pp = player.TransformComponent.WorldPosition
 		local now = _UtilLogic.ElapsedSeconds
 

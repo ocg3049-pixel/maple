@@ -50,6 +50,16 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- (성능/누수 수정) 플레이어 퇴장 시 감시 타이머 해제 - 해제하지 않으면 입퇴장이 반복될수록
+		-- 고아 타이머가 4Hz no-op으로 서버에 누적됐다.
+		if self._T.ctrlWatchdogId ~= nil then
+			_TimerService:ClearTimer(self._T.ctrlWatchdogId)
+			self._T.ctrlWatchdogId = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ControlWatchdogTick()
 		if not isvalid(self.Entity) then return end
 		-- 사망 중에는 일부러 잠가둔 것이므로 건드리지 않는다(HandleDeadLockStateEvent).
@@ -3243,13 +3253,35 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
+	method table GetMonsterCompsCached()
+		-- (성능) 서버 몬스터 컴포넌트 목록 0.25초 캐시. 장판 틱/소환수 대상 탐색이 저마다 맵 전체
+		-- 재귀 스캔(GetChildComponentsByTypeName)을 돌려 5인 동시 자동사냥에서 초당 수십 회의
+		-- 전수 순회가 쌓였다 - 짧은 캐시로 근접한 틱들의 스캔을 1회로 합친다(0.25초 내 죽은
+		-- 몬스터는 각 사용처의 IsDead 검사가 걸러낸다).
+		local now = _UtilLogic.ElapsedSeconds
+		if self._T.monListCache ~= nil and (now - (self._T.monListCacheAt or -99)) < 0.25 then
+			return self._T.monListCache
+		end
+		local map = self.Entity.CurrentMap
+		local comps = nil
+		if isvalid(map) then
+			comps = map:GetChildComponentsByTypeName("script.Monster", true)
+		end
+		if comps == nil then comps = {} end
+		self._T.monListCache = comps
+		self._T.monListCacheAt = now
+		return comps
+	end
+
+	@ExecSpace("ServerOnly")
 	method table FindMonstersInRadius(Vector2 fromPos, number radius, integer maxCount)
 		-- (다크드래곤) fromPos 반경 radius 안의 살아있는 몬스터를 가까운 순으로 최대 maxCount마리 반환한다.
 		-- 드래곤이 "자기 주변"만 공격하게 하려는 용도(넓은 전방박스 대신 작은 원형 반경).
+		-- (성능) 소환수들이 수초마다 반복 호출하므로 캐시된 목록을 쓴다.
 		local map = self.Entity.CurrentMap
 		local out = {}
 		if not isvalid(map) then return out end
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local monsterComps = self:GetMonsterCompsCached()
 		local cand = {}
 		for _, comp in ipairs(monsterComps) do
 			---@type Monster
@@ -3828,27 +3860,19 @@ script PlayerAttack extends AttackComponent
 		local key = target.Path
 		self._T.chargeBlowFrozen[key] = _UtilLogic.ElapsedSeconds + duration
 
-		-- 이동속도 50%: 처음 걸릴 때만 원래 속도를 저장하고 절반으로 줄인다(겹침 시 반감 중첩 방지).
-		if self._T.chargeBlowFrozenBaseSpeed == nil then self._T.chargeBlowFrozenBaseSpeed = {} end
-		local movement = target.MovementComponent
-		if isvalid(movement) and self._T.chargeBlowFrozenBaseSpeed[key] == nil then
-			self._T.chargeBlowFrozenBaseSpeed[key] = movement.InputSpeed
-			movement.InputSpeed = movement.InputSpeed * 0.5
-		end
+		-- (멀티 수정) 이동속도 50% 감속/복구는 몬스터 공유 장부(MonsterStatusLedger)가 전담한다.
+		-- 예전처럼 공격자별 _T에 원속도를 저장하면 두 플레이어가 같은 몬스터를 빙결시켰을 때
+		-- 반감이 0.25배로 중첩되거나(상대 빙결을 몰라서), 복구 순서에 따라 몬스터가 영구
+		-- 0.5배 슬로우로 고착됐다(리스폰 후에도 유지). 장부는 몬스터당 원속도 1벌만 기록하고
+		-- 마지막 만료에만 복구한다 (조기 발화 재예약/무효 시 재시도 패턴 포함 - TEST17/21).
+		_MonsterStatusLedger:ApplySlow(target, duration)
 
 		self:PlayChargeBlowFreezeVisual(target, duration)
-		-- 복구는 "성공할 때까지" 재시도한다 - 빙결 중 몬스터가 죽으면 복구 시점에 엔티티/컴포넌트가
-		-- 잠시 무효라 한 번짜리 타이머로는 복구가 통째로 건너뛰어져 리스폰 후에도 0.5 속도로 남는
-		-- 버그가 실측됐다(TEST17). 무효면 1초 간격으로 재시도해 리스폰 후에 복구한다.
-		-- (실측) 리스폰까지 12초를 넘는 경우가 있어 재시도 창을 45회(45초)로 넉넉히 잡는다.
+		-- 파란 틴트 복구: 자기 빙결 기록(chargeBlowFrozen)의 마지막 만료 시점에 색만 되돌린다.
+		-- (틴트는 시각 표현이라 공격자별 관리 유지 - 속도와 달리 늦게 풀려도 실해가 없다.)
 		local attemptRestore
 		local retriesLeft = 45
 		attemptRestore = function()
-			-- 아직 만료 전이면(다른 빙결로 연장됐거나, 타이머가 수 ms 일찍 발화한 경우) 남은 시간만큼
-			-- 재예약한다. (버그 수정) 예전엔 "연장한 쪽의 타이머가 복구하겠지"라며 그냥 return했는데,
-			-- 타이머가 목표 시각보다 살짝 일찍 발화하면 자기 자신의 만료도 "연장됨"으로 오인해
-			-- 복구가 영구히 건너뛰어졌다(TEST21 실측: 스킵 35건 전부 복구 누락). 재예약하면
-			-- 어떤 경우든 마지막 만료 시각 이후에 반드시 복구가 실행된다.
 			local untilTime = 0
 			if self._T.chargeBlowFrozen ~= nil then
 				untilTime = self._T.chargeBlowFrozen[key] or 0
@@ -3858,31 +3882,16 @@ script PlayerAttack extends AttackComponent
 				_TimerService:SetTimerOnce(attemptRestore, (untilTime - now) + 0.05)
 				return
 			end
-			local mv = nil
-			if isvalid(target) then
-				mv = target.MovementComponent
-			end
-			if not isvalid(target) or not isvalid(mv) then
+			if not isvalid(target) then
 				retriesLeft = retriesLeft - 1
-				log("[Freeze] 복구 재시도 " .. key .. " entity=" .. tostring(isvalid(target)) .. " mv=" .. tostring(isvalid(mv)) .. " 남은=" .. tostring(retriesLeft))
 				if retriesLeft > 0 then
 					_TimerService:SetTimerOnce(attemptRestore, 1.0)
-				else
-					-- 대상이 완전히 사라짐 - 상태만 정리한다.
-					if self._T.chargeBlowFrozen ~= nil then self._T.chargeBlowFrozen[key] = nil end
-					if self._T.chargeBlowFrozenBaseSpeed ~= nil then self._T.chargeBlowFrozenBaseSpeed[key] = nil end
+				elseif self._T.chargeBlowFrozen ~= nil then
+					self._T.chargeBlowFrozen[key] = nil
 				end
 				return
 			end
 			if self._T.chargeBlowFrozen ~= nil then self._T.chargeBlowFrozen[key] = nil end
-			local base = nil
-			if self._T.chargeBlowFrozenBaseSpeed ~= nil then
-				base = self._T.chargeBlowFrozenBaseSpeed[key]
-				self._T.chargeBlowFrozenBaseSpeed[key] = nil
-			end
-			if base ~= nil then
-				mv.InputSpeed = base
-			end
 			self:ClearChargeBlowTint(target)
 		end
 		_TimerService:SetTimerOnce(attemptRestore, duration)
@@ -4058,30 +4067,12 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void ApplyChargeBlowStun(Entity target)
-		-- 1초 스턴. 어썰터/코마 스턴과 동일한 방식(AI·이동 정지) + 머리 위 스턴 이펙트.
+		-- 1초 스턴. (멀티 수정) AI/이동 정지·복구는 몬스터 공유 장부(MonsterStatusLedger)가 전담 -
+		-- 공격자별 Enable 스냅샷 방식은 스턴이 겹치면 나중 스턴이 조기 해제되는 경쟁이 있었다.
 		if not isvalid(target) then return end
 		local duration = 1.0
-		-- 빙결과 동일 - AIChase/AIWander 중 붙어 있는 쪽을 모두 끈다(달팽이는 AIWander).
-		local aiChase = target.AIChaseComponent
-		local wasChaseEnabled = isvalid(aiChase) and aiChase.Enable
-		if isvalid(aiChase) then aiChase.Enable = false end
-		local aiWander = target.AIWanderComponent
-		local wasWanderEnabled = isvalid(aiWander) and aiWander.Enable
-		if isvalid(aiWander) then aiWander.Enable = false end
-		local movement = target.MovementComponent
-		local wasMovementEnabled = isvalid(movement) and movement.Enable
-		if isvalid(movement) then
-			movement:Stop()
-			movement.Enable = false
-		end
+		_MonsterStatusLedger:ApplyStun(target, duration)
 		self:PlayChargeBlowStunEffect(target, duration)
-		_TimerService:SetTimerOnce(function()
-			if isvalid(target) then
-				if isvalid(aiChase) and wasChaseEnabled then aiChase.Enable = true end
-				if isvalid(aiWander) and wasWanderEnabled then aiWander.Enable = true end
-				if isvalid(movement) and wasMovementEnabled then movement.Enable = true end
-			end
-		end, duration)
 	end
 
 	@ExecSpace("Multicast")
@@ -4144,7 +4135,8 @@ script PlayerAttack extends AttackComponent
 			if ticksLeft <= 0 then return end
 			ticksLeft = ticksLeft - 1
 			if not isvalid(map) then return end
-			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			-- (성능) 20초x10틱 장판이 여럿 겹치면 전수 스캔이 초당 수 회 쌓인다 - 캐시 목록 사용.
+			local monsterComps = self:GetMonsterCompsCached()
 			for _, comp in ipairs(monsterComps) do
 				---@type Monster
 				local mc = comp
@@ -4211,7 +4203,8 @@ script PlayerAttack extends AttackComponent
 			if ticksLeft <= 0 then return end
 			ticksLeft = ticksLeft - 1
 			if not isvalid(map) then return end
-			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			-- (성능) 20초x10틱 장판이 여럿 겹치면 전수 스캔이 초당 수 회 쌓인다 - 캐시 목록 사용.
+			local monsterComps = self:GetMonsterCompsCached()
 			for _, comp in ipairs(monsterComps) do
 				---@type Monster
 				local mc = comp
@@ -8589,26 +8582,10 @@ script PlayerAttack extends AttackComponent
 		-- MovementComponent:Stop()만으로는 부족했다(AIChase가 이미 내려둔 이동 명령이 몇 프레임 더
 		-- 이어지거나, 다른 경로로 다시 이동이 걸릴 수 있음). MovementComponent 자체도 3초간 완전히
 		-- 꺼서(Enable=false) 그 사이엔 어떤 경로로도 이동 로직이 아예 실행되지 않게 한다.
+		-- (멀티 수정) AI/이동 정지·복구는 몬스터 공유 장부(MonsterStatusLedger)가 전담 -
+		-- 공격자별 Enable 스냅샷 방식은 스턴이 겹치면 나중 스턴이 조기 해제되는 경쟁이 있었다.
 		if not isvalid(target) then return end
-		local aiChase = target.AIChaseComponent
-		local wasAIEnabled = isvalid(aiChase) and aiChase.Enable
-		if isvalid(aiChase) then
-			aiChase.Enable = false
-		end
-		local movement = target.MovementComponent
-		local wasMovementEnabled = isvalid(movement) and movement.Enable
-		if isvalid(movement) then
-			movement:Stop()
-			movement.Enable = false
-		end
-		_TimerService:SetTimerOnce(function()
-			if isvalid(target) and isvalid(aiChase) and wasAIEnabled then
-				aiChase.Enable = true
-			end
-			if isvalid(target) and isvalid(movement) and wasMovementEnabled then
-				movement.Enable = true
-			end
-		end, 3.0)
+		_MonsterStatusLedger:ApplyStun(target, 3.0)
 	end
 
 	method string GetComaEffectRuid(integer orbCount)
@@ -15564,27 +15541,9 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void ApplyAssaulterStun(Entity target)
-		-- 코마의 ApplyComaStun과 동일한 방식 - 몬스터 AI 추적/이동을 3초간 완전히 꺼서 행동불능으로 만든다.
+		-- 코마의 ApplyComaStun과 동일 - (멀티 수정) AI/이동 정지·복구는 몬스터 공유 장부가 전담.
 		if not isvalid(target) then return end
-		local aiChase = target.AIChaseComponent
-		local wasAIEnabled = isvalid(aiChase) and aiChase.Enable
-		if isvalid(aiChase) then
-			aiChase.Enable = false
-		end
-		local movement = target.MovementComponent
-		local wasMovementEnabled = isvalid(movement) and movement.Enable
-		if isvalid(movement) then
-			movement:Stop()
-			movement.Enable = false
-		end
-		_TimerService:SetTimerOnce(function()
-			if isvalid(target) and isvalid(aiChase) and wasAIEnabled then
-				aiChase.Enable = true
-			end
-			if isvalid(target) and isvalid(movement) and wasMovementEnabled then
-				movement.Enable = true
-			end
-		end, 3.0)
+		_MonsterStatusLedger:ApplyStun(target, 3.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -18637,6 +18596,20 @@ script PlayerAttack extends AttackComponent
 		-- 화염 지대 생성: 생성음+장판 이펙트(4종 랜덤, 10초 루프) + 2초마다 범위 판정(총 5회).
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
+		-- (성능) 동시 장판 상한: 플레이어당 3개. 자동사냥은 버프를 상시 유지하고 히트마다 10%
+		-- 프록이 굴러 5인이면 장판 수십 개가 동시 존재했다 - 장판마다 2초 주기 전수 스캔 +
+		-- 클라 루프 이펙트가 겹쳐 서버/클라 부하가 폭증하므로, 꽉 찼으면 생성을 생략한다.
+		local nowZ = _UtilLogic.ElapsedSeconds
+		local keptZ = {}
+		for _, e in ipairs(self._T.fireZoneExpiries or {}) do
+			if e > nowZ then table.insert(keptZ, e) end
+		end
+		if #keptZ >= 3 then
+			self._T.fireZoneExpiries = keptZ
+			return
+		end
+		table.insert(keptZ, nowZ + 10.0)
+		self._T.fireZoneExpiries = keptZ
 		local zonePower = self._T.fireZoneCombatPower or 0
 		local idx = _UtilLogic:RandomIntegerRange(1, 4)
 		self:PlayFireZoneSpawnFx(Vector3(pos.x, pos.y, 0), idx)
@@ -18646,7 +18619,7 @@ script PlayerAttack extends AttackComponent
 			if ticksLeft <= 0 then return end
 			ticksLeft = ticksLeft - 1
 			if not isvalid(self.Entity) or not isvalid(map) then return end
-			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			local monsterComps = self:GetMonsterCompsCached()
 			for _, comp in ipairs(monsterComps) do
 				---@type Monster
 				local mc = comp
@@ -18821,6 +18794,18 @@ script PlayerAttack extends AttackComponent
 		-- 빙하 영역 생성: 화염 지대와 같은 틱 구조(10초, 2초마다 ±1.5/±1.2 범위, 전투력 200~300%).
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
+		-- (성능) 동시 장판 상한: 플레이어당 3개 (화염 지대와 동일 이유 - 5인 프록 폭증 방지).
+		local nowZ = _UtilLogic.ElapsedSeconds
+		local keptZ = {}
+		for _, e in ipairs(self._T.glacierZoneExpiries or {}) do
+			if e > nowZ then table.insert(keptZ, e) end
+		end
+		if #keptZ >= 3 then
+			self._T.glacierZoneExpiries = keptZ
+			return
+		end
+		table.insert(keptZ, nowZ + 10.0)
+		self._T.glacierZoneExpiries = keptZ
 		local zonePower = self._T.glacierCombatPower or 0
 		self:PlayGlacierZoneFx(Vector3(pos.x, pos.y, 0))
 		local ticksLeft = 5
@@ -18829,7 +18814,7 @@ script PlayerAttack extends AttackComponent
 			if ticksLeft <= 0 then return end
 			ticksLeft = ticksLeft - 1
 			if not isvalid(self.Entity) or not isvalid(map) then return end
-			local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
+			local monsterComps = self:GetMonsterCompsCached()
 			for _, comp in ipairs(monsterComps) do
 				---@type Monster
 				local mc = comp
@@ -19116,28 +19101,10 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void ApplyPhoenixStun(Entity target, number duration)
-		-- 피닉스 스턴: 코마 스턴과 같은 방식이되, 배치 몬스터가 AIWander를 쓰는 경우까지 포함해
-		-- (빙결 처리와 동일하게) AIChase/AIWander/Movement를 duration 동안 모두 꺼서 행동불능으로 만든다.
+		-- 피닉스 스턴: (멀티 수정) AI(추적/배회)/이동 정지·복구는 몬스터 공유 장부가 전담 -
+		-- 스턴이 겹치면 나중 스턴이 조기 해제되던 공격자별 Enable 스냅샷 경쟁 제거.
 		if not isvalid(target) then return end
-		local aiChase = target.AIChaseComponent
-		local wasChaseEnabled = isvalid(aiChase) and aiChase.Enable
-		if isvalid(aiChase) then aiChase.Enable = false end
-		local aiWander = target.AIWanderComponent
-		local wasWanderEnabled = isvalid(aiWander) and aiWander.Enable
-		if isvalid(aiWander) then aiWander.Enable = false end
-		local movement = target.MovementComponent
-		local wasMovementEnabled = isvalid(movement) and movement.Enable
-		if isvalid(movement) then
-			movement:Stop()
-			movement.Enable = false
-		end
-		_TimerService:SetTimerOnce(function()
-			if isvalid(target) then
-				if isvalid(aiChase) and wasChaseEnabled then aiChase.Enable = true end
-				if isvalid(aiWander) and wasWanderEnabled then aiWander.Enable = true end
-				if isvalid(movement) and wasMovementEnabled then movement.Enable = true end
-			end
-		end, duration)
+		_MonsterStatusLedger:ApplyStun(target, duration)
 	end
 
 	@ExecSpace("Multicast")
@@ -21738,29 +21705,11 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void ApplyChainLightningStun(Entity target, number duration)
-		-- 빙결 대상 명중 시 2초 스턴: 차지 블로우 스턴과 동일한 방식(AI/이동 정지 + 머리 위 스턴 이펙트)
-		-- 이되 지속시간을 인자로 받는다.
+		-- 빙결 대상 명중 시 2초 스턴: (멀티 수정) AI/이동 정지·복구는 몬스터 공유 장부가 전담 -
+		-- 스턴이 겹치면 나중 스턴이 조기 해제되던 공격자별 Enable 스냅샷 경쟁 제거.
 		if not isvalid(target) then return end
-		local aiChase = target.AIChaseComponent
-		local wasChaseEnabled = isvalid(aiChase) and aiChase.Enable
-		if isvalid(aiChase) then aiChase.Enable = false end
-		local aiWander = target.AIWanderComponent
-		local wasWanderEnabled = isvalid(aiWander) and aiWander.Enable
-		if isvalid(aiWander) then aiWander.Enable = false end
-		local movement = target.MovementComponent
-		local wasMovementEnabled = isvalid(movement) and movement.Enable
-		if isvalid(movement) then
-			movement:Stop()
-			movement.Enable = false
-		end
+		_MonsterStatusLedger:ApplyStun(target, duration)
 		self:PlayChargeBlowStunEffect(target, duration)
-		_TimerService:SetTimerOnce(function()
-			if isvalid(target) then
-				if isvalid(aiChase) and wasChaseEnabled then aiChase.Enable = true end
-				if isvalid(aiWander) and wasWanderEnabled then aiWander.Enable = true end
-				if isvalid(movement) and wasMovementEnabled then movement.Enable = true end
-			end
-		end, duration)
 		log("PlayerAttack: 체인 라이트닝 빙결 대상 스턴 " .. tostring(duration) .. "초 - " .. tostring(target.Name))
 	end
 

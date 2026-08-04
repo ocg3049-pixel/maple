@@ -420,15 +420,24 @@ script EnhancementManager extends Logic
 			-- (Phase 2 연타 UX) 확인 다이얼로그를 생략하고 즉시 강화한다 - 버튼/P키는 기존 확인 유지.
 			if not self:IsWindowOpen() then return end
 			if self:IsConfirmDialogOpen() then
+				-- (감사) 파괴 직후 뜨는 재구매 다이얼로그는 직전 강화 입력과 0.5초 이상 간격이 있어야
+				-- Space로 수락된다 - 연타/매크로 중 파괴가 뜨면 유저 인지 없이 재구매→재등록→재강화
+				-- 루프가 잔액 소진까지 돌던 문제 방지 (버튼 클릭 수락은 영향 없음).
+				if self._T.pendingRebuySlot ~= nil
+					and _UtilLogic.ElapsedSeconds - (self._T.lastEnhanceInputAt or -99) < 0.5 then
+					return
+				end
 				log("[Enhance] Space → 확인")
 				self:AcceptConfirmDialog()
 			elseif self.currentTab == 1 then
 				log("[Enhance] Space → 즉시 강화(연타)")
+				self._T.lastEnhanceInputAt = _UtilLogic.ElapsedSeconds
 				self:DoEnhance()
 			elseif self.currentTab == 4 or self.currentTab == 5 then
 				-- (요청) 잠재/에디셔널 탭도 스타포스처럼 Space 연타로 즉시 재설정 (버튼과 동일 경로 -
 				-- 선택된 재화 탭(메소/큐브) 기준으로 소모·확률 처리까지 그대로)
 				log("[Enhance] Space → 즉시 재설정(연타) tab=" .. tostring(self.currentTab))
+				self._T.lastEnhanceInputAt = _UtilLogic.ElapsedSeconds
 				self:OnResetBtnTouch(self.currentTab)
 			end
 		elseif event.key == KeyboardKey.Tab then
@@ -954,6 +963,11 @@ script EnhancementManager extends Logic
 	-- ─── 강화 실행 ────────────────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void DoEnhance()
+		-- (감사) 매크로 연타 게이트: 최소 0.25초 간격. 오토클릭/키반복으로 초당 수십 회 강화가
+		-- 돌면 시간 비용이 0이 되어 밸런스가 무너지고, 저장 스냅샷 병합으로 회당 감사도 불가능해진다.
+		local nowGate = _UtilLogic.ElapsedSeconds
+		if nowGate - (self._T.lastEnhanceGateAt or -99) < 0.25 then return end
+		self._T.lastEnhanceGateAt = nowGate
 		if self.enhanceTargetRUID == "" then
 			self:AppendLog("아이템을 먼저 선택하세요.")
 			log("[Enhance] DoEnhance: 대상 없음")
@@ -1078,15 +1092,35 @@ script EnhancementManager extends Logic
 	end
 
 	-- ─── 인벤 업데이트 ────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method table SplitItemFieldsPreserve(string s)
+		-- (유실 방지) 아이템 문자열을 "|" 기준으로 빈 필드까지 보존하며 나눈다.
+		-- gmatch("[^|]+")는 빈 필드를 소거해버려, 잠재만 부여된 아이템(f8·f13~16이 빈 필드)을
+		-- 강화하는 순간 필드 인덱스가 앞으로 밀리며 잠재 등급/옵션이 오염된 채 저장되던 실버그의 원인.
+		local fields = {}
+		local start = 1
+		while true do
+			-- string.find는 (시작,끝) 2값 반환 - 둘 다 받아 LWA-1111 다중반환 경고를 피한다
+			local pos, posEnd = string.find(s, "|", start, true)
+			if pos == nil then
+				table.insert(fields, string.sub(s, start))
+				break
+			end
+			table.insert(fields, string.sub(s, start, pos - 1))
+			start = pos + 1
+		end
+		return fields
+	end
+
 	@ExecSpace("ClientOnly")
 	method void UpdateInvenItemStars(number newStars)
-		-- 잠재능력 등 추가 필드 보존: stars(4번째) 필드만 교체
+		-- 잠재능력 등 추가 필드 보존: stars(4번째) 필드만 교체 (빈 필드 보존 스플리터 필수)
 		-- (신규) 장착 중 장비가 대상이면 장비창 문자열에 직접 반영한다 (스탯·레벨 즉시 갱신).
 		if self.enhanceTargetEquipSlot > 0 then
 			local es = _UIEquipInventoryManager:GetEquip(self.enhanceTargetEquipSlot)
 			if es == "" then return end
-			local efields = {}
-			for part in string.gmatch(es, "[^|]+") do efields[#efields+1] = part end
+			local efields = self:SplitItemFieldsPreserve(es)
 			efields[4] = tostring(newStars)
 			local newStr = table.concat(efields, "|")
 			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, newStr)
@@ -1104,10 +1138,13 @@ script EnhancementManager extends Logic
 		if srcTab == "" then srcTab = "equip" end
 		local s = _UIEquipInventoryManager:GetTabItem(srcTab, idx)
 		if s == "" then return end
-		local fields = {}
-		for part in string.gmatch(s, "[^|]+") do fields[#fields+1] = part end
+		local fields = self:SplitItemFieldsPreserve(s)
 		fields[4] = tostring(newStars)
-		_UIEquipInventoryManager:SetTabItem(srcTab, idx, table.concat(fields, "|"))
+		local newInvStr = table.concat(fields, "|")
+		_UIEquipInventoryManager:SetTabItem(srcTab, idx, newInvStr)
+		-- (버그 수정) 인벤 경로도 대상 캐시를 갱신한다 - 갱신하지 않으면 이후 주문서/큐브가
+		-- 등록 시점의 별 수치로 아이템을 재조립해 강화 성과가 롤백되던 유실 버그.
+		self.enhanceTargetItemStr = newInvStr
 		_UIEquipInventoryManager:RefreshUI()
 		_CharacterPersistence:MarkDirty("enhance_inven")
 	end
@@ -1122,10 +1159,11 @@ script EnhancementManager extends Logic
 		if srcTab == "" then srcTab = "equip" end
 		local s = _UIEquipInventoryManager:GetTabItem(srcTab, idx)
 		if s ~= "" then
-			local fields = {}
-			for part in string.gmatch(s, "[^|]+") do fields[#fields+1] = part end
+			local fields = self:SplitItemFieldsPreserve(s)
 			fields[1] = newName
-			_UIEquipInventoryManager:SetTabItem(srcTab, idx, table.concat(fields, "|"))
+			local newStr = table.concat(fields, "|")
+			_UIEquipInventoryManager:SetTabItem(srcTab, idx, newStr)
+			self.enhanceTargetItemStr = newStr
 			_UIEquipInventoryManager:RefreshUI()
 		else
 			local ruid = self.enhanceTargetRUID
@@ -1133,10 +1171,11 @@ script EnhancementManager extends Logic
 			for i = 1, 9 do
 				local eq = _UIEquipInventoryManager:GetEquip(i)
 				if eq ~= "" and _UIEquipInventoryManager:ParseRUID(eq) == ruid then
-					local eqFields = {}
-					for part in string.gmatch(eq, "[^|]+") do eqFields[#eqFields+1] = part end
+					local eqFields = self:SplitItemFieldsPreserve(eq)
 					eqFields[1] = newName
-					_UIEquipInventoryManager:SetEquipStr(i, table.concat(eqFields, "|"))
+					local newStr = table.concat(eqFields, "|")
+					_UIEquipInventoryManager:SetEquipStr(i, newStr)
+					self.enhanceTargetItemStr = newStr
 					_UIEquipInventoryManager:RefreshUI()
 					return
 				end
@@ -1914,6 +1953,11 @@ script EnhancementManager extends Logic
 	-- ─── 큐브 리셋: 재설정 실행 ─────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void OnResetBtnTouch(integer tabIdx)
+		-- (감사) 매크로 연타 게이트: 최소 0.25초 간격 (DoEnhance와 공용 - 메소 10만/15만짜리
+		-- 재설정이 초당 수십 회 돌던 것 방지).
+		local nowGate = _UtilLogic.ElapsedSeconds
+		if nowGate - (self._T.lastEnhanceGateAt or -99) < 0.25 then return end
+		self._T.lastEnhanceGateAt = nowGate
 		local isDisabled = (tabIdx == 4 and self._T.tabPotDisabled) or (tabIdx == 5 and self._T.tabAddDisabled)
 		if isDisabled then
 			self:ShowItemUnusableDialog()

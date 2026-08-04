@@ -116,9 +116,16 @@ script CharacterPersistence extends Logic
 			accountDirty = false,
 			activeId = "",
 		}
-		self._T.sv[userId] = sv
-
 		local ec1, charsRaw = storage:GetAndWait("chars")
+		-- (유실 방지) 읽기 "오류"와 "데이터 없음"을 구분한다. NotFound(1000002)나 ec 0 + nil만 진짜
+		-- 신규 계정이고, 그 외 오류코드는 일시 장애다 - 이걸 빈 목록으로 캐시해버리면 이후 캐릭터
+		-- 생성/삭제의 chars 재기록이 기존 캐릭터 전원을 목록에서 지워버린다(마지막-쓰기-승리).
+		-- 오류면 캐시를 만들지 않고 loadFailed 표식만 남겨 호출부가 요청을 거부/재시도하게 한다.
+		if ec1 ~= 0 and ec1 ~= 1000002 then
+			log_warning("[Persist] chars 로드 실패 ec=" .. tostring(ec1) .. " (user=" .. userId .. ") - 캐시 생성 보류")
+			sv.loadFailed = true
+			return sv
+		end
 		if ec1 == 0 and charsRaw ~= nil and charsRaw ~= "" then
 			for _, line in ipairs(self:SplitLines(charsRaw)) do
 				local f = self:SplitTabs(line)
@@ -132,6 +139,12 @@ script CharacterPersistence extends Logic
 			end
 		end
 		local ec2, accRaw = storage:GetAndWait("account")
+		if ec2 ~= 0 and ec2 ~= 1000002 then
+			log_warning("[Persist] account 로드 실패 ec=" .. tostring(ec2) .. " (user=" .. userId .. ") - 캐시 생성 보류")
+			sv.loadFailed = true
+			return sv
+		end
+		self._T.sv[userId] = sv
 		if ec2 == 0 and accRaw ~= nil and accRaw ~= "" then
 			local f = self:SplitTabs(accRaw)
 			sv.lastId = f[1] or ""
@@ -263,7 +276,15 @@ script CharacterPersistence extends Logic
 		for id, _ in pairs(sv.dirtySaves) do
 			local s = sv.saves[id]
 			if s ~= nil and s ~= "" then
-				storage:SetAndWait("save_" .. id, s)
+				-- (유실 방지) 퇴장 flush는 마지막 기회라 실패 시 1회 즉시 재시도하고, 그래도
+				-- 실패하면 크게 남긴다 (캐시가 곧 해제되므로 이후 재시도 불가).
+				local ec = storage:SetAndWait("save_" .. id, s)
+				if ec ~= 0 then
+					local ec2 = storage:SetAndWait("save_" .. id, s)
+					if ec2 ~= 0 then
+						log_error("[Persist] 퇴장 최종 저장 실패 ec=" .. tostring(ec2) .. " (id=" .. id .. ", user=" .. userId .. ") - 세션 진행분 유실 위험")
+					end
+				end
 			end
 		end
 		sv.dirtySaves = {}
@@ -281,23 +302,35 @@ script CharacterPersistence extends Logic
 		-- 10초 주기: dirty인 것만 비동기 저장 (변경 없으면 아무것도 안 씀).
 		for userId, sv in pairs(self._T.sv) do
 			local storage = sv.storage
+			-- (유실 방지) 실패 콜백에서 dirty를 복원해 다음 틱이 재시도하게 한다 - 기존에는 발행과
+			-- 동시에 dirty를 내려버려, 쓰기 실패 + 이후 변경 없음이면 세션 진행분이 통째로 증발했다.
 			if sv.charsDirty then
 				sv.charsDirty = false
 				storage:SetAsync("chars", self:EncodeCharsStore(sv), function(ec, key)
-					if ec ~= 0 then log_warning("[Persist] chars 저장 실패 ec=" .. tostring(ec)) end
+					if ec ~= 0 then
+						log_warning("[Persist] chars 저장 실패 ec=" .. tostring(ec) .. " - 재시도 예약")
+						sv.charsDirty = true
+					end
 				end)
 			end
 			if sv.accountDirty then
 				sv.accountDirty = false
 				storage:SetAsync("account", self:EncodeAccount(sv), function(ec, key)
-					if ec ~= 0 then log_warning("[Persist] account 저장 실패 ec=" .. tostring(ec)) end
+					if ec ~= 0 then
+						log_warning("[Persist] account 저장 실패 ec=" .. tostring(ec) .. " - 재시도 예약")
+						sv.accountDirty = true
+					end
 				end)
 			end
 			for id, _ in pairs(sv.dirtySaves) do
 				local s = sv.saves[id]
 				if s ~= nil and s ~= "" then
+					local savedId = id
 					storage:SetAsync("save_" .. id, s, function(ec, key)
-						if ec ~= 0 then log_warning("[Persist] save 저장 실패 ec=" .. tostring(ec)) end
+						if ec ~= 0 then
+							log_warning("[Persist] save 저장 실패 ec=" .. tostring(ec) .. " - 재시도 예약")
+							sv.dirtySaves[savedId] = true
+						end
 					end)
 				end
 			end
@@ -327,6 +360,10 @@ script CharacterPersistence extends Logic
 	method void RequestCharacterList()
 		-- 캐릭터 목록 + 최근 접속 캐릭터 이름 회신.
 		local sv = self:EnsureLoadedServer(senderUserId)
+		if sv.loadFailed == true then
+			self:OnPersistLoadError("서버에서 캐릭터 목록을 불러오지 못했습니다.\n잠시 후 다시 로그인해주세요.", senderUserId)
+			return
+		end
 		self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, senderUserId)
 	end
 
@@ -334,9 +371,21 @@ script CharacterPersistence extends Logic
 	method void RequestCreateCharacter(string dataStr)
 		-- 캐릭터 생성: 슬롯 여유 + 월드 전체 닉네임 중복 검사 후 저장.
 		local sv = self:EnsureLoadedServer(senderUserId)
+		if sv.loadFailed == true then
+			self:OnCreateResult(false, "서버 오류로 생성에 실패했습니다. 잠시 후 다시 시도해주세요.", "", senderUserId)
+			return
+		end
 		local name = string.match(dataStr, "([^|]+)") or ""
 		if name == "" or string.find(dataStr, "\t") ~= nil or string.find(dataStr, "\n") ~= nil then
 			self:OnCreateResult(false, "잘못된 캐릭터 데이터입니다.", "", senderUserId)
+			return
+		end
+		-- (유실 방지) 이름에 "|"가 섞이면 파이프 구분 캐릭터 data의 필드가 밀려 외형/직업 파싱이
+		-- 통째로 깨진다 - data 필드 수가 표준(9)을 넘으면 이름에 구분자가 들어간 것으로 보고 거부.
+		local pipeCount = 0
+		for _ in string.gmatch(dataStr, "|") do pipeCount = pipeCount + 1 end
+		if pipeCount > 8 then
+			self:OnCreateResult(false, "닉네임에 사용할 수 없는 문자가 있습니다.", "", senderUserId)
 			return
 		end
 		-- 캐릭터 슬롯은 12칸(선택창은 3칸씩 4페이지로 보여준다).
@@ -362,9 +411,10 @@ script CharacterPersistence extends Logic
 		if ec2 ~= 0 then
 			log_warning("[Persist] 닉네임 레지스트리 등록 실패 ec=" .. tostring(ec2))
 		end
-		-- 캐릭터 목록은 중요 데이터라 즉시 저장
-		sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
-		sv.charsDirty = false
+		-- 캐릭터 목록은 중요 데이터라 즉시 저장. 실패하면 dirty를 유지해 주기 flush가 재시도한다.
+		local ecW = sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
+		sv.charsDirty = (ecW ~= 0)
+		if ecW ~= 0 then log_warning("[Persist] 생성 직후 chars 저장 실패 ec=" .. tostring(ecW) .. " - 재시도 예약") end
 		self:AppendAudit(sv, id, "create:" .. name, 0, 0, false)
 		log("[Persist] 캐릭터 생성: " .. name .. " (id=" .. id .. ", user=" .. senderUserId .. ")")
 		self:OnCreateResult(true, "", self:BuildCharsReply(sv), senderUserId)
@@ -374,12 +424,17 @@ script CharacterPersistence extends Logic
 	method void RequestDeleteCharacter(integer index)
 		-- 캐릭터 삭제: 목록에서 빼서 trash로 이동(7일 보관). 세이브/로그/닉네임은 유예기간 후 정리.
 		local sv = self:EnsureLoadedServer(senderUserId)
+		if sv.loadFailed == true then
+			self:OnPersistLoadError("서버 오류로 삭제에 실패했습니다. 잠시 후 다시 시도해주세요.", senderUserId)
+			return
+		end
 		local ch = sv.list[index]
 		if ch == nil then return end
 		table.remove(sv.list, index)
 		table.insert(sv.trash, { id = ch.id, deletedAt = DateTime.UtcNow.Elapsed, data = ch.data })
-		sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
-		sv.charsDirty = false
+		local ecD = sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
+		sv.charsDirty = (ecD ~= 0)
+		if ecD ~= 0 then log_warning("[Persist] 삭제 직후 chars 저장 실패 ec=" .. tostring(ecD) .. " - 재시도 예약") end
 		self:AppendAudit(sv, ch.id, "delete", 0, 0, false)
 		local name = string.match(ch.data, "([^|]+)") or "?"
 		log("[Persist] 캐릭터 삭제(7일 보관): " .. name .. " (id=" .. ch.id .. ")")
@@ -390,25 +445,39 @@ script CharacterPersistence extends Logic
 	method void RequestEnterCharacter(integer index)
 		-- 캐릭터 입장: 최근 접속 기록 갱신 + 저장된 세이브 회신(없으면 빈 문자열 = 신규).
 		local sv = self:EnsureLoadedServer(senderUserId)
+		if sv.loadFailed == true then
+			self:OnPersistLoadError("서버에서 저장 데이터를 불러오지 못했습니다.\n잠시 후 다시 로그인해주세요.", senderUserId)
+			return
+		end
 		local ch = sv.list[index]
 		if ch == nil then return end
 		local id = ch.id
 		local name = string.match(ch.data, "([^|]+)") or ""
-		sv.lastId = id
-		sv.lastName = name
-		sv.accountDirty = true
-		sv.activeId = id
 
 		local saveStr = sv.saves[id]
 		if saveStr == nil then
 			local ec, raw = sv.storage:GetAndWait("save_" .. id)
 			if ec == 0 and raw ~= nil then
 				saveStr = raw
-			else
+			elseif ec == 0 or ec == 1000002 then
+				-- 데이터 없음(NotFound/nil) = 진짜 신규 캐릭터
 				saveStr = ""
+			else
+				-- (유실 방지) 일시 오류를 "세이브 없음"으로 오인하면 클라이언트가 신규로 간주해
+				-- 초기 지급 상태를 구성하고 2초 뒤 그 상태가 원본 세이브를 영구히 덮어쓴다
+				-- (전 장비·강화·메소 증발). 오류면 입장 자체를 거부하고 캐시도 남기지 않는다.
+				log_warning("[Persist] 세이브 로드 실패 ec=" .. tostring(ec) .. " (id=" .. id .. ") - 입장 거부(원본 보호)")
+				self:OnPersistLoadError("서버에서 저장 데이터를 불러오지 못했습니다.\n잠시 후 다시 시도해주세요.", senderUserId)
+				return
 			end
 			sv.saves[id] = saveStr
 		end
+		-- 입장 확정 이후에만 활성/최근접속 기록을 갱신한다 (로드 실패 시 activeId가 남아
+		-- 떠돌이 스냅샷을 받는 일이 없도록).
+		sv.lastId = id
+		sv.lastName = name
+		sv.accountDirty = true
+		sv.activeId = id
 		-- 감사용 기준 메소 기록 (세이브 첫 줄 "M\t<메소>")
 		sv.lastMeso[id] = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
 		self:AppendAudit(sv, id, "enter", sv.lastMeso[id], 0, false)
@@ -429,7 +498,10 @@ script CharacterPersistence extends Logic
 		local prev = sv.lastMeso[id] or 0
 		local delta = meso - prev
 		local warn = false
-		if delta > 1000000 or delta < -1000000 then
+		-- (감사 보정) 고성 스타포스 1회 비용이 200만~600만이라 옛 임계값(100만)은 정상 유저가 상시
+		-- 경고를 울렸다. 강화 계열은 이제 시도마다 즉시 push되므로 "1회 push = 1회 시도" 기준으로
+		-- 1000만을 넘는 변동만 이상 징후로 본다.
+		if delta > 10000000 or delta < -10000000 then
 			-- 비정상 급증/급감 의심 - 로그에 표식을 남긴다 (자동 차단은 하지 않음)
 			warn = true
 			log_warning("[Persist] 메소 변동 이상 감지: " .. tostring(prev) .. " → " .. tostring(meso) .. " (reason=" .. reason .. ", user=" .. senderUserId .. ")")
@@ -440,6 +512,19 @@ script CharacterPersistence extends Logic
 		sv.lastMeso[id] = meso
 		sv.saves[id] = saveStr
 		sv.dirtySaves[id] = true
+		-- (유실 방지) 강화 계열 스냅샷은 10초 주기 flush를 기다리지 않고 즉시 비동기 기록한다 -
+		-- 그 사이 서버가 내려가도 파괴/성공이 롤백되지 않도록. 성공 시에만 dirty를 내리고(그 사이
+		-- 새 스냅샷이 왔으면 유지), 실패하면 dirty가 남아 다음 틱이 재시도한다.
+		if string.find(reason, "enhance", 1, true) ~= nil then
+			local writtenStr = saveStr
+			sv.storage:SetAsync("save_" .. id, writtenStr, function(ec, key)
+				if ec == 0 then
+					if sv.saves[id] == writtenStr then sv.dirtySaves[id] = nil end
+				else
+					log_warning("[Persist] 강화 즉시 저장 실패 ec=" .. tostring(ec) .. " - 주기 flush가 재시도")
+				end
+			end)
+		end
 		-- 캐릭터 목록의 외형 필드도 최신 장비로 맞춘다 (선택창 슬롯 아바타가 지금 입은 장비를 보여주도록)
 		self:SyncCharDataFromSave(sv, id, saveStr)
 	end
@@ -595,9 +680,19 @@ script CharacterPersistence extends Logic
 	end
 
 	@ExecSpace("Client")
+	method void OnPersistLoadError(string msg)
+		-- (유실 방지) 서버 스토리지 일시 장애로 목록/세이브를 못 읽었을 때 - 입장이 거부됐음을
+		-- 알린다. entered가 false로 남아 이 세션에서는 어떤 저장도 나가지 않는다(원본 보호).
+		log_warning("[Persist] " .. msg)
+		_UIToast:ShowMessage(msg)
+	end
+
+	@ExecSpace("Client")
 	method void ReceiveCharacterSave(string saveStr)
 		-- 입장한 캐릭터의 저장 데이터 수신: 있으면 복원, 없으면(신규) 현재 초기 지급 상태를 첫 저장.
 		local cl = self._T.cl
+		-- 직전 캐릭터의 보존 라인이 새 캐릭터 세이브에 섞이지 않게 초기화 (RestoreSave가 다시 채움)
+		cl.unknownLines = {}
 		if saveStr ~= "" then
 			self:RestoreSave(saveStr)
 		else
@@ -662,10 +757,17 @@ script CharacterPersistence extends Logic
 	@ExecSpace("ClientOnly")
 	method void MarkDirty(string reason)
 		-- 상태 변경 통지 (RefreshUI/AddMeso/스킬배정 등에서 호출). 2초 디바운스 후 서버로 스냅샷 전송.
+		-- (유실 방지) 강화 계열(enhance*)은 파괴/성공/재구매 같은 비가역 이벤트라 디바운스를 생략하고
+		-- 즉시 전송한다 - 파괴가 뜬 직후 2초 안에 강제 종료하면 서버에 파괴 전 스냅샷만 남아 파괴가
+		-- 롤백되던 악용(save-scumming)과, 성공 직후 크래시로 성공분이 유실되던 창을 함께 닫는다.
 		local cl = self._T.cl
 		if cl == nil or not cl.entered then return end
 		cl.dirty = true
 		cl.dirtyReasons[reason] = true
+		if string.find(reason, "enhance", 1, true) == 1 then
+			self:FlushToServer()
+			return
+		end
 		if cl.flushPending then return end
 		cl.flushPending = true
 		_TimerService:SetTimerOnce(function()
@@ -698,6 +800,9 @@ script CharacterPersistence extends Logic
 		local t = _UIEquipInventoryManager:ExportSaveTable()
 		local lines = {}
 		table.insert(lines, "M\t" .. tostring(math.floor(tonumber(t.meso) or 0)))
+		-- (업데이트 내구성) 세이브 포맷 버전 - 향후 포맷 변경 시 RestoreSave가 이 값으로 마이그레이션
+		-- 분기를 태운다. 서버 감사 로그가 첫 줄 "M\t"를 앵커로 파싱하므로 M 다음 줄에 둔다.
+		table.insert(lines, "V\t1")
 		-- potionAttackBonus(공격력 물약 보너스)는 세션 전용 스탯이라 저장하지 않는다(항상 0으로 기록,
 		-- 포맷 호환 유지) - "물약으로 오른 스탯은 종료 시 사라져야 한다"는 요청 반영.
 		table.insert(lines, "A\t" .. tostring(_CharInfoManager.atkSpeedStage) .. "\t0")
@@ -776,6 +881,11 @@ script CharacterPersistence extends Logic
 				table.insert(lines, "D\t" .. tostring(slotKey) .. "\t" .. tostring(s))
 			end
 		end
+		-- (업데이트 내구성) 복원 때 이 빌드가 해석하지 못해 보존해 둔 라인들을 그대로 재부착한다 -
+		-- 구버전 빌드가 신버전 세이브를 열어도 모르는 데이터를 지우지 않는다(라운드트립 보존).
+		for _, ln in ipairs(self._T.cl.unknownLines or {}) do
+			table.insert(lines, ln)
+		end
 		return table.concat(lines, "\n")
 	end
 
@@ -793,10 +903,13 @@ script CharacterPersistence extends Logic
 		local presetTables = {}
 		local shurikenIdx = 1
 		local skillLevels = {}   -- (Phase 4) "SP" 라인 - 스킬 투자 상태
+		local unknown = {}       -- (업데이트 내구성) 이 빌드가 모르는 라인 - 버리지 않고 보존
 		for _, line in ipairs(self:SplitLines(saveStr)) do
 			local kind = string.sub(line, 1, 1)
 			if kind == "M" then
 				t.meso = tonumber(string.sub(line, 3)) or 0
+			elseif kind == "V" then
+				-- 세이브 포맷 버전(현재 1) - 향후 포맷이 바뀌면 이 값으로 마이그레이션 분기
 			elseif kind == "A" then
 				local f = self:SplitTabs(line)
 				atkSpeed = math.floor(tonumber(f[2]) or 5)
@@ -815,6 +928,9 @@ script CharacterPersistence extends Logic
 				local itemStr = string.match(line, "^I\t[a-z]+\t%d+\t(.+)$")
 				if tab ~= nil and t.tabs[tab] ~= nil and idxStr ~= nil and itemStr ~= nil then
 					t.tabs[tab][idxStr] = itemStr
+				elseif tab ~= nil and t.tabs[tab] == nil then
+					-- (업데이트 내구성) 이 빌드가 모르는 탭의 아이템은 버리지 않고 보존한다
+					table.insert(unknown, line)
 				end
 			elseif kind == "H" then
 				local key = string.match(line, "^H\t([^\t]+)\t")
@@ -893,7 +1009,20 @@ script CharacterPersistence extends Logic
 						presetTables[n].funcKeys[funcId] = keyName
 					end
 				end
+			else
+				-- (업데이트 내구성) 이 빌드가 모르는 종류의 라인은 버리지 않고 보존한다 - 재직렬화 때
+				-- 그대로 재부착(BuildSaveString 끝부분). 신버전이 추가한 데이터를 구버전 빌드가 열어도,
+				-- 구버전 세이브를 신버전이 열어도 "모르는 것을 지우고 그 상태를 확정 저장"하는 사고
+				-- (퀵슬롯 증발 계열의 일반형)를 막는다.
+				if line ~= "" then
+					table.insert(unknown, line)
+				end
 			end
+		end
+		-- (업데이트 내구성) 보존 라인 저장 - BuildSaveString이 재부착한다.
+		self._T.cl.unknownLines = unknown
+		if #unknown > 0 then
+			log("[Persist] 이 빌드가 해석하지 못한 세이브 라인 " .. tostring(#unknown) .. "개 보존 (재직렬화 시 재부착)")
 		end
 		_UIEquipInventoryManager:ImportSaveTable(t)
 		-- (기능 변경) 공격속도 단계도 물약 공격력 보너스와 똑같이 "세션 전용"이다 - 공격 속도의 비약은
