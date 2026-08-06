@@ -1,15 +1,16 @@
 @Component
 script DarkDragon extends Component
 
-	-- 서먼 다크드래곤(2차 버프, 10분) 소환수. spearburstfadingeffect 모델(Sprite+Transform, 기본 RUID "")을
-	-- 플레이어의 자식으로 스폰한 뒤 이 컴포넌트를 붙인다. 위치는 부모(플레이어) 기준 로컬 궤도 공식으로
-	-- 각 클라이언트가 매 프레임 직접 계산해 움직인다(위치 동기화 트래픽 0, 떨림 없음). 애니메이션은
-	-- @Sync AnimState(idle/buf/stand)만 동기화하고 프레임 교체는 클라 로컬로 돌린다(프레임 RUID 동기화 불필요).
-	-- 소환 시 알파 0→1 페이드인. 서버 타이머: 2~4초 공격 / 20~30초 랜덤 버프 / 600초 수명.
+	-- 서먼 다크드래곤(2차 버프, 2026-08-04 개편) 소환수. spearburstfadingeffect 모델(Sprite+Transform,
+	-- 기본 RUID "")을 플레이어의 자식으로 스폰한 뒤 이 컴포넌트를 붙인다. 위치는 부모(플레이어) 기준 로컬
+	-- 궤도 공식으로 각 클라이언트가 매 프레임 직접 계산해 움직인다(위치 동기화 트래픽 0, 떨림 없음).
+	-- 애니메이션은 @Sync AnimState(idle/buf/stand)만 동기화하고 프레임 교체는 클라 로컬로 돌린다.
+	-- 소환 시 알파 0→1 페이드인. 서버 타이머: 3~7초 공격 / 버프는 소환 3~15초 최초 후 40~60초 간격 /
+	-- 수명은 스포너가 지정(플레이어 시전 = 투자 레벨 비례 200~600초).
 	-- RUID 대응표: msw-dev-tools/resources/다크드래곤/RUID.md
 
 	property Entity OwnerEntity = nil            -- 서버 전용(공격/버프 대상 주인). 클라는 부모로 충분.
-	property number Lifetime = 600               -- 서버 전용 수명(초). 플레이어 시전=600, 드래곤 버프 소환=90.
+	property number Lifetime = 600               -- 서버 전용 수명(초). 플레이어 시전=200~600, 드래곤 버프 소환=50.
 	@Sync property string AnimState = "idle"     -- idle / buf / stand
 	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
 	@Sync property number PhaseSeed = 0          -- 궤도 위상(드래곤마다 달라 겹치지 않게)
@@ -19,21 +20,60 @@ script DarkDragon extends Component
 		-- 서버: 수명/공격/버프 타이머 예약. PhaseSeed는 스폰 시각 기반으로 흩뿌린다.
 		self.PhaseSeed = _UtilLogic.ElapsedSeconds % 100
 		self._T.spawnAt = _UtilLogic.ElapsedSeconds
+		-- ⚠ (버그 수정 2026-08-05) Lifetime은 SummonDarkDragon이 `AddComponent` **다음 줄**에서 넣는데
+		-- OnBeginPlay는 AddComponent 시점에 이미 돌아, 여기서 읽으면 항상 프로퍼티 기본값(600)이다.
+		-- 그래서 투자 레벨이 낮아 200초여야 할 드래곤도, 버프로 추가 소환된 50초짜리 블랙드래곤도
+		-- 전부 10분을 살았다(드래곤 라이딩에서 같은 함정이 실측으로 드러나 함께 고친다).
+		-- 한 프레임 뒤에 대입이 끝난 값을 읽어 예약한다.
 		_TimerService:SetTimerOnce(function()
-			if isvalid(self.Entity) then self.Entity:Destroy() end
-		end, self.Lifetime)
+			if not isvalid(self.Entity) then return end
+			local life = math.max(1.0, self.Lifetime - 0.2)
+			log("[DarkDragon] 수명 예약 - " .. tostring(math.floor(self.Lifetime)) .. "초 뒤 소멸")
+			_TimerService:SetTimerOnce(function()
+				if isvalid(self.Entity) then self.Entity:Destroy() end
+			end, life)
+		end, 0.2)
 		self:ScheduleAttack()
 		self:ScheduleBuff(true)
+		self:ScheduleHealCheck()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleHealCheck()
+		-- (요청 2026-08-04) 랜덤 버프와 별도의 상시 힐: 15~30초마다 주인 HP를 확인해 풀피가 아니면
+		-- 힐을 1회 사용한다(연출/회복 공식은 버프 힐과 동일).
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			self:TryHealOwner()
+			self:ScheduleHealCheck()
+		end, 15.0 + _UtilLogic:RandomDouble() * 15.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryHealOwner()
+		if not isvalid(self.OwnerEntity) then return end
+		local pc = self.OwnerEntity.PlayerComponent
+		if not isvalid(pc) or pc.Hp >= pc.MaxHp then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		self.AnimState = "buf"
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self.AnimState == "buf" then self.AnimState = "idle" end
+		end, 1.2)
+		log("[DarkDragon] 상시 힐(15~30초 체크): 주인 HP " .. tostring(math.floor(pc.Hp)) .. "/" .. tostring(math.floor(pc.MaxHp)))
+		self:PlayHealCastAtDragon()
+		pa:ApplyHealToPlayer(self.OwnerEntity, pa:GetDarkDragonCombatPower())
 	end
 
 	@ExecSpace("ServerOnly")
 	method void ScheduleAttack()
-		-- 공격 주기. stand 자세(1.0~1.5초 대기 + 0.6초 유지, 최대 ~2.1초)와 겹치지 않게 2.5~4.5초 간격.
+		-- 공격 주기(2026-08-04 개편 요청): 3~7초 간격. stand 자세(최대 ~2.1초)와도 안 겹친다.
 		_TimerService:SetTimerOnce(function()
 			if not isvalid(self.Entity) then return end
 			self:TryAttack()
 			self:ScheduleAttack()
-		end, 2.5 + _UtilLogic:RandomDouble() * 2.0)
+		end, 3.0 + _UtilLogic:RandomDouble() * 4.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -131,15 +171,18 @@ script DarkDragon extends Component
 		if self._T.grayMatId ~= nil and self._T.grayMatId ~= "" then
 			options["MaterialID"] = self._T.grayMatId
 		end
-		local serial = _EffectService:PlayEffect(clipRuid, self.Entity, Vector3(startX, startY, 0), zRot, Vector3(1, 1, 1), false, options)
+		-- (요청 2026-08-04) 공격 궤적 이펙트 크기: 절반(0.5)은 너무 작다고 해서 원본의 70%로.
+		local serial = _EffectService:PlayEffect(clipRuid, self.Entity, Vector3(startX, startY, 0), zRot, Vector3(0.7, 0.7, 1), false, options)
 		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void CastRandomBuff()
-		-- buf 자세 1.2초 + 6종 중 랜덤. 시전 이펙트는 "드래곤 위치"에서 발동한다(요청). 단, 쉐도우파트너의
-		-- 그림자·콤보어택의 구슬(원) 회전 같은 "버프 지속 표현"은 기존대로 캐릭터에게 나타난다.
-		-- 버프별 지속시간(요청): 쉐도우파트너 20s / 콤보어택 20s / 서먼드래곤 90s / 메디테이션 30s / 분노 30s.
+		-- buf 자세 1.2초 + 가중 랜덤 7종(2026-08-04 개편, 가중치 합 110을 그대로 확률 비율로 사용):
+		-- 힐 30 / 콤보어택(30초) 20 / 아이언 월(30초) 20 / 서먼블랙드래곤(수명 50초) 10 /
+		-- 쉐도우파트너(20초) 10 / 메디테이션(60초) 10 / 분노(60초) 10. (쿨타임 초기화는 개편에서 제외됨.)
+		-- 시전 이펙트는 "드래곤 위치"에서 발동한다(요청). 단, 쉐도우파트너의 그림자·콤보어택의 구슬 회전
+		-- 같은 "버프 지속 표현"과 힐/아이언 월의 수혜 이펙트는 캐릭터에게 나타난다.
 		if not isvalid(self.OwnerEntity) then return end
 		---@type PlayerAttack
 		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
@@ -151,38 +194,80 @@ script DarkDragon extends Component
 		local dirX = (self.FacingX >= 0) and 1 or -1
 		local pc = self.OwnerEntity.PlayerComponent
 		local userId = isvalid(pc) and pc.UserId or ""
-		local roll = math.floor(_UtilLogic:RandomDouble() * 6) + 1
-		if roll == 1 then
-			-- 쿨타임 초기화: 요청 이펙트(드래곤 머리 위) + 사운드, 주인 클라의 스킬 쿨다운 전부 리셋.
-			self:PlayHeadBuffEffect("280d255d900646b180a302ed10979568", "c454d99778eb4838ad367d434a3aad20")
-			if isvalid(pc) then _SkillManager:ResetAllCooldowns(userId) end
-			log("[DarkDragon] 버프: 쿨타임 전체 초기화")
-		elseif roll == 2 then
-			-- 서먼블랙드래곤: 주인 주변에 드래곤 한 마리 추가 소환(수명 90초). 드래곤은 계속 소환 가능.
-			self:PlayHeadBuffEffect("", "")
-			pa:SummonDarkDragonLife(pa:GetDarkDragonCombatPower(), 90)
-			log("[DarkDragon] 버프: 서먼블랙드래곤(추가 소환, 90초)")
-		elseif roll == 3 then
-			-- 콤보어택(20초): 구슬 회전은 캐릭터에게, 시전 마법진 버스트는 드래곤 위치에서.
-			pa:ActivateComboAttackSilent(20)
+		local roll = _UtilLogic:RandomDouble() * 110
+		if roll < 30 then
+			-- 힐(30/110): 비숍 힐 공식(전투력 5~15%)으로 주인 회복 + 회복 숫자. 시전 이펙트는 드래곤
+			-- 위치에서 2/3 크기, 주인에게는 전용 수혜 클립(e81f0ba3, PlayHealCastAtDragon 안에서 재생 -
+			-- ApplyHealToPlayer의 공용 머리 위 이펙트는 본인 대상이라 자동 생략됨).
+			self:PlayHealCastAtDragon()
+			pa:ApplyHealToPlayer(self.OwnerEntity, pa:GetDarkDragonCombatPower())
+			log("[DarkDragon] 버프: 힐")
+		elseif roll < 50 then
+			-- 콤보어택(20/110, 30초): 구슬 회전은 캐릭터에게, 시전 마법진 버스트는 드래곤 위치에서.
+			pa:ActivateComboAttackSilent(30)
 			self:PlayComboCastAtDragon()
-			log("[DarkDragon] 버프: 콤보 어택(20초)")
-		elseif roll == 4 then
-			-- 쉐도우파트너(20초): 그림자는 캐릭터에게, 시전 버스트는 드래곤 위치에서.
+			log("[DarkDragon] 버프: 콤보 어택(30초)")
+		elseif roll < 70 then
+			-- 아이언 월(20/110, 30초): 받는 피해 -20%(서버 PlayerHit). 시전 클립은 드래곤 위치에서
+			-- 2/3 크기, 주인에게는 수혜 클립(e9c90ecd) + 버프바 표시.
+			---@type PlayerHit
+			local hitIW = self.OwnerEntity:GetComponent("script.PlayerHit")
+			if isvalid(hitIW) then hitIW:StartIronWall(30, 20) end
+			if userId ~= "" then _SkillManager:ShowDragonIronWallBuff(30, userId) end
+			self:PlayIronWallCastAtDragon()
+			log("[DarkDragon] 버프: 아이언 월(30초, 피해 -20%)")
+		elseif roll < 80 then
+			-- 서먼블랙드래곤(10/110): 주인 주변에 드래곤 한 마리 추가 소환(수명 50초).
+			self:PlayHeadBuffEffect("", "")
+			pa:SummonDarkDragonLife(pa:GetDarkDragonCombatPower(), 50)
+			log("[DarkDragon] 버프: 서먼블랙드래곤(추가 소환, 50초)")
+		elseif roll < 90 then
+			-- 쉐도우파트너(10/110, 20초): 그림자는 캐릭터에게, 시전 버스트는 드래곤 위치에서.
 			pa:ActivateShadowPartnerSilent(20)
 			self:PlayShadowCastAtDragon()
 			log("[DarkDragon] 버프: 쉐도우 파트너(20초)")
-		elseif roll == 5 then
-			-- 메디테이션(30초): 공마 스탯은 주인 클라에, 검은색 이펙트는 드래곤 위치에서.
-			if isvalid(pc) then _CharInfoManager:ApplyDragonStatBuff("meditation", 30, 30, userId) end
+		elseif roll < 100 then
+			-- 메디테이션(10/110, 60초): 공마 스탯은 주인 클라에, 검은색 이펙트는 드래곤 위치에서.
+			if isvalid(pc) then _CharInfoManager:ApplyDragonStatBuff("meditation", 30, 60, userId) end
 			pa:CastDragonMeditationEffect(self.Entity, dirX)
-			log("[DarkDragon] 버프: 메디테이션(30초, 검은색)")
+			log("[DarkDragon] 버프: 메디테이션(60초, 검은색)")
 		else
-			-- 분노(30초): 공마 스탯은 주인 클라에, 검은색 이펙트는 드래곤 위치에서.
-			if isvalid(pc) then _CharInfoManager:ApplyDragonStatBuff("rage", 30, 30, userId) end
+			-- 분노(10/110, 60초): 공마 스탯은 주인 클라에, 검은색 이펙트는 드래곤 위치에서.
+			if isvalid(pc) then _CharInfoManager:ApplyDragonStatBuff("rage", 30, 60, userId) end
 			pa:CastDragonRageEffect(self.Entity, dirX)
-			log("[DarkDragon] 버프: 분노(30초, 검은색)")
+			log("[DarkDragon] 버프: 분노(60초, 검은색)")
 		end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHealCastAtDragon()
+		-- 힐 시전 이펙트(비숍 힐과 같은 클립)를 드래곤 위치에서 2/3 크기로 재생 + 힐 사용음 +
+		-- 주인(부모)에게 전용 힐 수혜 클립(e81f0ba3 - 요청 지정). OwnerEntity는 서버 전용이라 부모 사용.
+		if not self:IsClient() then return end
+		_EffectService:PlayEffectAttached("26a8af1751324d2c9f14b1719a28d3c8", self.Entity, Vector3(0, 0, 0), 0, Vector3(0.667, 0.667, 1), false, { ["OrderInLayer"] = 8 })
+		local owner = self.Entity.Parent
+		if isvalid(owner) then
+			-- (요청) 수혜 클립이 너무 위에 떠 보임 - 발 기준(y=0)으로 내림.
+			local serial = _EffectService:PlayEffectAttached("e81f0ba3f2b545d7895b98b1cf9be879", owner, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false)
+			_TimerService:SetTimerOnce(function()
+				_EffectService:RemoveEffect(serial)
+			end, 1.5)
+		end
+		_SoundService:PlaySound("a1a425ae3c1c49afa068ee212676c5dc", 1.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayIronWallCastAtDragon()
+		-- 아이언 월 시전 클립(fe52cf2e)을 드래곤 위치에서 2/3 크기로 재생 + 주인(부모)에게 수혜
+		-- 클립(e9c90ecd) + 사용음. OwnerEntity는 서버 전용이라 클라에서는 부모를 주인으로 쓴다.
+		if not self:IsClient() then return end
+		_EffectService:PlayEffectAttached("fe52cf2e9f9e4f059cfb4fb3856aecf9", self.Entity, Vector3(0, 0, 0), 0, Vector3(0.667, 0.667, 1), false, { ["OrderInLayer"] = 8 })
+		local owner = self.Entity.Parent
+		if isvalid(owner) then
+			-- (요청) 수혜 클립 위치는 팔라딘 아이언 월 사용 이펙트와 같은 발 기준(y=0)으로 내린다.
+			_EffectService:PlayEffectAttached("e9c90ecd65224980b56903dba89ef856", owner, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false)
+		end
+		_SoundService:PlaySound("3fe5f0b67992400d93c244a88f42731c", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -230,7 +315,8 @@ script DarkDragon extends Component
 		local parent = self.Entity.Parent
 		local pw = (isvalid(parent) and isvalid(parent.TransformComponent)) and parent.TransformComponent.WorldPosition or self.Entity.TransformComponent.WorldPosition
 		if self.AnimState ~= "stand" then
-			self._T.orbitT = (self._T.orbitT or (self.PhaseSeed or 0)) + delta * 1.3
+			-- (요청 2026-08-04) 이동속도 70%: 배회 시간축 1.3 → 0.91.
+			self._T.orbitT = (self._T.orbitT or (self.PhaseSeed or 0)) + delta * 0.91
 		end
 		local t = self._T.orbitT or (self.PhaseSeed or 0)
 		-- (요청) 활동 반경 크게(원래 1.5 → 약 3배). 화면 안에 대체로 머물도록 가로 ±4.5, 세로 위아래로 넓게.
@@ -241,7 +327,7 @@ script DarkDragon extends Component
 		-- 현재 드래곤 월드좌표를 목표로 부드럽게 보간(지연 추적). 초기엔 플레이어 위치에서 시작해 서서히 퍼진다.
 		if self._T.worldPos == nil then self._T.worldPos = Vector3(pw.x, pw.y + 1.0, 0) end
 		local cur = self._T.worldPos
-		local k = math.min(1.0, 1.6 * delta)   -- 추적 지연 강도(작을수록 더 느긋하게 따라옴)
+		local k = math.min(1.0, 1.12 * delta)   -- 추적 지연 강도(작을수록 더 느긋하게 따라옴) - 이동속도 70% 요청으로 1.6→1.12
 		self._T.worldPos = Vector3(cur.x + (targetWorld.x - cur.x) * k, cur.y + (targetWorld.y - cur.y) * k, 0)
 		-- child라 Position은 로컬 - 스무딩된 월드좌표를 부모 기준 로컬로 환산해 넣는다.
 		tr.Position = Vector3(self._T.worldPos.x - pw.x, self._T.worldPos.y - pw.y, 0)

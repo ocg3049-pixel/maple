@@ -1,0 +1,129 @@
+@Logic
+@ExecSpace("ClientOnly")
+script BattoBuffUI extends Logic
+
+	property Entity buffIconGroup = "a1726005-16a9-44dd-b16f-1a8375f3a890"
+	property SpriteGUIRendererComponent grayOverlay = "5b0b5fcd-a13a-49fb-bbe7-be8252c54128"
+	property TextComponent countdownText = "5123c4ad-0cb8-458d-b055-58c79519d95e"
+	property TextComponent stackText = "8c0430c1-18a6-4e9c-b67a-fbbd9cd7abb7"
+
+	method void ShowBuff(number duration)
+		-- 발도술 버프 타이머 표시/갱신 (HasteBuffUI 복제). 이미 표시 중이어도 새 타이머로 교체되므로
+		-- 지속시간만 갱신되고 아이콘이 중첩되지는 않는다(항상 하나의 아이콘/카운트다운만 존재).
+		if not self:IsClient() then return end
+		if duration <= 0 then return end
+		self._T.battoTotalDuration = duration
+		self._T.battoRemaining = duration
+
+		if isvalid(self.buffIconGroup) then
+			self.buffIconGroup.Enable = true
+			local canvasGroup = self.buffIconGroup.CanvasGroupComponent
+			if isvalid(canvasGroup) then canvasGroup.GroupAlpha = 1 end
+		end
+
+		if self._T.battoTimerId then
+			_TimerService:ClearTimer(self._T.battoTimerId)
+		end
+
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.battoTimerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self._T.battoRemaining = self._T.battoRemaining - delta
+			self:UpdateBuffDisplay()
+		end, 1 / 60)
+
+		self:UpdateBuffDisplay()
+	end
+
+	method void UpdateBuffDisplay()
+		-- 매 프레임 남은 시간에 따라 회색 오버레이(FillAmount)/카운트다운 텍스트/마지막 5초 페이드아웃을 갱신한다.
+		local remaining = self._T.battoRemaining
+		local total = self._T.battoTotalDuration
+
+		if remaining <= 0 then
+			if self._T.battoTimerId then
+				_TimerService:ClearTimer(self._T.battoTimerId)
+				self._T.battoTimerId = nil
+			end
+			if isvalid(self.buffIconGroup) then
+				self.buffIconGroup.Enable = false
+			end
+			return
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.FillAmount = math.max(0, math.min(1, (total - remaining) / total))
+		end
+
+		if isvalid(self.countdownText) then
+			if remaining < 5 then
+				self.countdownText.Text = ""
+			elseif remaining < 60 then
+				self.countdownText.FontColor = Color(1, 1, 1, 1)
+				self.countdownText.Text = tostring(math.ceil(remaining))
+			else
+				-- 분 단위 표시일 때는 "분" 글자 없이 숫자만, 노란색으로 표시한다.
+				self.countdownText.FontColor = Color(1, 1, 0, 1)
+				self.countdownText.Text = tostring(math.floor(remaining / 60))
+			end
+		end
+
+		if remaining < 5 and isvalid(self.buffIconGroup) then
+			local canvasGroup = self.buffIconGroup.CanvasGroupComponent
+			if isvalid(canvasGroup) then
+				canvasGroup.GroupAlpha = remaining / 5
+			end
+		end
+	end
+
+	method void OnEndPlay()
+		-- 타이머 정리 (연결 해제 필수 규칙).
+		if self._T.battoTimerId then
+			_TimerService:ClearTimer(self._T.battoTimerId)
+		end
+	end
+
+	method number GetRemaining()
+		-- 버프 아이콘 정렬(BuffBarManager)이 남은 시간을 조회하기 위한 getter. 비활성 상태면 0.
+		return self._T.battoRemaining or 0
+	end
+
+	method void HideBuff()
+		-- (버프 아이콘 우클릭 취소) 표시를 즉시 정리한다 - 남은 시간 0으로 만들어 종료 경로를 태운다.
+		self._T.battoRemaining = 0
+		self:UpdateBuffDisplay()
+	end
+
+	method void ShowStacks(integer stacks)
+		-- (요청) 발도술이 배정된 퀵슬롯 아이콘 위에 현재 중첩 수(x1/x2/x3)를 표시한다.
+		-- 슬롯 위치는 프록 시점마다 다시 찾는다(지속 중 슬롯을 옮겨도 다음 프록부터 따라간다).
+		if not self:IsClient() then return end
+		if not isvalid(self.stackText) then return end
+		-- ⚠ 퀵슬롯은 키≠위치(Slot_<위치> 엔티티) - 키를 위치로 역조회하는 공용 헬퍼를 쓴다(쿨다운 UI와 동일).
+		local barPos = _SkillManager:FindBarPosForSkillName("발도술")
+		if barPos == "" then
+			self.stackText.Entity.Enable = false
+			return
+		end
+		local slotEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. barPos)
+		if isvalid(slotEnt) then
+			-- 슬롯(50x50) 우상단 모서리에 작게 얹는다 - 쿨다운 숫자(중앙)와 겹치지 않는 위치.
+			local slotPos = slotEnt.UITransformComponent.anchoredPosition
+			self.stackText.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x + 14, slotPos.y + 22)
+		end
+		self.stackText.FontColor = Color(1, 0.95, 0.4, 1)
+		self.stackText.Text = "x" .. tostring(stacks)
+		self.stackText.Entity.Enable = true
+	end
+
+	method void HideStacks()
+		-- 중첩 프록 종료 - 퀵슬롯 위 중첩 표시를 내린다.
+		if not self:IsClient() then return end
+		if isvalid(self.stackText) then
+			self.stackText.Entity.Enable = false
+		end
+	end
+
+end

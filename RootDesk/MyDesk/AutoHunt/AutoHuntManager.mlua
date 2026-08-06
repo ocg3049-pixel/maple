@@ -42,10 +42,12 @@ script AutoHuntManager extends Logic
 			self._T.target = nil
 			self._T.chaseStart = _UtilLogic.ElapsedSeconds
 			self._T.comboStep = 0
+			self._T.noTargetSince = nil   -- 이전 세션 잔재로 켜자마자 복귀하는 것 방지
 			_UIToast:ShowMessage("자동사냥 시작 (" .. keyName .. "로 중지)")
 		else
 			_UIToast:ShowMessage("자동사냥 중지")
 			self._T.comboStep = 0
+			self._T.rideFlight = false   -- (다크나이트) 비행 이동 중 OFF - 탑승 상태는 유저 조작에 맡긴다
 			self:StopMoving()
 		end
 		-- (팔라딘) 서버 자동 가드(피격 타이밍 25% 자동 발동) 상태 동기화 - 가드 투자 레벨 동봉.
@@ -115,6 +117,8 @@ script AutoHuntManager extends Logic
 			if isvalid(sc) and sc.CurrentStateName == "IDLE" then
 				sc:ChangeState("MOVE")
 			end
+			-- (신고) 배회 걷기 중에도 지형 턱에 끼면 점프로 탈출한다.
+			self:CheckStuckAndJump(now, player, player.TransformComponent.WorldPosition)
 		end
 	end
 
@@ -122,6 +126,14 @@ script AutoHuntManager extends Logic
 	@ExecSpace("ClientOnly")
 	method boolean IsActive()
 		return self.autoOn == true
+	end
+
+	-- 자동사냥이 지금 스스로 걷는 중인지(컨트롤러를 끄고 MoveToDirection으로 이동).
+	-- PlayerAttack의 방향 잠금 강제 IDLE이 이 걷기와 싸우며 MOVE↔IDLE로 튕기지 않게,
+	-- 걷는 동안은 방향 잠금이 물러나는 판단(ShouldEnforceDirectionLock)에 쓰인다.
+	@ExecSpace("ClientOnly")
+	method boolean IsAutoMoving()
+		return self.autoOn == true and self._T.moving == true
 	end
 
 	-- 현재 대상 쪽 수평 조준 방향(-1/1). 대상이 없으면 바라보는 방향(LookDirectionX)을 쓴다.
@@ -149,11 +161,26 @@ script AutoHuntManager extends Logic
 		local roles = {
 			-- 버프 (지속형 - 만료 전 주기 재시전)
 			["부스터"] = "buff", ["분노"] = "buff", ["파워가드"] = "buff", ["메디테이션"] = "buff",
-			["블레스"] = "buff", ["헤이스트"] = "buff", ["드래곤 블러드"] = "buff", ["샤프 아이즈"] = "buff",
+			["블레스"] = "buff", ["헤이스트"] = "buff", ["샤프 아이즈"] = "buff",
 			["콤보 어택"] = "buff", ["홀리 매직쉘"] = "buff", ["브랜디쉬 강화"] = "buff",
-			["불의 영역"] = "buff", ["빙하지대"] = "buff",
+			["불의 영역"] = "buff", ["빙하지대"] = "buff", ["발도술"] = "buff",
+			-- (다크나이트) 드래곤 블러드: HP를 계속 소모하는 유지형이라 HP 게이트 + 버프바 잔여 확인이
+			-- 필요한 전용 역할(주기 재시전만 하는 일반 buff와 다름 - DragonBloodTick 참고)
+			["드래곤 블러드"] = "dragonblood",
+			-- (다크나이트) 드래곤 라이딩: 미소환+쿨 종료 상태에서만 "소환"으로 사용(활성 중 재시전=탑승이라 금지)
+			["드래곤 라이딩"] = "dragonride",
 			-- (팔라딘) 아이언 월/속성필드도 지속형 버프 - 주기는 GetBuffPeriod가 투자 레벨로 계산
 			["아이언 월"] = "buff", ["속성필드"] = "buff",
+			-- (나이트로드) 지속시간형 버프 2종 - 주기는 GetBuffPeriod가 투자 레벨로 계산한다.
+			--   · 암행: 1분+분배당 10초 (온히트 그림자 표창)
+			--   · 쉐도우 파트너: 30초+분배당 10초 (표창 100개 소모 - 재고가 모자라면 자동으로 낮은
+			--     번호 표창으로 내려가므로 시전 자체는 항상 성공한다)
+			["암행"] = "buff", ["쉐도우 파트너"] = "buff",
+			-- (나이트로드) 각성: 쿨 5분 고정 - 돌면 바로 쓰는 게 이득이라 전용 역할로 뺀다.
+			["각성"] = "awakening",
+			-- (나이트로드, 요청 2026-08-05) 드레인 샷: HP 보충기 전용 역할 - HP가 깎여 있으면
+			-- 자체 쿨(5초)이 돌 때마다 로테이션에 앞서 우선 사용한다(TryAttackCast 상단 참고).
+			["드레인 샷"] = "drainshot",
 			-- (팔라딘) 리스토네이션: HP가 풀이 아닐 때만 30~60초 주기 회복 (요청)
 			["리스토네이션"] = "restoration",
 			-- (팔라딘) 궁병 지원: 120~150초 주기 사용 (요청)
@@ -173,6 +200,8 @@ script AutoHuntManager extends Logic
 			["에로우 봄"] = "aoe", ["새비지블로우"] = "aoe", ["어썰터"] = "aoe", ["암살"] = "aoe",
 			["익스플로젼"] = "aoe", ["포이즌 미스트"] = "aoe", ["파이어 샷"] = "aoe",
 			["폭풍의 시"] = "aoe",
+			-- (다크나이트) 스피어 버스터: 3차 주력 광역 - 미분류라 자동사냥이 아예 안 쓰던 것 수정
+			["스피어 버스터"] = "aoe",
 			-- 이동기: 위아래로 제법 떨어진 대상 추적 전용 (요청 - 가까운 적에게는 쓰지 않는다)
 			["섬광"] = "mobility",
 			-- 대시: 같은 층의 먼 대상(3유닛↑) 접근 가속 (요청 - 이동 시 대시 스킬 활용)
@@ -195,7 +224,9 @@ script AutoHuntManager extends Logic
 		if self._T.roleCacheUntil ~= nil and self._T.roleCacheUntil > now then return end
 		self._T.roleCacheUntil = now + 5.0
 		local buffs, summons, aoes, singles, mobilities, dashes = {}, {}, {}, {}, {}, {}
-		local restorations, archers, chargemodes = {}, {}, {}
+		local restorations, archers, chargemodes, dragonbloods, dragonrides = {}, {}, {}, {}, {}
+		local awakenings = {}
+		local drainshots = {}
 		local hotkeys = _SkillManager:ExportHotkeys()
 		for key, slot in pairs(hotkeys) do
 			if slot ~= nil and slot.name ~= nil and slot.name ~= "" then
@@ -209,6 +240,10 @@ script AutoHuntManager extends Logic
 				elseif role == "restoration" then table.insert(restorations, { key = key, name = slot.name })
 				elseif role == "archer" then table.insert(archers, { key = key, name = slot.name })
 				elseif role == "chargemode" then table.insert(chargemodes, { key = key, name = slot.name })
+				elseif role == "dragonblood" then table.insert(dragonbloods, { key = key, name = slot.name })
+				elseif role == "dragonride" then table.insert(dragonrides, { key = key, name = slot.name })
+				elseif role == "awakening" then table.insert(awakenings, { key = key, name = slot.name })
+				elseif role == "drainshot" then table.insert(drainshots, { key = key, name = slot.name })
 				end
 			end
 		end
@@ -221,11 +256,22 @@ script AutoHuntManager extends Logic
 		self._T.slotRestorations = restorations
 		self._T.slotArchers = archers
 		self._T.slotChargemodes = chargemodes
+		self._T.slotDragonBloods = dragonbloods
+		self._T.slotDragonRides = dragonrides
+		self._T.slotAwakenings = awakenings
+		self._T.slotDrainShots = drainshots
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
-		if not self.autoOn then return end
+		-- (신고 2026-08-04) 수동 조작 중에도 지형 턱/발판 이음매에 끼어 좌우 이동이 안 먹는 경우가
+		-- 있다 - 자동사냥이 꺼져 있어도 수동 끼임 탈출 감시는 항상 돌린다(자동사냥 중에는 기존
+		-- CheckStuckAndJump가 담당하므로 중복 방지를 위해 OFF일 때만).
+		if not self.autoOn then
+			local mp = _UserService.LocalPlayer
+			if isvalid(mp) then self:ManualStuckTick(mp) end
+			return
+		end
 		local player = _UserService.LocalPlayer
 		if not isvalid(player) then return end
 		-- 사망 중에는 일시정지 (부활하면 자동 재개)
@@ -235,6 +281,23 @@ script AutoHuntManager extends Logic
 			return
 		end
 		local now = _UtilLogic.ElapsedSeconds
+
+		-- (다크나이트, 요청 사양) 드래곤 라이딩 = "이동할 때만 탑승"하는 이동기.
+		-- ① 자동사냥이 스스로 탑승한 비행 이동(rideFlight) 중이면 목표점까지 날아가고 도착 즉시 하차한다
+		--    (하차한 드래곤은 소환수로서 따로 공격). 비행 시작은 아래 추적 분기(위층 대상)에서 건다.
+		-- ② 그 외의 탑승(수동 탑승 등 - 비행 목표가 없는 상태)은 다른 스킬이 전부 막히고
+		--    조작이 충돌하므로 자동 하차한다.
+		if _SkillManager:IsDragonRideMounted() then
+			if self._T.rideFlight == true then
+				self:RideFlightTick(now, player, delta)
+			elseif (self._T.nextDismount or 0) <= now then
+				self._T.nextDismount = now + 1.5
+				_SkillManager:ToggleDragonRide()
+				log("[AutoHunt] 목표 없는 탑승 감지 - 자동 하차 (비행과 자동 이동 충돌 방지)")
+			end
+			return
+		end
+		self._T.rideFlight = false   -- 하차 상태면 비행 플래그 정리(안전망)
 
 		-- (신고) 자동 점프/다운점프의 착지 복귀: 컨트롤러가 꺼진 동안 JUMP/FALL 상태로 남으면
 		-- 이후 걷기/대기 모션이 안 나온다 - 점프 0.35초 뒤부터 착지가 확인되면 IDLE로 되돌린다.
@@ -254,6 +317,9 @@ script AutoHuntManager extends Logic
 		-- (버그 수정) 시전 모션 홀드: 방금 스킬을 시전했다면 모션·잠금이 끝날 때까지
 		-- 이동/점프/재선정을 하지 않는다 - 모션이 끝나기 전에 걸어나가 스윙이 끊기는 문제 방지.
 		if (self._T.holdMoveUntil or 0) > now then
+			-- 시전 홀드 동안의 정지를 "끼임"으로 오판하지 않게 샘플을 비운다 (재개 후 새로 잰다)
+			self._T.stuckLastX = nil
+			self._T.stuckLastY = nil
 			return
 		end
 		-- (요청) 파이널어택 모션 존중: 스윙 모션 가드(파워스트라이크/슬래시블러스트/파이널어택/브랜디쉬)가
@@ -282,12 +348,16 @@ script AutoHuntManager extends Logic
 		if target == nil or not isvalid(target) then
 			-- (P2) 몬스터가 없어도 버프/소환수 유지는 계속하고, 그 외에는 배회하며 리젠을 기다린다.
 			-- (요청) 맨아래 층에서 잡을 대상이 없으면(남은 적이 위층뿐이거나 전멸) 위로 복귀한다.
+			-- (신고 2026-08-06) 중간 발판 정체: 남은 적이 위층뿐이면(도달 수단 없어 후보 제외) 맨아래가
+			-- 아니라서 복귀도 못 하고 리젠까지 제자리 배회만 했다 - 무대상 4초 지속 시 중간에서도 복귀.
 			if not self:TryUtilityCast(now) then
 				if self:TryBottomReturn(now, player) then return end
+				if self:TryNoTargetReturn(now, player) then return end
 				self:WanderTick(now, player, delta)
 			end
 			return
 		end
+		self._T.noTargetSince = nil
 
 		local mon = target:GetComponent("script.Monster")
 		if mon == nil or mon.IsDead == true then
@@ -329,6 +399,28 @@ script AutoHuntManager extends Logic
 		-- (버그 수정) 사거리 판정에 수직 거리도 포함한다 - |dx|만 보면 아래/위층 몬스터를 "사거리 내"로
 		-- 오인해 허공에 파워스트라이크/슬래시블러스트를 발동했다. 같은 층(|dy|<1.2)일 때만 공격하고,
 		-- 스킬 실판정(반경 1.5)보다 안쪽인 유클리드 1.15 이내까지 붙어야 공격한다 (헛빵 방지).
+		-- (나이트로드, 요청) 각성 중에는 표창 3종이 드래곤 로어 범위(가로 ±15 / 세로 ±7.5)를 방향 무관으로
+		-- 조준하므로 **제자리에서 거의 다 닿는다** - 굳이 걸어가지 않고 그 자리에서 계속 던진다.
+		-- 표창 스킬이 하나도 배정돼 있지 않으면(근접 위주 구성) 평소처럼 접근한다.
+		if self:IsAwakeningOn() and self:HasStarThrowSlot()
+			and math.abs(dx) <= 15.0 and math.abs(dy) <= 7.5 then
+			if self._T.moving then self:StopMoving() end
+			self._T.chaseStart = now
+			if math.abs(dx) > 0.05 then
+				local pccAw = player.PlayerControllerComponent
+				if isvalid(pccAw) then
+					local wantAw = (dx > 0) and 1 or -1
+					if pccAw.LookDirectionX ~= wantAw then
+						pccAw.LookDirectionX = wantAw
+						self._T.dirChangedAt = now
+					end
+				end
+			end
+			if not self:TryUtilityCast(now) then
+				self:TryAttackCast(now, player, pp)
+			end
+			return
+		end
 		if dist > 1.15 or math.abs(dy) >= 1.2 then
 			-- (요청) 맨아래 층에서 남은 적이 수평으로 꽤 멀면(8유닛↑) 걸어가지 않고 위로 복귀해
 			-- 위에서부터 다시 내려오며 잡는다 (하강 순환 동선).
@@ -340,6 +432,30 @@ script AutoHuntManager extends Logic
 				self._T.target = nil
 				self:StopMoving()
 				log("[AutoHunt] 추적 타임아웃 - 대상 제외 후 재선정")
+				return
+			end
+			-- (다크나이트, 요청 사양) 위층 대상(dy≥1.2)은 드래곤 라이딩으로 날아 올라간다 - "이동할 때만
+			-- 탑승"이고 도착하면 RideFlightTick이 즉시 하차시킨다(드래곤은 다시 소환수로 따로 공격).
+			-- 소환이 활성일 때만(미탑승) 가능 - 소환 자체는 TryUtilityCast의 dragonride 유지가 담당.
+			if dy >= 1.2 and (self._T.nextRideMove or 0) <= now
+				and self._T.slotDragonRides ~= nil and #self._T.slotDragonRides > 0
+				and _SkillManager:CanAutoMountDragonRide() then
+				self._T.nextRideMove = now + 4.0
+				self._T.rideFlight = true
+				self._T.rideFlightX = mp.x
+				-- (버그 수정 2026-08-04) 목표 높이를 몬스터 +0.3 → **+1.0**으로 올린다.
+				-- 하차 처리(SkillManager.ToggleDragonRide)는 탑승 때 올렸던 만큼 캐릭터를 0.6 내리는데,
+				-- +0.3에서 내리면 발판 표면보다 0.3 **아래**가 되어 발판이 캐릭터를 잡지 못하고
+				-- 그대로 떨어졌다("올라가다 말고 다시 떨어진다"의 직접 원인). +1.0이면 하차 후에도
+				-- 발판 위(+0.4)라 중력이 자연스럽게 착지시킨다.
+				self._T.rideFlightY = mp.y + 1.0
+				self._T.rideFlightStart = now
+				-- (버그 수정) 거리 비례 타임아웃/진척 감시의 기준값을 탑승 시점에 기록해 둔다.
+				self._T.rideFlightDist = math.sqrt(dx * dx + (dy + 1.0) * (dy + 1.0))
+				self._T.rideProgressDist = nil
+				self._T.rideProgressAt = now + 2.0
+				_SkillManager:ToggleDragonRide()   -- 탑승 (하차는 RideFlightTick 도착 판정이)
+				log("[AutoHunt] 드래곤 라이딩 비행 이동 시작 (dy=" .. string.format("%.2f", dy) .. ")")
 				return
 			end
 			-- (요청) 섬광 = 상하 이동기: 위아래로 제법 떨어진(|dy|≥1.2) 대상을 쫓을 때만 시전한다 -
@@ -379,17 +495,50 @@ script AutoHuntManager extends Logic
 				if isvalid(sc) and sc.CurrentStateName == "IDLE" then
 					sc:ChangeState("MOVE")
 				end
+				-- (신고) 걷는데 제자리면(지형 턱에 낌) 점프로 탈출한다.
+				self:CheckStuckAndJump(now, player, pp)
 			elseif self._T.moving then
 				self:StopMoving()
 			end
 			-- (P2 개선) 위/아래 발판 추적: 수평으로 먼저 정렬한 뒤에만 점프/다운점프한다 -
 			-- 멀리서 무의미하게 뛰어오르는 낭비 방지 (위 발판은 |dx|≤1.2, 아래 발판은 |dx|≤1.5에서만)
+			-- (나이트로드, 요청) 헤이스트 점프 보정: 헤이스트가 켜져 있으면 점프력이 "바로 위 발판을
+			-- 살짝 넘길 만큼"으로 미리 맞춰진다(PlayerAttack.HasteJumpAssistTick) - 그 사거리 안의
+			-- 위층 대상은 점프로 확실히 올라갈 수 있다. 수평 정렬이 끝난 뒤에만 뛴다.
+			if (self._T.nextJump or 0) <= now and dy >= 1.2 and math.abs(dx) <= 1.2
+				and self:GetHasteJumpReach() >= dy then
+				self._T.nextJump = now + 1.0
+				self._T.jumpedAt = now
+				player.MovementComponent:Jump()
+				if isvalid(sc) then sc:ChangeState("JUMP") end
+				log("[AutoHunt] 헤이스트 점프 보정으로 위 발판 추적 (dy=" .. string.format("%.2f", dy)
+					.. " 사거리=" .. string.format("%.2f", self:GetHasteJumpReach()) .. ")")
+				return
+			end
 			if (self._T.nextJump or 0) <= now then
 				-- (요청) 위 발판의 적에게는 점프 자체를 하지 않는다 - 점프 정점 타이밍에만 닿는
 				-- 공격은 난이도만 높다. 위층 적은 FindTarget에서 아예 제외되고(섬광 보유 시 예외),
 				-- 아래층 적만 다운점프로 내려가 잡는다. 컨트롤러가 꺼진 동안엔 낙하 상태 전환도
 				-- 직접 해줘야 모션이 나온다 (걷기 IDLE→MOVE와 같은 이유, 착지 복귀는 OnUpdate 상단).
 				if dy < -0.8 and math.abs(dx) <= 1.5 then
+					-- (신고 2026-08-06) 발밑에 착지 발판이 없으면 DownJump가 엔진에서 무시돼 0.8초마다
+					-- 제자리 재시도(미세 이동)만 반복했다 - 레이캐스트로 착지 발판을 확인하고, 없으면
+					-- 추적 타임아웃(5초)을 기다리지 않고 즉시 이 대상을 제외하고 재선정한다.
+					local mapDJ = player.CurrentMap
+					local fhDJ = isvalid(mapDJ) and mapDJ.FootholdComponent or nil
+					local canLand = false
+					if isvalid(fhDJ) then
+						canLand = fhDJ:Raycast(Vector2(pp.x, pp.y - 0.3), Vector2(0, -1), 8.0) ~= nil
+					end
+					if not canLand then
+						if self._T.banned == nil then self._T.banned = {} end
+						self._T.banned[target] = now + 4.0
+						self._T.target = nil
+						self._T.nextScan = 0
+						self:StopMoving()
+						log("[AutoHunt] 아래 발판 없음 - 다운점프 불가 대상 제외 후 재선정")
+						return
+					end
 					self._T.nextJump = now + 0.8
 					self._T.jumpedAt = now
 					player.MovementComponent:DownJump()
@@ -423,6 +572,162 @@ script AutoHuntManager extends Logic
 				self:TryAttackCast(now, player, pp)
 			end
 		end
+	end
+
+	-- (신고) 끼임 탈출: 걷기 시도 중인데 실제로 거의 안 움직이면(지형 턱/모서리에 낌 - 점프나
+	-- 이동기 없이는 못 빠져나옴) 전방 점프로 턱을 넘는다. 0.6초마다 이동량을 재고, 연속 3회
+	-- 점프로도 못 빠져나오면 그 대상을 제외하고 재선정한다(도달 불가 지형).
+	@ExecSpace("ClientOnly")
+	method void CheckStuckAndJump(number now, Entity player, Vector3 pp)
+		if (self._T.stuckCheckAt or 0) > now then return end
+		local lastX = self._T.stuckLastX
+		local lastY = self._T.stuckLastY
+		self._T.stuckLastX = pp.x
+		self._T.stuckLastY = pp.y
+		self._T.stuckCheckAt = now + 0.6
+		if lastX == nil then return end
+		-- 걷기 시도 중 + 지상 + 0.6초간 이동량이 미미하면 끼임으로 판정 (공중/낙하 중은 제외)
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return end
+		if math.abs(pp.x - lastX) >= 0.08 or math.abs(pp.y - lastY) >= 0.3 then
+			self._T.stuckCount = 0
+			return
+		end
+		self._T.stuckCount = (self._T.stuckCount or 0) + 1
+		if self._T.stuckCount >= 3 then
+			-- 점프로도 못 빠져나오는 지형: 대상을 잠시 제외하고 재선정한다.
+			self._T.stuckCount = 0
+			local target = self._T.target
+			if target ~= nil and isvalid(target) then
+				if self._T.banned == nil then self._T.banned = {} end
+				self._T.banned[target] = now + 4.0
+			end
+			self._T.target = nil
+			self._T.nextScan = 0
+			self:StopMoving()
+			log("[AutoHunt] 끼임 지속 - 대상 제외 후 재선정")
+			return
+		end
+		-- 전방 점프로 턱 넘기 (착지 복귀는 OnUpdate 상단의 jumpedAt 처리)
+		player.MovementComponent:Jump()
+		self._T.jumpedAt = now
+		local sc = player.StateComponent
+		if isvalid(sc) then sc:ChangeState("JUMP") end
+		log("[AutoHunt] 끼임 감지 - 점프 탈출 시도 (" .. tostring(self._T.stuckCount) .. "/3)")
+	end
+
+	-- (신고 2026-08-04) 수동 조작 끼임 탈출: 이동키(좌/우 한쪽)를 누르고 있는데 지상에서 0.5초간
+	-- 제자리면 지형 턱/발판 이음매에 낀 것으로 보고 자동 점프로 턱을 넘겨준다(자동사냥 끼임 탈출의
+	-- 수동판 - CheckStuckAndJump와 상태를 분리해 서로 간섭하지 않는다). 시전 잠금(PlayerController
+	-- 비활성) 중이나 공중에서는 판정하지 않는다.
+	@ExecSpace("ClientOnly")
+	method void ManualStuckTick(Entity player)
+		local now = _UtilLogic.ElapsedSeconds
+		local pcc = player.PlayerControllerComponent
+		if not isvalid(pcc) or not pcc.Enable then
+			self._T.mStuckLastX = nil
+			return
+		end
+		local leftHeld = _InputService:IsKeyPressed(KeyboardKey.LeftArrow)
+		local rightHeld = _InputService:IsKeyPressed(KeyboardKey.RightArrow)
+		if leftHeld == rightHeld then   -- 안 누르거나 양쪽 동시 - 이동 의도 없음으로 보고 샘플 초기화
+			self._T.mStuckLastX = nil
+			return
+		end
+		-- (신고 2026-08-05) 시전 스윙 중에는 끼임 점프를 쏘지 않는다 - 드레인 샷처럼 컨트롤러를
+		-- 끄지 않는 시전 중에 방향키를 잡고 있으면 제자리가 되는데, 이걸 지형 끼임으로 오인해
+		-- "방향전환만 해도 자동으로 점프"하던 원인. 스윙이 끝나면 샘플을 새로 재기 시작한다.
+		---@type PlayerAttack
+		local paSwing = player:GetComponent(PlayerAttack)
+		if isvalid(paSwing) and paSwing:IsSwingMotionActive() then
+			self._T.mStuckLastX = nil
+			return
+		end
+		if (self._T.mStuckCheckAt or 0) > now then return end
+		local pp = player.TransformComponent.WorldPosition
+		local lastX = self._T.mStuckLastX
+		local lastY = self._T.mStuckLastY
+		self._T.mStuckLastX = pp.x
+		self._T.mStuckLastY = pp.y
+		self._T.mStuckCheckAt = now + 0.5
+		if lastX == nil then return end
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return end
+		if math.abs(pp.x - lastX) >= 0.08 or math.abs(pp.y - lastY) >= 0.3 then return end
+		player.MovementComponent:Jump()
+		local sc = player.StateComponent
+		if isvalid(sc) and (sc.CurrentStateName == "IDLE" or sc.CurrentStateName == "MOVE") then
+			sc:ChangeState("JUMP")
+		end
+		-- 좌표를 남겨 끼임 지점 분석 데이터로 쓴다(신고 재현 시 이 로그 위치가 문제 지형).
+		log("[AutoHunt] 수동 끼임 감지 - 자동 점프 탈출 (x=" .. string.format("%.2f", pp.x) .. " y=" .. string.format("%.2f", pp.y) .. " dir=" .. (rightHeld and "R" or "L") .. ")")
+	end
+
+	-- (다크나이트) 드래곤 라이딩 비행 이동 1틱: 탑승 시점에 기록한 목표점(rideFlightX/Y)으로 직선 비행
+	-- (KinematicMove 자유이동이라 MoveToDirection에 y성분이 그대로 먹힌다).
+	--
+	-- (버그 수정 2026-08-04) "위 발판으로 올라가려다 별로 못 간 상태에서 내려 다시 떨어진다"는 신고.
+	-- 원인 두 가지:
+	--   ① 도착 판정이 **유클리드 0.8**이라, 목표(몬스터)가 대각선으로 가까우면 아직 발판 높이에
+	--      한참 못 미쳤는데도 도착으로 쳐서 공중에서 하차 → 발판이 없어 그대로 추락했다.
+	--      → **수평으로 붙었고(|dx|≤0.6) 목표 높이까지 실제로 올라왔을 때(y ≥ 목표y-0.25)**만 도착.
+	--   ② 안전망 타임아웃이 6초 고정이었는데, 탑승 이동속도가 스펙 개편으로 1.0~1.38배까지
+	--      내려가(예전 3.2배) 같은 높이를 오르는 데 훨씬 오래 걸린다 - 정상 비행 도중에 타임아웃이
+	--      먼저 터져 공중에서 내려버렸다. → 거리에 비례한 타임아웃(최소 8초, 최대 20초)으로 바꾸고,
+	--      "2초 동안 목표까지의 거리가 0.2도 줄지 않으면" 막힌 것으로 보고 그때 하차한다.
+	@ExecSpace("ClientOnly")
+	method void RideFlightTick(number now, Entity player, number delta)
+		local tx = self._T.rideFlightX or 0
+		local ty = self._T.rideFlightY or 0
+		local pp = player.TransformComponent.WorldPosition
+		local fdx = tx - pp.x
+		local fdy = ty - pp.y
+		local fdist = math.sqrt(fdx * fdx + fdy * fdy)
+
+		-- 진척 감시: 2초마다 거리를 비교해 0.2 이상 줄지 않았으면 막힌 것으로 본다.
+		local stalled = false
+		if (self._T.rideProgressAt or 0) <= now then
+			local prev = self._T.rideProgressDist
+			if prev ~= nil and (prev - fdist) < 0.2 then stalled = true end
+			self._T.rideProgressDist = fdist
+			self._T.rideProgressAt = now + 2.0
+		end
+
+		local elapsed = now - (self._T.rideFlightStart or now)
+		local limit = math.max(8.0, math.min(20.0, (self._T.rideFlightDist or fdist) * 2.0 + 5.0))
+		local arrived = (math.abs(fdx) <= 0.6 and pp.y >= (ty - 0.25))
+		if arrived or stalled or elapsed > limit then
+			self._T.rideFlight = false
+			_SkillManager:ToggleDragonRide()   -- 하차 - 드래곤은 소환수로 복귀해 따로 공격
+			self._T.holdMoveUntil = now + 0.8  -- 하차 워프 연출(0.5초) 동안 대기
+			self._T.target = nil
+			self._T.nextScan = 0
+			local reason = "도착"
+			if not arrived then
+				if stalled then reason = "진척 없음" else reason = "시간 초과" end
+			end
+			log("[AutoHunt] 드래곤 라이딩 비행 종료(" .. reason .. ") - 하차 (dist="
+				.. string.format("%.2f", fdist) .. " dy=" .. string.format("%.2f", fdy)
+				.. " t=" .. string.format("%.1f", elapsed) .. "/" .. string.format("%.1f", limit) .. ")")
+			return
+		end
+		local pcc = player.PlayerControllerComponent
+		if isvalid(pcc) then
+			if pcc.Enable then pcc.Enable = false end
+			if math.abs(fdx) > 0.05 then pcc.LookDirectionX = (fdx > 0) and 1 or -1 end
+		end
+		-- (버그 수정) 목표 바로 아래에서 수평 성분이 0에 가까워지면 정규화 벡터가 흔들려 제자리를
+		-- 맴돈다 - 아직 높이가 모자라면 상승(y)을 우선해 확실히 발판 높이까지 올라가게 한다.
+		local dirX = fdx
+		local dirY = fdy
+		if fdy > 0.3 and math.abs(fdx) < 0.3 then
+			dirX = 0
+			dirY = fdy
+		end
+		local dlen = math.sqrt(dirX * dirX + dirY * dirY)
+		if dlen < 0.0001 then dlen = 1 end
+		player.MovementComponent:MoveToDirection(Vector2(dirX / dlen, dirY / dlen), delta)
+		self._T.moving = true
 	end
 
 	-- (팔라딘, 요청) 속성 콤보 선설치: 3차부터는 적이 없어도 지나가며 속성 연계를 미리 깔아둔다.
@@ -516,15 +821,96 @@ script AutoHuntManager extends Logic
 			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("속성필드"))
 			return math.max(10.0, 60.0 + 20.0 * (lv - 1) - 2.0)
 		end
+		-- (나이트로드) 암행 - 1분 + 분배당 10초. 만료 2초 전에 갱신한다.
+		if skillName == "암행" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("암행"))
+			return math.max(10.0, _SkillManager:GetAmhaengDuration(lv) - 2.0)
+		end
+		-- (나이트로드) 쉐도우 파트너 - 30초 + 분배당 10초. 표창 100개를 먹지만 재고가 모자라면
+		-- 낮은 번호 표창으로 자동 폴백하므로 주기 유지만 하면 된다.
+		if skillName == "쉐도우 파트너" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("쉐도우 파트너"))
+			return math.max(10.0, _SkillManager:GetShadowPartnerDurationForLevel(lv) - 2.0)
+		end
+		-- (히어로) 발도술도 지속시간이 투자 레벨 비례(30초 + 분배당 20초) - 만료 2초 전에 갱신한다.
+		if skillName == "발도술" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("발도술"))
+			return math.max(10.0, 30.0 + 20.0 * (lv - 1) - 2.0)
+		end
 		return 270.0
 	end
 
 	-- 버프(스킬별 주기 유지)·소환수(재소환 주기 290초)를 하나씩 돌아가며 유지한다.
 	-- 이번 틱에 유틸 스킬을 시전했으면 true (공격은 다음 틱에).
+	-- (나이트로드) 각성이 지금 켜져 있는가 - 제자리 사냥 판정에 쓴다.
+	@ExecSpace("ClientOnly")
+	method boolean IsAwakeningOn()
+		return _SkillManager:IsAwakeningActive()
+	end
+
 	@ExecSpace("ClientOnly")
 	method boolean TryUtilityCast(number now)
 		if (self._T.nextUtil or 0) > now then return false end
 		if self._T.lastCast == nil then self._T.lastCast = {} end
+		-- (나이트로드, 요청 2026-08-06) 마크 오브 어쌔신: 배워뒀는데 꺼져 있으면 켠다(토글 ON 유지 -
+		-- 자동사냥은 표창 소모 2배를 감수하고 표식 딜을 쓴다). 즉시 동작이라 return하지 않는다.
+		if (self._T.nextMarkCheck or 0) <= now then
+			self._T.nextMarkCheck = now + 5.0
+			if not _SkillManager:IsAssassinMarkEnabled()
+				and _SkillManager:GetHeroSkillLevelByName("마크 오브 어쌔신") >= 1 then
+				_SkillManager:SetAssassinMarkEnabled(true)
+				log("[AutoHunt] 마크 오브 어쌔신 자동 ON")
+			end
+		end
+		-- (나이트로드, 요청 2026-08-06) 표창+ 주기 교체: 표창이 2종 이상 열려 있으면 10초~3분 랜덤
+		-- 주기로 갈아끼우며 사냥한다. (요청 보강 2026-08-06) **가능한 높은 등급 우선** - 재고가
+		-- 넉넉한(40개↑) 2번 이상 표창만 후보로, 번호가 높을수록 가중 2배씩(최고 등급 위주 + 약간의
+		-- 다양성). 1번(무제한 기본 표창)은 다른 표창 재고가 전부 바닥일 때만 고른다 - 사냥 중
+		-- 소진 시 낮은 번호로 내려가는 폴백은 TryConsumeShuriken이 따로 처리한다.
+		-- 다른 유틸 시전을 막지 않는 즉시 동작이라 return하지 않는다.
+		if _SkillManager:GetUnlockedShurikenCount() >= 2 then
+			if (self._T.nextShurikenSwap or 0) <= now then
+				local unlocked = _SkillManager:GetUnlockedShurikenCount()
+				self._T.nextShurikenSwap = now + 10.0 + _UtilLogic:RandomDouble() * 170.0
+				local cands = {}
+				local total = 0
+				for i = 2, unlocked do
+					if _SkillManager:GetShurikenCount(i) >= 40 then
+						local w = 2 ^ (i - 1)
+						table.insert(cands, { idx = i, w = w })
+						total = total + w
+					end
+				end
+				local pick = 1
+				if total > 0 then
+					local r = _UtilLogic:RandomDouble() * total
+					pick = cands[#cands].idx
+					for _, c in ipairs(cands) do
+						r = r - c.w
+						if r <= 0 then
+							pick = c.idx
+							break
+						end
+					end
+				end
+				_SkillManager:AutoSelectShuriken(pick)
+			end
+		end
+		-- (나이트로드, 요청) 각성은 쿨(5분 고정)이 돌면 **가장 먼저** 쓴다 - 지속 39초 동안 공속 +15단계에
+		-- 표창 3종이 드래곤 로어 범위를 전부 조준하므로 아껴 봐야 손해다. 이미 켜져 있으면 건너뛴다.
+		-- 실제 쿨 판정은 SkillManager의 전용 게이트가 하므로 여기서는 20초마다 조회만 재시도한다.
+		if self._T.slotAwakenings ~= nil and #self._T.slotAwakenings > 0 then
+			if (self._T.nextAwakening or 0) <= now and not self:IsAwakeningOn() then
+				self._T.nextAwakening = now + 20.0
+				if _SkillManager:CanAutoCastAwakening() then
+					self._T.nextUtil = now + 1.2
+					self._T.holdMoveUntil = now + 1.0
+					_SkillManager:UseSkillInSlot(self._T.slotAwakenings[1].key)
+					log("[AutoHunt] 각성 시전 (쿨 종료 - 즉시 사용)")
+					return true
+				end
+			end
+		end
 		if self._T.slotBuffs ~= nil then
 			for _, s in ipairs(self._T.slotBuffs) do
 				local last = self._T.lastCast[s.name] or -99999
@@ -541,13 +927,52 @@ script AutoHuntManager extends Logic
 		if self._T.slotSummons ~= nil then
 			for _, s in ipairs(self._T.slotSummons) do
 				local last = self._T.lastCast[s.name] or -99999
-				if now - last >= 290.0 then
+				-- (다크나이트) 서먼 다크드래곤은 지속 200~600초 + 쿨타임 10분(2026-08-04 개편)이라, 기본
+				-- 290초 주기로 재시도하면 거부만 반복된다 - 쿨 종료 직후(605초)에 재소환하도록 전용 주기.
+				local period = 290.0
+				if s.name == "서먼 다크드래곤" then period = 605.0 end
+				if now - last >= period then
 					self._T.lastCast[s.name] = now
 					self._T.nextUtil = now + 1.2
 					self._T.holdMoveUntil = now + 1.0
 					_SkillManager:UseSkillInSlot(s.key)
 					log("[AutoHunt] 유지 시전: " .. s.name .. " (" .. s.key .. ")")
 					return true
+				end
+			end
+		end
+		-- (다크나이트) 드래곤 라이딩: 미소환 + 재사용 대기 종료 상태에서만 "소환"으로 사용한다.
+		-- 활성 중 재시전은 탑승 토글이라 CanAutoSummonDragonRide가 막는다(자동사냥은 절대 탑승하지 않음).
+		if self._T.slotDragonRides ~= nil and #self._T.slotDragonRides > 0 then
+			if (self._T.nextDragonRide or 0) <= now then
+				self._T.nextDragonRide = now + 20.0   -- 조회 재시도 간격(실제 재소환은 자체 쿨 5분이 게이트)
+				if _SkillManager:CanAutoSummonDragonRide() then
+					self._T.nextUtil = now + 1.2
+					self._T.holdMoveUntil = now + 1.0
+					_SkillManager:UseSkillInSlot(self._T.slotDragonRides[1].key)
+					log("[AutoHunt] 드래곤 라이딩 소환 (자동사냥은 탑승하지 않음)")
+					return true
+				end
+			end
+		end
+		-- (다크나이트) 드래곤 블러드: HP를 계속 소모하는 유지형(10초마다 최대 HP 4%, 10% 이하 자동해제).
+		-- 주기 재시전 대신 버프바 잔여로 꺼짐(자동해제 포함)을 감지해 재점화하되, HP 50% 미만이면
+		-- 켜자마자 다시 자동해제로 떨어지는 낭비라 HP가 회복될 때까지 기다린다.
+		if self._T.slotDragonBloods ~= nil and #self._T.slotDragonBloods > 0 then
+			if (self._T.nextDragonBlood or 0) <= now then
+				self._T.nextDragonBlood = now + 10.0
+				if _DragonBloodBuffUI:GetRemaining() <= 3.0 then
+					local playerDB = _UserService.LocalPlayer
+					if isvalid(playerDB) then
+						local pcDB = playerDB.PlayerComponent
+						if isvalid(pcDB) and (pcDB.MaxHp or 0) > 0 and (pcDB.Hp or 0) / pcDB.MaxHp >= 0.5 then
+							self._T.nextUtil = now + 1.2
+							self._T.holdMoveUntil = now + 1.0
+							_SkillManager:UseSkillInSlot(self._T.slotDragonBloods[1].key)
+							log("[AutoHunt] 드래곤 블러드 재점화 (HP " .. tostring(pcDB.Hp) .. "/" .. tostring(pcDB.MaxHp) .. ")")
+							return true
+						end
+					end
 				end
 			end
 		end
@@ -588,7 +1013,15 @@ script AutoHuntManager extends Logic
 	@ExecSpace("ClientOnly")
 	method void TryAttackCast(number now, Entity player, Vector3 pp)
 		if (self._T.nextAtk or 0) > now then return end
-		self._T.nextAtk = now + 0.5
+		-- (나이트로드, 요청 2026-08-05) 각성 중에는 공속 +15단계로 스킬 쿨(0.73~0.80×공속)이 0.2초
+		-- 안팎까지 줄어든다 - 0.5초 고정 틱이면 대부분을 흘려보내므로, "스킬 키를 누르고 있는 것처럼"
+		-- 공속에 맞춰 틱을 좁힌다(하한 0.12초).
+		local awakeningOn = self:IsAwakeningOn()
+		local atkTick = 0.5
+		if awakeningOn then
+			atkTick = math.max(0.12, 0.85 * _CharInfoManager:GetAttackSpeedMultiplier())
+		end
+		self._T.nextAtk = now + atkTick
 		-- (헛빵 수정) 시전 직전 재검증: 0.5초 주기 사이에 대상이 죽었거나 스킬 실판정 반경(1.5)
 		-- 밖으로 벗어났으면 이번 시전을 건너뛴다 - 파스/슬블/차지 블로우 허공 시전 방지.
 		local target = self._T.target
@@ -601,10 +1034,18 @@ script AutoHuntManager extends Logic
 		local tp = target.TransformComponent.WorldPosition
 		local cdx = tp.x - pp.x
 		local cdy = tp.y - pp.y
-		if math.sqrt(cdx * cdx + cdy * cdy) > 1.3 then return end
+		-- (버그 수정 2026-08-05) 각성 제자리 사냥은 드래곤 로어 범위(±15/±7.5)의 대상을 그대로 두고
+		-- 시전하는데, 이 사거리 게이트(1.3)가 그 대상을 걸러버려 제자리에서 아무것도 안 하고 서 있었다.
+		-- 각성 + 표창 슬롯이면 로어 범위까지 허용한다(표창 3종이 방향 무관 자동조준하므로 헛빵이 아니다).
+		if awakeningOn and self:HasStarThrowSlot() then
+			if math.abs(cdx) > 15.0 or math.abs(cdy) > 7.5 then return end
+		else
+			if math.sqrt(cdx * cdx + cdy * cdy) > 1.3 then return end
+		end
 		-- (헛빵 수정 2) 방향 전환 직후 0.25초는 시전 보류 - 서버의 LookDirectionX 복제가 아직 옛
 		-- 방향이라 등 뒤로 시전됐다. 잠깐 기다렸다 재시도한다.
-		if (now - (self._T.dirChangedAt or -99)) < 0.25 then
+		-- (각성 예외) 각성 중 표창 3종은 방향 무관 조준이라 등 뒤 판정이 없다 - 보류 없이 바로 던진다.
+		if not awakeningOn and (now - (self._T.dirChangedAt or -99)) < 0.25 then
 			self._T.nextAtk = now + 0.15
 			return
 		end
@@ -616,13 +1057,29 @@ script AutoHuntManager extends Logic
 			return
 		end
 		-- 대상이 현재 바라보는 방향의 뒤쪽이면 이번 틱은 방향만 맞추고 시전하지 않는다 (전방 박스 판정).
+		-- (각성 예외) 방향 무관 조준이라 몸만 돌려두고 시전은 미루지 않는다.
 		local pccDir = player.PlayerControllerComponent
 		if isvalid(pccDir) and math.abs(cdx) > 0.05 then
 			local wantDir = (cdx > 0) and 1 or -1
 			if pccDir.LookDirectionX ~= wantDir then
 				pccDir.LookDirectionX = wantDir
 				self._T.dirChangedAt = now
-				self._T.nextAtk = now + 0.15
+				if not awakeningOn then
+					self._T.nextAtk = now + 0.15
+					return
+				end
+			end
+		end
+		-- (나이트로드, 요청 2026-08-05) 드레인 샷 = HP 보충기: HP가 90% 아래고 자체 쿨(5초)이 돌았으면
+		-- 로테이션을 기다리지 않고 우선 사용한다. 대상이 사거리에 있는 지금이 기회다 - 맞혀야 회복된다.
+		if self._T.slotDrainShots ~= nil and #self._T.slotDrainShots > 0
+			and (self._T.nextDrainShot or 0) <= now then
+			local pcDS = player.PlayerComponent
+			if isvalid(pcDS) and (pcDS.MaxHp or 0) > 0 and (pcDS.Hp / pcDS.MaxHp) < 0.90 then
+				self._T.nextDrainShot = now + 5.5
+				self._T.holdMoveUntil = now + 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()
+				_SkillManager:UseSkillInSlot(self._T.slotDrainShots[1].key)
+				log("[AutoHunt] 드레인 샷 (HP 보충)")
 				return
 			end
 		end
@@ -652,14 +1109,27 @@ script AutoHuntManager extends Logic
 		-- 상위 호환 강등: 브랜디쉬 보유 시 하위 스킬 가중치 ×0.01 (≈1%)
 		local hasBrandish = false
 		local hasChargeBlow = false
+		local hasSpearBurst = false
 		for _, c in ipairs(pool) do
 			if c.name == "브랜디쉬" then hasBrandish = true end
 			if c.name == "차지 블로우" then hasChargeBlow = true end
+			if c.name == "스피어 버스터" then hasSpearBurst = true end
 		end
 		if hasBrandish then
 			for _, c in ipairs(pool) do
 				if c.name == "파워스트라이크" or c.name == "슬래시블러스트" then
 					c.w = c.w * 0.01
+				end
+			end
+		end
+		-- (다크나이트) 스피어 버스터 보유 시: 브랜디쉬/차지 블로우와 같은 상위 호환 규칙으로
+		-- 파스/슬블을 1%로 강등하고 스피어 버스터가 주력이 된다(단독 대상에게도 기본 가중 1.0).
+		if hasSpearBurst then
+			for _, c in ipairs(pool) do
+				if c.name == "파워스트라이크" or c.name == "슬래시블러스트" then
+					c.w = c.w * 0.01
+				elseif c.name == "스피어 버스터" and not crowded then
+					c.w = 1.0
 				end
 			end
 		end
@@ -671,6 +1141,100 @@ script AutoHuntManager extends Logic
 					c.w = c.w * 0.01
 				elseif c.name == "차지 블로우" and not crowded then
 					c.w = 1.0
+				end
+			end
+		end
+
+		-- (나이트로드, 요청 2026-08-05) 표창 상위호환 강등 - 브랜디쉬 규칙과 동일:
+		-- 트리플 스로우 보유 시 럭키세븐 ×0.01, 쿼드러플 스로우 보유 시 트리플 스로우 ×0.01
+		-- (셋 다 있으면 럭키세븐은 트리플의 1%의 다시 일부라 사실상 안 나온다).
+		local hasTripleThrow = false
+		local hasQuadThrow = false
+		local hasAvenger = false
+		for _, c in ipairs(pool) do
+			if c.name == "트리플 스로우" then hasTripleThrow = true end
+			if c.name == "쿼드러플 스로우" then hasQuadThrow = true end
+			if c.name == "어벤져" then hasAvenger = true end
+		end
+		if hasTripleThrow then
+			for _, c in ipairs(pool) do
+				if c.name == "럭키세븐" then c.w = c.w * 0.01 end
+			end
+		end
+		if hasQuadThrow then
+			for _, c in ipairs(pool) do
+				if c.name == "트리플 스로우" then c.w = c.w * 0.01 end
+			end
+		end
+		-- (나이트로드, 요청 2026-08-05) 어벤져 우선: 어벤져는 관통 광역이라, 전방 직선(관통 사거리
+		-- 8유닛)에 서로 떨어져 늘어선 적이 **5마리 이상**이면 트리플/쿼드러플보다 이득이다 -
+		-- 표창 상위기들의 현재 가중(강등/몰림 보정 후)의 3배로 올린다.
+		if hasAvenger then
+			local avFront = self:CountMonstersInFront(player, pp, lookDir, 8.0)
+			if avFront >= 5 then
+				local starW = 0
+				for _, c in ipairs(pool) do
+					if (c.name == "쿼드러플 스로우" or c.name == "트리플 스로우" or c.name == "럭키세븐")
+						and c.w > starW then
+						starW = c.w
+					end
+				end
+				local avW = math.max(starW, 0.15) * 3.0
+				for _, c in ipairs(pool) do
+					if c.name == "어벤져" and c.w < avW then c.w = avW end
+				end
+			end
+			-- (요청 2026-08-06) 각성 중에는 어벤져를 거의 쓰지 않는다(×2%) - 각성은 표창 3종이
+			-- 로어 범위 자동조준 + 전탄 크리티컬이 되는 구간이라 표창 연사가 압도적으로 이득.
+			-- 위 전방 5마리 부스트가 걸렸더라도 이 감쇠가 마지막에 덮는다.
+			if awakeningOn then
+				for _, c in ipairs(pool) do
+					if c.name == "어벤져" then c.w = c.w * 0.02 end
+				end
+			end
+		end
+
+		-- (다크나이트) 드래곤 로어 사용 규칙 — **주력기(스피어 버스터) 대비 사용 비율로 직접 지정한다**
+		-- (요청 2026-08-05 재조정: 이전의 "감쇠 ×0.3 + 최소 간격 게이트 + 쓰고도 35% 남을 것" 조합은
+		--  실제로는 거의 안 나왔다. 소모율이 마스터 51%라 "35% 여유" 조건이 사실상 HP 86% 이상을
+		--  요구했고, 25초 간격 게이트가 남은 기회마저 잘라냈다. 셋 다 걷어내고 비율만 남긴다):
+		--  ① HP가 **60% 이하면 사용하지 않는다**(가중 0).
+		--  ② (요청 2026-08-05 재조정) **HP가 많을수록 더 자주** - 60%에서 20%, 100%(풀)에서 150%로
+		--     비율이 **연속적으로** 올라간다(HP 80% = 85%, 90% = 117%).
+		--     ⚠ 이전 사양은 "99% 이상이면 1:1, 그 아래는 전부 20%"인 계단식이었는데, 로어 자체가
+		--       최대 HP의 41~70%를 먹어 한 번 쓰면 다시는 99%에 못 닿는다 - 결과적으로 항상 20%로
+		--       굳어 "HP가 많은데도 안 쓴다"는 신고가 나왔다. 계단을 없애고 램프로 바꾼다.
+		--  ③ 광역기라 단독 대상에게 쓰면 HP만 날린다 - 주변 2마리 이상일 때만 허용한다(기존 3마리에서 완화).
+		-- ⚠ 비율의 기준은 "이 시점의 스피어 버스터 가중"이다. 위 상위호환/몰림 보정이 모두 끝난 뒤여야
+		-- 하므로 이 블록의 위치를 앞으로 옮기지 말 것(몰림 3.0 / 단독 1.0 → 로어는 그 1/5 또는 1/3).
+		local roarHpRatio = 1.0
+		local pcHpGate = player.PlayerComponent
+		if isvalid(pcHpGate) and (pcHpGate.MaxHp or 0) > 0 then
+			roarHpRatio = (pcHpGate.Hp or 0) / pcHpGate.MaxHp
+		end
+		local roarSpearW = 0
+		for _, c in ipairs(pool) do
+			if c.name == "스피어 버스터" then roarSpearW = c.w end
+		end
+		local roarCrowded = (nearby >= 2)
+		-- 소모량(최대 HP의 41~70%)보다 현재 HP가 적으면 시전 자체가 막힌다(SkillManager의 HP 부족 게이트).
+		-- 뽑아 봐야 차단 + 토스트만 나오므로 여기서 미리 제외한다 - 투자 레벨이 낮아 소모율이 60%를
+		-- 넘는 구간에서만 실제로 걸린다(마스터 51%, 30 마스터 41%면 60% 하한이 더 빡빡하다).
+		local roarCostRatio = _SkillManager:GetDragonRoarHpCostPercent(
+			math.max(1, _SkillManager:GetHeroSkillLevelByName("드래곤 로어"))) / 100
+		for _, c in ipairs(pool) do
+			if c.name == "드래곤 로어" then
+				if roarHpRatio <= 0.60 or roarHpRatio <= roarCostRatio or not roarCrowded then
+					c.w = 0
+				else
+					-- 스피어 버스터를 안 배웠거나 슬롯에 없으면 기준이 없다 - 광역 기본 가중(3.0)을 기준으로 삼는다.
+					local baseW = (roarSpearW > 0) and roarSpearW or 3.0
+					-- HP 60% → 100% 구간을 0.2 → 1.5로 선형 보간(계단 없음 - 위 ② 참고).
+					local roarT = (roarHpRatio - 0.60) / 0.40
+					if roarT < 0 then roarT = 0 end
+					if roarT > 1 then roarT = 1 end
+					local share = 0.2 + 1.3 * roarT
+					c.w = baseW * share
 				end
 			end
 		end
@@ -714,6 +1278,10 @@ script AutoHuntManager extends Logic
 		if pick.name == "돌진" then
 			self._T.nextCharge = now + 12.0
 		end
+		-- (요청 2026-08-05) 드래곤 로어의 최소 간격 게이트(25초/12초)는 **삭제**했다.
+		-- 사용 빈도를 "스피어 버스터 대비 비율"로 지정받았는데, 시간 게이트가 남아 있으면 뽑혀도
+		-- 차단되어 실제 비율이 지정값보다 훨씬 낮아진다(빈도가 너무 낮다는 신고의 직접 원인).
+		-- 빈도 조절은 위 HP 비례 가중 램프(60% 20% ~ 풀 150%)와 HP 60% 하한만으로 한다.
 		-- 시전 모션 동안 이동 금지 (서버 컨트롤 잠금 0.65×공속 + 여유)
 		self._T.holdMoveUntil = now + 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()
 		_SkillManager:UseSkillInSlot(pick.key)
@@ -822,8 +1390,18 @@ script AutoHuntManager extends Logic
 		-- (요청) 하강 우선 규칙: 같은 층 적의 수평 거리가 아래층 적까지 거리의 3배 이상이면
 		-- 멀리 걸어가는 대신 아래층 적을 대상으로 삼아 다운점프로 내려간다.
 		-- 같은 층에 적이 아예 없을 때도 아래층 적이 있으면 그쪽으로 내려간다.
+		-- (신고 2026-08-06) 단, 그 대상의 x에 착지 발판이 없으면(플레이어 층 아래가 뚫린 지형)
+		-- 다운점프로 내려갈 수 없다 - 하강 우선권을 주지 않는다(일반 점수 선정으로 넘어가고,
+		-- 거기서 골라져도 다운점프 분기의 발밑 검사가 즉시 제외한다).
 		if belowBest ~= nil then
-			if sameLayerNearest == nil or sameLayerNearest >= belowBestDist * 3.0 then
+			local mapFB = player.CurrentMap
+			local fhFB = isvalid(mapFB) and mapFB.FootholdComponent or nil
+			local belowReachable = true
+			if isvalid(fhFB) then
+				local bx = belowBest.TransformComponent.WorldPosition.x
+				belowReachable = fhFB:Raycast(Vector2(bx, pp.y - 0.3), Vector2(0, -1), 8.0) ~= nil
+			end
+			if belowReachable and (sameLayerNearest == nil or sameLayerNearest >= belowBestDist * 3.0) then
 				return belowBest
 			end
 		end
@@ -834,7 +1412,13 @@ script AutoHuntManager extends Logic
 		-- (요청) 위 발판의 적(위쪽으로 1.1유닛 이상)은 섬광 같은 상하 이동기가 없으면 도달 수단이
 		-- 없다 - 위로 점프하는 접근을 없앴으므로 아예 대상 후보에서 제외한다. 아래층은 다운점프로
 		-- 내려갈 수 있어 그대로 둔다.
-		local hasMobility = self._T.slotMobilities ~= nil and #self._T.slotMobilities > 0
+		-- (다크나이트) 드래곤 라이딩 소환이 활성(미탑승)이면 탑승 비행으로 위층에 갈 수 있으므로
+		-- 섬광과 동일하게 위층 적도 후보에 넣는다.
+		-- (나이트로드) 헤이스트가 켜져 있으면 점프 보정 사거리만큼 위 발판에 올라갈 수 있다 -
+		-- 그 높이 안의 위층 적은 후보에 넣는다(사거리 밖은 여전히 제외).
+		local hasteReach = self:GetHasteJumpReach()
+		local hasMobility = (self._T.slotMobilities ~= nil and #self._T.slotMobilities > 0)
+			or (self._T.slotDragonRides ~= nil and #self._T.slotDragonRides > 0 and _SkillManager:CanAutoMountDragonRide())
 		local best = nil
 		local bestScore = 0
 		for _, comp in ipairs(comps) do
@@ -846,7 +1430,7 @@ script AutoHuntManager extends Logic
 					if banUntil == nil or banUntil <= now then
 						local wp = e.TransformComponent.WorldPosition
 						local relY = wp.y - pp.y
-						if relY >= 1.1 and not hasMobility then
+						if relY >= 1.1 and not hasMobility and relY > hasteReach then
 							continue
 						end
 						local dxA = math.abs(wp.x - pp.x)
@@ -881,8 +1465,6 @@ script AutoHuntManager extends Logic
 		if not isvalid(rb) or not rb:IsOnGround() then return false end
 		local map = player.CurrentMap
 		if not isvalid(map) then return false end
-		local spawnE = map:GetChildByName("SpawnLocation", true)
-		if not isvalid(spawnE) then return false end
 		local fh = map.FootholdComponent
 		if not isvalid(fh) then return false end
 		-- 발밑 0.3유닛 아래에서 아래로 8유닛 레이캐스트 - 발판이 잡히면 아직 맨아래가 아니다.
@@ -896,6 +1478,46 @@ script AutoHuntManager extends Logic
 			local below2 = fh:Raycast(Vector2(pp.x, by - 0.3), Vector2(0, -1), 8.0)
 			if below2 ~= nil then return false end
 		end
+		return self:ReturnToSpawn(now, player, "맨아래 도달")
+	end
+
+	-- (신고 2026-08-06) 중간 발판 무대상 정체 복귀: 잡을 수 있는 대상이 하나도 없는 상태(남은 적이
+	-- 위층뿐이라 후보 제외/추적 제외 중)가 4초 이상 이어지고 맵에 살아있는 몬스터는 있으면,
+	-- 맨아래가 아니어도 스폰 지점으로 복귀해 하강 순환을 다시 시작한다.
+	-- 전멸(살아있는 몬스터 0)이면 리젠 대기이므로 배회를 유지한다(헛복귀 반복 방지). 복귀했으면 true.
+	@ExecSpace("ClientOnly")
+	method boolean TryNoTargetReturn(number now, Entity player)
+		if self._T.noTargetSince == nil then
+			self._T.noTargetSince = now
+			return false
+		end
+		if now - self._T.noTargetSince < 4.0 then return false end
+		local comps = self:GetMonsterComps(player)
+		local anyAlive = false
+		for _, comp in ipairs(comps) do
+			if isvalid(comp) and comp.IsDead ~= true then
+				anyAlive = true
+				break
+			end
+		end
+		if not anyAlive then return false end
+		if self:ReturnToSpawn(now, player, "무대상 4초 지속") then
+			self._T.noTargetSince = nil
+			return true
+		end
+		return false
+	end
+
+	-- 스폰 지점(맨 위) 복귀 공용 절차 - 맨아래 도달/중간 무대상 정체 두 경로가 함께 쓴다.
+	@ExecSpace("ClientOnly")
+	method boolean ReturnToSpawn(number now, Entity player, string reason)
+		if (self._T.nextBottomReturn or 0) > now then return false end
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return false end
+		local map = player.CurrentMap
+		if not isvalid(map) then return false end
+		local spawnE = map:GetChildByName("SpawnLocation", true)
+		if not isvalid(spawnE) then return false end
 		self._T.nextBottomReturn = now + 4.0
 		-- 순간이동은 검증된 패턴대로 1회만 호출한다 (SetWorldPosition 반복 호출은 되돌림 버그).
 		local sp = spawnE.TransformComponent.WorldPosition
@@ -908,8 +1530,37 @@ script AutoHuntManager extends Logic
 		if isvalid(sc) and sc.CurrentStateName == "MOVE" then
 			sc:ChangeState("IDLE")
 		end
-		log("[AutoHunt] 맨아래 도달 - 위 스폰 지점으로 복귀 (" .. string.format("%.1f, %.1f", sp.x, sp.y) .. ")")
+		log("[AutoHunt] 스폰 지점 복귀(" .. reason .. ") (" .. string.format("%.1f, %.1f", sp.x, sp.y) .. ")")
 		return true
+	end
+
+	-- (나이트로드) 표창 스킬(럭키세븐/트리플/쿼드러플)이 퀵슬롯에 하나라도 있는가 -
+	-- 각성 중 "제자리 사냥" 판정에 쓴다(표창이 없으면 각성 중에도 평소처럼 붙어야 한다).
+	@ExecSpace("ClientOnly")
+	method boolean HasStarThrowSlot()
+		local lists = { self._T.slotAoes, self._T.slotSingles }
+		for _, lst in ipairs(lists) do
+			if lst ~= nil then
+				for _, s in ipairs(lst) do
+					if s.name == "럭키세븐" or s.name == "트리플 스로우" or s.name == "쿼드러플 스로우" then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	-- (나이트로드) 헤이스트 점프 보정으로 올라갈 수 있는 높이(월드 유닛). 헤이스트가 꺼져 있으면 0.
+	-- 점프 높이는 점프력의 **제곱**에 비례한다(실측) - 보정 배율도 제곱으로 들어간다.
+	-- 실제 보정은 서버(PlayerAttack.HasteJumpAssistTick)가 발판을 찾아 걸어주므로, 여기서는
+	-- "그 사거리 안이면 올라갈 수 있다"는 판단 기준으로만 쓴다. 여유 0.15는 발판 두께/오차 몫.
+	@ExecSpace("ClientOnly")
+	method number GetHasteJumpReach()
+		if _HasteBuffUI:GetRemaining() <= 0 then return 0 end
+		local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("헤이스트"))
+		local mult = _SkillManager:GetHasteJumpRangeMult(lv)
+		return 1.194 * mult * mult - 0.15
 	end
 
 	@ExecSpace("ClientOnly")
@@ -931,6 +1582,10 @@ script AutoHuntManager extends Logic
 			end
 		end
 		self._T.moving = false
+		-- 끼임 감지 샘플 초기화 - 정지 후 새 걷기에서 이전 위치와 비교하는 오판 방지
+		self._T.stuckLastX = nil
+		self._T.stuckLastY = nil
+		self._T.stuckCount = 0
 	end
 
 end

@@ -16,9 +16,14 @@ script HealerSummon extends Component
 	-- (LocoState/MotionCmd)을 보고 body 엔티티에 ActionStateChangedEvent를 직접 보내 재생한다.
 
 	property Entity OwnerEntity = nil              -- 서버 전용(소환한 플레이어)
-	property number Lifetime = 300                 -- 서버 전용 수명(초)
-	property number HealerMaxHp = 100              -- 서버 전용: 최대 HP(주인 최대 HP의 2/3)
+	property number Lifetime = 300                 -- 서버 전용 수명(초) - 투자 레벨 비례(60~350)
+	property number HealerMaxHp = 100              -- 서버 전용: 최대 HP(주인 최대 HP의 40%~69%)
 	property number HealerHp = 100                 -- 서버 전용: 현재 HP
+	-- (스펙 개편 2026-08-04) 힐 1회 회복량 = **주인 최대 HP의 이 비율(%)**. 이전에는 전투력의
+	-- 5%~15%를 굴렸다.
+	-- (요청 2026-08-05 하향) "힐러가 너무 세다" - 5% + 3포인트당 1%p(마스터 15%)에서
+	-- **3% + 5레벨당 1%p(마스터 30 = 10%)** 로 내렸다. 공식은 SkillManager.GetHealerHealPercent 한 곳.
+	property integer HealPercent = 3               -- 서버 전용: 주인 최대 HP 대비 힐량(%) - 1레벨 3% ~ 마스터 10%
 	@Sync property number HealerLevel = 1          -- 힐러 레벨(플레이어 레벨의 2/3)
 	@Sync property string LocoState = "stand"      -- stand / walk / jump (이동 모션)
 	@Sync property string MotionCmd = ""           -- "seq|모션명|재생속도" - 1회성 스킬 모션 명령
@@ -470,8 +475,9 @@ script HealerSummon extends Component
 	@ExecSpace("ServerOnly")
 	method integer HealNearbySummons(Vector3 myPos)
 		-- 사거리(좌우/위아래 3.6) 안의 아군 소환수를 회복시킨다 - 같은 주인이 소환한 것만 대상.
-		-- 회복 공식/연출은 유저의 힐이 쓰는 PlayerAttack 헬퍼를 그대로 재사용해 규격을 통일한다
-		-- (ApplyHealToHero / ApplyHealToDragon / ApplyHealToHealer). 자기 자신은 HealSelf가 이미 처리했다.
+		-- (스펙 개편 2026-08-04) 힐량이 "주인 최대 HP의 N%"라는 고정값으로 바뀌어, 배율을 다시 굴리는
+		-- ApplyHealToHero/Dragon/Healer 대신 회복량을 그대로 넘기는 공용 경로(ApplyFlatHealToSummon)를
+		-- 쓴다 - 본인/주인/소환수가 전부 같은 회복량을 받는다. 자기 자신은 HealSelf가 이미 처리했다.
 		local owner = self.OwnerEntity
 		if not isvalid(owner) then return 0 end
 		---@type PlayerAttack
@@ -479,7 +485,8 @@ script HealerSummon extends Component
 		if not isvalid(pa) then return 0 end
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return 0 end
-		local cp = self:GetCombatPower()
+		local healAmount = self:RollHealAmount()
+		if healAmount <= 0 then return 0 end
 		local healed = 0
 		local function inRange(e)
 			if not isvalid(e) then return false end
@@ -490,7 +497,7 @@ script HealerSummon extends Component
 			---@type HeroSummon
 			local hs = comp
 			if isvalid(hs) and hs.OwnerEntity == owner and hs.HeroHp > 0 and inRange(hs.Entity) then
-				pa:ApplyHealToHero(hs.Entity, cp)
+				pa:ApplyFlatHealToSummon(hs.Entity, healAmount)
 				healed = healed + 1
 			end
 		end
@@ -498,7 +505,7 @@ script HealerSummon extends Component
 			---@type SummonDragon
 			local sd = comp
 			if isvalid(sd) and sd.OwnerEntity == owner and sd.DragonHp > 0 and inRange(sd.Entity) then
-				pa:ApplyHealToDragon(sd.Entity, cp)
+				pa:ApplyFlatHealToSummon(sd.Entity, healAmount)
 				healed = healed + 1
 			end
 		end
@@ -507,7 +514,7 @@ script HealerSummon extends Component
 			---@type HealerSummon
 			local hl = comp
 			if isvalid(hl) and hl ~= self and hl.OwnerEntity == owner and hl.HealerHp > 0 and inRange(hl.Entity) then
-				pa:ApplyHealToHealer(hl.Entity, cp)
+				pa:ApplyFlatHealToSummon(hl.Entity, healAmount)
 				healed = healed + 1
 			end
 		end
@@ -516,11 +523,21 @@ script HealerSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method integer RollHealAmount()
-		-- 회복량: 플레이어 힐과 같은 공식(전투력의 10%를 기준으로 ±50% = 5%~15%).
+		-- (스펙 개편 2026-08-04) 회복량 = **주인 최대 HP × HealPercent%**
+		-- (요청 2026-08-05 하향) 1레벨 5%~마스터 15% → **1레벨 3% + 5레벨당 1%p, 마스터 10%**.
+		-- 이전에는 전투력의 5%~15%를 굴렸지만, 투자 레벨로 정해지는 고정값으로 바뀌었다(변동 없음).
 		-- 블레스 활성 중이면 최종 회복량이 10% 증가한다(blessHealMult).
-		local baseHeal = self:GetCombatPower() * 0.10
-		local mult = 0.5 + _UtilLogic:RandomDouble() * 1.0
-		return math.floor(baseHeal * mult * (self._T.blessHealMult or 1.0))
+		local ownerMaxHp = 0
+		local owner = self.OwnerEntity
+		if isvalid(owner) and isvalid(owner.PlayerComponent) then
+			ownerMaxHp = owner.PlayerComponent.MaxHp or 0
+		end
+		if ownerMaxHp <= 0 then
+			-- 주인을 못 찾는 예외 상황(맵 이탈 직후 등)에서는 자기 최대 HP를 기준으로 대신 계산한다.
+			ownerMaxHp = self.HealerMaxHp
+		end
+		local pct = math.max(1, self.HealPercent or 5)
+		return math.floor(ownerMaxHp * pct / 100 * (self._T.blessHealMult or 1.0))
 	end
 
 	@ExecSpace("ServerOnly")

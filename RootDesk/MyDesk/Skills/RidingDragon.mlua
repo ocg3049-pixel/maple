@@ -21,7 +21,7 @@ script RidingDragon extends Component
 	--  워프에 즉시 따라붙는다 - 의도된 동작.)
 	-- 맵 자식이라 클라가 부모로 주인을 알 수 없다 → 주인을 @Sync로 내려준다(첫 프레임 nil 가드 필요).
 	@Sync property Entity OwnerEntity = nil
-	property number Lifetime = 300               -- 서버 전용 수명(초). 요청 스펙 = 5분.
+	property number Lifetime = 150               -- 서버 전용 수명(초). 소환 시 투자 레벨별 지속시간으로 덮어쓴다(2분 30초 + 분배당 20초).
 	@Sync property string AtkState = ""          -- "" (평상시) | "atk1" | "atk2"
 	@Sync property boolean Riding = false        -- true면 플레이어가 탑승 중
 	@Sync property boolean Warping = false       -- 탑승 연출: 제자리에서 이펙트 재생하며 잠시 사라진 상태
@@ -29,16 +29,28 @@ script RidingDragon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
-		-- 서버: 수명(5분) / 공격(5~7초) 타이머 예약.
+		-- 서버: 수명 / 공격(5~7초) 타이머 예약.
 		self._T.spawnAt = _UtilLogic.ElapsedSeconds
+		-- ⚠ (버그 수정 2026-08-05) **여기서 self.Lifetime을 바로 읽으면 안 된다.**
+		-- SummonRidingDragonFor는 `AddComponent` → `comp.Lifetime = duration` 순서로 값을 넣는데,
+		-- OnBeginPlay는 AddComponent 시점에 이미 실행돼 그때 Lifetime은 아직 **프로퍼티 기본값**이다.
+		-- 예전에는 기본값(300)과 실제 지속시간(5분 고정)이 같아 드러나지 않았지만, 지속시간이 투자
+		-- 레벨 비례(150~530초)로 바뀌면서 마스터도 150초 만에 소멸했다 - 클라는 소환이 유지 중이라
+		-- 여기는데 드래곤만 사라져 "탑승은 되는데 드래곤이 안 보인다"는 신고로 나타났다.
+		-- 한 프레임(0.2초) 뒤에 대입이 끝난 값을 읽어 예약한다(용 소환의 지연 InitServer와 같은 이유).
 		_TimerService:SetTimerOnce(function()
 			if not isvalid(self.Entity) then return end
-			-- 소멸 이펙트를 먼저 각 클라에서 재생하고, 0.2초 뒤에 실제로 엔티티를 지운다.
-			self:PlayVanishEffect()
+			local life = math.max(1.0, self.Lifetime - 0.2)
+			log("[RidingDragon] 수명 예약 - " .. tostring(math.floor(self.Lifetime)) .. "초 뒤 소멸")
 			_TimerService:SetTimerOnce(function()
-				if isvalid(self.Entity) then self.Entity:Destroy() end
-			end, 0.2)
-		end, self.Lifetime)
+				if not isvalid(self.Entity) then return end
+				-- 소멸 이펙트를 먼저 각 클라에서 재생하고, 0.2초 뒤에 실제로 엔티티를 지운다.
+				self:PlayVanishEffect()
+				_TimerService:SetTimerOnce(function()
+					if isvalid(self.Entity) then self.Entity:Destroy() end
+				end, 0.2)
+			end, life)
+		end, 0.2)
 		self:ScheduleAttack()
 		-- 맵 자식이라 주인이 사라져도 자동으로 정리되지 않는다(플레이어 자식이던 시절과 다른 점).
 		-- 주인이 없어지면 스스로 소멸한다.
@@ -60,7 +72,9 @@ script RidingDragon extends Component
 				end, 0.2)
 			end
 		end, 1.0)
-		log("[RidingDragon] 소환 - 수명 " .. tostring(self.Lifetime) .. "초")
+		-- ⚠ 이 시점의 self.Lifetime은 아직 기본값이라 로그로 찍으면 오해를 부른다(위 주석 참고).
+		-- 실제 수명은 위 지연 예약 안의 "수명 예약" 로그를 볼 것.
+		log("[RidingDragon] 소환")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -116,7 +130,8 @@ script RidingDragon extends Component
 						self:PlayHitEffect(tt, hitRuid)
 						if isvalid(pa) then
 							pa:DealRidingDragonHit(tt)
-							-- 드래곤 블러드(4차 버프)가 켜져 있으면 드래곤이 때릴 때마다 주인이 최대 HP의 3%를 회복한다.
+							-- 드래곤 블러드(4차 버프)가 켜져 있으면 드래곤이 때릴 때마다 주인이 최대 HP를 회복한다
+							-- (회복률은 드래곤 블러드 투자 레벨 구간 - 1~9레벨 1% / 10~19 2% / 20+ 3%).
 							pa:OnDragonAttackHeal()
 						end
 					end, (i - 1) * 0.08)
@@ -188,6 +203,16 @@ script RidingDragon extends Component
 			if self._T.ownerWatchId ~= nil then
 				_TimerService:ClearTimer(self._T.ownerWatchId)
 				self._T.ownerWatchId = nil
+			end
+			-- (요청 2026-08-05) **드래곤이 사라지면 주인 클라의 "소환 중" 상태도 반드시 함께 끝낸다.**
+			-- 쿨타임(5분)이 지속시간(최대 8분 50초)보다 짧아, 드래곤만 먼저 사라지고 클라만 소환 중으로
+			-- 남으면 그 키가 계속 "탑승 토글"로 동작해 없는 드래곤에 타는 혼란이 생긴다(사용자 신고).
+			-- 수명 만료 / 주인 이탈 / 맵 이동 등 어떤 이유로 사라져도 이 한 경로를 지난다.
+			local owner = self.OwnerEntity
+			if isvalid(owner) then
+				---@type PlayerAttack
+				local pa = owner:GetComponent("script.PlayerAttack")
+				if isvalid(pa) then pa:NotifyRidingDragonGone() end
 			end
 			return
 		end

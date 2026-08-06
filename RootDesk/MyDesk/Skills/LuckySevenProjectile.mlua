@@ -14,6 +14,41 @@ script LuckySevenProjectile extends Component
 	property number DamageRateMin = 1.0
 	property number DamageRateMax = 1.5
 
+	-- ── 마크 오브 어쌔신 (2026-08-05 신설, 같은 날 2차 개편) ─────────────
+	-- CurveFly: true면 직선 추적 대신 **조향(steering) 방랑 비행**을 한다(마크 표창 전용).
+	--   몬스터에게서 랜덤한 방향으로 튀어나온 뒤(초기 표창 각도도 그 방향), 진행각을 목표 쪽으로
+	--   제한된 속도로만 틀고 사인 흔들림을 더해 이리저리 휘면서 1~3초에 걸쳐 도달한다.
+	--   진행각은 동반 시각 엔티티의 ZRotation에 매 틱 반영된다(부착 이펙트는 회전을 못 바꾼다 -
+	--   회전형 표창과 같은 동반 엔티티 패턴). 클라이언트가 시각 경로를 갈라야 하므로 @Sync.
+	-- CurveSide/CurveBend: 흔들림의 위상 방향(±1)과 진폭(rad/s). 발마다 다르게 줘서 제각각 휜다.
+	-- FlightDuration: 유도 램프 지연(초) - 이 시간까지는 약하게만 유도되어 밖으로 퍼지고,
+	--   이후 유도가 점점 강해져 수명 안에 반드시 도달한다.
+	-- MarkEligible: 이 표창의 실히트가 마크 프록을 일으킬 수 있는가(표창 3종의 원본 표창만 true -
+	--   마크 표창 자신은 false라 연쇄 폭발하지 않는다).
+	@Sync
+	property boolean CurveFly = false
+	property number CurveSide = 1
+	property number CurveBend = 1.2
+	property number FlightDuration = 0.7
+	property boolean MarkEligible = false
+
+	-- (요청 2026-08-06) 발사 후 이 시간 동안은 **도달 판정을 하지 않는다** - 마크 표창이 뭉쳐 있는
+	-- 적 사이에서 튀어나올 때 바로 옆 적에게 부딪혀 즉시 사라지는 것을 막고, 일단 퍼져나가
+	-- 유영하는 모습을 보여준 뒤에만 꽂히게 한다(기본 0 = 기존 표창들은 그대로 즉시 판정).
+	property number NoHitTime = 0
+
+	-- (요청 2026-08-06 연출 개편) 부채꼴 전개 대형: 플레이어 등 뒤의 대형 슬롯 위치(월드 좌표)와
+	-- 발사 시차. 전개(슬롯까지 ease-out 0.35초) → 겨눔(0.18초 + LaunchDelay 동안 표적 방향으로
+	-- 회전하며 부유) → 발사(직선 급강하) 3단계로 난다. 서버 전용 값이라 동기화하지 않는다.
+	property number FormationX = 0
+	property number FormationY = 0
+	property number LaunchDelay = 0
+
+	-- 명중 시 재생할 타격음. 마크 표창은 전용 히트사운드를 쓴다 - 클라이언트 표시 RPC(ShowHitEffect)가
+	-- 자기 복제본에서 읽으므로 @Sync로 내린다.
+	@Sync
+	property string HitSoundRUID = "48c2f4049db54b3b88b9144320d3d41a"
+
 	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcCritical/CalcDamage가
 	-- 서버에서 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 직접 읽을 수 없어, 발사한 플레이어가
 	-- SyncCritRate로 동기화해둔 값을 그대로 넘겨받는다.
@@ -58,6 +93,10 @@ script LuckySevenProjectile extends Component
 	-- 원본 표창 전용(서버에서만 읽음): 쉐도우 파트너 버프 중에 발사됐는지 여부.
 	-- 히트 시 원본+보너스(타수 2배) 합산·2줄 표시와 히트 이펙트 시간차 2배 재생에 쓰인다.
 	property boolean ShadowEchoOn = false
+
+	-- (2026-08-05 개편) 분신 몫의 데미지 배율(본체 대비). PlayerAttack.GetShadowEchoRate()가 계산한
+	-- 값을 발사 시점에 새겨준다 - 쉐도우 파트너 투자 레벨에 따라 0.50(1레벨)~0.79(마스터 30)다.
+	property number ShadowEchoRate = 0.5
 
 	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID(PlayerAttack이 발사 시점에 채워준다).
 	-- 블리자드처럼 스킨을 한시적으로 바꾸는 연출이 이 투사체의 수동 데미지 표시에도 적용되게 하려면
@@ -124,6 +163,12 @@ script LuckySevenProjectile extends Component
 		-- 서버가 띄운 회전 동반 엔티티(SpawnSpinVisualIfNeeded)가 아이콘을 돌리며 대신 보여준다.
 		if not self.Fired then return end
 		if self._T.flyStarted then return end
+		-- (마크 오브 어쌔신) 방랑 비행 표창은 부착 이펙트를 쓰지 않는다 - 부착 이펙트는 재생 후 회전을
+		-- 바꿀 수 없어 진행 방향을 따라가지 못한다. 동반 엔티티(SpawnSpinVisualIfNeeded)가 대신 보여준다.
+		if self.CurveFly then
+			self._T.flyStarted = true
+			return
+		end
 		self._T.flyStarted = true
 		-- 그림자 몫(시각 전용) 표창은 투명도 70%로 재생해 원본과 구분되면서도 같은 모습이 되게 한다.
 		local opts = {}
@@ -262,6 +307,16 @@ script LuckySevenProjectile extends Component
 			-- 진행 방향 각도를 그대로(-180~180도) 담는다. 좌우 반전 없이 이 각도만으로 눕힌다.
 			self.FlyAngle = math.deg(math.atan(dy, dx))
 		end
+		-- (마크 오브 어쌔신, 연출 개편 2026-08-06) 첫 진행 방향 = 스폰점(플레이어) → 등 뒤 대형 슬롯.
+		-- 초기 표창 각도도 그 방향을 향하고, 이후 3단계 비행(OnUpdate CurveFly 분기)이 이어받는다.
+		if self.CurveFly then
+			local sp = self.Entity.TransformComponent.Position
+			local a = math.atan(self.FormationY - sp.y, self.FormationX - sp.x)
+			self._T.velAngle = a
+			self._T.formStart = Vector3(sp.x, sp.y, sp.z)
+			self.FlyDirX = (math.cos(a) < 0) and -1 or 1
+			self.FlyAngle = math.deg(a)
+		end
 		self.Fired = true
 		self:SpawnSpinVisualIfNeeded()
 		log("[Shuriken] Fire skin=" .. tostring(self.SkinIndex)
@@ -280,13 +335,18 @@ script LuckySevenProjectile extends Component
 	@ExecSpace("ServerOnly")
 	method void SpawnSpinVisualIfNeeded()
 		-- 회전형 표창이면 아이콘을 들고 따라다닐 동반 엔티티를 띄운다.
+		-- (마크 오브 어쌔신) 방랑 비행(CurveFly) 표창도 동반 엔티티를 쓴다 - 부착 이펙트는 회전을
+		-- 못 바꾸므로, 비행 클립을 실은 동반 엔티티의 ZRotation을 진행각에 맞춰 매 틱 갱신한다.
+		-- 전용 비행 클립이 없는 표창(토피/일비)은 기존처럼 아이콘 회전으로 대신한다.
 		local info = _ShurikenLibrary:Get(self.SkinIndex)
-		if not info.spin then return end
+		local curveAligned = self.CurveFly and (info.fly ~= nil and info.fly ~= "") and not info.spin
+		if not info.spin and not self.CurveFly then return end
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
 		local pos = self.Entity.TransformComponent.WorldPosition
 		local ent = _SpawnService:SpawnByModelId("spearburstfadingeffect", "shuriken_spin", pos, map)
 		if not isvalid(ent) then return end
+		self._T.curveAligned = curveAligned
 		-- 아이콘 스프라이트의 중심이 엔티티 원점에서 어긋난 양(피벗이 좌하단이라 생기는 값, 실측).
 		-- 이걸 회전시켜 빼주지 않으면 회전축이 모서리라 "제자리 회전"이 아니라 원을 그리며 돈다.
 		self._T.spinOx = info.ox or 0
@@ -295,7 +355,7 @@ script LuckySevenProjectile extends Component
 		ent:AddComponent("script.SpinningShuriken")
 		---@type SpinningShuriken
 		local sv = ent:GetComponent("script.SpinningShuriken")
-		if sv ~= nil then sv.IconRUID = info.icon end
+		if sv ~= nil then sv.IconRUID = curveAligned and info.fly or info.icon end
 		-- 안전장치: 어떤 경로로도 정리되지 않는 경우가 있어(실측 - 맵에 동반 엔티티 4개가 쌓여 있었다)
 		-- 표창 최대 수명보다 조금 뒤에 스스로 사라지게 못을 박아둔다.
 		ent:Destroy(self.MaxLifetime + 0.5)
@@ -319,6 +379,53 @@ script LuckySevenProjectile extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void RetargetNearestMonster()
+		-- (마크 오브 어쌔신, 요청 2026-08-06) 방랑 비행 중 대상이 죽으면 **근처의 다른 살아있는
+		-- 몬스터로 갈아타** 계속 날아간다. 매 프레임 맵 전체를 훑지 않게 0.2초 간격으로만 재시도한다.
+		local nowT = _UtilLogic.ServerElapsedSeconds
+		if (self._T.nextRetargetAt or 0) > nowT then return end
+		self._T.nextRetargetAt = nowT + 0.2
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		-- (요청 2026-08-06) 플레이어가 지금 노리는 표적은 갈아타기 대상에서도 제외한다 -
+		-- 마크가 먼저 죽이면 날아가던 플레이어 표창이 헛방이 된다(시전자 PlayerAttack에 위임 판정).
+		local ownerPa = nil
+		---@type LuckySevenProjectileAttack
+		local acRT = self.Entity:GetComponent("script.LuckySevenProjectileAttack")
+		if acRT ~= nil and isvalid(acRT.OwnerEntity) then
+			---@type PlayerAttack
+			local paTmp = acRT.OwnerEntity:GetComponent("script.PlayerAttack")
+			ownerPa = paTmp
+		end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local comps = map:GetChildComponentsByTypeName("script.Monster", true)
+		local best = nil
+		local bestD = 64.0   -- 반경 8유닛(제곱) 안에서만 찾는다
+		for _, comp in ipairs(comps) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead and mc.Entity.Enable
+				and not (ownerPa ~= nil and isvalid(ownerPa) and ownerPa:IsAssassinMarkExcluded(mc.Entity)) then
+				local mp = mc.Entity.TransformComponent.WorldPosition
+				local ddx = mp.x - myPos.x
+				local ddy = mp.y - myPos.y
+				local d2 = ddx * ddx + ddy * ddy
+				if d2 < bestD then
+					bestD = d2
+					best = mc
+				end
+			end
+		end
+		if best == nil then return end
+		self._T.target = best.Entity
+		self._T.targetMonster = best
+		self._T.targetDied = nil
+		local tp = best.Entity.TransformComponent.Position
+		self._T.fallbackPos = Vector3(tp.x, tp.y + _ShurikenLibrary:GetThrowHeight(), tp.z)
+		log("[Shuriken] 마크 표창 재타게팅 → " .. tostring(best.Entity.Name))
+	end
+
+	@ExecSpace("ServerOnly")
 	method void OnUpdate(number delta)
 		if self._T.hit then return end
 		
@@ -337,18 +444,29 @@ script LuckySevenProjectile extends Component
 		--   같은 각도로 돌려서 위치에서 빼주면 중심이 표창 위치에 고정된 채 제자리에서만 돈다.
 		if isvalid(self._T.spinEnt) then
 			local p = self.Entity.TransformComponent.WorldPosition
-			self._T.spinAngle = ((self._T.spinAngle or 0) + 720 * delta) % 360
-			local th = math.rad(self._T.spinAngle)
-			local ox = self._T.spinOx or 0
-			local oy = self._T.spinOy or 0
-			local rx = ox * math.cos(th) - oy * math.sin(th)
-			local ry = ox * math.sin(th) + oy * math.cos(th)
-			self._T.spinEnt.TransformComponent.WorldPosition = Vector3(p.x - rx, p.y - ry, p.z)
-			self._T.spinEnt.TransformComponent.ZRotation = self._T.spinAngle
+			if self._T.curveAligned then
+				-- (마크 오브 어쌔신) 비행 클립을 진행 방향으로 정렬한다 - 휘어질 때마다 각도가 따라 돈다.
+				-- 클립 기본 방향은 왼쪽(head=180, 9종 전부 실측)이라 진행각 - 180이 렌더 각도다.
+				self._T.spinEnt.TransformComponent.WorldPosition = Vector3(p.x, p.y, p.z)
+				self._T.spinEnt.TransformComponent.ZRotation = math.deg(self._T.velAngle or 0) - 180
+			else
+				self._T.spinAngle = ((self._T.spinAngle or 0) + 720 * delta) % 360
+				local th = math.rad(self._T.spinAngle)
+				local ox = self._T.spinOx or 0
+				local oy = self._T.spinOy or 0
+				local rx = ox * math.cos(th) - oy * math.sin(th)
+				local ry = ox * math.sin(th) + oy * math.cos(th)
+				self._T.spinEnt.TransformComponent.WorldPosition = Vector3(p.x - rx, p.y - ry, p.z)
+				self._T.spinEnt.TransformComponent.ZRotation = self._T.spinAngle
+			end
 		end
 		
 		-- 대상이 살아있으면 계속 추적하고, 죽어서 사라졌으면 캐스팅 시점에 저장된 마지막 위치로 계속 날아간다
 		-- (럭키세븐은 항상 표창 2개 분의 데미지 표시가 나가야 하므로, 대상 소멸 여부와 무관하게 끝까지 도달시킨다).
+		-- (마크 오브 어쌔신) 방랑 표창만 예외 - 대상이 죽으면 근처의 다른 살아있는 몬스터로 갈아탄다.
+		if self.CurveFly and self:IsTargetGone() then
+			self:RetargetNearestMonster()
+		end
 		local aimPos = self:GetAimPos(self._T.fallbackPos)
 		if aimPos == nil then
 			self:ClearSpinVisual()
@@ -361,11 +479,65 @@ script LuckySevenProjectile extends Component
 		local dy = aimPos.y - myPos.y
 		local dist = math.sqrt(dx * dx + dy * dy)
 		
-		if dist <= self.HitRadius then
+		-- 무충돌 유예(NoHitTime) 안에는 도달로 치지 않는다 - 유예 중에는 대상을 스쳐 지나가며 계속 유영한다.
+		if dist <= self.HitRadius and self._T.lifetime >= self.NoHitTime then
 			self:OnHit()
 			return
 		end
-		
+
+		-- (마크 오브 어쌔신, 2026-08-05 2차 개편) 방랑 조향 비행: 랜덤 방향으로 튀어나온 진행각을
+		-- 목표 쪽으로 **제한된 회전 속도**로만 틀어간다. 유도 세기는 FlightDuration까지는 약해서
+		-- 바깥으로 자유롭게 퍼지고, 그 뒤 시간에 비례해 강해져 수명(1~3초) 안에 반드시 도달한다.
+		-- 사인 흔들림(CurveBend 진폭, CurveSide 위상)이 더해져 이리저리 휘고, 도달 직전에는 잦아든다.
+		-- 진행각은 동반 시각 엔티티의 ZRotation에 그대로 반영된다(위 spinEnt 갱신 참고).
+		-- (마크 오브 어쌔신, 연출 개편 2026-08-06) 3단계 비행:
+		--   ① 전개(0~0.35초): 스폰점(플레이어)에서 등 뒤 대형 슬롯까지 ease-out으로 미끄러진다.
+		--   ② 겨눔(0.35~0.53+시차): 슬롯에 떠서 미세하게 부유하며 표창 각도만 표적 쪽으로 돌린다.
+		--   ③ 발사: 표적을 향해 직선 급강하(Speed). 도달 판정은 NoHitTime(=①+② 길이)이 열어준다.
+		if self.CurveFly then
+			local t = self._T.lifetime
+			local deployT = 0.35
+			local launchAt = deployT + 0.18 + (self.LaunchDelay or 0)
+			local wantAng = math.atan(dy, dx)
+			if t < deployT then
+				-- ① 전개: ease-out 보간으로 슬롯에 안착. 각도는 이동 방향을 따라간다.
+				local p0 = self._T.formStart
+				if p0 == nil then
+					p0 = Vector3(myPos.x, myPos.y, myPos.z)
+					self._T.formStart = p0
+				end
+				local k = t / deployT
+				k = 1.0 - (1.0 - k) * (1.0 - k)
+				local nx = p0.x + (self.FormationX - p0.x) * k
+				local ny = p0.y + (self.FormationY - p0.y) * k
+				local mvx = nx - myPos.x
+				local mvy = ny - myPos.y
+				if mvx * mvx + mvy * mvy > 0.000001 then
+					self._T.velAngle = math.atan(mvy, mvx)
+				end
+				self.Entity.TransformComponent.Position = Vector3(nx, ny, myPos.z)
+				return
+			elseif t < launchAt then
+				-- ② 겨눔: 슬롯에서 살짝 떠다니며(부유) 각도를 표적 방향으로 부드럽게 돌린다.
+				local ang = self._T.velAngle or 0
+				local diff = wantAng - ang
+				while diff > math.pi do diff = diff - 2 * math.pi end
+				while diff < -math.pi do diff = diff + 2 * math.pi end
+				local maxTurn = 9.0 * delta
+				if diff > maxTurn then diff = maxTurn elseif diff < -maxTurn then diff = -maxTurn end
+				self._T.velAngle = ang + diff
+				self.Entity.TransformComponent.Position = Vector3(
+					self.FormationX, self.FormationY + 0.04 * math.sin(t * 9.0), myPos.z)
+				return
+			end
+			-- ③ 발사: 직선 급강하 - 각도는 진행 방향 그대로.
+			self._T.velAngle = wantAng
+			self.Entity.TransformComponent.Position = Vector3(
+				myPos.x + math.cos(wantAng) * self.Speed * delta,
+				myPos.y + math.sin(wantAng) * self.Speed * delta, myPos.z)
+			return
+		end
+
 		local moveX, moveY = 0, 0
 		if dist > 0.0001 then
 			moveX = dx / dist
@@ -384,8 +556,21 @@ script LuckySevenProjectile extends Component
 		self:ClearSpinVisual()
 
 		-- 쉐도우 파트너의 그림자 몫(시각 전용) 표창: 직접적인 데미지를 주지 않는다는 요청 -
-		-- 데미지 판정/데미지 스킨/히트 이펙트 전부 없이 도달 지점에서 조용히 사라진다.
+		-- 데미지 판정과 데미지 숫자는 없다.
+		-- (요청 2026-08-05) 다만 **타격 이펙트와 타격음은 원본 표창과 똑같이** 낸다 - 그림자 표창이
+		--   원본 뒤에 이어서 날아가게 바뀌면서, 소리 없이 꽂히면 뒤쪽 절반이 통째로 먹통처럼 들렸다.
+		-- ⚠ 허공 투척(SilentOnMiss)이면 원본도 조용히 사라지므로 그림자도 소리/이펙트를 내면 안 된다.
+		-- ⚠ 대상이 비행 중에 죽었으면 **타격 이펙트만** 생략하고 타격음은 그대로 낸다.
+		--   그림자 몫은 원본보다 뒤에 도착하는데, 사망 유예(마지막 원본 표창에만 죽음)를 쓰는 구조라
+		--   대상이 죽는 시전에서는 그림자 표창이 **항상** 사후 도착이다 - 여기서 소리까지 막으면
+		--   "몬스터를 잡을 때마다 뒤쪽 절반이 무음"이 된다(요청과 정반대). 이펙트를 막는 이유는
+		--   그 자리에 몬스터가 부활하면 "hit 이펙트를 달고 부활"하는 것처럼 보이기 때문이고,
+		--   소리에는 그 문제가 없다.
 		if self.VisualOnly then
+			if not self.SilentOnMiss then
+				local vpos = self.Entity.TransformComponent.Position
+				self:ShowShadowHitEffect(vpos.x, vpos.y, vpos.z, self.HitEffectRUID, self._T.targetDied ~= true)
+			end
 			_EntityService:Destroy(self.Entity)
 			return
 		end
@@ -421,6 +606,15 @@ script LuckySevenProjectile extends Component
 				bonus = ac._T.lastBonus or 0
 				damageIsCritical = ac._T.lastDamageIsCritical or false
 				bonusIsCritical = ac._T.lastBonusIsCritical or false
+			end
+		end
+		-- (마크 오브 어쌔신) 표창 3종의 원본 표창이 **실제로 적중**했을 때만 시전자에게 프록을 위임한다.
+		-- 마크 표창 자신은 MarkEligible=false라 연쇄하지 않는다.
+		if landedRealHit and self.MarkEligible and ac ~= nil and isvalid(ac.OwnerEntity) then
+			---@type PlayerAttack
+			local ownerPa = ac.OwnerEntity:GetComponent("script.PlayerAttack")
+			if isvalid(ownerPa) then
+				ownerPa:TryProcAssassinMark(target, pos, self.CombatPower)
 			end
 		end
 		if not landedRealHit and self.SilentOnMiss then
@@ -462,7 +656,8 @@ script LuckySevenProjectile extends Component
 					damage = math.floor(damage * 2.0)
 				end
 				if self.ShadowEchoOn then
-					bonus = math.floor(damage * (0.55 + math.random() * 0.10))
+					-- (2026-08-05 개편) 분신 몫은 투자 레벨별 고정 배율(0.50~0.79)이다 - 발사 시점에 새겨진 값을 쓴다.
+					bonus = math.floor(damage * (self.ShadowEchoRate or 0.5))
 					bonusIsCritical = _UtilLogic:RandomDouble() < critRate
 					if bonusIsCritical then
 						bonus = math.floor(bonus * 2.0)
@@ -541,19 +736,33 @@ script LuckySevenProjectile extends Component
 			ruid, mapEnt,
 			Vector3(px, py, pz), 0, Vector3(1, 1, 1), false
 		)
-		_SoundService:PlaySound("48c2f4049db54b3b88b9144320d3d41a", 1.0)
-		-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 같은 자리(고정 좌표)에 한 번 더
-		-- 재생한다(투명도 70%) - 대상이 이미 죽어 사라졌어도 허공의 그 자리에서 발동한다.
-		if echo then
-			_TimerService:SetTimerOnce(function()
-				if not isvalid(mapEnt) then return end
-				_EffectService:PlayEffect(
-					ruid, mapEnt,
-					Vector3(px, py, pz), 0, Vector3(1, 1, 1), false, { ["Alpha"] = 0.7 }
-				)
-				log("[LuckySeven] 그림자 히트이펙트 발동(0.25초 지연) pos=(" .. tostring(px) .. "," .. tostring(py) .. ")")
-			end, 0.25)
+		-- 타격음은 표창마다 다를 수 있다(마크 오브 어쌔신 전용음) - @Sync로 내려온 값을 쓴다.
+		local sndRuid = (self.HitSoundRUID ~= nil and self.HitSoundRUID ~= "") and self.HitSoundRUID or "48c2f4049db54b3b88b9144320d3d41a"
+		_SoundService:PlaySound(sndRuid, 1.0)
+		-- ⚠ (2026-08-05) 예전에는 여기서 "그림자 몫"을 흉내내려고 같은 이펙트를 0.25초 뒤에 한 번 더
+		--   재생했다. 지금은 그림자 표창이 **실제로 뒤이어 날아와 자기 자리에서 터지므로**(아래
+		--   ShowShadowHitEffect) 그 흉내는 폐기했다 - 남겨두면 표창 1발에 이펙트가 3번 터진다.
+		--   echo 인자는 호출부 시그니처를 건드리지 않으려고 그대로 두었다(지금은 쓰지 않는다).
+	end
+
+	@ExecSpace("Client")
+	method void ShowShadowHitEffect(number px, number py, number pz, string hitRuid, boolean showEffect)
+		-- 쉐도우 파트너의 그림자 몫 표창이 꽂힌 자리의 타격 이펙트 + 타격음.
+		-- 이펙트는 원본과 같은 클립을 투명도 70%로(그림자 몫 공통 규칙), 타격음은 원본과 **동일하게**
+		-- 낸다(요청: "그림자 표창의 히트사운드도 플레이어 것과 같이 있어야 한다").
+		-- showEffect=false = 대상이 이미 죽어 사라진 뒤 도착 → 소리만 내고 이펙트는 생략한다.
+		local mapEnt = self.Entity.CurrentMap
+		if not isvalid(mapEnt) then return end
+		if showEffect then
+			local ruid = (hitRuid ~= nil and hitRuid ~= "") and hitRuid or "458e72f0720a4584a9a7fc3642b6e601"
+			_EffectService:PlayEffect(
+				ruid, mapEnt,
+				Vector3(px, py, pz), 0, Vector3(1, 1, 1), false, { ["Alpha"] = 0.7 }
+			)
 		end
+		_SoundService:PlaySound("48c2f4049db54b3b88b9144320d3d41a", 1.0)
+		log("[LuckySeven] 그림자 표창 타격음" .. (showEffect and " + 이펙트" or "(이펙트 생략 - 대상 사망)")
+			.. " pos=(" .. tostring(px) .. "," .. tostring(py) .. ")")
 	end
 
 end

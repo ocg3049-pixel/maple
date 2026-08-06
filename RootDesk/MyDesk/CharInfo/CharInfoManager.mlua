@@ -18,6 +18,16 @@ script CharInfoManager extends Logic
 	-- 활성 버프들의 보너스 합이다. 전투력은 스킬 시전 시 RPC 인자로 서버에 전달되므로(SkillManager
 	-- 참고) 이 보너스가 스킬 데미지에도 자동으로 반영된다.
 	property integer buffAttackBonus = 0
+	-- (발도술) 처치 중첩 버프의 크리티컬 확률 보너스(+3%×중첩). CalcCritRate/UpdateStats 두 곳에서 가산된다.
+	property integer battoCritBonus = 0
+
+	-- (표창+ 개편 2026-08-05) 지금 고른 표창 종류가 주는 상시 효과. 표창을 바꾸거나 표창+ 계열 스킬에
+	-- 포인트를 찍을 때 SkillManager.ApplyShurikenAttackBonus가 통째로 다시 대입한다(누적이 아니다).
+	--   · 공격력은 skillAttackBonus에 함께 합산된다(아래 프로퍼티)
+	--   · 크리티컬 확률은 CalcCritRate/UpdateStats에서 가산
+	--   · 공격속도 단계는 GetAttackSpeedStage에서 가산(부스터/발도술과 겹쳐 적용)
+	property integer shurikenCritBonus = 0
+	property integer shurikenAtkSpeedStage = 0
 
 	-- 스킬 포인트 투자로 얻는 상시 공격력 보너스. 지금은 "표창+"(포인트 1당 +2)만 쓴다.
 	-- 버프(buffAttackBonus)와 달리 켜고 끄는 것이 아니라 투자 포인트에 따라 고정으로 유지된다.
@@ -283,7 +293,9 @@ script CharInfoManager extends Logic
 		end
 		local totalDmgPct = dmgPct + comboDmgPct
 		-- (Phase 4) 기본 크리티컬 확률 50% → 10% (GDD §4.7) - 크확은 주로 잠재 옵션으로 쌓는 성장 축
-		local critRate     = 10 + critAdd
+		-- (발도술) 처치 중첩 버프의 크확 보너스(+3%×중첩)를 스탯창에도 반영한다(CalcCritRate와 동일 가산).
+		-- (표창+ 개편) 고른 표창의 크확(5~9번 10~30%)도 함께 표시한다.
+		local critRate     = 10 + critAdd + self.battoCritBonus + self.shurikenCritBonus
 		-- 크리티컬 데미지: 기본 125%(크리티컬 적중 시 데미지 100% -> 125%로 상승) + 장비 잠재능력의
 		-- "크리티컬 데미지 +N%" 옵션 합산. PlayerAttack.SyncCritDamage로 서버에 동기화되어 실제
 		-- 전투 데미지 계산(크리티컬 배율)에 그대로 반영된다.
@@ -344,7 +356,8 @@ script CharInfoManager extends Logic
 	-- 공격속도 단계 반환 (기본 5단계 + 무기 보너스)
 	@ExecSpace("ClientOnly")
 	method integer GetAttackSpeedStage()
-		return self.atkSpeedStage + self:GetWeaponAttackSpeedBonus()
+		-- (표창+ 개편) 고른 표창의 공속 단계(8·9번 +1)도 함께 얹는다.
+		return self.atkSpeedStage + self:GetWeaponAttackSpeedBonus() + self.shurikenAtkSpeedStage
 	end
 
 	-- 공격속도 단계 → 시간 배율. 5단계=1.0(현재 파워스트라이크 기준), 1단계 오를 때마다 이전 단계 대비 10%씩 줄어든다(복리).
@@ -416,6 +429,135 @@ script CharInfoManager extends Logic
 		end
 	end
 
+	-- 발도술(히어로 3차) 기본 사용 효과: 버프 지속시간 동안 공속 +1단계. 부스터와 동일한 토큰 패턴이되
+	-- 별도 필드(battoProc*)라 부스터/비약과 겹쳐 적용된다. 재시전 시 이전 적용을 되돌리고 새로 건다.
+	-- (효과 개편) 예전엔 처치 중첩 프록이 이 메서드로 공속을 올렸지만, 지금은 시전 시점(SkillManager
+	-- 디스패치)이 지속시간 전체로 1단계를 거는 용도다. 중첩 프록은 UseBattoStackBuff(공격력/크확) 참고.
+	@ExecSpace("ClientOnly")
+	method void UseBattoAtkSpeed(number remain, integer stages)
+		if self._T.battoProcActive then
+			self.atkSpeedStage = self.atkSpeedStage - (self._T.battoProcStages or 1)
+		end
+		self.atkSpeedStage = self.atkSpeedStage + stages
+		self._T.battoProcStages = stages
+		self._T.battoProcActive = true
+		log("[CharInfo] 발도술 프록 - 공격속도 +" .. tostring(stages) .. "단계 (" .. string.format("%.1f", remain) .. "초): " .. tostring(self.atkSpeedStage) .. "단계")
+		local cwBT = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwBT) and cwBT.Enable then
+			self:UpdateStats()
+		end
+		self._T.battoProcToken = (self._T.battoProcToken or 0) + 1
+		local myToken = self._T.battoProcToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.battoProcToken ~= myToken then return end
+			self:CancelBattoAtkSpeed()
+		end, remain)
+	end
+
+	-- 발도술 프록 공속 원복(만료/취소 공용). 서버 종료 통보(NotifyBattoProcEnd)와 클라 자체 만료
+	-- 타이머 어느 쪽이 먼저 와도 한 번만 되돌린다.
+	@ExecSpace("ClientOnly")
+	method void CancelBattoAtkSpeed()
+		if not self._T.battoProcActive then return end
+		self._T.battoProcToken = (self._T.battoProcToken or 0) + 1
+		self.atkSpeedStage = self.atkSpeedStage - (self._T.battoProcStages or 1)
+		self._T.battoProcActive = false
+		log("[CharInfo] 발도술 프록 종료 - 공격속도 원복: " .. tostring(self.atkSpeedStage) .. "단계")
+		local cwBT = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwBT) and cwBT.Enable then
+			self:UpdateStats()
+		end
+	end
+
+	-- 각성(나이트로드 4차): 지속시간 동안 공속을 구간별로 크게 올린다(1~9분배 5단계 / 10~19 10단계 /
+	-- 20분배 이상 15단계). 부스터/발도술과 같은 토큰 패턴이되 별도 필드(awakeningProc*)라 서로 겹쳐
+	-- 적용된다. 재시전 시 이전 적용을 정확히 되돌리고 새로 건다.
+	-- ⚠ 공속은 서버에 대응 데이터가 없는 **클라 전용 상태**다(부스터와 같은 이유) - 스킬 시전 때
+	--   GetAttackSpeedMultiplier로 계산한 배율이 RPC 인자로 서버에 전달된다.
+	@ExecSpace("ClientOnly")
+	method void UseAwakeningAtkSpeed(number remain, integer stages)
+		if self._T.awakeningProcActive then
+			self.atkSpeedStage = self.atkSpeedStage - (self._T.awakeningProcStages or 0)
+		end
+		self.atkSpeedStage = self.atkSpeedStage + stages
+		self._T.awakeningProcStages = stages
+		self._T.awakeningProcActive = true
+		log("[CharInfo] 각성 - 공격속도 +" .. tostring(stages) .. "단계 (" .. string.format("%.1f", remain) .. "초): " .. tostring(self.atkSpeedStage) .. "단계")
+		local cwAW = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwAW) and cwAW.Enable then
+			self:UpdateStats()
+		end
+		self._T.awakeningProcToken = (self._T.awakeningProcToken or 0) + 1
+		local myToken = self._T.awakeningProcToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.awakeningProcToken ~= myToken then return end
+			self:CancelAwakeningAtkSpeed()
+		end, remain)
+	end
+
+	-- 각성 공속 원복(만료/취소/서버 종료 통보 공용). 어느 쪽이 먼저 와도 한 번만 되돌린다.
+	@ExecSpace("ClientOnly")
+	method void CancelAwakeningAtkSpeed()
+		if not self._T.awakeningProcActive then return end
+		self._T.awakeningProcToken = (self._T.awakeningProcToken or 0) + 1
+		self.atkSpeedStage = self.atkSpeedStage - (self._T.awakeningProcStages or 0)
+		self._T.awakeningProcActive = false
+		log("[CharInfo] 각성 종료 - 공격속도 원복: " .. tostring(self.atkSpeedStage) .. "단계")
+		local cwAW = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwAW) and cwAW.Enable then
+			self:UpdateStats()
+		end
+	end
+
+	-- 발도술 처치 중첩 프록(효과 개편): 중첩당 공격력 +10(buffAttackBonus 합산 경로 - 분노/메디와 겹침)과
+	-- 크리티컬 확률 +3%(battoCritBonus)를 remain초 동안 적용한다. 중첩이 바뀌면 이전 적용을 정확히
+	-- 되돌리고 새 수치를 다시 건다. 서버(PlayerAttack.AddBattoStack)가 중첩/남은 시간을 계산해 넘긴다.
+	-- 스킬은 시전 때마다 전투력/크확을 새로 넘기지만, 엔진이 서버에서 직접 띄우는 기본공격은 동기화 값만
+	-- 보므로 다크사이트와 같은 즉시 재동기화(SyncDarkSightStats - 이름과 달리 범용 스탯 재동기화)를 태운다.
+	@ExecSpace("ClientOnly")
+	method void UseBattoStackBuff(number remain, integer stacks)
+		if self._T.battoStackActive then
+			self.buffAttackBonus = self.buffAttackBonus - (self._T.battoStackAtk or 0)
+			self.battoCritBonus = self.battoCritBonus - (self._T.battoStackCrit or 0)
+		end
+		local atkBonus = 10 * stacks
+		local critBonus = 3 * stacks
+		self.buffAttackBonus = self.buffAttackBonus + atkBonus
+		self.battoCritBonus = self.battoCritBonus + critBonus
+		self._T.battoStackAtk = atkBonus
+		self._T.battoStackCrit = critBonus
+		self._T.battoStackActive = true
+		log("[CharInfo] 발도술 중첩 프록 - 공격력 +" .. tostring(atkBonus) .. " 크확 +" .. tostring(critBonus) .. "% (" .. string.format("%.1f", remain) .. "초)")
+		local cwBS = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwBS) and cwBS.Enable then
+			self:UpdateStats()
+		end
+		_SkillManager:SyncDarkSightStats()
+		self._T.battoStackToken = (self._T.battoStackToken or 0) + 1
+		local myToken = self._T.battoStackToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.battoStackToken ~= myToken then return end
+			self:CancelBattoStackBuff()
+		end, remain)
+	end
+
+	-- 발도술 중첩 프록 원복(만료/취소 공용). 서버 종료 통보와 클라 자체 만료 타이머 어느 쪽이 먼저 와도
+	-- 한 번만 되돌리고, 기본공격용 서버 동기화 값도 즉시 갱신한다.
+	@ExecSpace("ClientOnly")
+	method void CancelBattoStackBuff()
+		if not self._T.battoStackActive then return end
+		self._T.battoStackToken = (self._T.battoStackToken or 0) + 1
+		self.buffAttackBonus = self.buffAttackBonus - (self._T.battoStackAtk or 0)
+		self.battoCritBonus = self.battoCritBonus - (self._T.battoStackCrit or 0)
+		self._T.battoStackActive = false
+		log("[CharInfo] 발도술 중첩 프록 종료 - 공격력/크확 원복 (buffAttackBonus=" .. tostring(self.buffAttackBonus) .. " battoCritBonus=" .. tostring(self.battoCritBonus) .. ")")
+		local cwBS = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwBS) and cwBS.Enable then
+			self:UpdateStats()
+		end
+		_SkillManager:SyncDarkSightStats()
+	end
+
 	-- 브랜디쉬 강화(4차 버프): 5분간 ①브랜디쉬 데미지 1.5배 ②브랜디쉬 공속 +1단계 ③브랜디쉬 이펙트/아이콘
 	-- 붉은/핑크색. 부스터와 동일한 토큰 패턴(중첩 없이 지속시간만 갱신). 브랜디쉬 전용이라 전역 atkSpeedStage를
 	-- 건드리지 않고 별도 플래그로만 관리한다 - SkillManager가 브랜디쉬 시전 시 IsBrandishEnhanceActive를 읽어
@@ -442,24 +584,23 @@ script CharInfoManager extends Logic
 		return self._T.brandishEnhanceActive == true
 	end
 
-	-- 어드밴스드 스피어 버스터(4차 패시브): 보유 중이면 스피어 버스터 데미지 1.5배 + 이펙트 색 변경.
-	-- 어드밴스드 콤보(4차 패시브)와 동일하게 이 게임엔 "패시브를 슬롯에 배정/학습"하는 시스템이 없어
-	-- (패시브는 슬롯 이동 불가) 보유=항상 적용으로 둔다. 나중에 실제 학습 시스템이 생기면 이 값만 게이팅하면 된다.
-	-- (요청) 스피어버스터 강화 ON: 새로 그린 전용 아트(용머리/마법진/날개/찌르기3종)로 스피어 버스터를
-	-- 강화한다(데미지 1.5배 + 이펙트를 신규 아트로 대체). 끄려면 이 값을 false로.
-	property boolean advancedSpearBusterOwned = true
-	method boolean IsAdvancedSpearBusterOwned()
-		return self.advancedSpearBusterOwned == true
+	-- 어드밴스드 스피어 버스터(4차, 2026-08-05 스펙 개편): **연출 전용 토글**이다.
+	-- 데미지 보너스(분배당 스피어 버스터 줄당 최소 +5%p / 최대 +10%p)는 투자 레벨만으로 항상 적용되고
+	-- (SkillManager.GetAdvSpearBurstMin/MaxBonus), 이 값은 새로 그린 전용 아트(용머리/마법진/날개/
+	-- 찌르기3종)를 쓸지 여부만 결정한다. OFF면 안 배운 것처럼 원래 스피어 버스터 이펙트로 나간다.
+	-- (구 사양의 "보유 시 데미지 1.5배"는 폐지 - 레벨 스케일과 이중 성장이었다.)
+	property boolean advancedSpearBusterEffectOn = true
+	method boolean IsAdvancedSpearBusterEffectOn()
+		return self.advancedSpearBusterEffectOn == true
 	end
 
-	-- (요청) 스킬 우클릭으로 스피어버스터 강화를 켜고 끈다. 토글 후 새 상태(true=ON)를 돌려준다.
-	-- 클라 전용 상태(SkillManager가 시전 시 클라에서 IsAdvancedSpearBusterOwned를 읽어 combatPower/enhanced를
-	-- 결정하므로 여기서 토글하면 즉시 다음 시전부터 반영된다).
+	-- (요청) 어드밴스드 스피어 버스터를 퀵슬롯에서 쓰면 강화 이펙트를 켜고 끈다. 토글 후 새 상태(true=ON)를 돌려준다.
+	-- 클라 전용 상태(SkillManager가 시전 시 이 값을 읽어 enhanced 플래그만 서버로 넘긴다 - 데미지는 무관).
 	@ExecSpace("ClientOnly")
-	method boolean ToggleAdvancedSpearBuster()
-		self.advancedSpearBusterOwned = not (self.advancedSpearBusterOwned == true)
-		log("[CharInfoManager] 스피어버스터 강화 " .. (self.advancedSpearBusterOwned and "ON" or "OFF"))
-		return self.advancedSpearBusterOwned
+	method boolean ToggleAdvancedSpearBusterEffect()
+		self.advancedSpearBusterEffectOn = not (self.advancedSpearBusterEffectOn == true)
+		log("[CharInfoManager] 어드밴스드 스피어 버스터 강화 이펙트 " .. (self.advancedSpearBusterEffectOn and "ON" or "OFF"))
+		return self.advancedSpearBusterEffectOn
 	end
 
 	-- 에로우 블로우 강화(1차): ON이면 에로우 블로우가 적중 지점에서 폭발해 최대 5명까지 시간차로 타격한다.
@@ -478,20 +619,20 @@ script CharInfoManager extends Logic
 		return self.arrowBlowEnhanceOn
 	end
 
-	-- 암행(1차): 원래 상시 적용 패시브였으나 (요청) ON/OFF 토글로 전환. 켜져 있는 동안만
-	-- 온히트 그림자 표창이 발동한다. 기본은 OFF - 스킬을 슬롯에 배정해 쓰면 켜지고 꺼진다.
-	-- 실제 발동 판정은 서버(PlayerAttack)에서 하므로, 토글 시 SkillManager가 RPC로 서버에도 반영한다.
+	-- 암행(나이트로드 2차): 상시 패시브 → ON/OFF 토글 → (요청 2026-08-05) **지속시간이 있는 버프**로
+	-- 바뀌었다. 켜져 있는 동안만 온히트 그림자 표창이 발동한다.
+	-- ⚠ 지속시간 관리(타이머·버프바 표시·서버 통보)는 전부 SkillManager가 한다 - 여기는 "지금 켜져
+	--   있는가" 하나만 들고 있는다(발동 판정은 서버 PlayerAttack, 스위치는 RequestSetAmhaengState).
 	property boolean amhaengOn = false
 	method boolean IsAmhaengActive()
 		return self.amhaengOn == true
 	end
 
 	@ExecSpace("ClientOnly")
-	method boolean ToggleAmhaeng()
-		-- 암행을 켜고 끈다. 토글 후 새 상태(true=ON)를 돌려준다.
-		self.amhaengOn = not (self.amhaengOn == true)
+	method void SetAmhaengActive(boolean on)
+		-- 암행 활성 상태를 그대로 지정한다(시전 시 true / 만료·취소 시 false).
+		self.amhaengOn = (on == true)
 		log("[CharInfoManager] 암행 " .. (self.amhaengOn and "ON" or "OFF"))
-		return self.amhaengOn
 	end
 
 	-- 암행2(3차): 암행1과 같은 확률(5%)로 **독립적으로** 굴려, 몬스터 뒤쪽에 그림자를 소환해
@@ -578,6 +719,22 @@ script CharInfoManager extends Logic
 			local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 			if isvalid(cw) and cw.Enable then self:UpdateStats() end
 		end, duration)
+	end
+
+	-- (용 소환, 2026-08-04) 살아 있는 소환 용 1마리당 공격력 +10. 지속시간이 정해진 다른 버프와 달리
+	-- "현재 마리 수로 계속 갱신"되는 값이라 ApplyAttackBuff의 토큰/타이머 패턴을 쓰지 않고, 이전 값과의
+	-- 차이만 buffAttackBonus에 반영한다(용이 추가 소환되거나 격추될 때마다 곧바로 따라온다).
+	@ExecSpace("ClientOnly")
+	method void SetSummonDragonAttackBonus(integer atkBonus)
+		-- atkBonus = 살아 있는 마리 수 × 10. 0이면 보너스가 완전히 사라진다(소환 종료/전멸).
+		local prev = self._T.summonDragonAtk or 0
+		if prev == atkBonus then return end
+		self.buffAttackBonus = self.buffAttackBonus - prev + atkBonus
+		self._T.summonDragonAtk = atkBonus
+		log("[CharInfo] 소환 용 공격력 보너스 " .. tostring(prev) .. " → " .. tostring(atkBonus)
+			.. " (합계 buffAttackBonus=" .. tostring(self.buffAttackBonus) .. ")")
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then self:UpdateStats() end
 	end
 
 	-- (버프 아이콘 우클릭 취소) 공마 버프(분노/메디테이션/파워가드)를 즉시 종료한다 -
@@ -688,7 +845,9 @@ script CharInfoManager extends Logic
 			end
 		end
 		-- (Phase 4) 기본 크리티컬 확률 50% → 10% (GDD §4.7)
-		return 10 + critAdd
+		-- (발도술) 처치 중첩 버프의 크확 보너스(+3%×중첩) 가산 - 스킬 시전/기본공격 동기화 모두 이 값을 탄다.
+		-- (표창+ 개편) 고른 표창의 크확(5~9번 10~30%) 가산.
+		return 10 + critAdd + self.battoCritBonus + self.shurikenCritBonus
 	end
 
 	-- (Phase 4) 잠재 "스킬 재사용 대기시간 -N초" 옵션의 합산 초. SkillManager.ApplyCooldownReduction이
