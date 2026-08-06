@@ -1,0 +1,153 @@
+@Logic
+@ExecSpace("ClientOnly")
+script ShadowCloneSwapCooldownUI extends Logic
+
+	-- 분신 위치 교환 재사용 대기시간(5초) 표시. DarkSightCooldownUI 복제 - 분신 소환이 배정된 퀵슬롯
+	-- 아이콘 위에 검은 오버레이가 덮이고 남은 시간이 숫자로 뜬다. UUID는 UIBuilder가 write bind로 주입한다.
+	--
+	-- (신고 2026-08-06) 분신이 살아 있을 때 스킬을 다시 누르면 **위치 교환**(별도 쿨타임 5초)인데
+	-- 그 쿨타임이 퀵슬롯에 전혀 표시되지 않아 언제 다시 바꿀 수 있는지 알 수 없었다.
+	--
+	-- ⚠ 소환 자체의 재사용 대기시간(5분)과는 별개다 - 이 UI는 "교환"만 담당한다.
+
+	property SpriteGUIRendererComponent grayOverlay = "f2048fb7-8b5f-4cb1-a961-595f4e4ae3d1"
+	property TextComponent countdownText = "0e4bbe43-209d-42cd-9d6a-695445f8fad6"
+
+	-- (신고 2026-08-06 추가) 소환 자체의 재사용 대기시간(5분)도 같은 슬롯에 표시한다.
+	-- 두 쿨타임(소환 5분 / 교환 5초)은 동시에 돌 수 있으므로 **각각의 마감 시각을 따로 들고**
+	-- 남은 시간이 더 긴 쪽을 그린다 - 오버레이 엔티티가 하나뿐이라 서로 덮어쓰면 안 된다.
+
+	method void ShowSummonCooldown(number duration, string slotKey)
+		-- 분신 소환(5분) 쿨타임 시작.
+		self._T.summonTotal = duration
+		self._T.summonUntil = _UtilLogic.ElapsedSeconds + duration
+		self:ShowCooldown(duration, slotKey)
+	end
+
+	method void ShowSwapCooldown(number duration, string slotKey)
+		-- 위치 교환(5초) 쿨타임 시작.
+		self._T.swapTotal = duration
+		self._T.swapUntil = _UtilLogic.ElapsedSeconds + duration
+		self:ShowCooldown(duration, slotKey)
+	end
+
+	method void ShowCooldown(number duration, string slotKey)
+		-- slotKey = 퀵슬롯 위치 접미사(Slot_<위치>). 오버레이/텍스트를 그 슬롯 위로 옮긴 뒤 카운트다운 시작.
+		if not self:IsClient() then return end
+		if duration <= 0 then return end
+		self._T.totalDuration = duration
+		self._T.remaining = duration
+		self._T.slotKey = slotKey
+
+		-- 오버레이 스프라이트를 .ui에 Filled로 저장하면 렌더링되지 않는 문제가 있어(프로젝트 공통),
+		-- 저장은 Simple로 하고 런타임에 매번 Filled/Vertical로 바꿔준다.
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Type = ImageType.Filled
+			self.grayOverlay.FillMethod = FillMethodType.Vertical
+		end
+
+		local slotEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. tostring(slotKey))
+		if isvalid(slotEnt) then
+			local slotPos = slotEnt.UITransformComponent.anchoredPosition
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Entity.Enable = true
+		end
+		if isvalid(self.countdownText) then
+			self.countdownText.Entity.Enable = true
+		end
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self._T.remaining = self._T.remaining - delta
+			self:UpdateCooldownDisplay()
+		end, 1 / 60)
+
+		self:UpdateCooldownDisplay()
+		log("[ShadowCloneSwapCooldownUI] 위치 교환 쿨타임 표시 시작 duration=" .. tostring(duration) .. " slot=" .. tostring(slotKey))
+	end
+
+	method void UpdateCooldownDisplay()
+		-- 소환/교환 두 쿨타임 중 **남은 시간이 더 긴 쪽**을 그린다(오버레이가 하나뿐이라 합쳐 보여준다).
+		local now = _UtilLogic.ElapsedSeconds
+		local remaining = self._T.remaining
+		local total = self._T.totalDuration
+		local summonLeft = (self._T.summonUntil or 0) - now
+		local swapLeft = (self._T.swapUntil or 0) - now
+		if summonLeft > 0 or swapLeft > 0 then
+			if summonLeft >= swapLeft then
+				remaining = summonLeft
+				total = self._T.summonTotal or summonLeft
+			else
+				remaining = swapLeft
+				total = self._T.swapTotal or swapLeft
+			end
+			self._T.remaining = remaining
+			self._T.totalDuration = total
+		end
+
+		if remaining <= 0 then
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.Enable = false
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.Enable = false
+			end
+			self._T.summonUntil = 0
+			self._T.swapUntil = 0
+			-- 쿨타임 완료: 슬롯 아이콘 2번 깜빡임으로 재사용 가능 알림(모든 쿨타임 스킬 공통).
+			_SkillManager:BlinkSlotReady(self._T.slotKey or "")
+			return
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.FillAmount = math.max(0, math.min(1, remaining / total))
+		end
+		if isvalid(self.countdownText) then
+			-- 소환 쿨타임이 5분이라 1분 이상은 분 단위(노란색), 그 아래는 초 단위로 보여준다.
+			if remaining < 60 then
+				self.countdownText.FontColor = Color(1, 1, 1, 1)
+				self.countdownText.Text = tostring(math.ceil(remaining))
+			else
+				self.countdownText.FontColor = Color(1, 1, 0, 1)
+				self.countdownText.Text = tostring(math.floor(remaining / 60))
+			end
+		end
+	end
+
+	method void ResetCooldown()
+		-- (리커버리 오로라) 남아있던 쿨타임을 즉시 초기화한다.
+		if not self:IsClient() then return end
+		if self._T.timerId then
+			self._T.summonUntil = 0
+			self._T.swapUntil = 0
+			self._T.remaining = 0
+			self:UpdateCooldownDisplay()
+		end
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+	end
+
+end

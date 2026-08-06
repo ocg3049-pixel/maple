@@ -29,6 +29,15 @@ script CharInfoManager extends Logic
 	property integer shurikenCritBonus = 0
 	property integer shurikenAtkSpeedStage = 0
 
+	-- (샤프 아이즈, 신궁 4차 2026-08-06) 버프 지속 중에만 얹히는 크리티컬 보너스.
+	--   · 크리티컬 확률: 분배 1포인트당 +1%p (마스터 30에서 +30) - CalcCritRate/UpdateStats에서 가산
+	--   · 크리티컬 데미지: 전 구간 공통 +8%p - CalcCritDamage/UpdateStats에서 가산
+	-- 발도술 중첩(battoCritBonus)과 같은 자리에 더해지되 별도 필드라 서로 겹쳐 적용된다.
+	-- ⚠ 두 값 모두 **클라 전용 상태**다(장비 잠재와 같은 이유) - 서버 판정에는 스킬 시전/버프 시작 시점의
+	--   SyncCritRate / SyncCritDamage로 밀어 넣는다(SkillManager.SyncSharpEyesStats).
+	property integer sharpEyesCritBonus = 0
+	property integer sharpEyesCritDmgBonus = 0
+
 	-- 스킬 포인트 투자로 얻는 상시 공격력 보너스. 지금은 "표창+"(포인트 1당 +2)만 쓴다.
 	-- 버프(buffAttackBonus)와 달리 켜고 끄는 것이 아니라 투자 포인트에 따라 고정으로 유지된다.
 	property integer skillAttackBonus = 0
@@ -295,11 +304,13 @@ script CharInfoManager extends Logic
 		-- (Phase 4) 기본 크리티컬 확률 50% → 10% (GDD §4.7) - 크확은 주로 잠재 옵션으로 쌓는 성장 축
 		-- (발도술) 처치 중첩 버프의 크확 보너스(+3%×중첩)를 스탯창에도 반영한다(CalcCritRate와 동일 가산).
 		-- (표창+ 개편) 고른 표창의 크확(5~9번 10~30%)도 함께 표시한다.
-		local critRate     = 10 + critAdd + self.battoCritBonus + self.shurikenCritBonus
+		-- (샤프 아이즈) 버프 지속 중 크확 보너스(+1%p×분배)도 함께 반영한다(CalcCritRate와 동일 가산).
+		local critRate     = 10 + critAdd + self.battoCritBonus + self.shurikenCritBonus + self.sharpEyesCritBonus
 		-- 크리티컬 데미지: 기본 125%(크리티컬 적중 시 데미지 100% -> 125%로 상승) + 장비 잠재능력의
 		-- "크리티컬 데미지 +N%" 옵션 합산. PlayerAttack.SyncCritDamage로 서버에 동기화되어 실제
 		-- 전투 데미지 계산(크리티컬 배율)에 그대로 반영된다.
-		local critDamage   = 125 + critDmgAdd
+		-- (샤프 아이즈) 버프 지속 중 +8%p(전 구간 공통)도 함께 반영한다(CalcCritDamage와 동일 가산).
+		local critDamage   = 125 + critDmgAdd + self.sharpEyesCritDmgBonus
 
 		-- Defense ignore: base 50% + additional compounded
 		local defIgnore = 100 - (1 - 0.5) * (1 - defIgnoreAdd / 100) * 100
@@ -603,21 +614,10 @@ script CharInfoManager extends Logic
 		return self.advancedSpearBusterEffectOn
 	end
 
-	-- 에로우 블로우 강화(1차): ON이면 에로우 블로우가 적중 지점에서 폭발해 최대 5명까지 시간차로 타격한다.
-	-- 어드밴스드 스피어 버스터와 동일하게 스킬을 슬롯에 배정해 쓰면 ON/OFF가 토글되는 클라 전용 상태다
-	-- (SkillManager가 시전 시 클라에서 읽어 enhanced 플래그를 서버로 넘긴다). 기본은 OFF.
-	property boolean arrowBlowEnhanceOn = false
-	method boolean IsArrowBlowEnhanceActive()
-		return self.arrowBlowEnhanceOn == true
-	end
-
-	@ExecSpace("ClientOnly")
-	method boolean ToggleArrowBlowEnhance()
-		-- 에로우 블로우 강화를 켜고 끈다. 토글 후 새 상태(true=ON)를 돌려준다.
-		self.arrowBlowEnhanceOn = not (self.arrowBlowEnhanceOn == true)
-		log("[CharInfoManager] 에로우 블로우 강화 " .. (self.arrowBlowEnhanceOn and "ON" or "OFF"))
-		return self.arrowBlowEnhanceOn
-	end
+	-- ⚠ (요청 2026-08-06) "에로우 블로우 강화"는 ON/OFF 토글 → **패시브**가 되어 이 클라 상태가
+	--   폐지됐다. 폭발 여부는 이제 SkillManager가 시전 시점에 투자 레벨(≥1)로 직접 판정한다.
+	--   토글 상태 프로퍼티/메서드(arrowBlowEnhanceOn / IsArrowBlowEnhanceActive /
+	--   ToggleArrowBlowEnhance)는 참조가 남지 않아 제거했다.
 
 	-- 암행(나이트로드 2차): 상시 패시브 → ON/OFF 토글 → (요청 2026-08-05) **지속시간이 있는 버프**로
 	-- 바뀌었다. 켜져 있는 동안만 온히트 그림자 표창이 발동한다.
@@ -635,38 +635,31 @@ script CharInfoManager extends Logic
 		log("[CharInfoManager] 암행 " .. (self.amhaengOn and "ON" or "OFF"))
 	end
 
-	-- 암행2(3차): 암행1과 같은 확률(5%)로 **독립적으로** 굴려, 몬스터 뒤쪽에 그림자를 소환해
-	-- 더블스탭 또는 새비지블로우를 쓰게 한다. 암행1과 마찬가지로 테스트용 ON/OFF 토글이다.
+	-- 암행2(3차): 암행1과 같은 확률로 **독립적으로** 굴려, 몬스터 뒤쪽에 그림자를 소환해
+	-- 더블스탭 또는 새비지블로우를 쓰게 한다.
+	-- (요청 2026-08-06) ON/OFF 토글 → 암행1과 **완전히 같은 지속시간 버프**로 전환했다.
+	-- ⚠ 지속시간 관리(타이머·버프바 표시·서버 통보)는 전부 SkillManager가 한다 - 여기는 "지금 켜져
+	--   있는가" 하나만 들고 있는다(암행1과 동일한 구조).
 	property boolean amhaeng2On = false
 	method boolean IsAmhaeng2Active()
 		return self.amhaeng2On == true
 	end
 
 	@ExecSpace("ClientOnly")
-	method boolean ToggleAmhaeng2()
-		-- 암행2를 켜고 끈다. 토글 후 새 상태(true=ON)를 돌려준다.
-		self.amhaeng2On = not (self.amhaeng2On == true)
+	method void SetAmhaeng2Active(boolean on)
+		-- 암행2 활성 상태를 그대로 지정한다(시전 시 true / 만료·취소 시 false).
+		self.amhaeng2On = (on == true)
 		log("[CharInfoManager] 암행2 " .. (self.amhaeng2On and "ON" or "OFF"))
-		return self.amhaeng2On
 	end
 
 	-- 백스탭(2차): 몬스터가 바라보는 방향의 뒤쪽에서 때리면 추가 데미지를 주는 스킬.
-	-- (요청) 테스트를 위해 지금은 암행과 동일한 ON/OFF 토글이다 - 나중에 "스킬을 보유하고만 있으면
-	-- 항상 발동"으로 바꿀 예정이므로, 발동 여부 판정을 이 한 곳(IsBackstabActive)에만 두어
-	-- 그때 이 메서드가 항상 true를 돌려주도록 고치면 되게 만들어 둔다.
-	-- 실제 뒤통수 판정/데미지 증가는 서버(PlayerAttack)에서 하므로, 토글 시 SkillManager가 RPC로
-	-- 서버에도 반영한다(암행과 동일한 구조).
-	property boolean backstabOn = false
+	-- (요청 2026-08-06) 테스트용 ON/OFF 토글 → **패시브**로 전환했다. 이제 배우기만 하면(투자 1 이상)
+	-- 항상 발동하고, 퀵슬롯에도 올릴 수 없다(SkillManager.IsPassiveSkillName).
+	-- ⚠ 발동 여부 판정은 이 메서드 한 곳에만 둔다 - 서버 스위치(RequestSetBackstabState)의 on 인자는
+	--   전부 "투자 레벨 ≥ 1"에서 나오므로, 여기 backstabOn 상태는 더 이상 쓰지 않는다.
+	--   실제 뒤통수 판정/데미지 증가는 서버(PlayerAttack.ApplyBackstabBonus)가 담당한다.
 	method boolean IsBackstabActive()
-		return self.backstabOn == true
-	end
-
-	@ExecSpace("ClientOnly")
-	method boolean ToggleBackstab()
-		-- 백스탭을 켜고 끈다. 토글 후 새 상태(true=ON)를 돌려준다.
-		self.backstabOn = not (self.backstabOn == true)
-		log("[CharInfoManager] 백스탭 " .. (self.backstabOn and "ON" or "OFF"))
-		return self.backstabOn
+		return _SkillManager:GetHeroSkillLevelByName("백스탭") >= 1
 	end
 
 	-- 매직 에로우(3차 토글 3종): 매직 미사일의 속성 강화 상태. ""=무속성(기본), "light"=빛(노랑·하양),
@@ -847,7 +840,8 @@ script CharInfoManager extends Logic
 		-- (Phase 4) 기본 크리티컬 확률 50% → 10% (GDD §4.7)
 		-- (발도술) 처치 중첩 버프의 크확 보너스(+3%×중첩) 가산 - 스킬 시전/기본공격 동기화 모두 이 값을 탄다.
 		-- (표창+ 개편) 고른 표창의 크확(5~9번 10~30%) 가산.
-		return 10 + critAdd + self.battoCritBonus + self.shurikenCritBonus
+		-- (샤프 아이즈) 버프 지속 중 크확 보너스(+1%p×분배) 가산.
+		return 10 + critAdd + self.battoCritBonus + self.shurikenCritBonus + self.sharpEyesCritBonus
 	end
 
 	-- (Phase 4) 잠재 "스킬 재사용 대기시간 -N초" 옵션의 합산 초. SkillManager.ApplyCooldownReduction이
@@ -890,7 +884,46 @@ script CharInfoManager extends Logic
 				end
 			end
 		end
-		return 125 + critDmgAdd
+		-- (샤프 아이즈) 버프 지속 중 크리티컬 데미지 +8%p(전 구간 공통) 가산.
+		return 125 + critDmgAdd + self.sharpEyesCritDmgBonus
+	end
+
+	-- (샤프 아이즈, 신궁 4차 2026-08-06) 버프 시작/갱신. 발도술 프록(UseBattoAtkSpeed)과 같은 토큰 패턴 -
+	-- 재시전하면 이전 적용을 정확히 되돌린 뒤 새로 건다(중복 가산 방지).
+	-- ⚠ 지속시간이 끝나면 이 안의 타이머가 스스로 CancelSharpEyes를 부른다 - 버프바 표시(SharpEyesBuffUI)와
+	--   서버 동기화(SkillManager)는 각자 자기 만료 경로에서 처리한다.
+	@ExecSpace("ClientOnly")
+	method void UseSharpEyes(number remain, integer critRateBonus, integer critDmgBonus)
+		self.sharpEyesCritBonus = critRateBonus
+		self.sharpEyesCritDmgBonus = critDmgBonus
+		self._T.sharpEyesActive = true
+		log("[CharInfo] 샤프 아이즈 - 크확 +" .. tostring(critRateBonus) .. "% / 크뎀 +" .. tostring(critDmgBonus)
+			.. "% (" .. string.format("%.0f", remain) .. "초)")
+		local cwSE = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwSE) and cwSE.Enable then
+			self:UpdateStats()
+		end
+		self._T.sharpEyesToken = (self._T.sharpEyesToken or 0) + 1
+		local mySEToken = self._T.sharpEyesToken
+		_TimerService:SetTimerOnce(function()
+			if self._T.sharpEyesToken ~= mySEToken then return end
+			self:CancelSharpEyes()
+		end, remain)
+	end
+
+	-- 샤프 아이즈 원복(만료/우클릭 취소 공용). 어느 경로가 먼저 와도 한 번만 되돌린다.
+	@ExecSpace("ClientOnly")
+	method void CancelSharpEyes()
+		if not self._T.sharpEyesActive then return end
+		self._T.sharpEyesToken = (self._T.sharpEyesToken or 0) + 1
+		self.sharpEyesCritBonus = 0
+		self.sharpEyesCritDmgBonus = 0
+		self._T.sharpEyesActive = false
+		log("[CharInfo] 샤프 아이즈 종료 - 크확/크뎀 원복")
+		local cwSE2 = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cwSE2) and cwSE2.Enable then
+			self:UpdateStats()
+		end
 	end
 
 	-- Standalone combat-power number (same formula as UpdateStats' "Combat" stat), for callers that only need the number (e.g. UIMyInfoManager's world HUD level).
@@ -1131,6 +1164,18 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method integer GetDisplayLevel()
 		return self:GetLevelForEquipCP(self:CalcEquipCombatPower())
+	end
+
+	-- GetLevelForEquipCP의 **역함수** - 그 레벨에 요구되는 장비 전투력(레벨 곡선 값)을 돌려준다.
+	-- (요청 2026-08-07) 소환수(용사)의 "레벨에 맞는 전투력"을 구하는 데 쓴다 - 구 사양의
+	-- "레벨 × 10"은 레벨 곡선과 무관한 선형값이라 고레벨에서 실제 전투력의 1/1000 수준이었다.
+	@ExecSpace("ClientOnly")
+	method number GetEquipCPForLevel(integer level)
+		self:GetLevelForEquipCP(0)   -- 곡선 캐시 보장(최초 1회 CSV 로드)
+		local curve = self._T.levelCurve
+		if curve == nil then return 0 end
+		local lv = math.max(1, math.min(math.floor(level), 200))
+		return curve[lv] or 0
 	end
 
 	-- Returns starforce flat bonus stats table {str, dex, int, luk, atk}
