@@ -1,0 +1,194 @@
+@Component
+script ArrowBombProjectile extends Component
+
+	-- 에로우 봄(신궁·보우마스터 2차, 2026-08-07 신설). 구조는 **강화 에로우 블로우와 같다** -
+	-- 화살 한 발이 날아가 처음 맞은 적에게서 폭발하고, 폭발 반경 안의 적을 추가로 때린다.
+	-- 다른 점은 연출뿐이다:
+	--   · 직격 대상  = 폭발 프레임 0~8을 70ms 간격으로 재생(원본 클래식 아트 9장)
+	--   · 주변 대상  = sub1~4를 90/100/110/120ms 간격으로 재생(4장)
+	-- 아트는 사용자 제공 원본을 **WZ 원점 기준으로 패딩 정렬**해 직접 업로드했다
+	-- (원본/RUID 대응표: msw-dev-tools/resources/에로우봄/RUID.md).
+
+	property number Speed = 9
+
+	-- 사거리 = Speed × MaxLifetime. (요청 2026-08-07) 1.5초(13.5유닛 - 화면 가로보다 길다)는
+	-- 너무 멀다 → 0.6초 = **5.4유닛**(화면 가로의 약 40%). 에로우 블로우도 같은 값으로 맞췄다.
+	property number MaxLifetime = 0.6
+
+	property number CombatPower = 0
+
+	-- 캐릭터 정보창의 실제 크리티컬 확률(%) - PlayerAttack이 발사 시점에 채워준다. CalcDamage는 서버에서
+	-- 실행되는데 장비 잠재능력은 클라이언트 전용 상태라 서버가 직접 읽을 수 없어, 발사한 플레이어가
+	-- 동기화해둔 값을 그대로 넘겨받는다(에로우 블로우와 동일한 방식).
+	property number CritRate = 50
+
+	-- 발사한 플레이어의 "현재" 데미지 스킨 RUID. 비어 있으면 공용 기본 히트 스킨으로 폴백한다.
+	property string DamageSkinRUID = ""
+
+	-- 데미지 배율. 1레벨 150%~170%이고 분배 1포인트당 최소·최대에 각각 +0.1이 더해진 값을
+	-- PlayerAttack이 발사 시점에 새겨준다(공식 한 곳: SkillManager.GetArrowBombRate*).
+	property number RateMin = 1.5
+	property number RateMax = 1.7
+
+	-- 폭발 지점 기준으로 추가 타격 대상을 찾는 반경(world unit).
+	property number BlastRadius = 2.0
+
+	-- 폭발로 맞힐 수 있는 최대 인원(첫 명중 대상 포함).
+	property integer BlastMaxTargets = 6
+
+	-- 폭발 이펙트 크기 배율. 업로드 원본이 250x227(=2.5x2.27 유닛)로 큰 편이라 줄여서 쓴다.
+	property number EffectScale = 0.7
+
+	@Sync
+	property boolean Fired = false
+
+	method void OnBeginPlay()
+		-- 발사 상태 초기화(서버 전용 필드).
+		if self:IsServer() then
+			self._T.lifetime = 0
+			self._T.dirX = 1
+			self._T.dirY = 0
+			self._T.hit = false
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire(number dirX, number dirY)
+		-- 정규화된 방향 벡터를 받아 발사 시작. 원본 화살 그림은 **머리(폭탄)가 -x쪽(왼쪽)**을 향하고
+		-- 깃이 오른쪽에 있다(실측: /tmp 확대 이미지로 확인) - 에로우 블로우와 같은 규격이라
+		-- 각도에 180도를 더해 보정한다.
+		self._T.dirX = dirX
+		self._T.dirY = dirY
+		self.Entity.TransformComponent.ZRotation = math.deg(math.atan(dirY, dirX)) + 180
+		self.Fired = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasHit()
+		-- 이 화살이 이미 한 명을 맞혔는지. 명중 후에는 직격 판정을 막는다.
+		return self._T.hit == true
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity GetBlastTarget()
+		-- 폭발 추가 타격이 "지금 이 한 번의 판정에서" 통과시킬 단일 대상.
+		-- (밀집 지역에서 '목록 포함' 방식으로 필터링하면 이웃까지 겹쳐 맞으므로 단일 포인터 방식을 쓴다.)
+		return self._T.blastTarget
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkHit(Entity defender)
+		-- 명중 확정(ArrowBombProjectileAttack.CalcDamage가 호출) → 그 자리에서 폭발한다.
+		self._T.hit = true
+		self:StartBlast(defender)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void StartBlast(Entity firstTarget)
+		-- 폭발 처리:
+		--  (1) 직격 대상 위에 폭발 프레임 0~8 재생(70ms 간격)
+		--  (2) 반경 안의 다른 적을 (BlastMaxTargets - 1)명까지 골라 각각 sub1~4 재생 + 추가 타격
+		if self._T.blast then return end
+		self._T.blast = true
+
+		local spr = self.Entity.SpriteRendererComponent
+		if isvalid(spr) then spr.Enable = false end
+
+		---@type ArrowBombProjectileAttack
+		local ac = self.Entity:GetComponent("script.ArrowBombProjectileAttack")
+		if ac ~= nil and isvalid(firstTarget) then
+			ac:PlayMainBlastEffect(firstTarget, self.EffectScale)
+		end
+
+		-- 추가 타격 대상 선정 - 첫 명중 대상은 이미 데미지를 입었으므로 제외하고,
+		-- 폭발 반경 안에서 가까운 순으로 고른다.
+		local pos = self.Entity.TransformComponent.WorldPosition
+		local bx, by = pos.x, pos.y
+		local extra = {}
+		local map = self.Entity.CurrentMap
+		if isvalid(map) then
+			local comps = map:GetChildComponentsByTypeName("script.Monster", true)
+			local cands = {}
+			for _, c in ipairs(comps) do
+				---@type Monster
+				local mc = c
+				if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead and mc.Entity ~= firstTarget then
+					local mp = mc.Entity.TransformComponent.WorldPosition
+					local dx = mp.x - bx
+					local dy = mp.y - by
+					local d = math.sqrt(dx * dx + dy * dy)
+					if d <= self.BlastRadius then
+						table.insert(cands, { entity = mc.Entity, dist = d })
+					end
+				end
+			end
+			table.sort(cands, function(a, b) return a.dist < b.dist end)
+			local maxExtra = self.BlastMaxTargets - 1
+			for i = 1, math.min(#cands, maxExtra) do
+				table.insert(extra, cands[i].entity)
+			end
+		end
+
+		-- ⚠ (요청 2026-08-07) 주변 적은 **직격과 동시에** 맞아야 한다 - 에로우 블로우 강화가 쓰는
+		--   "0.2~0.3초에 걸쳐 한 명씩" 순차 타격을 여기서는 쓰지 않고 같은 프레임에 전부 처리한다.
+		--   대상마다 단일 포인터(blastTarget)를 세운 채로 한 번씩 판정하므로 순차가 아니어도
+		--   이웃까지 겹쳐 맞지는 않는다.
+		for i = 1, #extra do
+			self:DealBlastHit(extra[i])
+		end
+
+		-- 이펙트가 끝난 뒤에 화살 엔티티를 정리한다(예약된 타이머가 이 컴포넌트를 쓰므로
+		-- 그 전에 파괴하면 안 된다). 직격 폭발 9프레임(0.63초) + 페이드를 감안해 넉넉히 잡는다.
+		local cleanupAt = 1.2
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then _EntityService:Destroy(self.Entity) end
+		end, cleanupAt)
+
+		log("[ArrowBomb] 폭발 pos=(" .. string.format("%.2f", bx) .. "," .. string.format("%.2f", by)
+			.. ") 추가대상=" .. tostring(#extra) .. "명 (첫 명중 포함 총 " .. tostring(#extra + 1) .. "명)")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DealBlastHit(Entity target)
+		-- 폭발 추가 타격 1회. 단일 CurrentTarget 포인터를 세운 채로 그 대상 위치에 판정을 한 번 낸다.
+		if not isvalid(self.Entity) then return end
+		if not isvalid(target) then return end
+		---@type ArrowBombProjectileAttack
+		local ac = self.Entity:GetComponent("script.ArrowBombProjectileAttack")
+		if ac == nil then return end
+		local tp = target.TransformComponent.WorldPosition
+		local ty = tp.y
+		local thc = target.HitComponent
+		if isvalid(thc) then ty = ty + thc.ColliderOffset.y end
+		self._T.blastTarget = target
+		ac:AttackFrom(Vector2(0.8, 0.8), Vector2(tp.x, ty), "skill.arrowbomb.blast", CollisionGroups.HitBox)
+		self._T.blastTarget = nil
+		-- 주변 적은 sub1~4 폭발을 본다(직격은 0~8을 이미 재생 중이라 겹치지 않게 생략).
+		ac:PlaySubBlastEffect(target, self.EffectScale)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		if not self.Fired then return end
+
+		-- 명중 후에는 폭발 연출/추가 타격이 끝날 때까지 이 자리에 남아야 하므로(StartBlast가 예약한
+		-- 타이머들이 이 컴포넌트를 쓴다) 파괴하지 않고 이동/판정만 멈춘다.
+		if self._T.hit then return end
+
+		self._T.lifetime = self._T.lifetime + delta
+		if self._T.lifetime >= self.MaxLifetime then
+			_EntityService:Destroy(self.Entity)
+			return
+		end
+
+		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * delta, self._T.dirY * self.Speed * delta)
+
+		---@type ArrowBombProjectileAttack
+		local ac = self.Entity:GetComponent("script.ArrowBombProjectileAttack")
+		if ac ~= nil then
+			local pos = self.Entity.TransformComponent.Position
+			ac:AttackFast(CircleShape(Vector2(pos.x, pos.y), 0.3), "skill.arrowbomb", CollisionGroups.HitBox)
+		end
+	end
+
+end

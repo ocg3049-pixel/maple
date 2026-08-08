@@ -1,0 +1,113 @@
+@Logic
+@ExecSpace("ClientOnly")
+script MagicMissileCooldownUI extends Logic
+
+	-- 매직 미사일(1차) 쿨타임(5초) 표시. HolyMagicShellCooldownUI 복제 - 스킬이 배정된 퀵슬롯
+	-- 아이콘 위에 검은 오버레이가 덮이고, 시간이 지날수록 위에서부터 밝아지면서 남은 시간이
+	-- 숫자로 뜬다. UUID는 UIBuilder가 write bind로 주입한다.
+	--
+	-- (비숍 개편 2026-08-08 신설) 매직 미사일에 재사용 대기시간 5초가 생기면서 추가됐다.
+	-- 쿨타임 값은 SkillManager.GetMagicMissileCooldown 한 곳에서 나온다.
+	-- ⚠ 리커버리 오로라 안에서는 쿨타임을 걸지 않으므로 이 UI도 호출되지 않는다(다른 쿨타임 스킬과 동일).
+
+	property SpriteGUIRendererComponent grayOverlay = "d443bc5e-daad-4080-ac9c-995caa730155"
+	property TextComponent countdownText = "68ae83b6-eed3-451d-8495-34ed6d167eca"
+
+	method void ShowCooldown(number duration, string slotKey)
+		-- slotKey = 퀵슬롯 위치 접미사(Slot_<위치>). 오버레이/텍스트를 그 슬롯 위로 옮긴 뒤 카운트다운 시작.
+		if not self:IsClient() then return end
+		if duration <= 0 then return end
+		self._T.totalDuration = duration
+		self._T.remaining = duration
+		self._T.slotKey = slotKey
+
+		-- 오버레이 스프라이트를 .ui에 Filled로 저장하면 렌더링되지 않는 문제가 있어(프로젝트 공통),
+		-- 저장은 Simple로 하고 런타임에 매번 Filled/Vertical로 바꿔준다.
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Type = ImageType.Filled
+			self.grayOverlay.FillMethod = FillMethodType.Vertical
+		end
+
+		local slotEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_" .. tostring(slotKey))
+		if isvalid(slotEnt) then
+			local slotPos = slotEnt.UITransformComponent.anchoredPosition
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.UITransformComponent.anchoredPosition = Vector2(slotPos.x, slotPos.y + 4)
+			end
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.Entity.Enable = true
+		end
+		if isvalid(self.countdownText) then
+			self.countdownText.Entity.Enable = true
+		end
+
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+
+		local preTime = _UtilLogic.ElapsedSeconds
+		self._T.timerId = _TimerService:SetTimerRepeat(function()
+			local now = _UtilLogic.ElapsedSeconds
+			local delta = now - preTime
+			preTime = now
+			self._T.remaining = self._T.remaining - delta
+			self:UpdateCooldownDisplay()
+		end, 1 / 60)
+
+		self:UpdateCooldownDisplay()
+		log("[MagicMissileCooldownUI] 쿨타임 표시 시작 duration=" .. tostring(duration) .. " slot=" .. tostring(slotKey))
+	end
+
+	method void UpdateCooldownDisplay()
+		-- 매 프레임 남은 시간에 따라 오버레이(FillAmount)/카운트다운 텍스트를 갱신한다.
+		local remaining = self._T.remaining
+		local total = self._T.totalDuration
+
+		if remaining <= 0 then
+			if self._T.timerId then
+				_TimerService:ClearTimer(self._T.timerId)
+				self._T.timerId = nil
+			end
+			if isvalid(self.grayOverlay) then
+				self.grayOverlay.Entity.Enable = false
+			end
+			if isvalid(self.countdownText) then
+				self.countdownText.Entity.Enable = false
+			end
+			-- 쿨타임 완료: 슬롯 아이콘 2번 깜빡임으로 재사용 가능 알림(모든 쿨타임 스킬 공통).
+			_SkillManager:BlinkSlotReady(self._T.slotKey or "")
+			return
+		end
+
+		if isvalid(self.grayOverlay) then
+			self.grayOverlay.FillAmount = math.max(0, math.min(1, remaining / total))
+		end
+		if isvalid(self.countdownText) then
+			-- 쿨타임이 5초라 언제나 초 단위로만 보여준다.
+			self.countdownText.FontColor = Color(1, 1, 1, 1)
+			self.countdownText.Text = tostring(math.ceil(remaining))
+		end
+	end
+
+	method void ResetCooldown()
+		-- (리커버리 오로라) 오로라 안으로 들어오면 남아있던 쿨타임을 즉시 초기화한다. 남은 시간을 0으로
+		-- 만들어 UpdateCooldownDisplay가 오버레이/텍스트를 끄고 재사용 가능 깜빡임을 띄우게 한다.
+		if not self:IsClient() then return end
+		if self._T.timerId then
+			self._T.remaining = 0
+			self:UpdateCooldownDisplay()
+		end
+	end
+
+	method void OnEndPlay()
+		if self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+		end
+	end
+
+end

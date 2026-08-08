@@ -1,0 +1,138 @@
+@Logic
+script MpManager extends Logic
+
+	-- ── MP 자원 (2026-08-08 신설) ────────────────────────────────────────
+	-- 이 프로젝트에는 지금까지 MP가 **표시 전용**으로만 있었다(MapleHUDManager.displayMaxMp = 50 -
+	-- 게이지가 항상 가득 찬 채 "50 / 50"만 찍혔고, CharInfoManager 상태창은 "0 / 0"이었다).
+	-- 비숍 개편에서 텔레포트에 소모 MP가 생기면서 실제 자원으로 승격시킨 것이 이 Logic이다.
+	--
+	-- 설계 원칙 (이 프로젝트의 다른 스탯과 같은 계열로 맞췄다)
+	--   · **클라이언트 전용 상태**다. 최대치의 근거인 레벨(GetDisplayLevel)이 장비 전투력에서
+	--     환산되는 클라 전용 값이라 서버에는 대응 데이터가 아예 없다 - 인벤토리/공격속도 단계와 같은 이유.
+	--     서버가 MP를 알아야 하는 경우는 없다(소모 판정은 시전 직전 클라에서 끝난다).
+	--   · **저장하지 않는다.** 자연 회복이 있어 접속할 때마다 가득 찬 상태로 시작하면 충분하고,
+	--     세이브 포맷(CharacterPersistence)을 건드리지 않아도 된다.
+	--   · @Logic인 이유: 맵을 옮겨도 유지돼야 하는 세션 자원이다(맵 스코프가 아니다).
+	--
+	-- ⚠ @Logic에는 OnMapEnter/OnMapLeave가 오지 않는다 - 맵 이동 시 별도 처리가 필요 없도록
+	--   회복 타이머 하나로만 굴러가게 짜여 있다.
+
+	-- 현재 MP. 최대치는 레벨에서 매번 계산하므로 별도 프로퍼티를 두지 않는다
+	-- (레벨이 오르면 최대치만 늘고 현재치는 그대로 → 자연 회복으로 채워진다).
+	property number currentMp = 0
+
+	property integer regenTimerId = 0
+
+	-- 최대 MP 기본값(레벨 0 기준). 레벨당 증가분과 함께 이 두 상수가 최대치 공식의 전부다.
+	-- ⚠ (버그 수정 2026-08-08) 레벨당 +10은 **너무 컸다**. 레벨 137에서 최대 1420이 되는데 텔레포트
+	--   소모는 레벨과 무관한 10 고정이라, 한 번 써도 게이지가 0.7%밖에 안 줄어 "소모가 안 보인다"는
+	--   신고가 났다(신고 문구: "mp를 소모해도 바로 풀로 찬다"). 레벨당 +1로 낮춰 10 MP가 체감되게 한다
+	--   (레벨 137 → 187, 텔레포트 1회 = 게이지의 5.3%).
+	property integer mpBase = 50
+	property integer mpPerLevel = 1
+
+	-- 자연 회복 속도: 1초에 최대 MP의 몇 %를 채우는가.
+	-- ⚠ (버그 수정 2026-08-08) 3%/초는 소모 속도를 완전히 앞질렀다. 텔레포트는 자체 쿨 0.54초라
+	--   초당 약 1.85회(=18.5 MP/초) 쓸 수 있는데, 구 설정은 초당 42 MP를 채워 아무리 써도 항상 가득이었다.
+	--   2%/초로 낮춰(187 기준 3.7 MP/초) 연타하면 실제로 바닥나게 한다.
+	property number regenPercentPerSecond = 2.0
+
+	-- 회복 타이머 주기(초). 0.25초마다 조금씩 채워야 게이지가 뚝뚝 끊기지 않는다.
+	property number regenTickSeconds = 0.25
+
+	-- MP를 쓴 뒤 자연 회복이 다시 시작되기까지의 지연(초).
+	-- (버그 수정 2026-08-08) 지연이 없으면 소모한 그 다음 틱(0.25초)에 곧바로 되채워져 게이지가
+	-- 깜빡이지도 않는다. 연타 중에는 회복이 멈춰야 "쓰고 있다"는 게 보인다.
+	-- ⚠ 지연은 **자연 회복에만** 걸린다 - 포션/스킬 회복(RestoreMp)은 즉시 들어가야 한다.
+	property number regenDelaySeconds = 2.0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- MP를 가득 채운 상태로 시작하고 자연 회복 타이머를 건다.
+		self.currentMp = self:GetMaxMp()
+		self.regenTimerId = _TimerService:SetTimerRepeat(self.RegenTick, self.regenTickSeconds, self.regenTickSeconds)
+		log("[MpManager] OnBeginPlay - MP " .. tostring(math.floor(self.currentMp)) .. " / " .. tostring(self:GetMaxMp()))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 회복 타이머 해제(OnBeginPlay에서 건 것을 반드시 짝지어 푼다).
+		if self.regenTimerId ~= 0 then
+			_TimerService:ClearTimer(self.regenTimerId)
+			self.regenTimerId = 0
+		end
+	end
+
+	-- 최대 MP: 50 + 레벨 × 1 (레벨 10에서 60, 레벨 137에서 187, 레벨 200에서 250).
+	@ExecSpace("ClientOnly")
+	method integer GetMaxMp()
+		-- 레벨은 장비 전투력 환산 표시 레벨(GetDisplayLevel) - 이 프로젝트에서 "레벨"의 단일 진입점이다.
+		local level = _CharInfoManager:GetDisplayLevel()
+		return self.mpBase + self.mpPerLevel * math.max(0, math.floor(level))
+	end
+
+	-- 현재 MP(정수로 내림 - 표시/소모 판정 모두 이 값을 쓴다).
+	@ExecSpace("ClientOnly")
+	method integer GetCurrentMp()
+		-- 내부적으로는 소수로 회복되지만 밖에서는 항상 정수로 보인다.
+		local maxMp = self:GetMaxMp()
+		return math.max(0, math.min(maxMp, math.floor(self.currentMp)))
+	end
+
+	-- 소모 시도. MP가 부족하면 **아무것도 하지 않고 false**를 돌려준다(호출부가 시전을 취소한다).
+	@ExecSpace("ClientOnly")
+	method boolean TryConsumeMp(integer cost)
+		-- cost가 0 이하면 소모 없이 통과 - MP를 안 쓰는 스킬이 이 게이트를 지나가도 안전하다.
+		local need = math.max(0, math.floor(cost))
+		if need <= 0 then return true end
+		if self:GetCurrentMp() < need then
+			log("[MpManager] MP 부족 - 필요 " .. tostring(need) .. " / 보유 " .. tostring(self:GetCurrentMp()))
+			return false
+		end
+		self.currentMp = math.max(0, self.currentMp - need)
+		-- 소모 직후에는 자연 회복을 잠시 멈춘다(연타 중 게이지가 실제로 줄어들도록).
+		self._T.regenBlockedUntil = _UtilLogic.ElapsedSeconds + self.regenDelaySeconds
+		self:RefreshHud()
+		log("[MpManager] MP 소모 " .. tostring(need) .. " → 잔여 " .. tostring(self:GetCurrentMp()) .. " / " .. tostring(self:GetMaxMp()))
+		return true
+	end
+
+	-- MP 회복(포션/스킬용 공개 진입점). 최대치를 넘지 않는다.
+	@ExecSpace("ClientOnly")
+	method void RestoreMp(number amount)
+		-- 음수가 들어오면 소모가 되어버리므로 0 미만은 무시한다.
+		if amount == nil or amount <= 0 then return end
+		local maxMp = self:GetMaxMp()
+		self.currentMp = math.min(maxMp, self.currentMp + amount)
+		self:RefreshHud()
+	end
+
+	-- 즉시 가득 채운다(캐릭터 입장/부활 등).
+	@ExecSpace("ClientOnly")
+	method void FillMp()
+		-- 레벨이 바뀐 직후에도 그 시점의 최대치로 맞춰진다.
+		self.currentMp = self:GetMaxMp()
+		self:RefreshHud()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RegenTick()
+		-- 0.25초마다 최대 MP의 (regenPercentPerSecond% × 0.25초)만큼 채운다. 가득이면 아무것도 하지 않는다.
+		local maxMp = self:GetMaxMp()
+		if self.currentMp >= maxMp then
+			self.currentMp = maxMp
+			return
+		end
+		-- 소모 직후 회복 지연 중이면 이번 틱은 건너뛴다(RestoreMp는 이 게이트를 타지 않는다).
+		if (self._T.regenBlockedUntil or 0) > _UtilLogic.ElapsedSeconds then return end
+		self.currentMp = math.min(maxMp, self.currentMp + maxMp * (self.regenPercentPerSecond / 100) * self.regenTickSeconds)
+		self:RefreshHud()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshHud()
+		-- 하단 HUD의 MP 게이지/숫자를 즉시 갱신한다. HUD는 0.25초 주기로도 스스로 갱신하지만,
+		-- 소모는 그 사이에 일어나면 반 박자 늦게 보이므로 여기서 바로 밀어준다.
+		_MapleHUDManager:UpdateMpBar()
+	end
+end

@@ -1,0 +1,194 @@
+@Component
+script MiniMapUIManager extends Component
+
+	-- 좌측 상단 미니맵(요청 2026-08-08): 현재 맵의 발판(밝은 선)·벽(어두운 선)과
+	-- 몬스터(빨강)/소환수(초록)/플레이어(노랑) 위치를 실시간 표시한다.
+	-- 전용 UI 그룹(MiniMapUI)에 미리 만들어 둔 풀 엔티티를 재배치하는 방식이라
+	-- UI 엔티티를 런타임에 생성하지 않는다(대량 엔티티 함정 회피).
+	-- 클라이언트 전용: 미니맵은 각자 화면 표시일 뿐 서버 상태가 없다.
+
+	property integer FhPool = 120                -- 발판 선 풀 크기(.ui의 FH_N 개수와 일치)
+	property integer MobPool = 40                -- 몬스터 점 풀 크기
+	property integer SumPool = 8                 -- 소환수 점 풀 크기
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- 풀 엔티티 캐시. 컨트롤러는 그룹 루트의 자식이라 부모(루트) 밑 Board에서 찾는다.
+		local root = self.Entity.Parent
+		if not isvalid(root) then return end
+		local board = root:GetChildByName("Board", false)
+		if not isvalid(board) then
+			log_warning("[MiniMap] Board 엔티티를 찾지 못함")
+			return
+		end
+		self._T.board = board
+		self._T.fhPool = {}
+		for i = 1, self.FhPool do
+			self._T.fhPool[i] = board:GetChildByName("FH_" .. tostring(i), false)
+		end
+		self._T.mobPool = {}
+		for i = 1, self.MobPool do
+			self._T.mobPool[i] = board:GetChildByName("MOB_" .. tostring(i), false)
+		end
+		self._T.sumPool = {}
+		for i = 1, self.SumPool do
+			self._T.sumPool[i] = board:GetChildByName("SUM_" .. tostring(i), false)
+		end
+		self._T.ply = board:GetChildByName("PLY", false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 0.2초마다 갱신(마커 이동은 이 주기로 충분하고, 매 프레임 갱신은 낭비).
+		self._T.acc = (self._T.acc or 0) + delta
+		if self._T.acc < 0.2 then return end
+		self._T.acc = 0
+		if not isvalid(self._T.board) then return end
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		local map = player.CurrentMap
+		if not isvalid(map) then return end
+		-- 맵이 바뀌면 발판 레이아웃을 다시 그린다(발판은 정적이라 맵 전환 때만).
+		if self._T.builtMap ~= map then
+			self:RebuildFootholds(map)
+		end
+		self:UpdateMarkers(map, player)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RebuildFootholds(Entity map)
+		-- 발판 전체(GetFootholdAll)의 경계를 재서 보드 안에 비율 유지로 축소해 그린다.
+		local fhComp = map.FootholdComponent
+		local all = isvalid(fhComp) and fhComp:GetFootholdAll() or nil
+		local list = {}
+		local minX, maxX, minY, maxY = math.huge, -math.huge, math.huge, -math.huge
+		for _, f in ipairs(all or {}) do
+			local sp = f.StartPoint
+			local ep = f.EndPoint
+			minX = math.min(minX, sp.x, ep.x)
+			maxX = math.max(maxX, sp.x, ep.x)
+			minY = math.min(minY, sp.y, ep.y)
+			maxY = math.max(maxY, sp.y, ep.y)
+			table.insert(list, f)
+		end
+		if #list == 0 then
+			-- 발판 없는 맵: 전부 숨긴다.
+			for i = 1, self.FhPool do
+				local e = self._T.fhPool[i]
+				if isvalid(e) then e.Enable = false end
+			end
+			self._T.builtMap = map
+			self._T.mapScale = nil
+			return
+		end
+		-- 풀보다 발판이 많으면 긴 것부터 그린다(짧은 조각 생략이 지형 윤곽 훼손이 가장 적다).
+		table.sort(list, function(a, b) return a.Length > b.Length end)
+		local bs = self._T.board.UITransformComponent.RectSize
+		local w = bs.x - 16
+		local h = bs.y - 16
+		local spanX = math.max(0.1, maxX - minX)
+		local spanY = math.max(0.1, maxY - minY)
+		local scale = math.min(w / spanX, h / spanY)
+		local cx = (minX + maxX) * 0.5
+		local cy = (minY + maxY) * 0.5
+		self._T.mapScale = scale
+		self._T.mapCx = cx
+		self._T.mapCy = cy
+		self._T.halfW = w * 0.5
+		self._T.halfH = h * 0.5
+		for i = 1, self.FhPool do
+			local ent = self._T.fhPool[i]
+			if isvalid(ent) then
+				local f = list[i]
+				if f ~= nil then
+					local sp = f.StartPoint
+					local ep = f.EndPoint
+					local dx = ep.x - sp.x
+					local dy = ep.y - sp.y
+					local ut = ent.UITransformComponent
+					ut.anchoredPosition = Vector2(((sp.x + ep.x) * 0.5 - cx) * scale, ((sp.y + ep.y) * 0.5 - cy) * scale)
+					ut.RectSize = Vector2(math.max(2, math.sqrt(dx * dx + dy * dy) * scale), 2)
+					ut.ZRotation = math.deg(math.atan(dy, dx))
+					local spr = ent.SpriteGUIRendererComponent
+					if isvalid(spr) then
+						if f.IsBlockVerticalLine then
+							spr.Color = Color(1, 1, 1, 0.22)          -- 벽: 어둡게
+						else
+							spr.Color = Color(0.86, 0.90, 0.93, 0.62) -- 발판: 밝은 회백
+						end
+					end
+					ent.Enable = true
+				else
+					ent.Enable = false
+				end
+			end
+		end
+		self._T.builtMap = map
+		log("[MiniMap] 발판 레이아웃 갱신 - " .. tostring(#list) .. "개")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateMarkers(Entity map, Entity player)
+		local scale = self._T.mapScale
+		if scale == nil then return end
+		local cx = self._T.mapCx
+		local cy = self._T.mapCy
+		local hw = self._T.halfW
+		local hh = self._T.halfH
+		-- 몬스터(빨강): 살아있는 것만.
+		local mobs = map:GetChildComponentsByTypeName("script.Monster", true)
+		local mi = 0
+		for _, comp in ipairs(mobs or {}) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and mc.Entity.Enable and not mc.IsDead then
+				mi = mi + 1
+				if mi > self.MobPool then break end
+				local e = self._T.mobPool[mi]
+				if isvalid(e) then
+					local wp = mc.Entity.TransformComponent.WorldPosition
+					e.UITransformComponent.anchoredPosition = Vector2(
+						math.max(-hw, math.min(hw, (wp.x - cx) * scale)),
+						math.max(-hh, math.min(hh, (wp.y - cy) * scale)))
+					e.Enable = true
+				end
+			end
+		end
+		for i = math.min(mi, self.MobPool) + 1, self.MobPool do
+			local e = self._T.mobPool[i]
+			if isvalid(e) then e.Enable = false end
+		end
+		-- 소환수(초록): 용사/궁수/도적 소환(HeroSummon 컴포넌트).
+		local sums = map:GetChildComponentsByTypeName("script.HeroSummon", true)
+		local si = 0
+		for _, comp in ipairs(sums or {}) do
+			local sc = comp
+			if isvalid(sc) and isvalid(sc.Entity) then
+				si = si + 1
+				if si > self.SumPool then break end
+				local e = self._T.sumPool[si]
+				if isvalid(e) then
+					local wp = sc.Entity.TransformComponent.WorldPosition
+					e.UITransformComponent.anchoredPosition = Vector2(
+						math.max(-hw, math.min(hw, (wp.x - cx) * scale)),
+						math.max(-hh, math.min(hh, (wp.y - cy) * scale)))
+					e.Enable = true
+				end
+			end
+		end
+		for i = math.min(si, self.SumPool) + 1, self.SumPool do
+			local e = self._T.sumPool[i]
+			if isvalid(e) then e.Enable = false end
+		end
+		-- 플레이어(노랑).
+		local ply = self._T.ply
+		if isvalid(ply) then
+			local wp = player.TransformComponent.WorldPosition
+			ply.UITransformComponent.anchoredPosition = Vector2(
+				math.max(-hw, math.min(hw, (wp.x - cx) * scale)),
+				math.max(-hh, math.min(hh, (wp.y - cy) * scale)))
+			ply.Enable = true
+		end
+	end
+
+end

@@ -145,13 +145,30 @@ script FreezerSummon extends Component
 			if not isvalid(self.Entity) then return end
 			self.AtkState = "gone"
 			if isvalid(tt) then
-				self:PlayHitFx(tt)
+				-- (요청 2026-08-07) 단일 대상이 아니라 **범위 데미지** - 돌진해 꽂히는 지점(주 대상)
+				-- 주변 SPLASH_RADIUS 안의 몬스터를 가까운 순으로 **최대 6마리**까지 함께 때린다.
+				-- 대상 확정은 이펙트를 뿌리는 이 시점(1.2초)에 한 번만 하고, 0.3초 뒤 데미지는
+				-- 같은 목록에 그대로 들어간다(이펙트와 데미지 대상이 어긋나지 않게).
+				local htp = tt.TransformComponent.WorldPosition
+				local victims = {}
+				if isvalid(pa) then
+					victims = pa:FindMonstersInRadius(Vector2(htp.x, htp.y), 3.0, 6)
+				end
+				if #victims == 0 then victims = { tt } end
+				self._T.atkVictims = victims
+				for _, v in ipairs(victims) do
+					if isvalid(v) then self:PlayHitFx(v) end
+				end
+				log("[Freezer] 범위 타격 대상 " .. tostring(#victims) .. "마리(최대 6)")
 			end
 		end, 1.2)
 		-- (요청) 데미지는 히트 모션(활강 이펙트)의 4번째 프레임 시점(이펙트 시작 +0.3초)에 들어간다.
 		_TimerService:SetTimerOnce(function()
-			if not isvalid(self.Entity) or not isvalid(tt) then return end
-			if isvalid(pa) then pa:DealFreezerHit(tt) end
+			if not isvalid(self.Entity) or not isvalid(pa) then return end
+			for _, v in ipairs(self._T.atkVictims or {}) do
+				if isvalid(v) then pa:DealFreezerHit(v) end
+			end
+			self._T.atkVictims = nil
 		end, 1.5)
 		_TimerService:SetTimerOnce(function()
 			if isvalid(self.Entity) and self.AtkState == "gone" then self.AtkState = "return" end
@@ -188,7 +205,34 @@ script FreezerSummon extends Component
 		if not isvalid(target) then return end
 		local serial = _EffectService:PlayEffectAttached("9863cc13ee6f4de0b51d2888ac1370de", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
 		_SoundService:PlaySound("f03324b1068e4c1caf4d753262fc096f", 1.0)
-		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+		-- ⚠ (신고 2026-08-07) "히트 이펙트가 몬스터 리젠 때까지 이어진다."
+		-- 몬스터에 **붙인** 이펙트는 재생 도중 대상이 죽으면 엔티티가 꺼지면서 제거 타이머가 실효를
+		-- 잃고, 리젠으로 엔티티를 다시 켜면 그대로 살아난다(어썰터 스턴 전례와 같은 원인).
+		-- → 대상 쪽 장부(Monster.RegisterStatusEffect)에 등록해 사망 순간 스스로 지워지게 한다.
+		self:RegisterHitFxOnMonster(target, serial)
+		_TimerService:SetTimerOnce(function()
+			self:ReleaseHitFxOnMonster(target, serial)
+		end, 2.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RegisterHitFxOnMonster(Entity target, integer serial)
+		-- 대상에 붙인 이펙트를 몬스터 장부에 등록한다(사망 시 Monster.ClearStatusEffects가 지운다).
+		if not isvalid(target) then return end
+		---@type Monster
+		local mc = target:GetComponent("script.Monster")
+		if isvalid(mc) then mc:RegisterStatusEffect(serial) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReleaseHitFxOnMonster(Entity target, integer serial)
+		-- 정상 만료 경로. 장부에서 빼고 실제로도 지운다(대상이 이미 사라졌어도 제거는 항상 시도).
+		if isvalid(target) then
+			---@type Monster
+			local mc = target:GetComponent("script.Monster")
+			if isvalid(mc) then mc:UnregisterStatusEffect(serial) end
+		end
+		_EffectService:RemoveEffect(serial)
 	end
 
 	@ExecSpace("Multicast")

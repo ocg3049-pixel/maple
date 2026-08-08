@@ -1,0 +1,213 @@
+@Component
+script ArrowBombProjectileAttack extends AttackComponent
+
+	-- 에로우 봄 화살의 판정/연출 담당(구조는 ArrowBlowProjectileAttack과 동일).
+	-- 불의 영역/빙하지대 온히트 프록용 시전자 참조 - 발사 시점에 PlayerAttack이 넣어준다.
+	property Entity OwnerEntity = ""
+
+	method void OnAttack(Entity defender)
+		-- 시전자(PlayerAttack)의 불의 영역/빙하지대 공용 프록 판정으로 위임한다.
+		-- 부모 OnAttack은 ExecSpace 미지정이라 어노테이션 없이 오버라이드한다(LEA-3014 방지).
+		if not self:IsServer() then return end
+		if not isvalid(self.OwnerEntity) then return end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if isvalid(pa) then
+			pa:TryProcElementalZones(defender)
+		end
+	end
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- 직격("skill.arrowbomb")은 화살 한 발이 적 "한 명"만 맞힌다 - 이미 명중했으면 이후 판정을 막는다.
+		-- 폭발의 추가 타격("skill.arrowbomb.blast")은 명중 뒤의 별도 판정이라 HasHit 필터를 타지 않고,
+		-- 대신 그 순간 지정된 단일 대상만 통과시킨다(밀집 지역 교차 히트 방지).
+		if isvalid(defender.PlayerComponent) then return false end
+		-- 아군 소환수는 판정에서 제외한다.
+		if defender:GetComponent("script.HeroSummon") ~= nil then return false end
+		if defender:GetComponent("script.HealerSummon") ~= nil then return false end
+		if defender:GetComponent("script.SummonDragon") ~= nil then return false end
+		---@type ArrowBombProjectile
+		local proj = self.Entity:GetComponent("script.ArrowBombProjectile")
+		if attackInfo == "skill.arrowbomb.blast" then
+			if proj == nil then return false end
+			local blastTarget = proj:GetBlastTarget()
+			if not isvalid(blastTarget) or defender ~= blastTarget then return false end
+			return __base:IsAttackTarget(defender, attackInfo)
+		end
+		if proj ~= nil and proj:HasHit() then return false end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer ApplyBackstabToDamage(integer dmg, Entity defender, string attackInfo)
+		-- (백스탭) 판정과 배율은 시전자의 PlayerAttack 한 곳에서만 관리한다.
+		if not isvalid(self.OwnerEntity) then return dmg end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return dmg end
+		return pa:ApplyBackstabBonus(dmg, self.OwnerEntity, defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		-- 화살에 새겨진 RateMin/RateMax(1레벨 150%~170%, 분배 1포인트당 각 +10%p)를 쓴다.
+		-- 직격 판정에서만 명중을 기록하고 그 자리에서 폭발을 시작한다.
+		---@type ArrowBombProjectile
+		local proj = self.Entity:GetComponent("script.ArrowBombProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local rateMin = 1.5
+		local rateMax = 1.7
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			rateMin = proj.RateMin or rateMin
+			rateMax = proj.RateMax or rateMax
+			if attackInfo ~= "skill.arrowbomb.blast" then
+				proj:MarkHit(defender)
+			end
+		end
+		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
+		local dmg = math.floor(combatPower * mult)
+		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
+		-- 크리티컬은 여기서 직접 굴리고 배율을 반환값에 바로 곱한다(아래 CalcCritical은 엔진의 이중
+		-- 배율 적용을 막기 위해 항상 false를 반환). math.random() 대신 _UtilLogic:RandomDouble()을 쓰는
+		-- 이유는 짧은 간격의 연속 호출에서 같은 시퀀스를 반복 소비하는 문제 때문(다른 화살 스킬과 동일).
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		self:ShowArrowBombDamageSkin(defender, dmg, isCritical, self:GetProjectileDamageSkinId())
+		return dmg
+	end
+
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		-- CalcDamage가 이미 크리티컬 배율을 곱해뒀다 - 여기서 true를 반환하면 이중 적용된다.
+		return false
+	end
+
+	@ExecSpace("Client")
+	method void ShowArrowBombDamageSkin(Entity target, integer damage, boolean isCritical, string skinRuid)
+		-- 다른 스킬들과 동일한 데미지 스킨(RUID)을 재생해 룩앤필을 통일한다.
+		if not isvalid(target) then return end
+		_DamageSkinService:Play(
+			target, skinRuid, 0,
+			{ damage }, DamageSkinTweenType.Default, isCritical,
+			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
+		)
+	end
+
+	-- ── 폭발 연출 ────────────────────────────────────────────────────────
+	-- 업로드본은 애니메이션클립이 아니라 **정지 스프라이트 9장 / 4장**이라 EffectService로 재생할 수 없다.
+	-- 프로젝트에 이미 있는 스프라이트 페이드 엔티티(SpearBurstFadingEffect)에 프레임을 갈아끼우는
+	-- 방식을 그대로 재사용한다(에로우 블로우 적중 이펙트와 동일한 패턴).
+	-- ⚠ 9장 전부 **원점 정렬 패딩본**이라 좌표를 프레임마다 보정할 필요가 없다
+	--   (원본/RUID 대응표: msw-dev-tools/resources/에로우봄/RUID.md).
+
+	@ExecSpace("ServerOnly")
+	method void PlayMainBlastEffect(Entity target, number scale)
+		-- 직격 대상 위에서 폭발 프레임 0~8을 70ms(ori.txt의 delay70) 간격으로 재생한다.
+		if not isvalid(target) then return end
+		local offsetY = 0.3
+		local hitComp = target.HitComponent
+		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
+		self._T.fxSeq = (self._T.fxSeq or 0) + 1
+		local fxName = "ArrowBombFx_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.fxSeq)
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", fxName, Vector3(0, offsetY, 0), target)
+		if not isvalid(fx) then return end
+		fx:AddComponent("script.SpearBurstFadingEffect")
+		---@type SpearBurstFadingEffect
+		local comp = fx:GetComponent("script.SpearBurstFadingEffect")
+		if isvalid(comp) then
+			comp.IsFlipX = false
+			comp.StartAlpha = 1.0
+			comp.EndAlpha = 0.0
+			-- 9프레임 × 0.07초 = 0.63초를 다 보여준 뒤에 페이드가 시작되도록 잡는다.
+			comp.HoldDuration = 0.63
+			comp.TweenDuration = 0.2
+			comp.StartScale = scale
+			comp.EndScale = scale
+			comp.OrderInLayerValue = 5
+			comp.ClipRUID = self:GetMainFrameRUID(1)
+		end
+		for i = 2, 9 do
+			local idx = i
+			_TimerService:SetTimerOnce(function()
+				if isvalid(comp) then comp.ClipRUID = self:GetMainFrameRUID(idx) end
+			end, 0.07 * (idx - 1))
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(fx) then fx:Destroy() end
+		end, 1.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlaySubBlastEffect(Entity target, number scale)
+		-- 주변 적 위에서 sub1~4를 ori.txt의 delay(90/100/110ms) 간격으로 재생한다.
+		if not isvalid(target) then return end
+		local offsetY = 0.3
+		local hitComp = target.HitComponent
+		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
+		self._T.fxSeq = (self._T.fxSeq or 0) + 1
+		local fxName = "ArrowBombSubFx_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.fxSeq)
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", fxName, Vector3(0, offsetY, 0), target)
+		if not isvalid(fx) then return end
+		fx:AddComponent("script.SpearBurstFadingEffect")
+		---@type SpearBurstFadingEffect
+		local comp = fx:GetComponent("script.SpearBurstFadingEffect")
+		if isvalid(comp) then
+			comp.IsFlipX = false
+			comp.StartAlpha = 1.0
+			comp.EndAlpha = 0.0
+			-- 0.09 + 0.10 + 0.11 = 0.30초를 다 보여준 뒤 마지막 프레임(0.12초)에서 페이드.
+			comp.HoldDuration = 0.30
+			comp.TweenDuration = 0.15
+			comp.StartScale = scale
+			comp.EndScale = scale
+			comp.OrderInLayerValue = 5
+			comp.ClipRUID = self:GetSubFrameRUID(1)
+		end
+		_TimerService:SetTimerOnce(function()
+			if isvalid(comp) then comp.ClipRUID = self:GetSubFrameRUID(2) end
+		end, 0.09)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(comp) then comp.ClipRUID = self:GetSubFrameRUID(3) end
+		end, 0.19)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(comp) then comp.ClipRUID = self:GetSubFrameRUID(4) end
+		end, 0.30)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(fx) then fx:Destroy() end
+		end, 0.7)
+	end
+
+	method string GetMainFrameRUID(integer idx)
+		-- 직격 폭발 프레임 1~9 (원본 0~8). 250x227 원점 정렬 패딩본.
+		if idx == 2 then return "9577c2c79aff4636aa67cb832d91703c" end
+		if idx == 3 then return "68ca5bba347142838263628c96066398" end
+		if idx == 4 then return "825d339c2ed34e24b494c8ad8214b53b" end
+		if idx == 5 then return "59ece77cc3e048eeaef2bf54b54c2407" end
+		if idx == 6 then return "bcdddd66eb2c416da258762048bfd91f" end
+		if idx == 7 then return "adac8825ac814a11a7d96d84db9d69a8" end
+		if idx == 8 then return "456018bec18c489aa2dcc1117da21a39" end
+		if idx == 9 then return "28a35d3d72d3404e9c8435dabff002db" end
+		return "c64fc40bee6147ea974a02f82589246e"
+	end
+
+	method string GetSubFrameRUID(integer idx)
+		-- 주변 적 폭발 프레임 1~4 (원본 sub1~4). 157x151 원점 정렬 패딩본.
+		if idx == 2 then return "02015891ec7a43d6b367226b0db73e64" end
+		if idx == 3 then return "1cc870f3a57849dd9c43fd075e7c7a08" end
+		if idx == 4 then return "22678ae6b6f7441c82d351fab3563e54" end
+		return "7c3666e90e3641bba279a15d4a81e164"
+	end
+
+	method string GetProjectileDamageSkinId()
+		-- 발사한 플레이어의 현재 데미지 스킨. 비어 있으면 기본 히트 스킨으로 폴백한다.
+		---@type ArrowBombProjectile
+		local proj = self.Entity:GetComponent("script.ArrowBombProjectile")
+		if isvalid(proj) and proj.DamageSkinRUID ~= "" then
+			return proj.DamageSkinRUID
+		end
+		return "3271c3e79bf04ecba9a107d55495970d"
+	end
+
+end

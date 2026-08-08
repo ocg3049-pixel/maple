@@ -134,13 +134,29 @@ script PhoenixSummon extends Component
 			if not isvalid(self.Entity) then return end
 			self.AtkState = "gone"
 			if isvalid(tt) then
-				self:PlayHitFx(tt)
+				-- (요청 2026-08-07) 프리져와 동일하게 **범위 데미지** - 꽂히는 지점(주 대상) 주변
+				-- 3유닛 안의 몬스터를 가까운 순으로 **최대 6마리**까지 함께 때린다(스턴도 전원).
+				-- 대상 확정은 이펙트를 뿌리는 이 시점에 한 번만 한다(이펙트↔데미지 대상 일치).
+				local htp = tt.TransformComponent.WorldPosition
+				local victims = {}
+				if isvalid(pa) then
+					victims = pa:FindMonstersInRadius(Vector2(htp.x, htp.y), 3.0, 6)
+				end
+				if #victims == 0 then victims = { tt } end
+				self._T.atkVictims = victims
+				for _, v in ipairs(victims) do
+					if isvalid(v) then self:PlayHitFx(v) end
+				end
+				log("[Phoenix] 범위 타격 대상 " .. tostring(#victims) .. "마리(최대 6)")
 			end
 		end, 1.2)
 		-- 데미지+스턴은 히트 모션(활강 이펙트)의 4번째 프레임 시점(이펙트 시작 +0.3초)에 들어간다.
 		_TimerService:SetTimerOnce(function()
-			if not isvalid(self.Entity) or not isvalid(tt) then return end
-			if isvalid(pa) then pa:DealPhoenixHit(tt) end
+			if not isvalid(self.Entity) or not isvalid(pa) then return end
+			for _, v in ipairs(self._T.atkVictims or {}) do
+				if isvalid(v) then pa:DealPhoenixHit(v) end
+			end
+			self._T.atkVictims = nil
 		end, 1.5)
 		_TimerService:SetTimerOnce(function()
 			if isvalid(self.Entity) and self.AtkState == "gone" then self.AtkState = "return" end
@@ -176,7 +192,32 @@ script PhoenixSummon extends Component
 		if not isvalid(target) then return end
 		local serial = _EffectService:PlayEffectAttached("43a18ef761724c75b8e79049200a8dd9", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
 		_SoundService:PlaySound("82622cad8b1b4cef8c58aa36d07d949a", 1.0)
-		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 2.0)
+		-- ⚠ (신고 2026-08-07) 프리져와 같은 문제 - 몬스터에 붙인 이펙트가 재생 도중 대상이 죽으면
+		-- 제거 타이머가 실효를 잃고 리젠 때 그대로 살아난다. 대상 쪽 장부에 등록해 사망 시 지워지게 한다.
+		self:RegisterHitFxOnMonster(target, serial)
+		_TimerService:SetTimerOnce(function()
+			self:ReleaseHitFxOnMonster(target, serial)
+		end, 2.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RegisterHitFxOnMonster(Entity target, integer serial)
+		-- 대상에 붙인 이펙트를 몬스터 장부에 등록한다(사망 시 Monster.ClearStatusEffects가 지운다).
+		if not isvalid(target) then return end
+		---@type Monster
+		local mc = target:GetComponent("script.Monster")
+		if isvalid(mc) then mc:RegisterStatusEffect(serial) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReleaseHitFxOnMonster(Entity target, integer serial)
+		-- 정상 만료 경로. 장부에서 빼고 실제로도 지운다(대상이 이미 사라졌어도 제거는 항상 시도).
+		if isvalid(target) then
+			---@type Monster
+			local mc = target:GetComponent("script.Monster")
+			if isvalid(mc) then mc:UnregisterStatusEffect(serial) end
+		end
+		_EffectService:RemoveEffect(serial)
 	end
 
 	@ExecSpace("Multicast")
