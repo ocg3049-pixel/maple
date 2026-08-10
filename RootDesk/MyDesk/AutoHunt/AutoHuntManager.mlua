@@ -9,6 +9,11 @@ script AutoHuntManager extends Logic
 	--   내려가며 사냥하고, 맨아래에서 사냥감이 끊기면 SpawnLocation으로 복귀해 다시 내려온다.
 	-- · 공격/버프 시전은 전부 실제 버튼 경로(UseSkillInSlot)라 모션·쿨다운·위력 배율이 수동과 동일하다.
 	property boolean autoOn = false
+
+	-- 로프 등반 속도 계수(요청 2026-08-09). MoveToDirection에 넘길 델타에 곱한다.
+	-- 이력: 1.0 = 실측 2.0유닛/초(달리기와 비슷해 너무 빠름) → 0.45 = 약 0.5유닛/초(느리다는 신고)
+	--       → 0.675 = 약 0.76유닛/초 → 1.0125 = 약 1.14유닛/초 (요청: 다시 "1.5배").
+	property number RopeClimbSpeedFactor = 1.0125
 	property any keyHandler = nil
 
 	@ExecSpace("ClientOnly")
@@ -94,17 +99,82 @@ script AutoHuntManager extends Logic
 				self._T.wanderPhaseUntil = now + 1.0 + _UtilLogic:RandomDouble() * 1.5
 				self:StopMoving()
 			else
+				-- ⚠ (신고 2026-08-09) "다 잡은 층에서 좌우를 두리번거린다"의 원인:
+				--   예전엔 방향을 **먼저 정하고 걷다가** 발판 끝에서 되돌렸다. 짧은 발판에서는 그 되돌림이
+				--   매 구간 반복돼, 실제로는 거의 못 움직이면서 몸만 좌우로 도는 모습이 됐다.
+				--   → 걷기 구간에 들어가기 **전에** 실제로 걸을 수 있는 방향을 먼저 확인한다.
+				-- ⚠⚠ (버그 수정 2026-08-09, 실측으로 확정) **PredictFootholdEnd의 극성이 정반대로 쓰이고 있었다.**
+				--   `.d.mlua` 원문: "Checks whether you can move the distance from the step you are currently
+				--   stepping on" → **true = 그 거리만큼 갈 수 있다 / false = 발판 끝이라 못 간다.**
+				--   실측(map01, y=-1.25 지면 x[-2.76~4.44], 캐릭터를 좌표별로 옮겨가며 측정):
+				--     x=0.00(가운데)  R=true  L=true      x=2.00(가운데)  R=true  L=true
+				--     x=4.20(오른끝)  R=false L=true      x=4.40(오른끝)  R=false L=true
+				--     x=-2.60(왼끝)   R=true  L=false     x=-2.72(왼끝)   R=true  L=false
+				--   → 조각(0.9유닛)으로 쪼개진 지형에서도 **체인을 따라** 판정한다. 예전 주석의
+				--     "조각 경계마다 true라 엣지 감지에 못 쓴다"는 오진이었다 - 가운데에서 true인 건
+				--     오탐이 아니라 "갈 수 있다"는 정답이었다.
+				--   그래서 `not`을 붙인 이 코드는 **지형 한가운데서 canRight/canLeft가 둘 다 false**가 되어
+				--   아래 "양쪽 다 막힘" 분기로 빠졌다 → 배회가 3~5초 대기만 반복하며 **제자리에 얼어붙고**,
+				--   반대로 진짜 발판 끝에서만 "걸을 수 있다"고 판단했다(신고 "언덕에 잘 대응하지 못한다 /
+				--   양쪽을 왔다갔다 하지 못한다"의 직접 원인).
+				local rbPick = player.RigidbodyComponent
+				local canRight = true
+				local canLeft = true
+				if isvalid(rbPick) and rbPick:IsOnGround() then
+					canRight = rbPick:PredictFootholdEnd(0.4, true)
+					canLeft = rbPick:PredictFootholdEnd(0.4, false)
+				end
+				if not canRight and not canLeft then
+					-- 양쪽 다 막힘 = 설 자리만 있는 좁은 발판. **방향도 건드리지 않고** 그냥 쉰다
+					-- (여기서 방향을 바꾸면 그게 바로 두리번거림이 된다).
+					self._T.wanderWalking = false
+					self._T.wanderPhaseUntil = now + 3.0 + _UtilLogic:RandomDouble() * 2.0
+					self:StopMoving()
+					return
+				end
 				self._T.wanderWalking = true
-				self._T.wanderDir = (_UtilLogic:RandomDouble() < 0.5) and -1 or 1
-				self._T.wanderPhaseUntil = now + 1.0 + _UtilLogic:RandomDouble() * 1.0
+				-- 이전 방향을 70% 이어가되, 그쪽이 막혀 있으면 열린 쪽으로 간다.
+				local prevDir = self._T.wanderDir
+				if prevDir ~= 1 and prevDir ~= -1 then
+					prevDir = (_UtilLogic:RandomDouble() < 0.5) and -1 or 1
+				end
+				local wantDir = prevDir
+				if _UtilLogic:RandomDouble() >= 0.7 then wantDir = -prevDir end
+				if wantDir > 0 and not canRight then wantDir = -1 end
+				if wantDir < 0 and not canLeft then wantDir = 1 end
+				self._T.wanderDir = wantDir
+				-- 한 방향으로 충분히 이동해야 리젠 지점을 훑는다(구간 1.0~2.0초 → 1.6~3.2초).
+				self._T.wanderPhaseUntil = now + 1.6 + _UtilLogic:RandomDouble() * 1.6
 				log("[AutoHunt] 배회 걷기 dir=" .. tostring(self._T.wanderDir))
 			end
 		end
 		if self._T.wanderWalking == true then
 			-- 발판 끝 감지 → 방향 반전 (떨어짐 방지)
+			-- ⚠ (신고 2026-08-09) 여기에 쿨다운이 없어서, 발판이 짧으면 반전 직후 반대쪽 끝도 곧바로
+			--   걸려 **매 프레임 좌우로 튀는** 진동이 났다("좌우로 빠르게 반복"의 직접 원인).
+			--   0.7초 안에 다시 반전해야 하는 상황 = 발판이 너무 짧다는 뜻이므로, 더 튕기지 말고
+			--   이번 걷기 구간을 접고 대기로 넘어간다.
 			local rb = player.RigidbodyComponent
-			if isvalid(rb) and rb:IsOnGround() and rb:PredictFootholdEnd(0.6, (self._T.wanderDir or 1) > 0) then
-				self._T.wanderDir = -(self._T.wanderDir or 1)
+			-- 발판 끝에 닿으면 **되돌지 않고 그대로 멈춘다.**
+			-- ⚠ 예전엔 여기서 방향을 반전했는데, 그 반전이 곧 "두리번거림"이었다. 출발 방향은 위에서
+			--   이미 "걸을 수 있는 쪽"으로 골랐으니, 끝에 닿았다는 건 이 방향으로 다 걸었다는 뜻이다 -
+			--   자연스럽게 멈춰 쉬고, 다음 구간에서 열린 방향을 새로 고르면 된다.
+			-- 예측 거리 0.4(구 0.6): 0.6이면 좌우 합쳐 1.2유닛 이상인 발판에서만 걸을 수 있어,
+			-- 이 맵처럼 짧은 턱이 많은 지형에서는 배회가 매번 즉시 중단됐다(실측).
+			-- ⚠ (버그 수정 2026-08-09) 위 canRight/canLeft와 **같은 극성 오류**가 여기에도 있었다 -
+			--   PredictFootholdEnd는 "갈 수 있으면 true"라, `not` 없이 쓰면 **길이 열려 있을 때 멈추고**
+			--   진짜 발판 끝에서는 계속 걸어 떨어졌다. 멈춰야 하는 건 false(= 더 못 간다)일 때다.
+			if isvalid(rb) and rb:IsOnGround() and not rb:PredictFootholdEnd(0.4, (self._T.wanderDir or 1) > 0) then
+				-- (신고 2026-08-09) 끊긴 게 **절벽이 아니라 뛰어 올라설 턱**이면 멈추지 말고 넘어간다 -
+				-- 그래야 리젠을 기다리는 동안에도 위/아래 단을 오가며 넓게 훑는다(추적 경로와 같은 판정).
+				if self:TryStepUpOverWall(player, player.TransformComponent.WorldPosition,
+					(self._T.wanderDir or 1), now) then
+					return
+				end
+				self._T.wanderWalking = false
+				self._T.wanderPhaseUntil = now + 1.0 + _UtilLogic:RandomDouble() * 1.5
+				self:StopMoving()
+				return
 			end
 			local pcc = player.PlayerControllerComponent
 			if isvalid(pcc) then
@@ -223,7 +293,14 @@ script AutoHuntManager extends Logic
 			-- 단일 (기본 로테이션)
 			["파워스트라이크"] = "single", ["럭키세븐"] = "single", ["더블스탭"] = "single",
 			["새비지블로우"] = "single",
-			["매직클로"] = "single", ["더블샷"] = "single", ["패닉"] = "single", ["코마"] = "single",
+			["매직클로"] = "single", ["더블샷"] = "single",
+			-- (요청 2026-08-09, 히어로 3차) 패닉/코마는 **콤보 구슬을 전량 소모하는 같은 자원**을 놓고
+			-- 다투므로 확률 로테이션에 두면 안 된다 - 구슬 1개짜리 패닉이 계속 새어 나가 코마가 구슬을
+			-- 모을 기회를 빼앗는다. 스나이핑/피어싱처럼 **자기 규칙**을 가진 전용 역할로 뺀다.
+			--   · 코마 = 구슬 수에 비례해 범위가 커지는 전방위 다수기(TryComaCast)
+			--   · 패닉 = 잘 죽지 않는 단일 대상(보스/탱커) 전용(TryPanicCast)
+			-- ⚠ 특히 코마를 "single"로 두면 몰렸을 때 가중이 0.15로 **깎여서** 정작 쓸 자리에서 안 나갔다.
+			["패닉"] = "panic", ["코마"] = "coma",
 			["매직 미사일"] = "single", ["썬더볼트"] = "single", ["파이어에로우"] = "single",
 			["홀리 에로우"] = "single", ["엔젤레이"] = "single", ["에로우 블로우"] = "single",
 			["아이언 에로우"] = "single",
@@ -237,6 +314,14 @@ script AutoHuntManager extends Logic
 			-- (신궁 2026-08-06 신설) 피어싱도 같은 차지 구조라 전용 역할이 필요하다 - 일반 로테이션에
 			-- 넣으면 UseSkillInSlot이 차지를 "시작"만 하고 아무도 떼주지 않아 눌린 채로 굳는다.
 			["피어싱"] = "piercing",
+			-- (썬콜, 요청 2026-08-08) 텔레포트 = 이동기(수직 2.31유닛 도약 / 수평 접근 가속) - 전용 역할.
+			["텔레포트"] = "teleport",
+			-- (썬콜, 요청 2026-08-08) 리커버리 오로라 = 주변 노쿨 설치기. 블리자드 난사 콤보의 축이라
+			-- 일반 버프 주기가 아니라 자체 쿨 종료 즉시 재설치하는 전용 역할로 뺀다.
+			["리커버리 오로라"] = "recoveryaura",
+			-- (불독, 2026-08-08) 리커버리 마나 = 리커버리 오로라의 불독판(같은 오로라 + MP 회복) -
+			-- 쿨타임 상태도 SkillManager에서 공유하므로 역할도 같다(메테오 난사 콤보의 축).
+			["리커버리 마나"] = "recoveryaura",
 		}
 		return roles[skillName] or "manual"
 	end
@@ -254,6 +339,10 @@ script AutoHuntManager extends Logic
 		local darksights, smokescreens, shadowclones = {}, {}, {}
 		-- (신궁 2026-08-06) 체인샷 = 이동기 / 스나이핑 = 자기 규칙 차지기.
 		local chainshots, snipings, piercings = {}, {}, {}
+		-- (썬콜 2026-08-08) 텔레포트 = 이동기 / 리커버리 오로라 = 노쿨 설치기.
+		local teleports, recoveryauras = {}, {}
+		-- (히어로 3차 2026-08-09) 코마 = 구슬 비례 범위 다수기 / 패닉 = 탱커 전용 단일기.
+		local comas, panics = {}, {}
 		local hotkeys = _SkillManager:ExportHotkeys()
 		for key, slot in pairs(hotkeys) do
 			if slot ~= nil and slot.name ~= nil and slot.name ~= "" then
@@ -277,6 +366,10 @@ script AutoHuntManager extends Logic
 				elseif role == "chainshot" then table.insert(chainshots, { key = key, name = slot.name })
 				elseif role == "sniping" then table.insert(snipings, { key = key, name = slot.name })
 				elseif role == "piercing" then table.insert(piercings, { key = key, name = slot.name })
+				elseif role == "teleport" then table.insert(teleports, { key = key, name = slot.name })
+				elseif role == "recoveryaura" then table.insert(recoveryauras, { key = key, name = slot.name })
+				elseif role == "coma" then table.insert(comas, { key = key, name = slot.name })
+				elseif role == "panic" then table.insert(panics, { key = key, name = slot.name })
 				end
 			end
 		end
@@ -299,6 +392,10 @@ script AutoHuntManager extends Logic
 		self._T.slotChainShots = chainshots
 		self._T.slotSnipings = snipings
 		self._T.slotPiercings = piercings
+		self._T.slotTeleports = teleports
+		self._T.slotRecoveryAuras = recoveryauras
+		self._T.slotComas = comas
+		self._T.slotPanics = panics
 	end
 
 	@ExecSpace("ClientOnly")
@@ -383,6 +480,15 @@ script AutoHuntManager extends Logic
 		---@type PlayerAttack
 		local paGuard = player:GetComponent(PlayerAttack)
 		if isvalid(paGuard) and paGuard:IsBrandishMotionGuardOn() then
+			-- 가드가 풀린 직후를 알기 위해 마지막으로 켜져 있던 시각을 남긴다.
+			self._T.motionGuardLastOn = now
+			return
+		end
+		-- (신고 2026-08-09) 가드 해제 직후 곧바로 다음 행동(특히 다운점프)을 하면, 공격 모션이 빼둔
+		-- FALL/JUMP 액션시트 매핑이 아직 복구되기 전이라 **모션 없이 선 자세로 내려간다**.
+		-- 근본 수정은 PlayerAttack.RestoreBrandishStateMotions를 Multicast로 바꾼 것이고, 이건 그 전파를
+		-- 확실히 기다리기 위한 얇은 유예다(0.12초).
+		if (self._T.motionGuardLastOn or -99) + 0.12 > now then
 			return
 		end
 
@@ -392,20 +498,82 @@ script AutoHuntManager extends Logic
 		if self:ElementComboTick(now, player) then return end
 
 		-- 대상 탐색 (0.3초 주기 캐시)
-		if self._T.target == nil or not isvalid(self._T.target) or (self._T.nextScan or 0) <= now then
+		-- ⚠ (버그 수정 2026-08-09) 로프 등반 중에는 재탐색을 멈춘다. 0.3초마다 최근접 대상이 바뀌면
+		--   그때마다 EndRopeClimb("대상 변경")이 걸려 **등반이 시작되자마자 취소되는 무한 루프**가 된다
+		--   (실측: 5초에 시작 16회/취소 16회). 등반은 자체 타임아웃이 있으니 여기서 고정해도 안전하다.
+		local ropeBusy = ((self._T.ropeState or "") ~= "") and isvalid(self._T.target)
+		-- (요청 2026-08-10) **대상 잠금 5초** - 한 번 목표를 정했으면 5초 안에는 다른 몬스터로 갈아타지
+		--   않는다. 0.3초마다 "최근접"으로 다시 고르는 구조라, 리젠/몬스터 이동으로 최근접이 바뀔 때마다
+		--   목표가 흔들려 왔다 갔다 하는 이해할 수 없는 동선이 나왔다(신고: 맵 좌측 아래).
+		--   ⚠ 잠금은 **대상이 살아 있을 때만** 건다 - 죽었거나 사라졌으면 즉시 새로 고른다(대부분의
+		--     대상은 5초 안에 죽으므로 실제로 지연이 체감되는 구간은 거의 없다).
+		--   ⚠ 포기 경로는 잠금과 무관하게 살아 있다 - 5초 추적 타임아웃 / 끼임 3회 / 다운점프 불가 /
+		--     로프 타임아웃은 모두 `self._T.target = nil`을 직접 넣으므로 아래 curAlive가 false가 된다.
+		local curT0 = self._T.target
+		local curAlive = false
+		if curT0 ~= nil and isvalid(curT0) then
+			local mcLock = curT0:GetComponent("script.Monster")
+			curAlive = (mcLock ~= nil and mcLock.IsDead ~= true)
+		end
+		local targetLocked = curAlive and ((self._T.targetLockUntil or 0) > now)
+		if not ropeBusy and not targetLocked
+			and (self._T.target == nil or not isvalid(self._T.target) or (self._T.nextScan or 0) <= now) then
 			self._T.nextScan = now + 0.3
 			local newTarget = self:FindTarget(player)
-			if newTarget ~= self._T.target then
+			-- (요청 2026-08-09) 잠금 5초가 풀린 뒤에도 **뒤로 되돌아가는 재선정은 하지 않는다.**
+			--   가던 길에 몬스터가 리젠되면 그쪽이 최근접이 되어 대상이 바뀌고, 지금까지 걸어온 거리를
+			--   그대로 되돌아간다. 그 사이 또 리젠되면 다시 뒤집혀 왕복만 하는 구간이 생긴다.
+			--   → 현재 대상이 아직 살아 있고 1초 이상 접근 중이었다면, **진행 방향과 반대쪽** 후보로는
+			--     갈아타지 않는다(앞쪽/같은 방향 후보는 가는 길에 있으므로 그대로 허용).
+			--   포기 경로는 그대로 살아 있다 - 5초 추적 타임아웃 / 끼임 / 도달 불가 판정이 대상을 바꾼다.
+			local keepTarget = false
+			local curT = self._T.target
+			if newTarget ~= nil and curT ~= nil and isvalid(curT) and newTarget ~= curT
+				and (now - (self._T.chaseStart or now)) >= 1.0 then
+				local pxNow = player.TransformComponent.WorldPosition.x
+				local curDx = curT.TransformComponent.WorldPosition.x - pxNow
+				local newDx = newTarget.TransformComponent.WorldPosition.x - pxNow
+				-- 부호가 다르면 = 반대편이다(되돌아가야 한다). 0.2 안쪽의 미세한 차이는 방향으로 안 본다.
+				if math.abs(curDx) > 0.2 and math.abs(newDx) > 0.2
+					and ((curDx > 0) ~= (newDx > 0)) then
+					keepTarget = true
+					if (self._T.keepLogAt or -99) + 3.0 < now then
+						self._T.keepLogAt = now
+						log("[AutoHunt] 되돌아가기 방지 - 접근 " .. string.format("%.1f", now - (self._T.chaseStart or now))
+							.. "초째라 뒤쪽 대상으로 갈아타지 않는다")
+					end
+				end
+			end
+			if newTarget ~= self._T.target and not keepTarget then
+				-- (요청 2026-08-09) 대상이 바뀌면 진행 중이던 로프 등반은 무효다 - 여기서 정리하지 않으면
+				-- 옛 대상 기준 목표높이로 계속 매달려 올라가는 유령 등반이 남는다.
+				self:EndRopeClimb(player, "대상 변경")
 				self._T.target = newTarget
 				self._T.chaseStart = now
+				-- 새 목표를 잡은 순간부터 5초 잠금 시작(요청 2026-08-10).
+				self._T.targetLockUntil = now + 5.0
+				-- 대상이 얼마나 자주 바뀌는지 추적용(잠금이 실제로 먹는지 확인 + 향후 동선 디버깅).
+				log("[AutoHunt] 대상 변경 (직전 유지 " .. string.format("%.1f", now - (self._T.lastRetargetAt or now)) .. "초)")
+				self._T.lastRetargetAt = now
 			end
 		end
 		local target = self._T.target
+		-- (썬콜, 요청 2026-08-08) 블리자드 + 리커버리 오로라 콤보: 오로라 주변 노쿨을 이용해 블리자드를
+		-- 주력으로 난사한다. 이 틱을 콤보가 소비했으면(제자리 난사 / 오로라 복귀 걷기) 여기서 끝낸다.
+		-- ⚠ 대상은 인자로 넘기지 않고 안에서 self._T.target을 읽는다 - Entity 파라미터에 nil이 넘어가면
+		--   메서드 본문이 한 줄도 실행되지 않는 엔진 함정([[feedback_msw_nil_entity_param_silent_fail]])
+		--   때문에 "무대상 난사" 분기가 통째로 죽는다.
+		if self:MageAuraComboTick(now, player, delta) then return end
+		-- (불독, 요청 2026-08-08) 포이즌 미스트 카펫: 사냥 동선을 따라 지나가며 아직 안 덮인 자리에
+		-- 독안개를 깔아둔다(익스플로젼 유폭 재료). 대상 유무와 무관 - 주변에 적이 있을 때만 소비된다.
+		if self:PoisonCarpetTick(now, player) then return end
 		if target == nil or not isvalid(target) then
 			-- (P2) 몬스터가 없어도 버프/소환수 유지는 계속하고, 그 외에는 배회하며 리젠을 기다린다.
 			-- (요청) 맨아래 층에서 잡을 대상이 없으면(남은 적이 위층뿐이거나 전멸) 위로 복귀한다.
 			-- (신고 2026-08-06) 중간 발판 정체: 남은 적이 위층뿐이면(도달 수단 없어 후보 제외) 맨아래가
 			-- 아니라서 복귀도 못 하고 리젠까지 제자리 배회만 했다 - 무대상 4초 지속 시 중간에서도 복귀.
+			-- 대상이 없으면 등반할 이유도 없다 - 로프에 매달린 채 배회 로직과 뒤엉키지 않게 먼저 정리한다.
+			self:EndRopeClimb(player, "무대상")
 			if not self:TryUtilityCast(now) then
 				if self:TryBottomReturn(now, player) then return end
 				if self:TryNoTargetReturn(now, player) then return end
@@ -458,6 +626,68 @@ script AutoHuntManager extends Logic
 			log("[AutoHunt] px=" .. string.format("%.2f", pp.x) .. " dx=" .. string.format("%.2f", dx) .. " dy=" .. string.format("%.2f", dy) .. " look=" .. tostring(lookX))
 		end
 
+		-- (요청 2026-08-09) 로프 등반: 앞점프로 닿지 않는 위층 대상은 로프로 올라간다.
+		-- 이 함수가 true를 돌려주면 이번 틱의 이동은 등반 상태 기계가 가져간 것이므로 아래 추적 로직을 건너뛴다.
+		-- ⚠ 등반 중에는 공격도 하지 않는다 - CLIMB 상태에서는 시전 자체가 막혀 있어(각 Attack*의 상태 가드)
+		--   여기서 return하는 것이 실제 동작과 일치한다.
+		-- (요청 2026-08-10) 점프 공격 공중 단계: 도약 창(jumpAtkUntil)이 열려 있으면 이동/추적
+		-- 로직을 멈추고, 상승 중 대상이 전방 공격 박스(위 1.0) 안에 든 순간 공중 시전한다
+		-- (TryAttackCast의 지상 게이트에 이 창 동안만 예외를 뚫어 놓았다). 착지하면 창을 닫는다.
+		-- ⚠ 로프 판정(RopeClimbTick)보다 먼저 - 공중 도약 중에 로프 접근이 끼어들면 안 된다.
+		if (self._T.jumpAtkUntil or 0) > now then
+			local rbJa = player.RigidbodyComponent
+			if isvalid(rbJa) and not rbJa:IsOnGround() then
+				-- 상승 구간(도약 0.5초 안)에서만 시전 - 판정 박스는 시전 0.25초 뒤 그 시점 위치라,
+				-- 정점 직전에 쏘면 판정 순간이 정점 부근이 되어 위쪽 1.0 박스가 대상을 덮는다.
+				-- (신고 2차) 가장자리 도약(대각선 위 대상) 허용: |dx|≤1.25까지, 유클리드는 서버
+				-- 실판정(1.5) 안쪽 1.42까지. 정점을 지나 대상이 살짝 아래로 내려가도 아래 박스(0.5)가
+				-- 있으므로 dy 하한은 -0.4까지 본다. dy 상한 1.05 = 위 박스 1.0 + 몬스터 콜라이더가
+				-- 중심 아래로 처지는 몫.
+				if dy >= -0.4 and dy <= 1.05 and math.abs(dx) <= 1.35
+					and (dx * dx + dy * dy) <= 1.42 * 1.42
+					and (now - (self._T.jumpedAt or now)) <= 0.5 then
+					self._T.chaseStart = now
+					self._T.jumpAtkCastDone = true
+					self:TryAttackCast(now, player, pp)
+				end
+				return
+			end
+			if (now - (self._T.jumpedAt or 0)) > 0.35 then
+				self._T.jumpAtkUntil = 0   -- 착지 - 창 종료 (다음 도약은 nextJumpAtk 쿨 뒤)
+				-- 헛도약 판정: 이번 도약에서 대상이 한 번도 시전 게이트에 못 들었으면 기하적으로
+				-- 못 닿는 자리다 - 2회 연속이면 TryJumpAttack이 포기한다(무한 도약 루프 방지).
+				if self._T.jumpAtkCastDone == true then
+					self._T.jumpAtkFails = 0
+				else
+					self._T.jumpAtkFails = (self._T.jumpAtkFails or 0) + 1
+					log("[AutoHunt] 점프 공격 헛도약 (" .. tostring(self._T.jumpAtkFails)
+						.. "/2) - 공중 시전 게이트에 못 넣음 (dy=" .. string.format("%.2f", dy)
+						.. " dx=" .. string.format("%.2f", dx) .. ")")
+				end
+			else
+				return   -- 도약 직후 아직 지상 판정인 프레임 - 대기
+			end
+		end
+
+		-- (신고 2026-08-10 3차) **"바로 조금 위" 대상 우선 점프 공격.** 점프 정점 공격이 닿는
+		-- 높이(0.9 ~ 점프사거리+1.15)의 가까운(|dx|≤2.5) 위층 대상은 로프/등반으로 돌아가지 않고
+		-- 그 자리에서 점프 공격으로 잡는다 - 사람이 하듯 "점프+공격 한 번"이 동선이 제일 짧다.
+		-- 그동안 로프 판정이 이보다 먼저라, 로프가 있는 맵에서는 점프 한 번이면 닿는 적도 매번
+		-- 로프로 돌아가서 점프 공격이 보이지 않았다(신고의 직접 원인).
+		--   · 하한 0.9: 그 아래는 서 있는 공격 박스(위 1.0)가 이미 닿아 지상 공격이 더 빠르다.
+		--   · 걸어서 이어진 지형(경사/계단 체인)은 제외 - 걸어 올라가는 게 자연스럽다.
+		--   · 헛도약 2회면 TryJumpAttack이 스스로 포기하므로 로프/등반 경로가 그대로 이어받는다.
+		if (self._T.ropeState or "") == "" and dy >= 0.9 and dist > 1.15
+			and math.abs(dx) <= 2.5 then
+			local reachJa = self:GetPlainJumpReach(player)
+			if dy <= reachJa + 1.15 and not self:IsWalkConnectedToTarget(player, pp, mp)
+				and self:TryJumpAttack(now, player, dx, dy, reachJa, delta) then
+				return
+			end
+		end
+
+		if self:RopeClimbTick(now, player, pp, target, dy, delta) then return end
+
 		-- (버그 수정) 사거리 판정에 수직 거리도 포함한다 - |dx|만 보면 아래/위층 몬스터를 "사거리 내"로
 		-- 오인해 허공에 파워스트라이크/슬래시블러스트를 발동했다. 같은 층(|dy|<1.2)일 때만 공격하고,
 		-- 스킬 실판정(반경 1.5)보다 안쪽인 유클리드 1.15 이내까지 붙어야 공격한다 (헛빵 방지).
@@ -494,6 +724,27 @@ script AutoHuntManager extends Logic
 					local wantSn = (dx > 0) and 1 or -1
 					if pccSn.LookDirectionX ~= wantSn then
 						pccSn.LookDirectionX = wantSn
+						self._T.dirChangedAt = now
+					end
+				end
+			end
+			if not self:TryUtilityCast(now) then
+				self:TryAttackCast(now, player, pp)
+			end
+			return
+		end
+		-- (썬콜, 요청 2026-08-08) 마법 사거리 안의 대상은 걸어가 붙지 않고 제자리에서 시전한다.
+		-- "먼 거리 한 명의 적"은 매직클로가, 4차에서는 체인라이트닝이 이 자리를 주로 맡는다
+		-- (각성 표창/연막 저격 제자리 사냥의 자매 규칙 - 실제 스킬 선택은 TryAttackCast의 썬콜 블록).
+		if self:ShouldMageSnipe(player, pp, dx, dy) then
+			if self._T.moving then self:StopMoving() end
+			self._T.chaseStart = now
+			if math.abs(dx) > 0.05 then
+				local pccMg = player.PlayerControllerComponent
+				if isvalid(pccMg) then
+					local wantMg = (dx > 0) and 1 or -1
+					if pccMg.LookDirectionX ~= wantMg then
+						pccMg.LookDirectionX = wantMg
 						self._T.dirChangedAt = now
 					end
 				end
@@ -569,6 +820,31 @@ script AutoHuntManager extends Logic
 					end
 				end
 			end
+			-- (썬콜, 요청 2026-08-08) 텔레포트 = 이동기. 위아래로 떨어진 대상(±2.4유닛 이내)은 수직
+			-- 텔레포트로 층을 넘고, 같은 층 먼 대상(3유닛↑)은 텔레포트(2.31유닛 도약)로 접근을 가속한다.
+			-- 방향키 입력이 없으면 시전 분기가 자동사냥 조준값(GetAimDirX/Y)을 방향키처럼 읽는다.
+			-- MP가 모자라면 UseSkillInSlot이 조용히 거부하고 걷기가 그대로 이어진다(손해 없음).
+			if self._T.slotTeleports ~= nil and #self._T.slotTeleports > 0
+				and (self._T.nextTeleportMove or 0) <= now then
+				local tpDirY = 0
+				if dy >= 1.2 and dy <= 2.4 then tpDirY = 1
+				elseif dy <= -1.2 and dy >= -2.4 then tpDirY = -1 end
+				if tpDirY ~= 0 or (math.abs(dy) < 0.8 and math.abs(dx) >= 3.0) then
+					self._T.nextTeleportMove = now + 0.9   -- 자체 쿨 0.54초 + 여유
+					self._T.aimDirX = (dx > 0) and 1 or -1
+					self._T.aimDirY = tpDirY
+					local pccTp = player.PlayerControllerComponent
+					if isvalid(pccTp) then pccTp.LookDirectionX = self._T.aimDirX end
+					_SkillManager:UseSkillInSlot(self._T.slotTeleports[1].key)
+					log("[AutoHunt] 텔레포트 이동 (dx=" .. string.format("%.2f", dx)
+						.. " dy=" .. string.format("%.2f", dy) .. ")")
+					if tpDirY ~= 0 then
+						-- 수직 텔레포트는 착지/재선정 시간을 준다. 수평은 걷기와 겹쳐 그대로 가속된다.
+						self._T.holdMoveUntil = now + 0.35
+						return
+					end
+				end
+			end
 			-- 자동 이동 중에만 컨트롤러를 끈다 (입력 0이 이동을 덮는 문제 - 정지/OFF 시 복구)
 			local pcc = player.PlayerControllerComponent
 			if isvalid(pcc) and pcc.Enable then pcc.Enable = false end
@@ -576,7 +852,24 @@ script AutoHuntManager extends Logic
 			-- 바라보는 방향 = 이동 방향. 스킬 판정/이펙트는 전부 LookDirectionX를 읽으므로 직접 갱신한다
 			if isvalid(pcc) then pcc.LookDirectionX = dir end
 			-- (요청) 같은 층의 먼 대상(3유닛↑)은 대시(러시)로 가속 접근한다 - 질주 0.4초, 자체 쿨 3초
+			-- (요청 2026-08-10) **질주 중 발판에서 떨어지지 않게 한다.** 질주는 이동속도 2배라 평소 걷기보다
+			--   훨씬 빨리 가장자리에 닿는다. 두 겹으로 막는다:
+			--   ① 시작 게이트 - 진행 방향으로 지면이 2유닛 이상 이어질 때만 질주에 든다.
+			--   ② 주행 중 감시 - 이미 질주 중이라도 앞이 0.7유닛 안에 끊기면 즉시 질주를 끊는다
+			--      (EndSprint는 질주 중이 아니면 스스로 return하므로 매 틱 불러도 안전하다).
+			--   판정은 PredictFootholdEnd(= "그 거리만큼 갈 수 있으면 true").
+			local rbDash = player.RigidbodyComponent
+			local dashGroundOk = true
+			local dashEdgeNear = false
+			if isvalid(rbDash) and rbDash:IsOnGround() then
+				dashGroundOk = rbDash:PredictFootholdEnd(2.0, dir > 0)
+				dashEdgeNear = not rbDash:PredictFootholdEnd(0.7, dir > 0)
+			end
+			if dashEdgeNear then
+				_SkillManager:EndSprint()
+			end
 			if math.abs(dx) >= 3.0 and math.abs(dy) < 0.8 and (self._T.nextDash or 0) <= now
+				and dashGroundOk
 				and self._T.slotDashes ~= nil and #self._T.slotDashes > 0 then
 				self._T.nextDash = now + 3.5
 				self._T.aimDirX = dir
@@ -621,7 +914,24 @@ script AutoHuntManager extends Logic
 			end
 			-- 같은 층이면 공격 거리(유클리드 1.15)에 들 때까지 계속 걷는다. 다른 층 대상은 수평 정렬이
 			-- 끝나면(|dx|≤사거리) 좌우로 부들거리지 않게 제자리에서 점프/다운점프·섬광만 기다린다.
-			if math.abs(dy) < 1.2 or math.abs(dx) > range then
+			-- (요청 2026-08-10) **등반 직후 층 고정 동안에는 발판 밖으로 걸어 나가지 않는다.**
+			--   다운점프만 막으면 "가장자리로 걸어가 그냥 떨어지는" 경로가 그대로 남는다
+			--   (실측: 등반 1초 뒤 낙하 2건 - 다운점프가 아니라 걸어서 떨어진 것).
+			--   사다리로 올라온 직후가 특히 위험하다 - 도착 지점이 대개 발판 가장자리다.
+			--   앞이 막혀 있어도 위로 넘을 턱이면 아래 TryStepUpOverWall이 따로 처리하므로 손해가 없다.
+			local holdEdge = false
+			if (self._T.layerHoldUntil or 0) > now then
+				local rbHold = player.RigidbodyComponent
+				if isvalid(rbHold) and rbHold:IsOnGround()
+					and not rbHold:PredictFootholdEnd(0.4, dir > 0) then
+					holdEdge = true
+					if (self._T.holdEdgeLogAt or -99) + 3.0 < now then
+						self._T.holdEdgeLogAt = now
+						log("[AutoHunt] 등반 직후 층 고정 - 발판 끝이라 그 방향으로 걸어 나가지 않는다")
+					end
+				end
+			end
+			if (math.abs(dy) < 1.2 or math.abs(dx) > range) and not holdEdge then
 				player.MovementComponent:MoveToDirection(Vector2(dir, 0), delta)
 				self._T.moving = true
 				-- 걷기 모션: 컨트롤러가 꺼진 동안 상태를 직접 맞춘다 (버튼 이동과 같은 모션).
@@ -632,6 +942,50 @@ script AutoHuntManager extends Logic
 				end
 				-- (신고) 걷는데 제자리면(지형 턱에 낌) 점프로 탈출한다.
 				self:CheckStuckAndJump(now, player, pp)
+				-- (신고 2026-08-09 "벽을 보고 계속 걷고 있다") 진행 방향 지면이 끊겼는데(턱/벽) 대상이
+				-- 그 너머면, **대상과의 dy/|dx| 게이트와 무관하게** 올라설 발판을 확인하고 앞점프로 넘는다.
+				-- ⚠ 아래 "앞점프로 위 발판 등반"은 `dy>=0.4 && |dx|<=1.2` 게이트라 이 상황을 절대 못 잡는다 -
+				--   벽에 막혀 있으니 |dx|가 줄지 않고, 그래서 게이트가 영영 안 열려 벽만 보고 걷는다.
+				--   실측(map01): x=2.76 y=-6.65에서 state=MOVE인 채 6초 이상 정체, look=1,
+				--   PredictFootholdEnd(0.4/0.15, 오른쪽)=false. 이 지점은 y=-6.65 지면[-3.54~2.76]이
+				--   끝나고 **0.60 위**의 y=-6.05 지면[2.76~5.34]이 시작되는 한 단 턱이다.
+				-- ⚠ 끼임 탈출(CheckStuckAndJump)은 0.6초 표본을 쓰는데 시전 홀드(holdMoveUntil)마다
+				--   표본이 비워져 공격 중에는 거의 발동하지 못한다(실측 70초에 2회). 그래서 시간 표본이
+				--   필요 없는 **즉시 판정**(PredictFootholdEnd + 위쪽 레이캐스트)으로 따로 잡는다.
+				if not self:TryStepUpOverWall(player, pp, dir, now) then
+					-- (신고 2026-08-10) **같은 높이지만 끊긴 발판** 인지: 대상 쪽으로 걷는데 지면이 끊겼고
+					-- (앞 0.35에 더 못 감) 뛰어 올라설 턱도 없으며, 대상이 아래층도 아니면(dy>-0.8 -
+					-- 아래층 대상을 향해 걸어 내려가는 낙하는 정상 경로라 건드리지 않는다) 내 발판과 대상
+					-- 발판이 체인으로 이어져 있는지 확인한다. 끊겨 있으면 걸어가 봐야 낭떠러지에서 떨어져
+					-- 아래층으로 추락할 뿐이다(신고: 로프로 올라온 뒤 같은 높이의 건너편 발판 대상을 향해
+					-- 걷다가 추락) - 떨어지기 전에 멈추고 대상을 제외해 재선정한다.
+					-- ⚠ 이어진 움푹 지형(내려갔다 올라오는 길)은 체인이 붙어 있어 여기 걸리지 않는다.
+					local rbGap = player.RigidbodyComponent
+					if dy > -0.8 and isvalid(rbGap) and rbGap:IsOnGround()
+						and not rbGap:PredictFootholdEnd(0.35, dir > 0) then
+						-- 턱이 있고 점프로 닿으면 TryStepUpOverWall(쿨 1초)이 곧 넘는다 - 제외하지 않는다.
+						local stepH = self:GetStepUpHeightAhead(player, pp, dir)
+						if (stepH <= 0 or stepH > self:GetPlainJumpReach(player))
+							and not self:IsWalkConnectedToTarget(player, pp, mp) then
+							-- (신고 2026-08-10 2차) 걸어서 못 가는 너머의 적이 **약간 위**(0.5↑)면 제외하기
+							-- 전에 가장자리 점프 공격을 시도한다 - "걸어서는 못 가는 위치의 적에게 점프
+							-- 공격을 안 한다"의 직접 해결(가능 여부는 TryJumpAttack의 높이 reach+1.15 /
+							-- 거리 1.35 판정이 정한다).
+							if dy >= 0.5
+								and self:TryJumpAttack(now, player, dx, dy, self:GetPlainJumpReach(player), delta) then
+								return
+							end
+							if self._T.banned == nil then self._T.banned = {} end
+							self._T.banned[target] = now + 6.0
+							self._T.target = nil
+							self._T.nextScan = 0
+							self:StopMoving()
+							log("[AutoHunt] 끊긴 발판 너머 대상(dy=" .. string.format("%.2f", dy)
+								.. " dx=" .. string.format("%.2f", dx) .. ") - 낭떠러지 앞 정지, 제외 후 재선정")
+							return
+						end
+					end
+				end
 			elseif self._T.moving then
 				self:StopMoving()
 			end
@@ -650,12 +1004,75 @@ script AutoHuntManager extends Logic
 					.. " 사거리=" .. string.format("%.2f", self:GetHasteJumpReach()) .. ")")
 				return
 			end
+			-- (요청 2026-08-09) **앞점프로 올라갈 수 있는 지형이면 그냥 점프해서 올라간다.**
+			-- 그동안 위층 대상은 이동기(섬광/플래시 점프/더블 점프/텔레포트/헤이스트)를 가진 직업만
+			-- 따라갈 수 있어서, 히어로처럼 아무것도 없는 직업은 바로 위 발판의 적을 영영 못 잡았다
+			-- (FindTarget에서 후보 제외 → 무대상 배회 → 신고 "발판 경로를 못 찾는다").
+			-- ⚠ 아래 "위 발판엔 점프하지 않는다" 규칙과 모순이 아니다 - 그 규칙은 **공중에서 때리려는**
+			--   점프를 막은 것이고, 이건 **발판에 올라선 뒤** 평소처럼 싸우기 위한 이동이다.
+			--   그래서 올라설 발판이 실제로 있는지(HasFootholdAbove) 확인한 뒤에만 뛴다.
+			-- ⚠ 하한이 0.4인 이유(실측 2026-08-09): 이 맵의 턱은 **+0.49 / +1.03유닛**이었다. 예전처럼
+			--   1.1 이상만 "위층"으로 보면 이 턱들이 전부 "같은 층"으로 분류돼, 자동사냥이 턱 밑을
+			--   향해 계속 걸어가기만 하고 못 올라간다(신고 "발판 경로를 못 찾는다"의 직접 원인).
+			if (self._T.nextJump or 0) <= now and dy >= 0.4 and math.abs(dx) <= 1.2 then
+				local plainReach = self:GetPlainJumpReach(player)
+				-- (요청 2026-08-10) **대상이 선 그 발판까지 한 번에 올라설 수 있을 때만 뛴다.**
+				--   구 판정(HasSeparateFootholdAbove)은 "위에 아무 발판이라도 있나"라, 대상이 두 층 위면
+				--   중간 발판이 잡혀 통과했다 → 올라가도 대상 층엔 못 닿아 내려오고, 대상이 그대로라
+				--   같은 판단을 2~3번 반복했다(사용자 가설, 관측과 일치).
+				if plainReach >= dy and self:CanReachTargetLayer(player, pp, mp, plainReach) then
+					self._T.nextJump = now + 1.0
+					self._T.jumpedAt = now
+					-- 올라간 직후 되돌아 내려가지 않게 하강을 1.2초 보류 + 3초간 올라온 층 고정(신고 2026-08-10).
+					self._T.noDownJumpUntil = now + 1.2
+					self._T.layerHoldUntil = now + 3.0
+					player.MovementComponent:Jump()
+					if isvalid(sc) then sc:ChangeState("JUMP") end
+					log("[AutoHunt] 앞점프로 위 발판 등반 (dy=" .. string.format("%.2f", dy)
+						.. " 사거리=" .. string.format("%.2f", plainReach) .. ")")
+					return
+				end
+				-- 못 올라가는 위층 대상이다 - 5초 추적 타임아웃까지 붙어서 헛되이 기다리지 말고
+				-- **바로 제외하고 다른 대상을 고른다.** 이게 없으면 제외→재선정→같은 대상으로 왕복이 반복된다.
+				-- ⚠ 단, "확실히 못 간다"일 때만 제외한다 - 경사면처럼 걸어서 올라가는 지형이나 판정
+				--   불가 상황에서 제외하면 멀쩡한 대상을 버리는 회귀가 된다(IsTargetLayerUnreachable 참고).
+				if not self:IsTargetLayerUnreachable(player, pp, mp, plainReach) then
+					-- 뛰지는 않지만 대상은 유지 - 걷기/경사면 등반이 이어서 처리한다.
+					return
+				end
+				-- (요청 2026-08-10) 도달 불가 위층이라도 **점프 정점의 공격 박스가 닿는 높이**면
+				-- 제외하지 않고 점프 공격으로 잡는다 - 그동안 이런 적은 ban되어 무시됐다
+				-- (신고: "지형적으로 가기는 힘드나 점프 공격으로 간단하게 해치울 수 있는 적을 무시").
+				-- (신고 2차) dy≥1.2 게이트 삭제 - "약간 위"(0.4~1.2)의 중간 발판 차단 대상도 점프
+				-- 공격이 닿는다(높이 판정은 TryJumpAttack 안의 reach+1.15가 담당).
+				if self:TryJumpAttack(now, player, dx, dy, plainReach, delta) then
+					return
+				end
+				if self._T.banned == nil then self._T.banned = {} end
+				self._T.banned[target] = now + 6.0
+				self._T.target = nil
+				self._T.nextScan = 0
+				self:StopMoving()
+				log("[AutoHunt] 위층 대상 도달 불가(대상 발판까지 한 번에 못 올라감 dy="
+					.. string.format("%.2f", dy) .. " 사거리=" .. string.format("%.2f", plainReach)
+					.. ") - 제외 후 재선정")
+				return
+			end
 			if (self._T.nextJump or 0) <= now then
 				-- (요청) 위 발판의 적에게는 점프 자체를 하지 않는다 - 점프 정점 타이밍에만 닿는
 				-- 공격은 난이도만 높다. 위층 적은 FindTarget에서 아예 제외되고(섬광 보유 시 예외),
 				-- 아래층 적만 다운점프로 내려가 잡는다. 컨트롤러가 꺼진 동안엔 낙하 상태 전환도
 				-- 직접 해줘야 모션이 나온다 (걷기 IDLE→MOVE와 같은 이유, 착지 복귀는 OnUpdate 상단).
-				if dy < -0.8 and math.abs(dx) <= 1.5 then
+				-- ⚠ (신고 2026-08-10 "언덕에 올라갈 때마다 이상하게 한 번 움직인다") **올라간 직후 하강 금지.**
+				--   실측 궤적(10Hz): 앞점프로 둔덕(y=-0.65)에 착지 → 0.4초 서 있다가 → 같은 x에서 그대로
+				--   다운점프해 원래 층(y=-1.25)으로 되돌아가고, 이어서 한 층 더 내려갔다. 올라간 의미가
+				--   사라지고 "올라갔다 도로 내려오는" 한 동작이 눈에 띈다.
+				--   원인은 등반 판정(위층 대상)과 하강 판정(아래층 우선)이 서로를 모르는 것 - 착지한
+				--   순간의 최근접이 아래층이면 곧바로 하강 조건이 성립한다.
+				--   → 등반 직후 1.2초는 하강을 보류한다. 그 뒤에도 아래가 이득이면 그때 내려간다.
+				if (self._T.noDownJumpUntil or 0) > now then
+					-- 보류 중 - 이번 틱은 하강하지 않는다(걷기/공격은 그대로 진행).
+				elseif dy < -0.8 and math.abs(dx) <= 1.5 then
 					-- (신고 2026-08-06) 발밑에 착지 발판이 없으면 DownJump가 엔진에서 무시돼 0.8초마다
 					-- 제자리 재시도(미세 이동)만 반복했다 - 레이캐스트로 착지 발판을 확인하고, 없으면
 					-- 추적 타임아웃(5초)을 기다리지 않고 즉시 이 대상을 제외하고 재선정한다.
@@ -676,12 +1093,41 @@ script AutoHuntManager extends Logic
 					end
 					self._T.nextJump = now + 0.8
 					self._T.jumpedAt = now
+					-- ⚠ (신고 수정 2026-08-09) "아무 모션 없이 선 자세로 내려간다"의 원인:
+					--   **PlayerControllerComponent가 꺼져 있으면 ChangeState("FALL")이 적용되지 않는다**
+					--   (실측 30회: ctrlEnable=false면 직후에도 state=IDLE 그대로, true면 FALL로 전환됨).
+					--   낙하 중에는 자동사냥이 이동 입력을 주지 않으므로 컨트롤러를 켜도 조작이 충돌하지 않고,
+					--   오히려 엔진이 낙하/착지 모션을 스스로 재생해준다. 착지 후 정리는 OnUpdate 상단의
+					--   "착지 복귀"(jumpedAt) 로직이 담당한다.
+					-- ⚠ (신고 2026-08-09, 사용자 가설이 정확했다) 공격 모션 중에는 PlayerAttack이
+					--   FALL/JUMP 몸동작 매핑을 통째로 빼둔다(SuppressBrandishStateMotions). 그 구간에
+					--   다운점프하면 상태는 FALL이 되어도 재생할 클립이 없어 **선 자세로 내려간다**.
+					--   실측: 자동사냥 중 FALL 매핑이 빠져 있는 시간이 **396 샘플 중 182(46%)**나 됐다.
+					--   매핑이 돌아올 때까지 이번 틱은 미룬다 - 공격이 끝나면 곧 복구되고, 대상은 그대로라
+					--   다음 틱에 정상적으로 내려간다.
+					local asacDJ = player.AvatarStateAnimationComponent
+					if isvalid(asacDJ) and asacDJ.StateToAvatarBodyActionSheet["FALL"] == nil then
+						return
+					end
+					-- (요청 2026-08-09) 방금 공격했다면 다운점프를 **1초 미룬다.**
+					-- 매핑 복구만으로는 부족했다는 신고("내려갈 때 모션이 경직") - 공격 클립이 아직 재생
+					-- 중인데 낙하로 갈아타면 몸동작이 끊겨 굳은 것처럼 보인다. 공격 모션이 온전히 끝난 뒤
+					-- 내려가게 해 전환을 매끄럽게 한다. 대상은 그대로라 1초 뒤 같은 자리에서 이어진다.
+					if (self._T.lastAttackAt or -99) + 1.0 > now then
+						return
+					end
+					local pccDJ = player.PlayerControllerComponent
+					if isvalid(pccDJ) and not pccDJ.Enable then pccDJ.Enable = true end
+					self._T.moving = false
 					player.MovementComponent:DownJump()
 					if isvalid(sc) then sc:ChangeState("FALL") end
 				end
 			end
 		else
-			if self._T.moving then
+			-- ⚠ 방향 전환 발걸음(아래) 중에는 여기서 멈추면 안 된다 - StopMoving이 MovementComponent:Stop()을
+			--   부르기 때문에, 매 틱 "정지 → 이동"이 반복되어 발걸음이 상쇄돼 제자리에 머문다(실측: 방향은
+			--   55회 뒤집혔는데 x는 4.45 그대로였다).
+			if self._T.moving and (self._T.turnStepUntil or 0) <= now then
 				self:StopMoving()
 			end
 			self._T.chaseStart = now
@@ -692,14 +1138,31 @@ script AutoHuntManager extends Logic
 			-- LookDirectionX를 읽는데, 대입과 같은 프레임에 시전 RPC를 보내면 복제가 아직 옛 방향이라
 			-- 등 뒤로 판정 박스가 열렸다(dir=-1 targets=0 다발). TryAttackCast가 이 시각을 보고
 			-- 전환 직후 0.25초는 시전을 보류한다.
-			if math.abs(dx) > 0.05 then
+			-- ⚠ 불감대 0.2: 예전 0.05는 대상이 몸에 붙어 좌우로 조금만 흔들려도 방향이 뒤집혀
+			--   "제자리에서 이리저리 도는" 모습이 됐다(실측 50초에 55회 전환). 0.2 안쪽 흔들림은 무시한다.
+			if math.abs(dx) > 0.2 then
 				local pccFace = player.PlayerControllerComponent
 				if isvalid(pccFace) then
 					local wantDir = (dx > 0) and 1 or -1
 					if pccFace.LookDirectionX ~= wantDir then
 						pccFace.LookDirectionX = wantDir
 						self._T.dirChangedAt = now
+						-- (요청 2026-08-09) 방향만 홱 뒤집지 말고 **살짝 걸으면서** 돌게 한다.
+						self._T.turnStepUntil = now + 0.15
+						self._T.turnStepDir = wantDir
 					end
+				end
+			end
+			-- 방향 전환 직후의 짧은 발걸음.
+			-- ⚠ MoveToDirection의 deltaTime은 **사다리에서만** 적용된다(d.mlua) - 지상에선 걸음 길이를
+			--   델타가 아니라 **지속 시간**으로 조절해야 한다. 0.15초면 약 0.2유닛으로, 사거리(1.1) 안에 머문다.
+			if (self._T.turnStepUntil or 0) > now then
+				local pccStep = player.PlayerControllerComponent
+				if isvalid(pccStep) and pccStep.Enable then pccStep.Enable = false end
+				player.MovementComponent:MoveToDirection(Vector2(self._T.turnStepDir or 1, 0), delta)
+				self._T.moving = true
+				if isvalid(sc) and sc.CurrentStateName == "IDLE" then
+					sc:ChangeState("MOVE")
 				end
 			end
 			-- ① 버프/소환수 유지가 우선 ② 아니면 주변 몬스터 수에 맞는 공격 스킬
@@ -952,11 +1415,37 @@ script AutoHuntManager extends Logic
 		return true
 	end
 
-	-- 버프별 재시전 주기(초). 대부분 5분 버프라 270초, 콤보 어택은 30분 버프라 25분(1500초).
+	-- 버프별 재시전 주기(초). 기본값은 5분 버프 가정의 270초, 지속시간이 투자 레벨 비례인 버프는
+	-- 실제 지속시간 공식(SkillManager의 단일 출처 헬퍼)에서 2초 여유를 빼 "만료 직전 갱신"한다.
 	-- 자동사냥 ON 직후에는 lastCast가 비어 있어 어떤 주기든 즉시 1회 시전된다 - "꺼져 있으면 바로 켠다".
 	@ExecSpace("ClientOnly")
 	method number GetBuffPeriod(string skillName)
-		if skillName == "콤보 어택" then return 1500.0 end
+		-- (신고 2026-08-10) 콤보 어택: 구 코드는 "30분 버프"라는 낡은 가정으로 1500초(25분)였는데,
+		-- 실제 지속시간은 개편 후 **레벨 비례 120초(Lv1)~600초(Lv30)**다 - Lv30이 아니면 버프가
+		-- 꺼진 채 최대 23분을 방치해 구슬이 안 쌓이고 코마/패닉도 못 나갔다("끝나갈 때 다시 써야
+		-- 한다"의 직접 원인). 만료 2초 전에 갱신한다(서버가 중첩 없이 지속시간만 갱신).
+		if skillName == "콤보 어택" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("콤보 어택"))
+			return math.max(10.0, _SkillManager:GetComboDurationForLevel(lv) - 2.0)
+		end
+		-- (같은 유형 일괄 수정) 아래 버프들도 지속시간이 레벨 비례라 기본 270초로는 하위 레벨에서
+		-- 버프가 꺼진 채 방치됐다(부스터/분노/파워가드는 Lv1 20초!). 각자의 실제 공식과 동기화.
+		if skillName == "부스터" or skillName == "분노" or skillName == "파워가드" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName(skillName))
+			return math.max(10.0, _SkillManager:GetHeroBuffDuration(lv) - 2.0)
+		end
+		if skillName == "헤이스트" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("헤이스트"))
+			return math.max(10.0, _SkillManager:GetHasteDurationForLevel(lv) - 2.0)
+		end
+		if skillName == "샤프 아이즈" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("샤프 아이즈"))
+			return math.max(10.0, _SkillManager:GetSharpEyesDuration(lv) - 2.0)
+		end
+		if skillName == "메디테이션" then
+			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("메디테이션"))
+			return math.max(10.0, _SkillManager:GetMeditationDuration(lv) - 2.0)
+		end
 		-- (팔라딘) 지속시간이 투자 레벨 비례인 버프는 만료 2초 전에 갱신한다.
 		if skillName == "아이언 월" then
 			local lv = math.max(1, _SkillManager:GetHeroSkillLevelByName("아이언 월"))
@@ -1099,6 +1588,26 @@ script AutoHuntManager extends Logic
 					_SkillManager:UseSkillInSlot(self._T.slotAwakenings[1].key)
 					log("[AutoHunt] 각성 시전 (쿨 종료 - 즉시 사용)")
 					return true
+				end
+			end
+		end
+		-- (썬콜, 요청 2026-08-08) 리커버리 오로라: 재사용 대기시간이 돌면 사냥 중인 자리에 다시 깐다 -
+		-- 주변 노쿨을 이용해 블리자드(썬콜)/메테오(불독 - "리커버리 마나")를 난사하는 콤보의 축
+		-- (MageAuraComboTick이 활용한다).
+		-- 허공/이동 경로에 낭비하지 않게 주변(±8유닛, 같은 층)에 몬스터가 있을 때만 설치한다.
+		if self._T.slotRecoveryAuras ~= nil and #self._T.slotRecoveryAuras > 0 then
+			if (self._T.nextRecoveryAura or 0) <= now then
+				self._T.nextRecoveryAura = now + 10.0   -- 조회 재시도 간격(실제 게이트는 자체 쿨 2~3분)
+				local playerRA = _UserService.LocalPlayer
+				if isvalid(playerRA) and _SkillManager:CanAutoCastRecoveryAura() then
+					local ppRA = playerRA.TransformComponent.WorldPosition
+					if self:CountNearbyMonsters(playerRA, ppRA, 8.0) >= 1 then
+						self._T.nextUtil = now + 1.2
+						self._T.holdMoveUntil = now + 1.0
+						_SkillManager:UseSkillInSlot(self._T.slotRecoveryAuras[1].key)
+						log("[AutoHunt] " .. self._T.slotRecoveryAuras[1].name .. " 설치 (주변 노쿨 - 난사 콤보)")
+						return true
+					end
 				end
 			end
 		end
@@ -1302,13 +1811,28 @@ script AutoHuntManager extends Logic
 		-- 제자리 사냥 분기(각성/연막)에서 여기까지 오는 경우를 위해 근접 게이트보다 먼저 한 번 본다.
 		if self:TryIronArrowRanged(now, player, cdx, cdy) then return end
 		local smokeSniping = false
+		-- (썬콜, 요청 2026-08-08) 오로라 난사 모드: 오로라 안 + 블리자드 사용 가능이면 대상 거리와
+		-- 무관하게 시전한다(블리자드는 시전자 주변 발판에 알아서 떨어진다). 마법 사거리 판정
+		-- (ShouldMageSnipe)이 참이어도 붙지 않고 제자리에서 시전한다.
+		local mageSniping = false
+		-- (불독 확장 2026-08-08) 오로라 난사의 축은 썬콜 = 블리자드 / 불독 = 메테오 - 어느 쪽이든
+		-- 오로라 안 + 사용 가능이면 대상 거리와 무관하게 제자리에서 시전한다.
+		local mageBombard = _SkillManager:IsInRecoveryAura()
+			and ((self:HasBlizzardSlot() and _SkillManager:IsBlizzardReady())
+				or (self:HasMeteorSlot() and _SkillManager:IsMeteorReady()))
 		if awakeningOn and self:HasStarThrowSlot() then
 			if math.abs(cdx) > 15.0 or math.abs(cdy) > 7.5 then return end
 		elseif self:ShouldSnipeWithAssassinate(cdx, cdy) then
 			-- 연막 중 암살 사거리(9유닛) 안이면 붙지 않고 그대로 시전한다.
 			smokeSniping = math.sqrt(cdx * cdx + cdy * cdy) > 1.3
+		elseif mageBombard or self:ShouldMageSnipe(player, pp, cdx, cdy) then
+			mageSniping = math.sqrt(cdx * cdx + cdy * cdy) > 1.3
 		else
-			if math.sqrt(cdx * cdx + cdy * cdy) > 1.3 then return end
+			-- (요청 2026-08-10) 점프 공격 창 동안은 1.45까지 완화 - 가장자리 도약(대각선 위 대상)은
+			-- 1.3을 살짝 넘는다. 서버 실판정(반경 1.5) 안쪽까지만 연다.
+			local atkGate = 1.3
+			if (self._T.jumpAtkUntil or 0) > now then atkGate = 1.45 end
+			if math.sqrt(cdx * cdx + cdy * cdy) > atkGate then return end
 		end
 		-- (헛빵 수정 2) 방향 전환 직후 0.25초는 시전 보류 - 서버의 LookDirectionX 복제가 아직 옛
 		-- 방향이라 등 뒤로 시전됐다. 잠깐 기다렸다 재시도한다.
@@ -1319,22 +1843,39 @@ script AutoHuntManager extends Logic
 		end
 		-- (사용자 신고) 점프 중(공중) 시전 금지 - 타격 판정은 시전 0.25초 뒤 그 시점 위치의 전방
 		-- 박스(위 1.0/아래 0.5)라, 상승/하강 중에 쏘면 판정 순간 높이가 어긋나 빗맞는다. 지상에서만 쏜다.
+		-- (요청 2026-08-10) 예외: 점프 공격 창(jumpAtkUntil) 동안은 공중 시전을 허용한다 -
+		-- 지형적으로 못 올라가는 위층 대상은 점프 정점의 위쪽 박스(1.0)에 드는 그 순간이 유일한
+		-- 기회다(시전 타이밍은 OnUpdate의 점프 공격 훅이 dy≤0.9 + 상승 구간으로 이미 조준했다).
 		local rbAtk = player.RigidbodyComponent
 		if isvalid(rbAtk) and not rbAtk:IsOnGround() then
-			self._T.nextAtk = now + 0.15
-			return
+			if (self._T.jumpAtkUntil or 0) <= now then
+				self._T.nextAtk = now + 0.15
+				return
+			end
 		end
 		-- 대상이 현재 바라보는 방향의 뒤쪽이면 이번 틱은 방향만 맞추고 시전하지 않는다 (전방 박스 판정).
 		-- (각성 예외) 방향 무관 조준이라 몸만 돌려두고 시전은 미루지 않는다.
+		-- ⚠ (신고 2026-08-10 "적이 살짝 뒤에 있으면 사거리가 안 되는데도 그 자리에서 계속 공격한다")
+		--   **불감대 0.05가 이 버그의 원인이었다.** 서버 실판정은 `dx * dirX >= 0`(전방 박스,
+		--   FindSlashBlastTargets)이라 **0.03유닛만 뒤에 있어도 그 시전은 통째로 0마리 명중**이다.
+		--   그런데 |cdx| ≤ 0.05면 방향 보정을 건너뛰어, 뒤를 보고 계속 헛방을 쳤다.
+		--   실측 로그(02:22:20): `AttackBrandish 시전 dir=1.0` + 대상 dx=-0.030 → `DealBrandishFirstHits
+		--   targets=0`, 바로 다음 시전에서 dir=-1.0로 바뀌자 `targets=3`.
+		--   → 대상이 **바라보는 방향의 반대편이면 크기와 무관하게 무조건 돌린다.**
+		--     불감대는 "이미 앞쪽인데 미세하게 흔들리는" 경우에만 남긴다(제자리 회전 방지).
 		local pccDir = player.PlayerControllerComponent
-		if isvalid(pccDir) and math.abs(cdx) > 0.05 then
-			local wantDir = (cdx > 0) and 1 or -1
-			if pccDir.LookDirectionX ~= wantDir then
-				pccDir.LookDirectionX = wantDir
-				self._T.dirChangedAt = now
-				if not awakeningOn then
-					self._T.nextAtk = now + 0.15
-					return
+		if isvalid(pccDir) then
+			local lookNow = (pccDir.LookDirectionX >= 0) and 1 or -1
+			local isBehind = (cdx * lookNow) < 0
+			if isBehind or math.abs(cdx) > 0.05 then
+				local wantDir = (cdx > 0) and 1 or -1
+				if pccDir.LookDirectionX ~= wantDir then
+					pccDir.LookDirectionX = wantDir
+					self._T.dirChangedAt = now
+					if not awakeningOn then
+						self._T.nextAtk = now + 0.15
+						return
+					end
 				end
 			end
 		end
@@ -1376,6 +1917,10 @@ script AutoHuntManager extends Logic
 		-- (신궁 2026-08-06) 피어싱도 같은 자기 규칙 차지기 - 스나이핑이 안 나갔을 때만 시도한다
 		-- (둘 다 차지라 겹치면 서로의 차지를 취소한다).
 		if self:TryPiercingCast(now, player, pp, target) then return end
+		-- (히어로 3차, 요청 2026-08-09) 코마/패닉은 콤보 구슬을 전량 소모하는 자기 규칙 스킬이다 -
+		-- 확률 로테이션보다 먼저 판단한다. 코마(다수)를 먼저 보고, 안 나갔을 때만 패닉(탱커)을 본다.
+		if self:TryComaCast(now, player, pp, target) then return end
+		if self:TryPanicCast(now, player, pp, target) then return end
 		-- 다수 판정: 사거리권(1.6유닛)에 2마리 이상이면 광역 우선 (요청 - 다수면 슬래시블러스트 > 파워스트라이크)
 		local nearby = self:CountNearbyMonsters(player, pp, 1.6)
 		local crowded = (nearby >= 2)
@@ -1397,6 +1942,34 @@ script AutoHuntManager extends Logic
 			for _, s in ipairs(self._T.slotSingles) do
 				table.insert(pool, { key = s.key, name = s.name, w = crowded and 0.15 or 1.0 })
 			end
+		end
+
+		-- (요청 2026-08-09) 전사 1차 2종의 **하드 금지 규칙** - 위 확률 가중(0.15)으로는 가끔 나가서
+		-- "단일 대상에게 슬블만 긁는" 비효율이 남는다는 신고. 확률이 아니라 아예 후보에서 뺀다.
+		--   · 단일 대상 → 슬래시블러스트 금지 (파워스트라이크가 단일 딜을 담당)
+		--   · 슬래시블러스트 사거리에 4마리 이상 → 파워스트라이크 금지 (광역이 명백히 이득)
+		-- ⚠ 두 규칙의 기준을 **같은 카운트(sbTargets)**로 통일한 이유: 서로 다른 기준을 쓰면
+		--   "앞에 4마리인데 반경 1.6 안엔 1마리" 같은 구간에서 둘 다 0이 되어 기본공격으로 떨어진다.
+		-- 카운트는 서버 판정(FindSlashBlastTargets: 전방 2.0 / |dy| 1.0 / 최대 6)에 맞춘 근사치다.
+		local sbTargets = self:CountMonstersInFront(player, pp, lookDir, 2.0)
+		local bannedName = ""
+		for _, c in ipairs(pool) do
+			if c.name == "슬래시블러스트" or c.name == "슬래쉬블래스트" then
+				if sbTargets <= 1 and c.w > 0 then
+					c.w = 0
+					bannedName = "슬래시블러스트(단일)"
+				end
+			elseif c.name == "파워스트라이크" then
+				if sbTargets >= 4 and c.w > 0 then
+					c.w = 0
+					bannedName = "파워스트라이크(4마리+)"
+				end
+			end
+		end
+		-- 공격 틱마다 찍히면 로그가 넘치므로 3초에 한 번만 남긴다(규칙 발동 확인용).
+		if bannedName ~= "" and (self._T.banLogAt or -99) + 3.0 < now then
+			self._T.banLogAt = now
+			log("[AutoHunt] 전사1차 금지 규칙: " .. bannedName .. " 제외 (슬블 사거리 대상 " .. tostring(sbTargets) .. "마리)")
 		end
 
 		-- 상위 호환 강등: 브랜디쉬 보유 시 하위 스킬 가중치 ×0.01 (≈1%)
@@ -1616,6 +2189,151 @@ script AutoHuntManager extends Logic
 			end
 		end
 
+		-- ── (썬콜, 요청 2026-08-08) 로테이션 ──────────────────────────────────
+		-- ① 2차(썬더볼트)를 배웠으면 썬더볼트 위주로 사냥한다(앞뒤 ±3 최대 6명 동시 타격).
+		-- ② 매직클로는 "먼 거리의 적" 전용 원거리 필러 - 근접에서는 거의 안 쓴다.
+		-- ③ 매직 미사일은 위아래 판정(전방 6/세로 ±3)이 좋아 간간히 - 대상이 위아래로 벌어졌으면 올린다.
+		-- ④ 체인라이트닝이 있으면 매직클로/썬더볼트는 1%로 강등(브랜디쉬 상위 호환 관례).
+		-- ⑤ 리커버리 오로라 안에서는 블리자드가 압도적 주력(노쿨 난사)이고 체인/미사일을 조금 섞는다.
+		-- ⑥ 사거리/쿨타임이 안 되는 스킬은 이번 틱 후보에서 제외한다(원거리 제자리 시전 헛빵 방지).
+		local hasMagicClaw, hasThunderbolt, hasMagicMissileSk = false, false, false
+		local hasChainLightningSk, hasBlizzardSk = false, false
+		for _, c in ipairs(pool) do
+			if c.name == "매직클로" then hasMagicClaw = true end
+			if c.name == "썬더볼트" then hasThunderbolt = true end
+			if c.name == "매직 미사일" then hasMagicMissileSk = true end
+			if c.name == "체인라이트닝" then hasChainLightningSk = true end
+			if c.name == "블리자드" then hasBlizzardSk = true end
+		end
+		if hasMagicClaw or hasThunderbolt or hasMagicMissileSk or hasChainLightningSk or hasBlizzardSk then
+			local adxMage = math.abs(cdx)
+			local adyMage = math.abs(cdy)
+			for _, c in ipairs(pool) do
+				if c.name == "썬더볼트" then
+					c.w = crowded and 3.0 or 2.0
+				elseif c.name == "매직클로" then
+					-- 근접에서는 필러(0.4), 원거리 제자리 시전(mageSniping)에서는 주력 후보.
+					c.w = mageSniping and 2.0 or 0.4
+				elseif c.name == "매직 미사일" then
+					c.w = (adyMage >= 0.8) and 1.5 or 0.5
+				elseif c.name == "체인라이트닝" then
+					c.w = crowded and 3.0 or 1.8
+				elseif c.name == "블리자드" then
+					c.w = crowded and 3.0 or 1.0
+				end
+			end
+			-- ④ 상위 호환 강등.
+			if hasChainLightningSk then
+				for _, c in ipairs(pool) do
+					if c.name == "매직클로" or c.name == "썬더볼트" then c.w = c.w * 0.01 end
+				end
+			end
+			-- ⑥ 사거리/쿨타임 게이트. 상수는 서버 판정보다 살짝 안쪽(헛빵 방지 - ShouldMageSnipe와 동일).
+			local inAuraMage = _SkillManager:IsInRecoveryAura()
+			for _, c in ipairs(pool) do
+				if c.name == "썬더볼트" and (adxMage > 2.8 or adyMage > 0.9) then c.w = 0 end
+				if c.name == "매직클로" and (adxMage > 4.8 or adyMage > 1.4) then c.w = 0 end
+				if c.name == "체인라이트닝" then
+					-- 서버 첫 대상 조건: 전방 0.5~6.0 콘. 코앞(0.4 미만) 단독 대상은 첫 대상을 못 찾는다.
+					if adxMage > 5.5 or adyMage > 0.8 + adxMage * 0.45 then c.w = 0 end
+					if adxMage < 0.4 and nearby <= 1 then c.w = 0 end
+				end
+				if c.name == "매직 미사일" then
+					if not _SkillManager:IsMagicMissileReady() or adxMage > 5.5 or adyMage > 2.8 then c.w = 0 end
+				end
+				if c.name == "블리자드" then
+					if not _SkillManager:IsBlizzardReady() then
+						c.w = 0
+					elseif not inAuraMage and (adxMage > 12.0 or adyMage > 4.2) then
+						-- 오로라 밖에서는 대상이 블리자드 범위(±12.5/±4.7) 안일 때만 긴 쿨(제네시스와
+						-- 동일 공식 91~120초)을 쓴다.
+						c.w = 0
+					end
+				end
+			end
+			-- ⑤ 오로라 안 난사 모드: 블리자드 주력 + 체인/미사일 소량(요청 - "블리자드만 꼭 쓰는 건 아니다").
+			if inAuraMage and hasBlizzardSk and _SkillManager:IsBlizzardReady() then
+				for _, c in ipairs(pool) do
+					if c.name == "블리자드" then c.w = 20.0
+					elseif c.name == "체인라이트닝" then c.w = math.min(c.w, 2.0)
+					elseif c.name == "매직 미사일" then c.w = math.min(c.w, 1.5)
+					elseif c.name == "매직클로" or c.name == "썬더볼트" then c.w = math.min(c.w, 0.2)
+					end
+				end
+			end
+		end
+
+		-- ── (불독, 요청 2026-08-08) 로테이션 ──────────────────────────────────
+		-- 핵심 메커니즘: **포이즌 미스트를 맵 전역에 최대한 깔고 익스플로젼으로 사냥**한다.
+		-- ① 익스플로젼이 주력 - 주변 유폭권(±2.2/±1.5)에 독안개가 있으면 가중을 2배로 올린다
+		--    (독안개 파열마다 폭발 데미지가 한 번씩 더 들어가는 구조라 안개 위에서 터뜨리는 게 최대 효율).
+		-- ② 포이즌 미스트는 "이 자리가 아직 안 덮였고 주변에 적이 있을 때"만 - 넓게 깔기 자체는
+		--    PoisonCarpetTick(사냥 동선을 따라 지나가며 설치)이 담당하고, 로테이션에서는 근접전 중
+		--    발밑 보충만 한다. 동시 유지 상한(10개)도 카펫과 공유한다.
+		-- ③ 파이어에로우는 원거리 단일 필러(자동사냥은 방향키가 없어 수평 전방으로만 나간다).
+		-- ④ 메테오는 블리자드와 같은 규칙 - 몰렸을 때 우선, 쿨/사거리 게이트, 오로라 안에서는 난사 주력.
+		local hasFireArrowFp, hasPoisonMistFp, hasExplosionFp, hasMeteorFp = false, false, false, false
+		for _, c in ipairs(pool) do
+			if c.name == "파이어에로우" then hasFireArrowFp = true end
+			if c.name == "포이즌 미스트" then hasPoisonMistFp = true end
+			if c.name == "익스플로젼" then hasExplosionFp = true end
+			if c.name == "메테오" then hasMeteorFp = true end
+		end
+		if hasFireArrowFp or hasPoisonMistFp or hasExplosionFp or hasMeteorFp then
+			local adxFp = math.abs(cdx)
+			local adyFp = math.abs(cdy)
+			local inAuraFp = _SkillManager:IsInRecoveryAura()
+			local mistsNearFp = self:CountMistsNear(player, pp.x, pp.y, 2.2, 1.5)
+			local coveredHereFp = self:CountMistsNear(player, pp.x, pp.y, 2.5, 1.2) > 0
+			local mistTotalFp = #self:GetActiveMistPositions(player)
+			for _, c in ipairs(pool) do
+				if c.name == "익스플로젼" then
+					c.w = crowded and 3.0 or 1.5
+					if mistsNearFp >= 1 then c.w = c.w * 2.0 end
+				elseif c.name == "포이즌 미스트" then
+					if coveredHereFp or mistTotalFp >= 10 then
+						c.w = 0
+					else
+						c.w = (self:CountNearbyMonsters(player, pp, 2.5) >= 1) and 2.5 or 0
+					end
+				elseif c.name == "파이어에로우" then
+					c.w = mageSniping and 2.5 or 0.8
+				elseif c.name == "메테오" then
+					c.w = crowded and 3.0 or 1.0
+				end
+			end
+			-- 사거리/쿨타임 게이트. 상수는 서버 판정보다 살짝 안쪽(헛빵 방지 - 썬콜 ⑥과 같은 원리).
+			for _, c in ipairs(pool) do
+				if c.name == "파이어에로우" and (adxFp > 7.5 or adyFp > 0.6) then c.w = 0 end
+				if c.name == "익스플로젼" then
+					-- 폭발 본체 판정은 시전자 주변 ±3.0/±1.5 - 대상이 그 안이거나, 유폭할 안개+주변 적이
+					-- 있으면(안개 파열 데미지는 안개 자리 기준) 대상 거리와 무관하게 허용한다.
+					local targetInRange = adxFp <= 2.8 and adyFp <= 1.4
+					local mistCombo = mistsNearFp >= 1 and self:CountNearbyMonsters(player, pp, 3.0) >= 1
+					if not targetInRange and not mistCombo then c.w = 0 end
+				end
+				if c.name == "메테오" then
+					if not _SkillManager:IsMeteorReady() then
+						c.w = 0
+					elseif not inAuraFp and (adxFp > 12.0 or adyFp > 4.2) then
+						-- 오로라 밖에서는 대상이 메테오 범위(±12.5/±4.7) 안일 때만 긴 쿨(제네시스와
+						-- 동일 공식 91~120초)을 쓴다.
+						c.w = 0
+					end
+				end
+			end
+			-- 오로라 안 난사 모드: 메테오 주력 + 익스플로젼/미스트 소량(썬콜 ⑤의 불독판).
+			if inAuraFp and hasMeteorFp and _SkillManager:IsMeteorReady() then
+				for _, c in ipairs(pool) do
+					if c.name == "메테오" then c.w = 20.0
+					elseif c.name == "익스플로젼" then c.w = math.min(c.w, 2.0)
+					elseif c.name == "포이즌 미스트" then c.w = math.min(c.w, 1.0)
+					elseif c.name == "파이어에로우" or c.name == "매직클로" then c.w = math.min(c.w, 0.2)
+					end
+				end
+			end
+		end
+
 		-- (다크나이트) 드래곤 로어 사용 규칙 — **주력기(스피어 버스터) 대비 사용 비율로 직접 지정한다**
 		-- (요청 2026-08-05 재조정: 이전의 "감쇠 ×0.3 + 최소 간격 게이트 + 쓰고도 35% 남을 것" 조합은
 		--  실제로는 거의 안 나왔다. 소모율이 마스터 51%라 "35% 여유" 조건이 사실상 HP 86% 이상을
@@ -1665,14 +2383,32 @@ script AutoHuntManager extends Logic
 		-- (요청 2026-08-04) 좋은 스킬이지만 자동사냥 관전 시점에서 직업 컨셉(차지 블로우 속성
 		-- 연계)을 가리므로 사용빈도 하향: 몰림 부스트 ×4 → ×1.5, 기본 가중 ×0.35(크게 감쇠),
 		-- 여기에 최소 12초 간격 게이트 - 몰린 상황이 흔해 부스트만 낮춰서는 여전히 자주 나온다.
+		-- (요청 2026-08-10) **방향 게이트 신설**: 돌진은 바라보는 방향으로 몸이 밀려나는 이동기라,
+		-- 다음 사냥 지점(지금 대상을 잡은 뒤 이어갈 곳)이 등 뒤면 이동거리만 늘린다(신고: "돌진
+		-- 사용 시 다음 가야 할 지역과 반대로 이동") - 그때는 쓰지 않는다. 같은 방향이면 적을 다음
+		-- 동선 쪽으로 밀어 모으면서 이동거리도 버는 이득이라 몰림 부스트를 1.5 → 2.0으로 올린다.
+		local chargeInPool = false
+		for _, c in ipairs(pool) do
+			if c.name == "돌진" and c.w > 0 then chargeInPool = true end
+		end
+		local chargeNextDir = 0
+		if chargeInPool then chargeNextDir = self:GetNextHuntDirX(player, pp, target) end
 		for _, c in ipairs(pool) do
 			if c.name == "돌진" then
-				if frontCount <= 0 or (self._T.nextCharge or 0) > now then
+				if frontCount <= 0 or (self._T.nextCharge or 0) > now
+					or (self._T.jumpAtkUntil or 0) > now then
 					c.w = 0
+				elseif chargeNextDir ~= 0 and lookDir ~= chargeNextDir then
+					c.w = 0
+					if (self._T.chargeDirLogAt or -99) + 5.0 < now then
+						self._T.chargeDirLogAt = now
+						log("[AutoHunt] 돌진 방향 게이트 - 다음 사냥 지점(" .. tostring(chargeNextDir)
+							.. ")이 등 뒤라 미사용 (look=" .. tostring(lookDir) .. ")")
+					end
 				else
 					c.w = c.w * 0.35
 					if frontCount >= 2 then
-						c.w = c.w * 1.5
+						c.w = c.w * ((chargeNextDir ~= 0 and lookDir == chargeNextDir) and 2.0 or 1.5)
 					end
 				end
 			end
@@ -1693,12 +2429,57 @@ script AutoHuntManager extends Logic
 			end
 		end
 
+		-- (안전망, 썬콜 2026-08-08) 원거리 마법 시전 중에는 마법 스킬 외의 것이 남지 않게 한다 -
+		-- 근접기가 뽑히면 허공을 때린다. 쓸 수 있는 마법이 하나도 없으면 이번 틱은 쉰다
+		-- (기본공격 폴백도 허공이다 - 연막 저격 안전망과 같은 구조).
+		if mageSniping then
+			local mageW = 0
+			for _, c in ipairs(pool) do
+				-- (불독 2026-08-08) 파이어에로우(수평 원거리)/메테오(±12.5 광역)도 원거리에서 실제로 닿는
+				-- 마법이다 - 자기 사거리 게이트는 위 불독 블록이 이미 걸어뒀다.
+				if c.name == "매직클로" or c.name == "썬더볼트" or c.name == "매직 미사일"
+					or c.name == "체인라이트닝" or c.name == "블리자드"
+					or c.name == "파이어에로우" or c.name == "메테오" then
+					mageW = mageW + c.w
+				else
+					c.w = 0
+				end
+			end
+			if mageW <= 0 then
+				self._T.nextAtk = now + 0.2
+				return
+			end
+		end
+
+		-- (요청 2026-08-09) 자원(MP/HP) 비용을 못 내는 스킬은 후보에서 뺀다.
+		-- ⚠ 이게 없으면 UseSkillInSlot이 비용 부족으로 **조용히 return**해서, 뽑히기만 하고 아무것도
+		--   안 하는 "가만히 서 있는" 상태가 된다(MP 소모가 생긴 파워스트라이크/슬래시블러스트 신고).
+		--   전부 빠지면 아래 total<=0 분기가 그대로 기본공격 폴백으로 이어진다 - 분기를 새로 만들지 않는다.
+		for _, c in ipairs(pool) do
+			if c.w > 0 and not _SkillManager:CanAffordSkillCost(c.name) then
+				c.w = 0
+			end
+		end
+
 		local total = 0
 		for _, c in ipairs(pool) do total += c.w end
 		if #pool == 0 or total <= 0 then
-			-- 배정된 공격 스킬이 없으면 기본공격 (Control 공격과 동일 경로)
+			-- 배정된 공격 스킬이 없거나(또는 전부 자원 부족) 기본공격 (Control 공격과 동일 경로)
 			local pcc = player.PlayerControllerComponent
 			if isvalid(pcc) then pcc:ActionAttack() end
+			-- (요청 2026-08-09) 마지막 공격 시각 - 다운점프를 1초 미루는 판단에 쓴다.
+			self._T.lastAttackAt = now
+			-- (요청 2026-08-09) 기본공격 후 **0.5초간 아무 행동도 하지 않는다.**
+			-- holdMoveUntil은 OnUpdate 상단에서 이동/점프/대상 재선정/다음 공격을 통째로 막는
+			-- 기존 장치라 그대로 재사용한다(시전 모션 홀드와 같은 경로).
+			-- 기본공격 모션(임팩트 0.3초)이 온전히 끝난 뒤 다음 행동으로 넘어가게 하는 목적.
+			self._T.holdMoveUntil = now + 0.5
+			-- 공격 틱마다 찍히면 로그가 넘치므로 2초에 한 번만 남긴다(폴백에 빠진 이유 추적용).
+			if (self._T.basicAtkLogAt or -99) + 2.0 < now then
+				self._T.basicAtkLogAt = now
+				log("[AutoHunt] 기본공격 폴백 (후보 " .. tostring(#pool) .. "개, 가중합 " .. tostring(total)
+					.. " - 미배정이거나 전부 자원 부족)")
+			end
 			return
 		end
 
@@ -1734,6 +2515,24 @@ script AutoHuntManager extends Logic
 			self._T.holdMoveUntil = now + 2.0
 			self._T.nextAtk = now + 2.0
 		end
+		-- (요청 2026-08-08) 블리자드/메테오/제네시스는 서버가 조작을 3초 잠근다(행동불가) - 그런데
+		-- 자동사냥의 걷기(MoveToDirection)는 클라 권한이라 그 잠금이 안 먹혀 "블리자드를 쓰면서
+		-- 걸어 다니는" 신고가 났다. 잠금 동안 이동/다음 스킬을 함께 멈춘다(드래곤 로어와 같은 처리).
+		-- ⚠ 간격은 3.0이 아니라 4.6초 - 서버의 재시전 잠금(isBlizzarding/isGenesising, 4.5초 해제)이
+		--   행동 잠금(3초)보다 길어서, 3초 간격으로 다시 뽑으면 "요청 차단됨(이미 진행 중)"만 반복하며
+		--   헛요청이 낀다(실측: 사용 21회 중 발동 12회).
+		if pick.name == "블리자드" or pick.name == "메테오" or pick.name == "제네시스" then
+			self._T.holdMoveUntil = now + 3.0
+			self._T.nextAtk = now + 4.6
+		end
+		-- (불독 2026-08-08) 익스플로젼은 시전 1.0초 뒤 **그 시점의 시전자 위치**에서 터진다 -
+		-- 그 전에 걸어 나가면 폭발 중심이 대상/독안개에서 밀린다. 폭발 시점까지 이동을 멈춘다.
+		if pick.name == "익스플로젼" then
+			self._T.holdMoveUntil = now + 1.2
+			self._T.nextAtk = now + 1.2
+		end
+		-- (요청 2026-08-09) 마지막 공격 시각 - 다운점프를 1초 미루는 판단에 쓴다.
+		self._T.lastAttackAt = now
 		_SkillManager:UseSkillInSlot(pick.key)
 	end
 
@@ -1822,6 +2621,51 @@ script AutoHuntManager extends Logic
 		return count
 	end
 
+	-- (요청 2026-08-10) 다음 사냥 지점 미리 탐색: 지금 대상을 잡은 뒤 이어서 갈 곳이 내 기준
+	-- 어느 쪽인지(-1/1, 없거나 불명이면 0). "대상을 잡은 자리"(대상 위치) 기준 최근접(같은 층
+	-- 우선) 생존 몬스터를 다음 지점으로 본다 - 돌진 방향 게이트 등 동선 판단용. 0.5초 캐시.
+	@ExecSpace("ClientOnly")
+	method number GetNextHuntDirX(Entity player, Vector3 pp, Entity target)
+		-- 다음 사냥 지점(현재 대상 제외 최근접)의 수평 방향을 돌려준다. 캐시 0.5초.
+		local now = _UtilLogic.ElapsedSeconds
+		if self._T.nextDirAt ~= nil and (now - self._T.nextDirAt) < 0.5 then
+			return self._T.nextDirX or 0
+		end
+		self._T.nextDirAt = now
+		self._T.nextDirX = 0
+		if not isvalid(target) then return 0 end
+		local tp = target.TransformComponent.WorldPosition
+		local comps = self:GetMonsterComps(player)
+		local best = nil
+		local bestScore = 0
+		for _, comp in ipairs(comps) do
+			if isvalid(comp) and comp.IsDead ~= true then
+				local e = comp.Entity
+				if isvalid(e) and e ~= target and e.Visible ~= false then
+					local banUntil = nil
+					if self._T.banned ~= nil then banUntil = self._T.banned[e] end
+					if banUntil == nil or banUntil <= now then
+						local wp = e.TransformComponent.WorldPosition
+						local ddx = math.abs(wp.x - tp.x)
+						local ddy = math.abs(wp.y - tp.y)
+						-- FindTarget의 층 페널티와 같은 결: 다른 층은 수직 거리에 가중을 준다.
+						local score = ddx
+						if ddy >= 1.5 then score = score + ddy * 2 end
+						if best == nil or score < bestScore then
+							best = e
+							bestScore = score
+						end
+					end
+				end
+			end
+		end
+		if best == nil then return 0 end
+		local nx = best.TransformComponent.WorldPosition.x
+		if math.abs(nx - pp.x) < 0.5 then return 0 end   -- 사실상 제자리 - 방향으로 안 본다
+		self._T.nextDirX = (nx > pp.x) and 1 or -1
+		return self._T.nextDirX
+	end
+
 	@ExecSpace("ClientOnly")
 	method Entity FindTarget(Entity player)
 		-- 현재 맵에서 살아있는 최근접 몬스터. 같은 높이(|dy|<1.5)를 우선하고,
@@ -1830,6 +2674,73 @@ script AutoHuntManager extends Logic
 		if comps == nil or #comps == 0 then return nil end
 		local pp = player.TransformComponent.WorldPosition
 		local now = _UtilLogic.ElapsedSeconds
+		-- (신고 2026-08-10) 지금 밟고 있는 발판 Id - 아래 "끊긴 발판" 후보 걸러내기의 기준점.
+		local myFhId = 0
+		local rbMe = player.RigidbodyComponent
+		if isvalid(rbMe) then
+			local curFh = rbMe:GetCurrentFoothold()
+			if curFh ~= nil then myFhId = curFh.Id end
+		end
+		if myFhId <= 0 then myFhId = self:GetFootholdIdBelow(player, pp.x, pp.y + 0.1, 1.5) end
+
+		-- ⚠ (신고 2026-08-10 "등반해서 위에 적을 잡으려는 것처럼 하다가 등반 이후 바로 다시 내려간다")
+		--   **등반 직후 층 고정.** 올라온 발판 위에 아직 잡을 적이 남아 있으면 그 적부터 정리하고,
+		--   아래층 후보는 아예 보지 않는다.
+		--   근본 원인: 둔덕에 올라서면 아래층(y-0.60)의 적도 `|relY| < 1.5`라 **같은 층으로 분류**되어
+		--   최근접 경쟁에 그대로 끼어든다. 착지 순간 x가 더 가까운 아래층 적이 이기면 곧바로 목표가
+		--   아래로 넘어가고, 하강 보류(1.2초)가 풀리는 즉시 내려간다 - 올라간 의미가 사라진다.
+		--   → 등반 후 3초 동안은 **내 발 높이 ±0.4 안의 적만** 후보로 본다(그런 적이 하나도 없으면
+		--     평소 규칙으로 되돌아가 정상적으로 아래층을 고른다).
+		--   ⚠ 폭이 0.4인 이유(실측 2026-08-10): 이 맵의 둔덕 높이가 **0.60**이라 ±0.8로 두면 바로 아래
+		--     바닥의 적까지 "같은 층"에 들어와, 층 고정 중에도 그쪽으로 걸어가다 가장자리에서 떨어졌다
+		--     (등반 1초 뒤 낙하 2건). 0.4면 0.60 단차를 확실히 가르면서 발판 경사/스프라이트 오차는 견딘다.
+		local layerHold = ((self._T.layerHoldUntil or 0) > now)
+		if layerHold then
+			local sameLayerAny = false
+			for _, comp in ipairs(comps) do
+				if isvalid(comp) and comp.IsDead ~= true then
+					local e = comp.Entity
+					if isvalid(e) and e.Visible ~= false then
+						local banUntil = nil
+						if self._T.banned ~= nil then banUntil = self._T.banned[e] end
+						if banUntil == nil or banUntil <= now then
+							local wpA = e.TransformComponent.WorldPosition
+							-- (신고 2026-08-10) 높이가 같아도 **끊긴 건너편 발판**이면 층 고정 대상이 아니다 -
+							-- 그쪽으로 걸어가면 가장자리에서 그대로 떨어진다.
+							if math.abs(wpA.y - pp.y) <= 0.4
+								and self:IsWalkConnectedToPoint(player, myFhId, wpA.x, wpA.y) then
+								sameLayerAny = true
+							end
+						end
+					end
+				end
+			end
+			if sameLayerAny then
+				local bestHold = nil
+				local bestHoldDx = 0
+				for _, comp in ipairs(comps) do
+					if isvalid(comp) and comp.IsDead ~= true then
+						local e = comp.Entity
+						if isvalid(e) and e.Visible ~= false then
+							local banUntil = nil
+							if self._T.banned ~= nil then banUntil = self._T.banned[e] end
+							if banUntil == nil or banUntil <= now then
+								local wp = e.TransformComponent.WorldPosition
+								if math.abs(wp.y - pp.y) <= 0.4
+									and self:IsWalkConnectedToPoint(player, myFhId, wp.x, wp.y) then
+									local dxH = math.abs(wp.x - pp.x)
+									if bestHold == nil or dxH < bestHoldDx then
+										bestHold = e
+										bestHoldDx = dxH
+									end
+								end
+							end
+						end
+					end
+				end
+				if bestHold ~= nil then return bestHold end
+			end
+		end
 
 		-- 1차: 같은 층(|dy|<1.5) 후보의 최근접 수평 거리 - "같은 층 가까운 곳에 적이 있나" 판정.
 		-- 같은 패스에서 아래층(1.1유닛 이상 아래) 최근접 후보도 함께 찾는다 (하강 순환용).
@@ -1895,8 +2806,36 @@ script AutoHuntManager extends Logic
 		-- (헤이스트 점프 보정과 같은 취급 - 실제 도약은 추적 분기의 TryFlashJumpMove가 한다).
 		local hasteReach = self:GetHasteJumpReach()
 		local flashReach = self:GetFlashJumpReach()
+		-- (요청 2026-08-09) 이동기가 없어도 **앞점프로 닿는 높이**의 위층 적은 후보에 넣는다 -
+		-- 실제 도약은 추적 분기의 "앞점프로 위 발판 등반"이 하고, 올라설 발판 확인도 거기서 한다.
+		-- 이게 없으면 히어로처럼 이동기 없는 직업이 바로 위 발판의 적을 영영 후보에서 놓친다.
+		local plainReach = self:GetPlainJumpReach(player)
+		-- (썬콜, 요청 2026-08-08) 텔레포트가 퀵슬롯에 있으면 위 발판 2.31유닛까지 수직 텔레포트로
+		-- 올라갈 수 있다 - 그 높이 안의 위층 적을 후보에 넣는다(실제 도약은 추적 분기의 텔레포트 이동이).
+		local tpReach = 0
+		if self._T.slotTeleports ~= nil and #self._T.slotTeleports > 0 then tpReach = 2.4 end
 		local hasMobility = (self._T.slotMobilities ~= nil and #self._T.slotMobilities > 0)
 			or (self._T.slotDragonRides ~= nil and #self._T.slotDragonRides > 0 and _SkillManager:CanAutoMountDragonRide())
+		-- (요청 2026-08-10) 동선 예측: 살아있는 전체 몬스터의 무게중심 방향(x). 아래 점수 계산에서
+		-- "가는 길목에 있는" 후보를 살짝 우선해, 잡고 나서 다음 지형으로 자연스럽게 이어지게 한다.
+		local aliveSumX = 0
+		local aliveCnt = 0
+		for _, comp in ipairs(comps) do
+			if isvalid(comp) and comp.IsDead ~= true then
+				local eC = comp.Entity
+				if isvalid(eC) and eC.Visible ~= false then
+					aliveSumX = aliveSumX + eC.TransformComponent.WorldPosition.x
+					aliveCnt += 1
+				end
+			end
+		end
+		local centroidDir = 0
+		if aliveCnt >= 2 then
+			local cxAll = aliveSumX / aliveCnt
+			if math.abs(cxAll - pp.x) >= 1.0 then
+				centroidDir = (cxAll > pp.x) and 1 or -1
+			end
+		end
 		local best = nil
 		local bestScore = 0
 		for _, comp in ipairs(comps) do
@@ -1908,8 +2847,34 @@ script AutoHuntManager extends Logic
 					if banUntil == nil or banUntil <= now then
 						local wp = e.TransformComponent.WorldPosition
 						local relY = wp.y - pp.y
-						if relY >= 1.1 and not hasMobility and relY > hasteReach and relY > flashReach then
+						-- (요청 2026-08-09) 어떤 이동기로도 못 닿는 위층이라도 **로프로 올라갈 수 있으면** 후보다.
+						-- 실제 등반은 추적 분기의 RopeClimbTick이 담당하고, 실패하면 타임아웃으로 제외된다.
+						local ropeOk = false
+						if relY >= 1.1 then
+							ropeOk = self:FindUsableRope(player, pp, wp.y, wp.x) ~= nil
+						end
+						-- (요청 2026-08-10) 이동기·점프로 못 올라가는 위층이라도 **점프 정점 공격**
+						-- (점프 사거리 + 위쪽 판정 박스 0.9)이 닿는 높이면 후보에 남긴다 - 실제 공격은
+						-- 추적 분기의 TryJumpAttack이 담당한다(그동안 이런 적은 무시됐다는 신고).
+						if relY >= 1.1 and not hasMobility and relY > hasteReach and relY > flashReach
+							and relY > tpReach and relY > plainReach + 1.15 and not ropeOk then
 							continue
+						end
+						-- ⚠ (신고 2026-08-10) **높이는 같으나 끊겨서 서로 갈 수 없는 발판**의 적은 후보가 아니다.
+						--   예전엔 |relY|만 보고 "같은 층"으로 분류해, 건너편 발판의 적을 향해 걸어가다
+						--   가장자리에서 그대로 떨어졌다(신고: 좌측 로프로 올라간 뒤 우측 발판의 적을 향해 이동).
+						--   판정 범위는 (-0.8, 1.1) - 그 위는 위층 전용 도달 판정(위 continue)이, 그 아래는
+						--   다운점프 경로(착지 발판 레이캐스트)가 이미 따로 거른다.
+						--   ⚠ 끊겨 있어도 **앞점프로 그 발판에 올라설 수 있으면** 정상 후보다(작은 턱/선반).
+						if relY > -0.8 and relY < 1.1
+							and not self:IsWalkConnectedToPoint(player, myFhId, wp.x, wp.y)
+							and not self:CanReachTargetLayer(player, pp, wp, plainReach) then
+							-- (신고 2026-08-10 2차) **약간 위**(0.5↑)의 끊긴 선반 위 적은 점프 정점
+							-- 공격이 닿으면 후보에 남긴다 - 실제 공격은 추적 분기의 가장자리 점프
+							-- 공격(TryJumpAttack)이 담당한다. 그 외(같은 높이/아래의 건너편)는 기존대로 제외.
+							if not (relY >= 0.5 and relY <= plainReach + 1.15) then
+								continue
+							end
 						end
 						local dxA = math.abs(wp.x - pp.x)
 						local dyA = math.abs(relY)
@@ -1920,6 +2885,31 @@ script AutoHuntManager extends Logic
 							else
 								score = score + dyA * 2
 							end
+						end
+						-- (요청 2026-08-10) 군집 가중: 후보 주변(±2.0/±1.2)의 살아있는 적 수만큼
+						-- 점수를 깎는다(최대 3마리 × 0.6) - 거리가 비슷하면 뭉친 곳을 골라, 도착해서
+						-- 광역 로테이션으로 대상과 주변까지 한 번에 정리한다(요청: "대상 지점 + 주변
+						-- 몬스터를 잡고").
+						local nbrCnt = 0
+						for _, compN in ipairs(comps) do
+							if isvalid(compN) and compN.IsDead ~= true then
+								local eN = compN.Entity
+								if isvalid(eN) and eN ~= e and eN.Visible ~= false then
+									local wpN = eN.TransformComponent.WorldPosition
+									if math.abs(wpN.x - wp.x) <= 2.0 and math.abs(wpN.y - wp.y) <= 1.2 then
+										nbrCnt += 1
+									end
+								end
+							end
+						end
+						if nbrCnt > 3 then nbrCnt = 3 end
+						score = score - nbrCnt * 0.6
+						-- (요청 2026-08-10) 동선 연속 가중: 남은 적들의 무게중심과 같은 쪽 후보를
+						-- 0.8 우선한다 - "그다음 어디로 갈지"를 미리 보고 가는 길목의 적부터 잡아
+						-- 왕복 없이 한 방향으로 훑는 동선을 만든다.
+						if centroidDir ~= 0 and dxA >= 0.5
+							and (((wp.x - pp.x) > 0) == (centroidDir > 0)) then
+							score = score - 0.8
 						end
 						if best == nil or score < bestScore then
 							best = e
@@ -2062,10 +3052,871 @@ script AutoHuntManager extends Logic
 		return false
 	end
 
+	-- ── (썬콜, 요청 2026-08-08) 마법 원거리 사냥 / 블리자드+리커버리 오로라 콤보 ──
+
+	@ExecSpace("ClientOnly")
+	method string FindBlizzardSlotKey()
+		-- 블리자드가 배정된 단축키(없으면 빈 문자열). 역할은 aoe라 slotAoes에 들어 있다.
+		local lists = { self._T.slotAoes, self._T.slotSingles }
+		for _, lst in ipairs(lists) do
+			if lst ~= nil then
+				for _, s in ipairs(lst) do
+					if s.name == "블리자드" then return s.key end
+				end
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasBlizzardSlot()
+		-- 블리자드가 퀵슬롯에 올라와 있는가(오로라 콤보/난사 모드 판단에 쓴다).
+		return self:FindBlizzardSlotKey() ~= ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FindMeteorSlotKey()
+		-- (불독 2026-08-08) 메테오가 배정된 단축키(없으면 빈 문자열) - 블리자드의 불독판. 역할은 aoe.
+		local lists = { self._T.slotAoes, self._T.slotSingles }
+		for _, lst in ipairs(lists) do
+			if lst ~= nil then
+				for _, s in ipairs(lst) do
+					if s.name == "메테오" then return s.key end
+				end
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasMeteorSlot()
+		-- 메테오가 퀵슬롯에 올라와 있는가(불독 오로라 콤보/난사 모드 판단에 쓴다).
+		return self:FindMeteorSlotKey() ~= ""
+	end
+
+	-- ── (불독, 요청 2026-08-08) 포이즌 미스트 카펫 - 맵 전역에 독안개 깔기 ──────
+	-- 요청 메커니즘: "포이즌 미스트를 맵 전역에 가능한 한 깔고 익스플로젼으로 사냥".
+	-- 전용 경로 탐색 없이, 기존 사냥 동선(추적/배회/하강 순환)이 맵을 훑는 것을 이용해
+	-- "지나가는 자리가 아직 안 덮였고 주변에 적이 있으면" 발밑에 하나씩 깔아둔다.
+
+	@ExecSpace("ClientOnly")
+	method string FindPoisonMistSlotKey()
+		-- 포이즌 미스트가 배정된 단축키(없으면 빈 문자열). 역할은 aoe라 slotAoes에 들어 있다.
+		local lists = { self._T.slotAoes, self._T.slotSingles }
+		for _, lst in ipairs(lists) do
+			if lst ~= nil then
+				for _, s in ipairs(lst) do
+					if s.name == "포이즌 미스트" then return s.key end
+				end
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetActiveMistPositions(Entity player)
+		-- 맵에 살아있는 독안개 위치 목록(1초 캐시). 서버가 스폰한 독안개 엔티티는 클라에도 복제되므로
+		-- script.PoisonMistZone 컴포넌트 존재 여부로 스캔한다 - 커버리지/유폭권 판단 전용이라
+		-- 위치(Transform 동기화 값)만 읽고 서버 전용 상태는 건드리지 않는다.
+		local now = _UtilLogic.ElapsedSeconds
+		if self._T.mistPosCache ~= nil and (now - (self._T.mistPosCacheAt or -99)) < 1.0 then
+			return self._T.mistPosCache
+		end
+		local out = {}
+		local map = player.CurrentMap
+		if isvalid(map) then
+			local comps = map:GetChildComponentsByTypeName("script.PoisonMistZone", true)
+			for _, comp in ipairs(comps) do
+				if isvalid(comp) and isvalid(comp.Entity) then
+					local mpz = comp.Entity.TransformComponent.WorldPosition
+					table.insert(out, { x = mpz.x, y = mpz.y })
+				end
+			end
+		end
+		self._T.mistPosCache = out
+		self._T.mistPosCacheAt = now
+		return out
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer CountMistsNear(Entity player, number x, number y, number rangeX, number rangeY)
+		-- 기준점(x, y) 주변 박스(±rangeX/±rangeY) 안의 살아있는 독안개 수.
+		local n = 0
+		for _, m in ipairs(self:GetActiveMistPositions(player)) do
+			if math.abs(m.x - x) <= rangeX and math.abs(m.y - y) <= rangeY then
+				n += 1
+			end
+		end
+		return n
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean PoisonCarpetTick(number now, Entity player)
+		-- 사냥 동선을 따라 지나가며 독안개를 깔아둔다. 이 틱을 카펫이 소비했으면 true.
+		--   · 이 자리가 이미 덮여 있으면(±2.5/±1.2) 깔지 않는다 - "가능한 한 넓게".
+		--   · 허공에 낭비하지 않게 주변(±3.0)에 살아있는 몬스터가 있을 때만 깐다.
+		--   · 동시 유지 상한 10개 - 서버 부하(안개마다 1초 틱 전수 스캔) + 익스플로젼 유폭 상한(6개) 감안.
+		local key = self:FindPoisonMistSlotKey()
+		if key == "" then return false end
+		if (self._T.nextMistDrop or 0) > now then return false end
+		local pp = player.TransformComponent.WorldPosition
+		local mists = self:GetActiveMistPositions(player)
+		if #mists >= 10 then
+			self._T.nextMistDrop = now + 2.0
+			return false
+		end
+		if self:CountMistsNear(player, pp.x, pp.y, 2.5, 1.2) > 0 then return false end
+		if self:CountNearbyMonsters(player, pp, 3.0) < 1 then return false end
+		self._T.nextMistDrop = now + 2.0
+		if self._T.moving then self:StopMoving() end
+		-- 시전 모션(alert 0.6×공속) 동안 이동 금지 - 다른 유틸 시전과 같은 처리.
+		self._T.holdMoveUntil = now + 0.9
+		_SkillManager:UseSkillInSlot(key)
+		log("[AutoHunt] 포이즌 미스트 카펫 - 새 자리에 독안개 (" .. tostring(#mists + 1) .. "개째)")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ShouldMageSnipe(Entity player, Vector3 pp, number dx, number dy)
+		-- 제자리 원거리 시전이 "이득인" 상황만 고른다 - 아무 때나 서 버리면 썬더볼트(근거리 주력) 위주
+		-- 사냥이 무너진다. 사거리 상수는 서버 판정보다 살짝 안쪽(헛빵 방지):
+		--   매직클로 전방 5.0/±1.5 → 4.8/1.4, 매직 미사일 전방 6.0/±3.0 → 5.5/2.8(쿨 5초),
+		--   체인라이트닝 전방 0.5~6.0 콘(±0.8+0.45x) → 5.5.
+		--   ① 체인라이트닝이 닿는다 → 항상 제자리(4차 주력 - 매직클로/썬더볼트는 1%로 강등된 상태).
+		--   ② 주변에 적이 그 하나뿐이고 매직클로/매직 미사일이 닿는다 → 제자리("먼 거리 한 명" 요청).
+		--   ③ 대상이 위아래로 벌어져 있고(±0.8↑) 매직 미사일이 닿는다 → 제자리(수직 판정 활용).
+		--   ④ 썬더볼트를 아직 안 배웠고(1차) 매직클로가 닿는다 → 제자리(1차는 원거리가 주력이다).
+		local dist = math.sqrt(dx * dx + dy * dy)
+		if dist <= 1.15 then return false end   -- 근접 로테이션이 처리한다
+		local adx = math.abs(dx)
+		local ady = math.abs(dy)
+		local hasClaw, hasBolt, hasMissile, hasChain, hasFireArrowSn = false, false, false, false, false
+		local lists = { self._T.slotAoes, self._T.slotSingles }
+		for _, lst in ipairs(lists) do
+			if lst ~= nil then
+				for _, s in ipairs(lst) do
+					if s.name == "매직클로" then hasClaw = true end
+					if s.name == "썬더볼트" then hasBolt = true end
+					if s.name == "매직 미사일" then hasMissile = true end
+					if s.name == "체인라이트닝" then hasChain = true end
+					if s.name == "파이어에로우" then hasFireArrowSn = true end
+				end
+			end
+		end
+		if hasChain and adx >= 0.5 and adx <= 5.5 and ady <= 0.8 + adx * 0.45 then return true end
+		local clawReach = hasClaw and adx <= 4.8 and ady <= 1.4
+		local missileReach = hasMissile and adx <= 5.5 and ady <= 2.8 and _SkillManager:IsMagicMissileReady()
+		-- (불독 2026-08-08) 파이어에로우: 자동사냥은 방향키가 없어 수평 전방으로만 나간다 - 같은 높이의
+		-- 먼 대상만 원거리 저격 대상으로 삼는다(투사체 수명 1.5초 × 속도 6 = 9유닛보다 살짝 안쪽).
+		local fireArrowReach = hasFireArrowSn and adx <= 7.5 and ady <= 0.6
+		if self:CountNearbyMonsters(player, pp, 7.0) <= 1 and (clawReach or missileReach or fireArrowReach) then return true end
+		if ady >= 0.8 and missileReach then return true end
+		if (not hasBolt) and clawReach then return true end
+		return false
+	end
+
+	-- 오로라 주변 노쿨을 이용한 광역 난사 콤보 (썬콜 4차 = 블리자드 / 불독 4차 = 메테오).
+	-- 이 틱을 콤보가 소비했으면 true.
+	--   · 오로라 안 + (대상이 폭격 범위 안이거나 맵에 몬스터가 적으면) 제자리에서 난사한다.
+	--   · 오로라 밖 + 폭격기 쿨타임 중이면 오로라로 걸어 돌아가 쿨타임을 갱신한다
+	--     ("거리가 안 되면 가서 쓰고 다시 리커버리로 온다" - 가는 절반은 일반 추적이 담당).
+	-- (불독 확장 2026-08-08) 블리자드 자리에 메테오를 그대로 끼울 수 있게 "폭격기" 슬롯/쿨 판정만
+	-- 갈라 받는다 - 두 스킬 모두 시전자 주변 발판 ±12.5/±4.7에 알아서 떨어지는 같은 규격이다.
+	@ExecSpace("ClientOnly")
+	method boolean MageAuraComboTick(number now, Entity player, number delta)
+		-- ⚠ 대상(self._T.target)은 nil일 수 있어 인자로 받지 않는다(nil Entity 인자 = 본문 미실행 함정).
+		if self._T.slotRecoveryAuras == nil or #self._T.slotRecoveryAuras == 0 then return false end
+		local bombKey = self:FindBlizzardSlotKey()
+		local bombName = "블리자드"
+		if bombKey == "" then
+			bombKey = self:FindMeteorSlotKey()
+			bombName = "메테오"
+		end
+		if bombKey == "" then return false end
+		local bombReady = false
+		if bombName == "메테오" then
+			bombReady = _SkillManager:IsMeteorReady()
+		else
+			bombReady = _SkillManager:IsBlizzardReady()
+		end
+		if not _SkillManager:HasActiveRecoveryAura() then return false end
+		local target = self._T.target
+		local pp = player.TransformComponent.WorldPosition
+		if _SkillManager:IsInRecoveryAura() then
+			-- 살아있는 몬스터가 하나도 없으면 리젠 대기 - 평소 배회/복귀 로직에 맡긴다.
+			local aliveCount = 0
+			for _, comp in ipairs(self:GetMonsterComps(player)) do
+				if isvalid(comp) and comp.IsDead ~= true then aliveCount += 1 end
+			end
+			if aliveCount == 0 then return false end
+			-- 제자리 난사 조건: 대상이 폭격 범위(가로 ±12 / 세로 ±4.2 - 실범위 12.5/4.7보다 살짝
+			-- 안쪽) 안이거나, 맵에 몬스터가 적어서(3마리 이하) 굳이 걸어갈 가치가 없을 때.
+			-- 그 외(몬스터가 많은데 전부 멀다)는 일반 추적으로 나가 잡는다 - 폭격기를 쓰고 쿨이
+			-- 돌기 시작하면 아래 복귀 분기가 데려온다.
+			local inBlizRange = false
+			if target ~= nil and isvalid(target) then
+				local tpB = target.TransformComponent.WorldPosition
+				inBlizRange = math.abs(tpB.x - pp.x) <= 12.0 and math.abs(tpB.y - pp.y) <= 4.2
+			end
+			if not inBlizRange and aliveCount > 3 then return false end
+			if self._T.moving then self:StopMoving() end
+			self._T.chaseStart = now
+			if target ~= nil and isvalid(target) then
+				-- 대상이 있으면 바라보는 방향을 맞춰 둔다(체인라이트닝/매직 미사일 혼용 대비).
+				local tpF = target.TransformComponent.WorldPosition
+				local dxF = tpF.x - pp.x
+				if math.abs(dxF) > 0.05 then
+					local pccF = player.PlayerControllerComponent
+					if isvalid(pccF) then
+						local wantF = (dxF > 0) and 1 or -1
+						if pccF.LookDirectionX ~= wantF then
+							pccF.LookDirectionX = wantF
+							self._T.dirChangedAt = now
+						end
+					end
+				end
+				if not self:TryUtilityCast(now) then
+					self:TryAttackCast(now, player, pp)
+				end
+				return true
+			end
+			-- 대상이 없어도(전부 위층/추적 제외 등) 블리자드/메테오는 시전자 주변 발판에 알아서 떨어진다 -
+			-- 오로라 안이라 노쿨이므로 그냥 난사한다(간격 4.6초 = 서버 재시전 잠금 4.5초 + 여유,
+			-- 로테이션 픽과 동일 - 3초로 두면 "요청 차단됨" 헛요청이 낀다).
+			if not self:TryUtilityCast(now) then
+				if (self._T.nextAtk or 0) <= now and bombReady then
+					self._T.nextAtk = now + 4.6
+					self._T.holdMoveUntil = now + 3.0
+					_SkillManager:UseSkillInSlot(bombKey)
+					log("[AutoHunt] 오로라 난사 - " .. bombName .. " (무대상)")
+				end
+			end
+			return true
+		end
+		-- 오로라 밖: 폭격기를 쓰고 난 직후(쿨타임 중)면 오로라로 걸어 돌아가 쿨타임을 갱신한다.
+		if bombReady then return false end
+		local dxA = _SkillManager:GetRecoveryAuraX() - pp.x
+		if math.abs(dxA) <= 0.5 then return false end   -- 사실상 도착 - 진입 판정(±3.0/±2.5)에 맡긴다
+		local pccA = player.PlayerControllerComponent
+		if isvalid(pccA) and pccA.Enable then pccA.Enable = false end
+		local dirA = (dxA > 0) and 1 or -1
+		if isvalid(pccA) then pccA.LookDirectionX = dirA end
+		player.MovementComponent:MoveToDirection(Vector2(dirA, 0), delta)
+		self._T.moving = true
+		local scA = player.StateComponent
+		if isvalid(scA) and scA.CurrentStateName == "IDLE" then
+			scA:ChangeState("MOVE")
+		end
+		self:CheckStuckAndJump(now, player, pp)
+		if (self._T.nextAuraReturnDbg or 0) <= now then
+			self._T.nextAuraReturnDbg = now + 2.0
+			log("[AutoHunt] 리커버리 오로라 복귀 중 (dx=" .. string.format("%.2f", dxA) .. ")")
+		end
+		return true
+	end
+
 	-- (나이트로드) 헤이스트 점프 보정으로 올라갈 수 있는 높이(월드 유닛). 헤이스트가 꺼져 있으면 0.
 	-- 점프 높이는 점프력의 **제곱**에 비례한다(실측) - 보정 배율도 제곱으로 들어간다.
 	-- 실제 보정은 서버(PlayerAttack.HasteJumpAssistTick)가 발판을 찾아 걸어주므로, 여기서는
 	-- "그 사거리 안이면 올라갈 수 있다"는 판단 기준으로만 쓴다. 여유 0.15는 발판 두께/오차 몫.
+	@ExecSpace("ClientOnly")
+	method number GetPlainJumpReach(Entity player)
+		-- (요청 2026-08-09) **평범한 앞점프**로 올라갈 수 있는 높이(월드 유닛).
+		-- 실측 관계식은 높이 = 1.194 × JumpForce² (PlayerAttack.HasteJumpAssistTick 주석의 실측:
+		-- JumpForce 1.0 → 1.194유닛 / 1.4 → 2.313유닛). 0.15는 발판 두께/타이밍 오차 몫이다.
+		-- ⚠ JumpForce를 **실시간으로 읽는** 이유: 헤이스트 점프 보정이 이 값을 동적으로 바꾼다 -
+		--   고정 상수로 두면 보정 중에도 옛 사거리로 판단해 올라갈 수 있는 발판을 포기한다.
+		if not isvalid(player) then return 0 end
+		local mv = player.MovementComponent
+		if not isvalid(mv) then return 0 end
+		local jf = mv.JumpForce or 1.0
+		if jf <= 0 then return 0 end
+		-- 여유 0.05: 정점이 실측 1.194라 0.15를 빼면 1.044가 되어, 실제 맵에 흔한 **+1.03 턱**을
+		-- 0.014 차이로 아슬아슬하게만 통과한다(사실상 못 올라감). 정점은 물리적으로 확정값이므로
+		-- 발판 두께 몫만 남긴다.
+		return 1.194 * jf * jf - 0.05
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanReachTargetLayer(Entity player, Vector3 pp, Vector3 mp, number reach)
+		-- (요청 2026-08-10) **대상이 서 있는 그 발판까지 한 번에 올라설 수 있는가**를 본다. 올라설 수 있으면 true.
+		-- ⚠ 기존 HasSeparateFootholdAbove는 "위에 **아무** 발판이라도 있나"만 확인했다. 대상이 두 층 위면
+		--   중간 발판이 잡혀 true가 되어 일단 뛰어오르고, 올라가 봐야 대상 층에는 못 닿아 도로 내려온다.
+		--   그리고 대상이 그대로 남아 있으니 같은 판단을 2~3번 반복한다(사용자 가설 - 실제 관측과 일치).
+		-- 판정 3단계:
+		--   ① 대상 발밑 발판 = 대상이 실제로 서 있는 층
+		--   ② 그 층이 내 발 높이 기준 점프 사거리 안인가
+		--   ③ 위로 쏜 **첫 발판**이 곧 그 층인가(중간 발판이 먼저 걸리면 한 번에 못 올라간다)
+		local map = player.CurrentMap
+		local fh = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(fh) then return true end   -- 판정 불가면 막지 않는다(기존 동작 유지)
+		-- ① 대상 발밑(살짝 위에서 아래로) - 대상이 딛고 선 발판
+		local under = fh:Raycast(Vector2(mp.x, mp.y + 0.1), Vector2(0, -1), 2.0)
+		if under == nil then return false end
+		local layerY = under.StartPoint.y
+		if under.EndPoint.y > layerY then layerY = under.EndPoint.y end
+		-- ② 사거리 안인가
+		local h = layerY - pp.y
+		if h <= 0.05 or h > reach then return false end
+		-- ③ 올라가는 길에 더 낮은 발판이 먼저 가로막지 않는가
+		local hit = fh:Raycast(Vector2(mp.x, pp.y + 0.3), Vector2(0, 1), h + 0.5)
+		if hit == nil then return false end
+		if hit.Id ~= under.Id then return false end
+		-- 지금 밟고 있는 발판이 잡히면 경사면이다 - 걸어서 올라갈 수 있으니 뛰지 않는다.
+		local rb = player.RigidbodyComponent
+		if isvalid(rb) then
+			local cur = rb:GetCurrentFoothold()
+			if cur ~= nil and cur.Id == hit.Id then return false end
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsTargetLayerUnreachable(Entity player, Vector3 pp, Vector3 mp, number reach)
+		-- "이 대상 층은 **확실히** 못 간다"일 때만 true. 대상 제외(ban) 판단 전용이라 보수적으로 본다.
+		-- 확실한 두 경우만 true:
+		--   ① 대상 발판이 점프 사거리보다 높다
+		--   ② 올라가는 길을 **더 낮은 다른 발판**이 먼저 막는다(= 한 번에 못 올라간다)
+		-- 경사면(위로 쏜 발판이 지금 밟은 그 발판)·레이 실패·판정 불가는 전부 false로 둔다 -
+		-- 걸어서 올라가거나 다른 경로가 있을 수 있으므로 멀쩡한 대상을 버리지 않는다.
+		local map = player.CurrentMap
+		local fh = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(fh) then return false end
+		local under = fh:Raycast(Vector2(mp.x, mp.y + 0.1), Vector2(0, -1), 2.0)
+		if under == nil then return false end
+		local layerY = under.StartPoint.y
+		if under.EndPoint.y > layerY then layerY = under.EndPoint.y end
+		local h = layerY - pp.y
+		if h > reach then return true end                    -- ① 너무 높다
+		if h <= 0.05 then return false end
+		local hit = fh:Raycast(Vector2(mp.x, pp.y + 0.3), Vector2(0, 1), h + 0.5)
+		if hit == nil then return false end
+		local rb = player.RigidbodyComponent
+		if isvalid(rb) then
+			local cur = rb:GetCurrentFoothold()
+			if cur ~= nil and cur.Id == hit.Id then return false end   -- 경사면 - 걸어서 올라간다
+		end
+		if hit.Id ~= under.Id then return true end            -- ② 중간 발판이 먼저 막는다
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasSeparateFootholdAbove(Entity player, number atX, number fromY, number upDist)
+		-- atX 지점 위쪽 upDist 안에 **올라설 별개의 발판**이 있는지. 점프해도 올라설 곳이 없으면
+		-- 헛뛰기가 되므로, 다운점프의 "발밑 발판 확인"(Raycast 아래)과 짝을 이루는 위쪽 판정이다.
+		local map = player.CurrentMap
+		local fh = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(fh) then return true end   -- 판정 불가면 막지 않는다(기존 동작 유지)
+		local hit = fh:Raycast(Vector2(atX, fromY + 0.3), Vector2(0, 1), math.max(0.5, upDist + 0.5))
+		if hit == nil then return false end
+		-- ⚠ 지금 밟고 있는 발판이 그대로 잡히면 **경사면**이다 - 걸어서 올라갈 수 있으니 뛰지 않는다.
+		--   이 검사가 없으면 오르막에서 목표가 조금만 높아도 계속 점프해 우스꽝스럽게 튄다.
+		local rb = player.RigidbodyComponent
+		if isvalid(rb) then
+			local cur = rb:GetCurrentFoothold()
+			if cur ~= nil and cur.Id == hit.Id then return false end
+		end
+		return true
+	end
+
+	-- ── (신고 2026-08-09) 벽/턱 앞점프 등반 ────────────────────────────────
+	-- "벽을 보고 계속 걷고 있다"의 해결. 대상과의 상대 위치가 아니라 **내 발밑 지형**만 보고
+	-- 판정하므로, 대상이 벽 너머 어디에 있든(위/같은 높이/아래) 턱만 넘을 수 있으면 넘는다.
+
+	@ExecSpace("ClientOnly")
+	method number GetStepUpHeightAhead(Entity player, Vector3 pp, number dir)
+		-- 진행 방향 바로 앞(0.5유닛)에 **올라설 한 단 위 발판**이 있으면 그 높이(유닛)를, 없으면 0.
+		-- 아래로 뚝 떨어지는 절벽이면 위쪽에 아무것도 안 잡혀 0이 나온다 → 헛점프하지 않는다.
+		local map = player.CurrentMap
+		local fh = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(fh) then return 0 end
+		local curId = -1
+		local rb = player.RigidbodyComponent
+		if isvalid(rb) then
+			local cur = rb:GetCurrentFoothold()
+			if cur ~= nil then curId = cur.Id end
+		end
+		-- ⚠ 자기 발판 재검출 함정([[feedback-msw-foothold-raycast]] 1번): 서 있는 자리에서 정확히
+		--   위로 쏘면 자기 발판이 거리 0으로 잡힌다. 여기선 원점을 **진행 방향으로 0.5 밀어** 피하고,
+		--   그래도 같은 발판이 잡히면(경사면) 걸어서 올라갈 수 있다는 뜻이므로 0을 돌려준다.
+		local probeX = pp.x + dir * 0.5
+		local hit = fh:Raycast(Vector2(probeX, pp.y + 0.05), Vector2(0, 1), 3.0)
+		if hit == nil then return 0 end
+		if hit.Id == curId then return 0 end
+		local topY = hit.StartPoint.y
+		if hit.EndPoint.y > topY then topY = hit.EndPoint.y end
+		local h = topY - pp.y
+		if h <= 0.05 then return 0 end
+		return h
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean TryStepUpOverWall(Entity player, Vector3 pp, number dir, number now)
+		-- 걷는 방향으로 더 못 가는데(지면 끊김) 그 앞이 **뛰어 올라설 수 있는 턱**이면 앞점프한다.
+		-- 넘었으면 true. 인자 순서 주의: nil Entity 함정을 피하려 player를 첫 인자로 둔다.
+		if not isvalid(player) then return false end
+		if (self._T.nextJump or 0) > now then return false end
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return false end
+		-- PredictFootholdEnd는 "그 거리만큼 갈 수 있으면 true"다([[feedback-msw-predictfootholdend-polarity]]).
+		-- false = 지면이 끊겼다 = 벽이거나 절벽.
+		if rb:PredictFootholdEnd(0.35, dir > 0) then return false end
+		local stepUp = self:GetStepUpHeightAhead(player, pp, dir)
+		if stepUp <= 0 then return false end          -- 절벽(위에 아무것도 없음) - 뛰어봐야 소용없다
+		local reach = self:GetPlainJumpReach(player)
+		if stepUp > reach then return false end       -- 점프로 못 닿는 벽 - 추적 타임아웃이 대상을 바꾼다
+		self._T.nextJump = now + 1.0
+		self._T.jumpedAt = now
+		-- 턱을 넘은 직후 곧바로 도로 내려가지 않게: 하강 1.2초 보류 + 3초간 올라온 층 고정(신고 2026-08-10).
+		self._T.noDownJumpUntil = now + 1.2
+		self._T.layerHoldUntil = now + 3.0
+		player.MovementComponent:Jump()
+		local sc = player.StateComponent
+		if isvalid(sc) then sc:ChangeState("JUMP") end
+		log("[AutoHunt] 벽 앞점프 등반 (턱 높이=" .. string.format("%.2f", stepUp)
+			.. " 사거리=" .. string.format("%.2f", reach) .. " dir=" .. tostring(dir) .. ")")
+		return true
+	end
+
+	-- ── (요청 2026-08-10) 점프 공격 ─────────────────────────────────────────
+	-- 지형적으로는 못 올라가는 위층 대상이라도, 점프 정점의 전방 공격 박스(위 1.0)가 닿는
+	-- 높이(점프 사거리 + 1.15)면 무시하지 않고 점프 공격으로 잡는다.
+	-- 흐름: 수평 정렬(|dx|≤1.1 - 부족하면 이 안에서 걷는다) → 도약 + 공중 시전 창(jumpAtkUntil)
+	-- → OnUpdate의 점프 공격 훅이 대상이 박스에 든 순간 TryAttackCast(창 동안만 지상 게이트 예외)
+	-- → 착지 후 쿨(1.5초) 두고 반복 - 여러 대 때려야 죽는 적도 도약을 거듭하며 잡는다.
+	-- (신고 2026-08-10 2차) "약간 위 + 걸어서는 못 가는 위치의 적에게 점프 공격을 안 한다":
+	--   벽/낭떠러지에 막혀 대상 바로 밑(구 |dx|≤0.8)까지 못 가는 경우가 바로 그 상황인데,
+	--   정렬 실패로 포기(→제외)하고 있었다 - **가장자리 도약**을 허용한다: 지면이 끊겨 더 못
+	--   붙어도 |dx|≤1.35면 그 자리에서 뛴다(전방 박스가 대각선 위를 덮는다 - 서버 실판정 반경 1.5).
+	--   못 닿는 과확장은 헛도약 안전망(같은 대상 2회 연속 박스 진입 실패 → 포기 → 제외)이 걸러낸다.
+
+	@ExecSpace("ClientOnly")
+	method boolean TryJumpAttack(number now, Entity player, number dx, number dy, number reach, number delta)
+		-- 점프 공격을 시작/유지했으면 true(이번 틱 소비). 판정 밖이면 false - 호출부가 제외(ban)한다.
+		-- 높이 허용 +1.15: 위쪽 판정 박스 1.0 + 몬스터 콜라이더가 중심 아래로 처지는 몫. 못 닿는
+		-- 과확장은 아래 헛도약 안전망(2회 연속 박스 진입 실패 → 포기)이 자동으로 걸러낸다.
+		if dy > reach + 1.15 then return false end
+		-- 헛도약 안전망: 같은 대상에게 2번 연속 "공중 시전 게이트에 못 넣은" 도약을 했으면 물리적으로
+		-- 못 닿는 기하다 - 더 뛰지 않고 포기해 호출부의 제외(ban)로 넘긴다(무한 도약 루프 방지).
+		local tgtJa = self._T.target
+		if self._T.jumpAtkFailTgt ~= tgtJa then
+			self._T.jumpAtkFailTgt = tgtJa
+			self._T.jumpAtkFails = 0
+		end
+		if (self._T.jumpAtkFails or 0) >= 2 then return false end
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return true end   -- 직전 도약 낙하 중 - 대기
+		local dir = (dx > 0) and 1 or -1
+		local sc = player.StateComponent
+		local adx = math.abs(dx)
+		local canWalkCloser = rb:PredictFootholdEnd(0.3, dir > 0)
+		if adx > 1.1 and canWalkCloser then
+			-- 수평 정렬 걷기 - 더 붙을 수 있으면 붙는 게 명중률이 좋다.
+			local pccJa = player.PlayerControllerComponent
+			if isvalid(pccJa) then
+				if pccJa.Enable then pccJa.Enable = false end
+				pccJa.LookDirectionX = dir
+			end
+			player.MovementComponent:MoveToDirection(Vector2(dir, 0), delta)
+			self._T.moving = true
+			if isvalid(sc) and sc.CurrentStateName == "IDLE" then sc:ChangeState("MOVE") end
+			self._T.chaseStart = now   -- 교전 준비 중 - 5초 추적 타임아웃이 끊지 않게 갱신
+			return true
+		end
+		if adx > 1.35 then return false end   -- 지면이 끊겨 못 붙는데 가장자리 도약 범위도 밖
+		-- 정렬 완료(또는 가장자리) - 대상 쪽을 보고, 도약 간격이 돌면 뛴다.
+		if self._T.moving then self:StopMoving() end
+		local pccJb = player.PlayerControllerComponent
+		if isvalid(pccJb) and pccJb.LookDirectionX ~= dir then
+			pccJb.LookDirectionX = dir
+			self._T.dirChangedAt = now
+		end
+		if (self._T.nextJumpAtk or 0) > now then
+			self._T.chaseStart = now
+			return true   -- 도약 간격 대기(제자리)
+		end
+		self._T.nextJumpAtk = now + 1.5
+		self._T.nextJump = now + 1.2
+		self._T.jumpedAt = now
+		self._T.jumpAtkUntil = now + 1.1
+		self._T.jumpAtkCastDone = false   -- 이번 도약에서 박스 진입(시전 시도)이 있었는지 - 헛도약 판정용
+		self._T.chaseStart = now
+		-- 공격 틱 위상(0.5초)이 상승 구간(0.5초)과 어긋나면 도약을 통째로 흘려보낸다 - 창을 여는
+		-- 순간 틱을 초기화해 공중 훅이 조준한 첫 순간에 바로 쏠 수 있게 한다.
+		self._T.nextAtk = 0
+		player.MovementComponent:Jump()
+		if isvalid(sc) then sc:ChangeState("JUMP") end
+		log("[AutoHunt] 점프 공격 도약 (dy=" .. string.format("%.2f", dy)
+			.. " dx=" .. string.format("%.2f", dx)
+			.. " 점프 사거리=" .. string.format("%.2f", reach) .. ")")
+		return true
+	end
+
+	-- ── (요청 2026-08-09) 로프 등반 ────────────────────────────────────────
+	-- 앞점프로 닿지 않는 위층(이 맵 기준 +2.23유닛)은 로프가 정식 경로다. 맵의 ClimbableComponent를
+	-- 훑어 "논리 로프"(세로로 이어진 세그먼트 묶음) 목록을 만들고, 내 층과 대상 층을 **둘 다** 잇는
+	-- 로프가 있으면 그리로 걸어가 올라간다.
+	-- ⚠ 실측(2026-08-09): ActionClimb은 PlayerControllerComponent.Enable=false(자동사냥과 같은 조건)
+	--   에서도 동작한다 - state가 CLIMB로 바뀌고 y가 오른다.
+
+	@ExecSpace("ClientOnly")
+	method table GetRopes(Entity player)
+		-- 맵의 로프 목록을 만들어 캐시한다. 세그먼트 3개가 로프 한 줄이라 x가 같고 세로로 이어진 것끼리 묶는다.
+		local map = player.CurrentMap
+		if not isvalid(map) then return {} end
+		if self._T.ropeCache ~= nil and self._T.ropeCacheMap == map then return self._T.ropeCache end
+
+		local comps = map:GetChildComponentsByTypeName("ClimbableComponent", true)
+		-- 1) x별로 세그먼트 구간 모으기
+		local byX = {}
+		for _, c in ipairs(comps or {}) do
+			if isvalid(c) and isvalid(c.Entity) then
+				local wp = c.Entity.TransformComponent.WorldPosition
+				local cx = wp.x + c.BoxOffset.x
+				local half = c.BoxSize.y * 0.5
+				local key = string.format("%.1f", cx)
+				if byX[key] == nil then byX[key] = { x = cx, segs = {} } end
+				table.insert(byX[key].segs, {
+					bot = wp.y + c.BoxOffset.y - half,
+					top = wp.y + c.BoxOffset.y + half,
+				})
+			end
+		end
+		-- 2) 같은 x라도 층이 다른 별개 로프일 수 있으므로, 아래에서부터 훑어 **맞닿은 것만** 합친다.
+		local out = {}
+		for _, group in pairs(byX) do
+			table.sort(group.segs, function(a, b) return a.bot < b.bot end)
+			local cur = nil
+			for _, s in ipairs(group.segs) do
+				if cur == nil then
+					cur = { x = group.x, bot = s.bot, top = s.top }
+				elseif s.bot <= cur.top + 0.4 then
+					if s.top > cur.top then cur.top = s.top end
+				else
+					table.insert(out, cur)
+					cur = { x = group.x, bot = s.bot, top = s.top }
+				end
+			end
+			if cur ~= nil then table.insert(out, cur) end
+		end
+		self._T.ropeCache = out
+		self._T.ropeCacheMap = map
+		log("[AutoHunt] 로프 인덱스 구성: " .. tostring(#out) .. "줄 (세그먼트 " .. tostring(comps and #comps or 0) .. "개)")
+		return out
+	end
+
+	@ExecSpace("ClientOnly")
+	method table FindUsableRope(Entity player, Vector3 pp, number targetY, number targetX)
+		-- 내 발 높이에서 잡을 수 있고(하단이 발 근처 이하) 대상 층까지 닿는(상단이 대상 높이 이상) 로프 중
+		-- 수평으로 가장 가까운 것. 없으면 nil.
+		-- ⚠ (신고 2026-08-10) 높이만 맞아서는 안 된다 - 같은 높이라도 **끊긴 별개 발판**으로 이어지는
+		--   로프면 올라가 봐야 대상에게 갈 수 없다(좌측 로프로 올라간 뒤 같은 높이의 건너편 발판 대상을
+		--   향해 걷다가 낭떠러지에서 추락하는 신고의 뿌리). 로프를 올라 내려설 발판이 대상이 딛는 발판과
+		--   **체인으로 이어진** 로프만 쓴다.
+		local best = nil
+		local bestD = 99
+		local targetFhId = self:GetFootholdIdBelow(player, targetX, targetY + 0.1, 2.0)
+		for _, r in ipairs(self:GetRopes(player)) do
+			if r.bot <= pp.y + 0.8 and r.top >= targetY - 0.8 and r.top > pp.y + 0.5 then
+				local d = math.abs(r.x - pp.x)
+				-- 너무 먼 로프까지 원정을 가면 사냥 효율이 더 나빠진다(걸어가는 동안 리젠이 끝난다).
+				if d < bestD and d <= 12.0 then
+					-- 올라간 뒤 서게 될 발판(등반이 끝나는 높이 = min(대상 발높이, 로프 상단)의 로프 x 지점).
+					-- 발판을 못 찾으면(로프가 발판 가장자리 틈에 걸친 경우 등) 판정 불가로 보고 막지 않는다.
+					local landY = targetY
+					if r.top < landY then landY = r.top end
+					local landFhId = self:GetFootholdIdBelow(player, r.x, landY + 0.5, 2.5)
+					if targetFhId <= 0 or landFhId <= 0
+						or self:AreFootholdIdsConnected(player, landFhId, targetFhId) then
+						best = r
+						bestD = d
+					end
+				end
+			end
+		end
+		return best
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetFootholdIdBelow(Entity player, number x, number y, number dist)
+		-- (x, y)에서 아래로 dist만큼 레이캐스트해 처음 걸리는 발판의 Id. 없으면 0.
+		-- ⚠ Foothold 객체가 아니라 **Id(정수)**를 돌려준다 - 네이티브 객체를 인자로 넘기면 nil일 때
+		--   메서드 본문이 통째로 실행되지 않는 함정([[feedback_msw_nil_entity_param_silent_fail]])을
+		--   피하려고 아래 연결 판정은 전부 정수 Id로만 주고받는다.
+		local map = player.CurrentMap
+		local fh = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(fh) then return 0 end
+		local hit = fh:Raycast(Vector2(x, y), Vector2(0, -1), dist)
+		if hit == nil then return 0 end
+		return hit.Id
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean AreFootholdIdsConnected(Entity player, integer aId, integer bId)
+		-- 두 발판이 NextFootholdId/PreviousFootholdId 체인으로 **걸어서** 이어져 있는가.
+		-- 같은 높이처럼 보여도 끊긴 별개 발판은 체인이 끊겨 있다([[feedback-msw-foothold-raycast]] 3번:
+		-- 겉보기 한 층도 수십 조각 체인이라 단일 조각의 끝점만 봐서는 진짜 가장자리를 모른다 - 그 역이용).
+		-- 수직 연결선(턱/절벽 세그먼트)도 체인에 포함되므로 계단 지형은 "이어짐"으로 본다 -
+		-- 턱을 실제로 넘는 건 TryStepUpOverWall 몫이고, 여기서는 경로 존재 여부만 가른다.
+		-- 판정 불가(Id 0)면 막지 않는다(기존 동작 유지 - 멀쩡한 대상을 버리는 회귀 방지).
+		if aId <= 0 or bId <= 0 then return true end
+		if aId == bId then return true end
+		local map = player.CurrentMap
+		local fh = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(fh) then return true end
+		-- 맵 발판은 정적이라 결과를 캐시한다 (FindTarget이 0.3초마다 후보별로 물어본다).
+		if self._T.fhConnCacheMap ~= map then
+			self._T.fhConnCache = {}
+			self._T.fhConnCacheMap = map
+		end
+		local lo = math.min(aId, bId)
+		local hi = math.max(aId, bId)
+		local key = tostring(lo) .. "|" .. tostring(hi)
+		local cached = self._T.fhConnCache[key]
+		if cached ~= nil then return cached end
+		local start = fh:GetFoothold(aId)
+		if start == nil then return true end
+		-- 오른쪽(Next) 체인 → 실패 시 왼쪽(Previous) 체인. 한 층이 수십~수백 조각이라 상한은 넉넉히
+		-- 400(무한루프 방지용 안전망이지 실제 경로 길이 제한이 아니다).
+		local found = false
+		for pass = 1, 2 do
+			local cur = start
+			for i = 1, 400 do
+				local nid = cur.NextFootholdId
+				if pass == 2 then nid = cur.PreviousFootholdId end
+				if nid == nil or nid <= 0 or nid == aId then break end
+				local nxt = fh:GetFoothold(nid)
+				if nxt == nil then break end
+				if nxt.Id == bId then
+					found = true
+					break
+				end
+				cur = nxt
+			end
+			if found then break end
+		end
+		self._T.fhConnCache[key] = found
+		return found
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsWalkConnectedToPoint(Entity player, integer myFhId, number x, number y)
+		-- 내가 밟은 발판(myFhId)에서 (x, y) 지점이 딛고 선 발판까지 걸어서 갈 수 있는가.
+		-- 후보 몬스터별로 불리므로 발판 Id만 주고받는다(연결 판정 자체는 쌍 단위 캐시).
+		return self:AreFootholdIdsConnected(player, myFhId, self:GetFootholdIdBelow(player, x, y + 0.1, 2.0))
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsWalkConnectedToTarget(Entity player, Vector3 pp, Vector3 mp)
+		-- 지금 밟은 발판에서 대상이 딛는 발판까지 걸어서(체인으로) 갈 수 있는가.
+		local aId = 0
+		local rb = player.RigidbodyComponent
+		if isvalid(rb) then
+			local cur = rb:GetCurrentFoothold()
+			if cur ~= nil then aId = cur.Id end
+		end
+		if aId <= 0 then aId = self:GetFootholdIdBelow(player, pp.x, pp.y + 0.1, 1.5) end
+		local bId = self:GetFootholdIdBelow(player, mp.x, mp.y + 0.1, 2.0)
+		return self:AreFootholdIdsConnected(player, aId, bId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearRopeState(Entity player, string reason, boolean stopMove)
+		-- 등반 상태 정리 본체. 실패든 성공이든 반드시 이 한 곳을 지나게 해서 상태가 남지 않게 한다.
+		-- ⚠ stopMove=false는 **점프 도중에 계획만 취소할 때** 쓴다 - 아래 StopMoving 주석 참고.
+		if (self._T.ropeState or "") == "" then return end
+		self._T.ropeState = ""
+		self._T.ropeX = nil
+		self._T.ropeGoalY = nil
+		self._T.ropeUntil = nil
+		self._T.ropeJumpUntil = nil
+		self._T.ropeClimbFrom = nil
+		-- (요청 2026-08-09) 등반 무적 해제. 켠 적이 있을 때만 끄도록 서버 쪽에서 한 번 더 거른다.
+		if self._T.ropeInvincible == true then
+			self._T.ropeInvincible = false
+			_SkillManager:RequestSetClimbInvincible(false)
+		end
+		-- ⚠ (신고 2026-08-10 "언덕에 올라갈 때마다 이상하게 한 번 움직인다") StopMoving은
+		--   `MovementComponent:Stop()` + **PlayerController 재활성**을 한다. 이걸 `Jump()` 직후에
+		--   부르면 ① 점프의 수평 속도가 그 자리에서 끊기고 ② 컨트롤러가 살아나 입력 0의 감속이
+		--   덮어써서, 턱을 넘다 말고 제자리에서 툭 떨어지는 부자연스러운 한 동작이 나온다.
+		--   턱 등반으로 층이 바뀌어 계획만 무를 때는 이동을 건드리면 안 된다(stopMove=false).
+		if stopMove then self:StopMoving() end
+		log("[AutoHunt] 로프 등반 종료 - " .. tostring(reason))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EndRopeClimb(Entity player, string reason)
+		-- 기존 호출부 전부가 쓰는 기본형 - 정지까지 함께 한다.
+		self:ClearRopeState(player, reason, true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RopeClimbTick(number now, Entity player, Vector3 pp, Entity target, number dy, number delta)
+		-- 로프 등반 상태 기계. 이번 틱의 이동을 이 함수가 가져갔으면 true를 돌려준다(호출부는 즉시 return).
+		--   approach : 로프 x로 걸어가 정렬
+		--   climb    : ActionClimb으로 올라가기
+		local st = self._T.ropeState or ""
+
+		if st ~= "" then
+			-- 공통 중단 조건: 대상 소실 / 타임아웃
+			if not isvalid(target) then
+				self:EndRopeClimb(player, "대상 소실")
+				return false
+			end
+			if (self._T.ropeUntil or 0) < now then
+				-- 이 대상은 로프로도 못 잡는다고 보고 잠시 제외한다(무한 재시도 방지).
+				if self._T.banned == nil then self._T.banned = {} end
+				self._T.banned[target] = now + 6.0
+				self._T.target = nil
+				self._T.nextScan = 0
+				self:EndRopeClimb(player, "시간 초과 - 대상 제외")
+				return false
+			end
+		end
+
+		if st == "approach" then
+			local ddx = (self._T.ropeX or pp.x) - pp.x
+			if math.abs(ddx) > 0.12 then
+				-- ⚠ 실측: 매 틱 같은 속도로 밀면 목표를 지나쳐 좌우로 진동한다. 가까워지면 델타를 줄여
+				--   감속 정렬한다(로프 판정 폭이 0.5라 x가 어긋나면 아예 안 잡힌다).
+				local step = delta
+				if math.abs(ddx) < 0.5 then step = delta * 0.35 end
+				local pccA = player.PlayerControllerComponent
+				if isvalid(pccA) then
+					if pccA.Enable then pccA.Enable = false end
+					pccA.LookDirectionX = (ddx > 0) and 1 or -1
+				end
+				local aDir = (ddx > 0) and 1 or -1
+				player.MovementComponent:MoveToDirection(Vector2(aDir, 0), step)
+				self._T.moving = true
+				local scA = player.StateComponent
+				if isvalid(scA) and scA.CurrentStateName == "IDLE" then scA:ChangeState("MOVE") end
+				-- (신고 2026-08-09 2차) 로프까지 걸어가는 길목에 턱이 있으면 여기서도 벽을 보고 걷기만 했다 -
+				-- 실측: x=2.76 y=-6.65(0.60 턱)에서 look=1인 채 10초 정체 후에야 추적 분기가 넘겨줬다.
+				-- 추적 걷기와 **같은 판정**으로 턱을 넘는다(못 넘는 벽이면 로프 타임아웃이 대상을 바꾼다).
+				if self:TryStepUpOverWall(player, pp, aDir, now) then
+					-- ⚠ (신고 2026-08-09 3차 "올라간 뒤 10~15초 가만히 있는다") 턱을 넘으면 **내 층이 바뀐다.**
+					--   아까 고른 로프는 옛 층 기준이라 새 층을 잇지 않을 수 있는데, 그대로 두면 딴 층 로프의
+					--   x에 "정렬 완료" 하고 부착이 영영 실패해 ropeUntil이 끝날 때까지 얼어붙었다
+					--   (실측: y=-6.05에서 로프 구간 -3.85~-3.12에 정렬 → state=IDLE·ctrl=false로 9.5초 정지).
+					--   계획을 접고 다음 틱에 **새 층 기준으로 다시 고른다.**
+					-- ⚠ 정지시키지 않는다(stopMove=false) - 방금 Jump()를 부른 직후라 여기서 StopMoving을
+					--   하면 점프 수평 속도가 끊기고 컨트롤러가 되살아나 "이상하게 한 번 움직이는" 동작이 된다.
+					self:ClearRopeState(player, "턱 등반으로 층 변경 - 로프 재선정", false)
+					return true
+				end
+				return true
+			end
+			-- 정렬 완료 → **점프해서 로프를 잡는다.**
+			-- (요청 2026-08-09) 그냥 부착하면 제자리에서 스르륵 붙어 순간이동처럼 보인다는 신고 -
+			-- 먼저 뛰어오르고, 공중에서 로프 판정에 들어가는 순간 붙게 해 자연스러운 연결을 만든다.
+			-- ropeJumpUntil 동안은 ActionClimb을 부르지 않아 점프 궤적이 그대로 보인다.
+			-- ⚠ 컨트롤러가 꺼져 있으면 ChangeState가 먹지 않아 점프 모션이 안 나온다(다운점프와 같은 원인).
+			--   StopMoving이 컨트롤러를 켜주므로 그 뒤에 점프시켜야 모션이 보인다 - 부착 시점에 다시 끈다.
+			self:StopMoving()
+			player.MovementComponent:Jump()
+			local scJ = player.StateComponent
+			if isvalid(scJ) then scJ:ChangeState("JUMP") end
+			self._T.jumpedAt = now
+			self._T.ropeJumpUntil = now + 0.22
+			self._T.ropeState = "climb"
+			self._T.ropeClimbFrom = now   -- 부착 실패 조기 종료 판정 기준(아래 climb 분기)
+			-- 등반 무적 ON - 여기서 켜야 점프~부착 구간의 피격으로 떨어지는 것도 막힌다.
+			if self._T.ropeInvincible ~= true then
+				self._T.ropeInvincible = true
+				_SkillManager:RequestSetClimbInvincible(true)
+			end
+			log("[AutoHunt] 로프 정렬 완료 - 점프하며 등반 시작 (x=" .. string.format("%.2f", self._T.ropeX or 0)
+				.. " 목표높이=" .. string.format("%.2f", self._T.ropeGoalY or 0) .. ")")
+			return true
+		end
+
+		if st == "climb" then
+			-- 목표 높이에 도달했고 발판을 밟았으면 성공 종료 - 이후엔 평소 추적 로직이 이어받는다.
+			local rbC = player.RigidbodyComponent
+			if pp.y >= (self._T.ropeGoalY or 0) - 0.4 and isvalid(rbC) and rbC:IsOnGround() then
+				-- (요청 2026-08-10) **사다리로 올라온 직후 바로 떨어지지 않게** 한다 - 앞점프 등반과 같은 처리.
+				--   로프 도착 지점은 대개 발판 가장자리라, 그대로 아래층 대상을 향해 걸으면 한두 걸음 만에
+				--   떨어져 "올라오자마자 도로 내려가는" 동작이 된다.
+				--   ① 하강(다운점프) 1.2초 보류 ② 3초간 올라온 층 고정(FindTarget이 그 층 적만 본다)
+				--   ③ 층 고정 동안에는 발판 끝 방향으로 걸어 나가지도 않는다(아래 추적 걷기의 게이트).
+				self._T.noDownJumpUntil = now + 1.2
+				self._T.layerHoldUntil = now + 3.0
+				self:EndRopeClimb(player, "도착 (y=" .. string.format("%.2f", pp.y) .. ")")
+				return false
+			end
+			local pccC = player.PlayerControllerComponent
+			local mvC = player.MovementComponent
+			local scC = player.StateComponent
+			local onRope = isvalid(scC) and (scC.CurrentStateName == "CLIMB" or scC.CurrentStateName == "LADDER")
+			-- 점프 궤적이 보이도록 부착을 잠깐 미룬다(정렬 직후 뛰어오른 0.22초 구간).
+			if (self._T.ropeJumpUntil or 0) > now and not onRope then
+				self._T.moving = false
+				return true
+			end
+			-- ⚠ (신고 2026-08-09 "올라간 뒤 10~15초 가만히 있는다") **부착 실패 조기 종료.**
+			--   그 자리에 로프가 없으면 ActionClimb은 아무 일도 하지 않는데, 이 분기는 컨트롤러를 끄고
+			--   moving=false로 두기만 해서 캐릭터가 **완전히 멈춘 채** ropeUntil이 끝나기를 기다렸다.
+			--   그 타임아웃은 `6.0 + 거리×1.2 + dy×1.5`라 실제로 10~15초다(실측 사례: dy=1.80·거리 3.4 → 12.8초,
+			--   화면상 9.5초 정지 후 "대상 변경"으로 겨우 풀렸다. state=IDLE / ctrl=false / y 변화 0).
+			--   점프 구간이 끝나고 1.2초 안에 CLIMB에 못 들어갔으면 실패로 보고 즉시 접어 평소 추적으로 넘긴다.
+			if not onRope and isvalid(rbC) and rbC:IsOnGround()
+				and (self._T.ropeClimbFrom or now) + 1.2 < now then
+				self._T.ropeRetryUntil = now + 2.0   -- 같은 로프로 즉시 재시도해 튀는 것 방지
+				self:EndRopeClimb(player, "부착 실패 - 즉시 종료(타임아웃 대기 안 함)")
+				return false
+			end
+			if isvalid(pccC) and isvalid(mvC) then
+				if pccC.Enable then pccC.Enable = false end
+				if not onRope then
+					-- 아직 안 잡았으면 ActionClimb으로 **부착**한다.
+					-- ⚠ (실측 2026-08-09) moveOffset은 방향이 아니라 **이동량**처럼 동작한다 -
+					--   Vector2(0,1)로 부르면 붙는 순간 1유닛 이상 위로 튀어(로그: JUMP y=1.26 → CLIMB y=2.95)
+					--   "순간이동"처럼 보인다. 부착만 시키고 상승은 아래 MoveToDirection이 맡도록 작게 준다.
+					pccC:ActionClimb(Vector2(0, 0.05), mvC:GetClimbableHeight())
+				else
+					-- ⚠ (실측 2026-08-09) ActionClimb을 계속 부르면 약 1유닛만 오르고 그 자리에서 멈춘다.
+					--   부착 뒤의 실제 상승은 MoveToDirection이 담당한다 - MovementComponent.d.mlua의
+					--   "deltaTime only applies when on the ladder"가 이 경로를 가리킨다.
+					-- (신고 2026-08-09) 그대로 delta를 넘기면 **2.0유닛/초**로 달리기와 비슷해 "비정상적으로
+					--   빠르다"는 신고가 났다. 델타를 줄여 원작 로프 체감(약 0.9유닛/초)에 맞춘다.
+					mvC:MoveToDirection(Vector2(0, 1), delta * self.RopeClimbSpeedFactor)
+				end
+			end
+			self._T.moving = false
+			return true
+		end
+
+		-- ── 여기부터는 "새로 시작할지" 판단 ──
+		-- 앞점프로 닿는 높이면 로프를 쓸 이유가 없다(점프가 훨씬 빠르다).
+		if dy < 1.1 then return false end
+		if self:GetPlainJumpReach(player) >= dy then return false end
+		-- 이동기가 있는 직업은 기존 경로(섬광/플래시 점프/텔레포트 등)를 그대로 쓴다.
+		if self:GetFlashJumpReach() >= dy or self:GetDoubleJumpReach() >= dy or self:GetHasteJumpReach() >= dy then
+			return false
+		end
+		if (self._T.ropeRetryUntil or 0) > now then return false end
+
+		local mp = target.TransformComponent.WorldPosition
+		local rope = self:FindUsableRope(player, pp, mp.y, mp.x)
+		if rope == nil then
+			-- 쓸 수 있는 로프가 없으면 잠시 재탐색을 쉰다(매 틱 전체 로프를 훑지 않도록).
+			self._T.ropeRetryUntil = now + 1.0
+			return false
+		end
+		self._T.ropeState = "approach"
+		self._T.ropeX = rope.x
+		-- 목표 높이는 대상의 발 높이. 로프 상단보다 위면 로프 상단까지만 올라간다.
+		self._T.ropeGoalY = math.min(mp.y, rope.top)
+		-- 타임아웃: 수평 거리 비례 + 등반 시간 여유(로프는 느리다).
+		self._T.ropeUntil = now + 6.0 + math.abs(rope.x - pp.x) * 1.2 + dy * 1.5
+		log("[AutoHunt] 로프 등반 시작 - 로프 x=" .. string.format("%.2f", rope.x)
+			.. " 구간 " .. string.format("%.2f", rope.bot) .. "~" .. string.format("%.2f", rope.top)
+			.. " / 대상 dy=" .. string.format("%.2f", dy))
+		return true
+	end
+
 	@ExecSpace("ClientOnly")
 	method number GetHasteJumpReach()
 		if _HasteBuffUI:GetRemaining() <= 0 then return 0 end
@@ -2218,6 +4069,145 @@ script AutoHuntManager extends Logic
 			_SkillManager:UseSkillInSlot(key)
 		end, 0.4)
 		log("[AutoHunt] 체인샷 이동 - " .. reason)
+		return true
+	end
+
+	-- ── (히어로 3차, 요청 2026-08-09) 코마 = 구슬을 모아서 넓게 쓰는 다수기 ──
+	-- 요청 요지
+	--   · 패닉은 "보스나 잘 안 죽는 몬스터"가 아니면 쓸 일이 거의 없다.
+	--   · 코마는 다수기다. 바로 옆 한두 마리는 근접 공격으로 잡으면 되지만, **위/아래 포함 주변에 적이
+	--     많고 범위가 닿으면** 써주는 게 좋다. 사용 빈도를 늘려야 한다.
+	--   · 몬스터가 약해 콤보 어택의 이득(+20%/구슬)을 다른 스킬로 별로 못 보면 **더 자주** 쓴다.
+	--   · **구슬이 많을수록 범위가 넓어지므로 모아서 쓴다.**
+	-- 서버 실판정(PlayerAttack.NotifyComaMotionEnded)과 **같은 식**을 클라에서 재현해 판단한다:
+	--   halfW = 3.0 + (15.0-3.0) × (orb-1)/9,  halfH = halfW × 0.5,  전방위 박스, 가까운 순 최대 15명.
+	--   → 구슬 1개면 ±3.0/±1.5(옆칸만), 5개면 ±8.3/±4.2(위아래 층까지), 10개면 ±15/±7.5.
+
+	@ExecSpace("ClientOnly")
+	method integer GetComboOrbCount(Entity player)
+		-- 현재 쌓인 콤보 구슬 수. ComboOrbCount는 @Sync라 클라에서 그대로 읽힌다.
+		if not isvalid(player) then return 0 end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then return 0 end
+		return math.max(0, pa.ComboOrbCount or 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetComboOrbCapClient()
+		-- 구슬 상한. 서버 GetComboOrbCap과 같은 식이지만 **투자 레벨을 클라의 SkillManager에서** 읽는다
+		-- (서버 쪽 _T.comboSkillLv는 클라에 없어서 그대로 호출하면 항상 1이 나온다).
+		local comboLv = _SkillManager:GetHeroSkillLevelByName("콤보 어택")
+		local advLv = _SkillManager:GetHeroSkillLevelByName("어드밴스드 콤보")
+		local cap = math.min(5, 1 + math.floor(math.max(1, comboLv) / 5))
+		if advLv >= 1 then
+			cap = cap + math.min(5, 1 + math.floor(advLv / 5))
+		end
+		return math.max(1, cap)
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetComaHalfWidth(integer orbCount)
+		-- 구슬 수 → 코마 판정 반폭(서버와 동일 식). 세로는 이 값의 절반.
+		local orb = math.max(1, math.min(orbCount, 10))
+		return 3.0 + (15.0 - 3.0) * (orb - 1) / 9
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer CountMonstersInBox(Entity player, Vector3 pp, number halfW, number halfH)
+		-- 전방위 박스(|dx|≤halfW, |dy|≤halfH) 안의 살아있는 몬스터 수 - 코마 실판정과 같은 모양이다.
+		-- ⚠ 기존 CountNearbyMonsters는 **원형 반경**이라 "위/아래 층까지 닿는" 코마 박스를 못 나타낸다.
+		local comps = self:GetMonsterComps(player)
+		if comps == nil then return 0 end
+		local n = 0
+		for _, comp in ipairs(comps) do
+			if isvalid(comp) and comp.IsDead ~= true then
+				local e = comp.Entity
+				if isvalid(e) and e.Visible ~= false then
+					local wp = e.TransformComponent.WorldPosition
+					if math.abs(wp.x - pp.x) <= halfW and math.abs(wp.y - pp.y) <= halfH then
+						n = n + 1
+					end
+				end
+			end
+		end
+		return n
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsWeakMonsterTarget(Entity target)
+		-- "몬스터 수준이 낮아 콤보 어택의 이득을 다른 스킬로 별로 못 보는" 상황인가.
+		-- 기본 공격 한두 대에 죽는 수준(전투력이 대상 최대 HP의 3배 이상)이면 구슬을 아껴 봐야
+		-- +20%/구슬 버프가 실제 딜로 환산되지 않는다 - 그럴수록 코마로 **넓게 쓸어담는 게 이득**이다.
+		if not isvalid(target) then return false end
+		local mon = target:GetComponent("script.Monster")
+		if mon == nil then return false end
+		local maxHp = math.max(1, mon.MaxHp or 1)
+		local cp = _SkillManager:GetEffectiveCombatPower()
+		return cp >= maxHp * 3.0
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean TryComaCast(number now, Entity player, Vector3 pp, Entity target)
+		-- 코마 자기 규칙. 시전했으면 true.
+		if self._T.slotComas == nil or #self._T.slotComas == 0 then return false end
+		-- ⚠ 자체 스로틀 필수: 코마/패닉은 공용 쿨다운(skillOnCooldown, 0.75×공속)을 쓰므로 쿨 중에는
+		--   UseSkillInSlot이 조용히 거부한다. 스로틀이 없으면 조건이 참인 동안 매 틱 true를 돌려주며
+		--   **다른 공격까지 막아** 제자리에 서 있게 된다(구슬이 안 줄어 조건이 계속 참이기 때문).
+		if (self._T.nextComa or 0) > now then return false end
+		local orb = self:GetComboOrbCount(player)
+		if orb < 1 then return false end
+		local cap = self:GetComboOrbCapClient()
+		local halfW = self:GetComaHalfWidth(orb)
+		local hit = math.min(15, self:CountMonstersInBox(player, pp, halfW, halfW * 0.5))
+		-- 필요 대상 수 — **"모아서 쓴다"가 기본 원칙**(요청 2026-08-09).
+		--   구슬 1개 ±3.0/±1.5 → 5개 ±8.3/±4.2 → 10개 ±15/±7.5로 범위가 크게 벌어지므로,
+		--   덜 모은 상태에서 쏘는 것은 거의 항상 손해다. 그래서:
+		--   · 구슬 상한(모으기 완료) = 더 모아도 범위가 안 커진다 → 문턱을 낮춰 자주 쓴다.
+		--     약한 몬스터 구간이면 1마리라도 쓴다(어차피 구슬은 상한에서 놀고, 콤보 +20%/구슬의
+		--     이득도 다른 스킬로 환산이 안 되는 구간이다).
+		--   · 상한 -1 = 거의 다 모았다 → 4마리 이상이면 조금 앞당겨 쓴다.
+		--   · 그 아래 = **참고 더 모은다.** 판정 상한이 15명이라 지금 범위에 이미 15명이 들어찬
+		--     극단적인 경우에만(= 더 기다려도 더 못 때린다) 예외적으로 시전한다.
+		-- ⚠ 초기 구현은 이 문턱이 6이라 구슬 1~2개의 **좁은 범위**로 계속 나갔다(실측: ±3.0에 9마리).
+		--   몬스터가 빽빽한 맵에서는 6이 너무 쉽게 채워져 "모아 쓰기"가 사실상 무력화된다.
+		local weak = self:IsWeakMonsterTarget(target)
+		local need = 15
+		if orb >= cap then
+			need = 2
+			if weak then need = 1 end
+		elseif orb >= cap - 1 then
+			need = 4
+		end
+		if hit < need then return false end
+		self._T.nextComa = now + 1.0
+		self._T.holdMoveUntil = now + 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()
+		self._T.lastAttackAt = now
+		_SkillManager:UseSkillInSlot(self._T.slotComas[1].key)
+		log("[AutoHunt] 코마 시전 (구슬 " .. tostring(orb) .. "/" .. tostring(cap)
+			.. " 범위 ±" .. string.format("%.1f", halfW) .. "/±" .. string.format("%.1f", halfW * 0.5)
+			.. " 대상 " .. tostring(hit) .. "마리 필요 " .. tostring(need)
+			.. (weak and " 약한몹" or "") .. ")")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean TryPanicCast(number now, Entity player, Vector3 pp, Entity target)
+		-- 패닉 자기 규칙: **잘 죽지 않는 단일 대상(보스/탱커) 전용.** 시전했으면 true.
+		-- 구슬 1개당 1000%~1200%의 단일기라 잡몹에게 쓰면 구슬만 날린다 - 그 구슬은 코마가 써야 한다.
+		-- 기준: 남은 HP가 전투력의 5배를 넘는다(= 기본 공격 몇 대로는 안 죽는다).
+		if self._T.slotPanics == nil or #self._T.slotPanics == 0 then return false end
+		if (self._T.nextPanic or 0) > now then return false end   -- 코마와 같은 이유의 스로틀
+		if self:GetComboOrbCount(player) < 1 then return false end
+		local remain = self:GetTargetRemainHp(target)
+		local cp = _SkillManager:GetEffectiveCombatPower()
+		if remain < cp * 5.0 then return false end
+		self._T.nextPanic = now + 1.0
+		self._T.holdMoveUntil = now + 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()
+		self._T.lastAttackAt = now
+		_SkillManager:UseSkillInSlot(self._T.slotPanics[1].key)
+		log("[AutoHunt] 패닉 시전 (탱커 대상 - 남은HP " .. tostring(math.floor(remain))
+			.. " ≥ 전투력×5 " .. tostring(math.floor(cp * 5.0)) .. ")")
 		return true
 	end
 
