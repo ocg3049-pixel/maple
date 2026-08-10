@@ -59,27 +59,30 @@ script UIMyInfoManager extends Logic
     end
 
     @ExecSpace("Server")
-    method void ApplyLevelHp(integer level)
-        -- 클라이언트가 보고한 표시 레벨(전투력/10)로 최대 HP를 50 + 레벨×10으로 적용한다.
-        -- HP는 서버 권한이지만 레벨은 클라 전용 계산이라 이 RPC로 넘겨받는다.
+    method void ApplyMaxHp(integer reportedMax)
+        -- 클라이언트가 보고한 최대 HP를 적용한다. HP는 서버 권한이지만 레벨(장비 전투력 환산)과
+        -- 잠재 옵션은 클라 전용 계산이라 이 RPC로 최종값을 넘겨받는다.
+        -- (전투력 개편 2026-08-08) 기존 ApplyLevelHp(level)를 대체 - 잠재 "최대 HP +N%/+N" 옵션이
+        -- 실수치에 반영되도록 레벨 대신 계산 완료된 최대 HP를 통째로 받는다.
+        -- ⚠ 서버 메서드는 시그니처를 바꾸면 LEA-1102가 나므로 관례대로 개명했다.
         local player = _UserService:GetUserEntityByUserId(senderUserId)
         if not isvalid(player) then return end
         local pc = player.PlayerComponent
         if not isvalid(pc) then return end
 
-        if level < 0 then level = 0 end
-        local newMax = 50 + level * 10
+        local newMax = reportedMax
+        if newMax < 50 then newMax = 50 end
         local oldMax = pc.MaxHp or 50
         if newMax == oldMax then return end
 
         pc.MaxHp = newMax
         if newMax > oldMax then
-            -- 레벨업으로 최대치가 오르면 현재 HP도 같은 폭만큼 회복시켜 준다
+            -- 최대치가 오르면 현재 HP도 같은 폭만큼 회복시켜 준다
             pc.Hp = math.min((pc.Hp or 0) + (newMax - oldMax), newMax)
         else
             pc.Hp = math.min(pc.Hp or 0, newMax)
         end
-        log("[UIMyInfo] 레벨 " .. tostring(level) .. " → 최대 HP " .. tostring(newMax))
+        log("[UIMyInfo] 최대 HP " .. tostring(oldMax) .. " → " .. tostring(newMax))
     end
 
     @ExecSpace("ClientOnly")
@@ -131,11 +134,14 @@ script UIMyInfoManager extends Logic
         -- 표시 전투력에는 반영되지만 레벨에는 반영되지 않는다 ("순수 아이템 성능만 레벨로 치환").
         self.DisplayLevel = _CharInfoManager:GetDisplayLevel()
 
-        -- 최대 HP = 50 + 레벨×10. 레벨(전투력/10)은 장비 기반이라 클라에서만 계산되므로,
-        -- 서버의 MaxHp가 공식과 어긋나 있으면 보고해서 맞춘다 (0.5초 주기라 클로버 시 자가복구).
-        local expectedMaxHp = 50 + self.DisplayLevel * 10
+        -- 최대 HP = (50 + 레벨×5 + 잠재 최대HP 플랫) × (1 + 잠재 최대HP%/100).
+        -- (전투력 개편 2026-08-08) 잠재 "최대 HP" 옵션이 실수치로 반영된다 - 레벨/잠재 모두 클라 전용
+        -- 계산이라 서버의 MaxHp가 공식과 어긋나 있으면 최종값을 보고해서 맞춘다 (0.5초 주기 자가복구 -
+        -- 장비 교체/잠재 재설정도 다음 틱에 자동 반영).
+        local extras = _CharInfoManager:CollectPotentialExtras()
+        local expectedMaxHp = math.floor((50 + self.DisplayLevel * 5 + extras.hpFlat) * (1 + extras.hpPct / 100))
         if maxHp ~= expectedMaxHp then
-            self:ApplyLevelHp(self.DisplayLevel)
+            self:ApplyMaxHp(expectedMaxHp)
         end
 
         local levelEnt = _EntityService:GetEntityByPath("/ui/ToastGroup/UIMyInfo/info_top/text_level")
@@ -220,9 +226,25 @@ script UIMyInfoManager extends Logic
         return names[stage]
     end
 
+    -- (테스트 /전직 명령) 직업 오버라이드. 0 이하 = 해제. 세션 한정(_T) - 저장에 남지 않는다.
+    -- 모든 직업 참조(스킬창 필터·주스탯·직업명 표시)가 GetSelectedCharacterJobIdx 한 곳을 지나므로
+    -- 여기만 덮으면 전부 연동된다.
+    @ExecSpace("ClientOnly")
+    method void SetTestJobOverride(integer jobIdx)
+        if jobIdx == nil or jobIdx <= 0 then
+            self._T.testJobOverride = nil
+        else
+            self._T.testJobOverride = math.max(1, math.min(10, math.floor(jobIdx)))
+        end
+    end
+
     -- 캐릭터 선택 화면에서 저장된 slotData의 8번째 필드(직업 인덱스)를 읽어온다
     @ExecSpace("ClientOnly")
     method number GetSelectedCharacterJobIdx()
+        -- (테스트 /전직 명령) 오버라이드 활성 시 그 직업으로 판정
+        if (self._T.testJobOverride or 0) > 0 then
+            return self._T.testJobOverride
+        end
         local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
         if not isvalid(selectBg) then return 1 end
         local charSelectComp = selectBg:GetComponent(CharacterSelectComponent)

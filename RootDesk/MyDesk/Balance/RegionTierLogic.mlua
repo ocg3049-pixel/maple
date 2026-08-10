@@ -50,6 +50,50 @@ script RegionTierLogic extends Logic
 		end
 	end
 
+	-- 몬스터 레벨 → MaxHp. (밸런스 워크시트 §3, 2026-08-09)
+	-- HP(L) = (7L)² × m(L) × 1.5타 - 7L은 적정 레벨 유저의 전투력총합, 제곱이 스킬이 쓰는 전투력,
+	-- m(L)은 그 레벨대 주력 스킬의 "한 방 기대배율"(1차 1.5 → 2차 2.5~5 → 3차 5~10 → 4차 10~16 보간).
+	-- Balance/MonsterHpTable.csv가 진실의 원천 - 없거나 손상이면 같은 공식의 하드코딩 폴백.
+	@ExecSpace("ServerOnly")
+	method integer GetMonsterHpForLevel(integer level)
+		-- 레벨 구간 밖은 경계로 클램프. 테이블은 최초 1회만 읽어 배열로 캐시한다.
+		local lv = math.max(1, math.min(200, math.floor(level or 1)))
+		if self._T.monsterHpRows == nil then
+			local rows = nil
+			local ok, ds = pcall(function() return _DataService:GetTable("MonsterHpTable") end)
+			if ok and ds ~= nil then
+				local n = ds:GetRowCount()
+				if n >= 100 then
+					rows = {}
+					for i = 1, n do
+						local l = math.floor(tonumber(ds:GetCell(i, "level")) or 0)
+						local hp = math.floor(tonumber(ds:GetCell(i, "hp")) or 0)
+						if l >= 1 and hp >= 1 then rows[l] = hp end
+					end
+					log("[RegionTier] MonsterHpTable CSV 로드 완료 (" .. tostring(n) .. "레벨)")
+				end
+			end
+			self._T.monsterHpRows = rows or false
+		end
+		if self._T.monsterHpRows ~= false and self._T.monsterHpRows[lv] ~= nil then
+			return self._T.monsterHpRows[lv]
+		end
+		-- 폴백: CSV와 같은 공식 (m 앵커 선형 보간)
+		local anchors = { {1, 1.2}, {10, 1.5}, {29, 2.5}, {30, 2.5}, {69, 5.0}, {70, 5.0}, {119, 10.0}, {120, 10.0}, {200, 16.0} }
+		local m = anchors[#anchors][2]
+		for i = 1, #anchors - 1 do
+			local l0 = anchors[i][1]
+			local m0 = anchors[i][2]
+			local l1 = anchors[i + 1][1]
+			local m1 = anchors[i + 1][2]
+			if lv >= l0 and lv <= l1 then
+				if l1 == l0 then m = m0 else m = m0 + (lv - l0) / (l1 - l0) * (m1 - m0) end
+				break
+			end
+		end
+		return math.floor((7 * lv) * (7 * lv) * m * 1.5 + 0.5)
+	end
+
 	-- 맵 이름 → 티어. 로비는 지역 시작 티어, 미등록 맵(마을/테스트존 등)은 T1(게이트 없음).
 	@ExecSpace("ServerOnly")
 	method integer GetTierForMap(string mapName)

@@ -520,6 +520,8 @@ script UIEquipInventoryManager extends Logic
 		elseif event.key == KeyboardKey.Escape then
 			-- 단축키 세팅 창이 열려있으면 KeySettingManager가 Esc를 전담한다
 			if _KeySettingManager:IsWindowOpen() then return end
+			-- 전투분석 창이 열려있으면 종료 확인 다이얼로그가 Esc를 전담한다
+			if _BattleStatsManager:HandleEscape() then return end
 			-- 강화 확인 다이얼로그가 열려있으면 다이얼로그만 닫는다 (강화창은 유지)
 			if _EnhancementManager:IsConfirmDialogOpen() then
 				_EnhancementManager:HideEnhanceConfirm()
@@ -881,6 +883,21 @@ script UIEquipInventoryManager extends Logic
 					self:RefreshUI()
 					self.lastInvenSlot = 0
 					log("[EquipInven] 1억 메소 주머니 사용")
+				else
+					self.lastInvenSlot = slotIdx
+					self.lastInvenTime = t
+					self:StartInvenDrag(slotIdx)
+				end
+				return
+			end
+			-- 허수아비 생성: 더블클릭 → 발밑에 허수아비 소환(스택 1개 소모), 단일클릭 → 인벤 내 이동 드래그
+			if dragSI == 0 and dragName == "허수아비 생성" then
+				if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+					_BattleStatsManager:RequestSpawnDummy()
+					self:ConsumeScrollFromSlot(slotIdx)
+					self:RefreshUI()
+					self.lastInvenSlot = 0
+					log("[EquipInven] 허수아비 생성 사용")
 				else
 					self.lastInvenSlot = slotIdx
 					self.lastInvenTime = t
@@ -1335,211 +1352,85 @@ script UIEquipInventoryManager extends Logic
 		return w.ruid
 	end
 
-	-- 장비 분류·등급·옵션 슬롯(1/2/3)에 따른 잠재능력 옵션 롤링
+	-- (전투력 개편 2026-08-08) 잠재능력 옵션 풀 전면 정리 - 잠재/에디셔널 공용 단일 풀.
+	-- 주문서 부여(이 파일)와 큐브 재설정(EnhancementManager.GetRandomOption)이 모두 이 한 곳을 쓴다.
+	-- 레어 기준 옵션 종류(등급 배수 m: 레어1 / 에픽2 / 유니크3 / 레전드리4 - "해당 수치의 2·3·4배"):
+	--   · 공격력 +10m / 공격력 +3m
+	--   · STR/DEX/INT/LUK +(1~3)m %          (1~3은 균등 랜덤)
+	--   · 최대 HP/MP +(1~3)m %               (실수치 반영 - CharInfoManager.CollectPotentialExtras)
+	--   · STR/DEX/INT/LUK +6m / +12m
+	--   · [장갑 전용] 크리티컬 확률 +3m %    (레전드리 12%)
+	--   · [무기 전용] 공격력 +3m % / 공격속도 +3m % (레전드리 각 12%)
+	-- 옵션 "종류"를 균등 추첨하고, %계열 수치(1~3)만 추가로 굴린다. 기존 optSlot별 가중치는 폐지 -
+	-- optSlot 파라미터는 호출부 호환용으로만 남긴다.
 	@ExecSpace("ClientOnly")
 	method string RollPotOption(string equipType, string grade, integer optSlot)
-		local pool = {}
-		if grade == "레어" then
-			if equipType == "무기" then
-				if optSlot == 1 then
-					pool = {
-						{"STR +12",6.1224},{"DEX +12",6.1224},{"INT +12",6.1224},{"LUK +12",6.1224},
-						{"최대 HP +120",6.1224},{"최대 MP +120",6.1224},
-						{"공격력 +12",4.08163},{"마력 +12",4.08163},
-						{"STR +3%",6.1224},{"DEX +3%",6.1224},{"INT +3%",6.1224},{"LUK +3%",6.1224},
-						{"공격력 +3%",2.04082},{"마력 +3%",2.04082},
-						{"크리티컬 확률 +4%",2.04082},{"데미지 +3%",2.04082},
-						{"올스탯 +5",4.08163},
-						{"공격 시 HP 회복",2.04082},{"공격 시 MP 회복",2.04082},
-						{"몬스터 방어율 무시 +15%",2.04082}
-					}
-				elseif optSlot == 2 then
-					pool = {
-						{"STR +6",12.2727},{"DEX +6",12.2727},{"INT +6",12.2727},{"LUK +6",12.2727},
-						{"최대 HP +60",12.2727},{"최대 MP +60",12.2727},
-						{"공격력 +6",8.1818},{"마력 +6",8.1818},
-						{"STR +12",0.6122},{"DEX +12",0.6122},{"INT +12",0.6122},{"LUK +12",0.6122},
-						{"최대 HP +120",0.6122},{"최대 MP +120",0.6122},
-						{"공격력 +12",0.4082},{"마력 +12",0.4082},
-						{"STR +3%",0.6122},{"DEX +3%",0.6122},{"INT +3%",0.6122},{"LUK +3%",0.6122},
-						{"공격력 +3%",0.2041},{"마력 +3%",0.2041},
-						{"크리티컬 확률 +4%",0.2041},{"데미지 +3%",0.2041},
-						{"올스탯 +5",0.4082},
-						{"공격 시 HP 회복",0.2041},{"공격 시 MP 회복",0.2041},
-						{"몬스터 방어율 무시 +15%",0.2041}
-					}
-				else
-					pool = {
-						{"STR +6",13.5},{"DEX +6",13.5},{"INT +6",13.5},{"LUK +6",13.5},
-						{"최대 HP +60",13.5},{"최대 MP +60",13.5},
-						{"공격력 +6",9},{"마력 +6",9},
-						{"STR +12",0.06122},{"DEX +12",0.06122},{"INT +12",0.06122},{"LUK +12",0.06122},
-						{"최대 HP +120",0.06122},{"최대 MP +120",0.06122},
-						{"공격력 +12",0.04082},{"마력 +12",0.04082},
-						{"STR +3%",0.06122},{"DEX +3%",0.06122},{"INT +3%",0.06122},{"LUK +3%",0.06122},
-						{"공격력 +3%",0.02041},{"마력 +3%",0.02041},
-						{"크리티컬 확률 +4%",0.02041},{"데미지 +3%",0.02041},
-						{"올스탯 +5",0.04082},
-						{"공격 시 HP 회복",0.02041},{"공격 시 MP 회복",0.02041},
-						{"몬스터 방어율 무시 +15%",0.02041}
-					}
-				end
-			elseif equipType == "신발" then
-				if optSlot == 1 then
-					pool = {
-						{"STR +12",6.8182},{"DEX +12",6.8182},{"INT +12",6.8182},{"LUK +12",6.8182},
-						{"최대 HP +120",6.8182},{"최대 MP +120",6.8182},
-						{"이동속도 +8",4.5455},{"점프력 +8",4.5455},{"방어력 +120",4.5455},
-						{"STR +3%",6.8182},{"DEX +3%",6.8182},{"INT +3%",6.8182},{"LUK +3%",6.8182},
-						{"최대 HP +3%",4.5455},{"최대 MP +3%",4.5455},{"방어력 +3%",4.5455},{"올스탯 +5",4.5455}
-					}
-				elseif optSlot == 2 then
-					pool = {
-						{"STR +6",10.8},{"DEX +6",10.8},{"INT +6",10.8},{"LUK +6",10.8},
-						{"최대 HP +60",10.8},{"최대 MP +60",10.8},
-						{"이동속도 +4",7.2},{"점프력 +4",7.2},{"방어력 +60",10.8},
-						{"STR +12",0.6818},{"DEX +12",0.6818},{"INT +12",0.6818},{"LUK +12",0.6818},
-						{"최대 HP +120",0.6818},{"최대 MP +120",0.6818},
-						{"이동속도 +8",0.4545},{"점프력 +8",0.4545},{"방어력 +120",0.4545},
-						{"STR +3%",0.6818},{"DEX +3%",0.6818},{"INT +3%",0.6818},{"LUK +3%",0.6818},
-						{"최대 HP +3%",0.4545},{"최대 MP +3%",0.4545},{"방어력 +3%",0.4545},{"올스탯 +5",0.4545}
-					}
-				else
-					pool = {
-						{"STR +6",11.88},{"DEX +6",11.88},{"INT +6",11.88},{"LUK +6",11.88},
-						{"최대 HP +60",11.88},{"최대 MP +60",11.88},
-						{"이동속도 +4",7.92},{"점프력 +4",7.92},{"방어력 +60",11.88},
-						{"STR +12",0.06818},{"DEX +12",0.06818},{"INT +12",0.06818},{"LUK +12",0.06818},
-						{"최대 HP +120",0.06818},{"최대 MP +120",0.06818},
-						{"이동속도 +8",0.04545},{"점프력 +8",0.04545},{"방어력 +120",0.04545},
-						{"STR +3%",0.06818},{"DEX +3%",0.06818},{"INT +3%",0.06818},{"LUK +3%",0.06818},
-						{"최대 HP +3%",0.04545},{"최대 MP +3%",0.04545},{"방어력 +3%",0.04545},{"올스탯 +5",0.04545}
-					}
-				end
-			else
-				-- 모자/상의/하의/얼굴/눈장식 공통 레어 풀
-				if optSlot == 1 then
-					pool = {
-						{"STR +12",7.5},{"DEX +12",7.5},{"INT +12",7.5},{"LUK +12",7.5},
-						{"최대 HP +120",7.5},{"최대 MP +120",7.5},{"방어력 +120",5},
-						{"STR +3%",7.5},{"DEX +3%",7.5},{"INT +3%",7.5},{"LUK +3%",7.5},
-						{"최대 HP +3%",5},{"최대 MP +3%",5},{"방어력 +3%",5},{"올스탯 +5",5}
-					}
-				elseif optSlot == 2 then
-					pool = {
-						{"STR +6",12.8571},{"DEX +6",12.8571},{"INT +6",12.8571},{"LUK +6",12.8571},
-						{"최대 HP +60",12.8571},{"최대 MP +60",12.8571},{"방어력 +60",12.8571},
-						{"STR +12",0.75},{"DEX +12",0.75},{"INT +12",0.75},{"LUK +12",0.75},
-						{"최대 HP +120",0.75},{"최대 MP +120",0.75},{"방어력 +120",0.5},
-						{"STR +3%",0.75},{"DEX +3%",0.75},{"INT +3%",0.75},{"LUK +3%",0.75},
-						{"최대 HP +3%",0.5},{"최대 MP +3%",0.5},{"방어력 +3%",0.5},{"올스탯 +5",0.5}
-					}
-				else
-					pool = {
-						{"STR +6",14.1429},{"DEX +6",14.1429},{"INT +6",14.1429},{"LUK +6",14.1429},
-						{"최대 HP +60",14.1429},{"최대 MP +60",14.1429},{"방어력 +60",14.1429},
-						{"STR +12",0.075},{"DEX +12",0.075},{"INT +12",0.075},{"LUK +12",0.075},
-						{"최대 HP +120",0.075},{"최대 MP +120",0.075},{"방어력 +120",0.05},
-						{"STR +3%",0.075},{"DEX +3%",0.075},{"INT +3%",0.075},{"LUK +3%",0.075},
-						{"최대 HP +3%",0.05},{"최대 MP +3%",0.05},{"방어력 +3%",0.05},{"올스탯 +5",0.05}
-					}
-				end
-			end
+		local m = 0
+		local g = self:NormalizeGradeName(grade)
+		if g == "레어" then m = 1
+		elseif g == "에픽" then m = 2
+		elseif g == "유니크" then m = 3
+		elseif g == "레전드리" then m = 4 end
+		if m == 0 then return "" end
+
+		local kinds = {
+			"atk10", "atk3",
+			"str_pct", "dex_pct", "int_pct", "luk_pct", "hp_pct", "mp_pct",
+			"str6", "dex6", "int6", "luk6",
+			"str12", "dex12", "int12", "luk12",
+		}
+		if equipType == "장갑" then table.insert(kinds, "crit_pct") end
+		if equipType == "무기" then
+			table.insert(kinds, "atkp_pct")
+			table.insert(kinds, "spd_pct")
 		end
-		if #pool == 0 then return "" end
-		return self:RollOneOption(pool)
+
+		local idx = math.floor(_UtilLogic:RandomDouble() * #kinds) + 1
+		if idx < 1 then idx = 1 end
+		if idx > #kinds then idx = #kinds end
+		local kind = kinds[idx]
+
+		-- %계열(스탯/HP/MP)의 레어 기준 1~3 균등 랜덤 → 등급 배수 적용
+		local pctVal = (math.floor(_UtilLogic:RandomDouble() * 3) + 1)
+		if pctVal < 1 then pctVal = 1 end
+		if pctVal > 3 then pctVal = 3 end
+		pctVal = pctVal * m
+
+		if kind == "atk10" then return "공격력 +" .. tostring(10 * m) end
+		if kind == "atk3" then return "공격력 +" .. tostring(3 * m) end
+		if kind == "str_pct" then return "STR +" .. tostring(pctVal) .. "%" end
+		if kind == "dex_pct" then return "DEX +" .. tostring(pctVal) .. "%" end
+		if kind == "int_pct" then return "INT +" .. tostring(pctVal) .. "%" end
+		if kind == "luk_pct" then return "LUK +" .. tostring(pctVal) .. "%" end
+		if kind == "hp_pct" then return "최대 HP +" .. tostring(pctVal) .. "%" end
+		if kind == "mp_pct" then return "최대 MP +" .. tostring(pctVal) .. "%" end
+		if kind == "str6" then return "STR +" .. tostring(6 * m) end
+		if kind == "dex6" then return "DEX +" .. tostring(6 * m) end
+		if kind == "int6" then return "INT +" .. tostring(6 * m) end
+		if kind == "luk6" then return "LUK +" .. tostring(6 * m) end
+		if kind == "str12" then return "STR +" .. tostring(12 * m) end
+		if kind == "dex12" then return "DEX +" .. tostring(12 * m) end
+		if kind == "int12" then return "INT +" .. tostring(12 * m) end
+		if kind == "luk12" then return "LUK +" .. tostring(12 * m) end
+		if kind == "crit_pct" then return "크리티컬 확률 +" .. tostring(3 * m) .. "%" end
+		if kind == "atkp_pct" then return "공격력 +" .. tostring(3 * m) .. "%" end
+		if kind == "spd_pct" then return "공격속도 +" .. tostring(3 * m) .. "%" end
+		return ""
 	end
 
-	-- 에디셔널 잠재능력 전용 확률 풀
+	-- 에디셔널 잠재능력: (전투력 개편 2026-08-08) 잠재와 같은 단일 풀에서 뽑되 **수치를 절반**으로 낮춘다
+	-- (요청: "에디셔널은 윗잠재의 절반 옵션"). 절반은 반올림 - 예) 공격력 +3 → +2, 레전드리 공속 +12% → +6%.
 	@ExecSpace("ClientOnly")
 	method string RollAddPotOption(string equipType, string grade, integer optSlot)
-		local pool = {}
-		if grade == "레어" then
-			if equipType == "무기" then
-				if optSlot == 1 then
-					pool = {
-						{"최대 HP +100",5.8824},{"최대 MP +100",5.8824},
-						{"이동속도 +6",5.8824},{"점프력 +6",5.8824},{"방어력 +100",5.8824},
-						{"STR +12",5.8824},{"DEX +12",5.8824},{"INT +12",5.8824},{"LUK +12",5.8824},
-						{"공격력 +12",3.9216},{"마력 +12",3.9216},
-						{"최대 HP +2%",3.9216},{"최대 MP +2%",3.9216},
-						{"STR +3%",3.9216},{"DEX +3%",3.9216},{"INT +3%",3.9216},{"LUK +3%",3.9216},
-						{"공격력 +3%",1.9608},{"마력 +3%",1.9608},
-						{"크리티컬 확률 +4%",3.9216},{"데미지 +3%",1.9608},{"올스탯 +5",5.8824}
-					}
-				elseif optSlot == 2 then
-					pool = {
-						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
-						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
-						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},{"방어력 +60",10.8932},
-						{"공격력 +6",7.2622},{"마력 +6",7.2622},
-						{"최대 HP +100",0.1153},{"최대 MP +100",0.1153},
-						{"이동속도 +6",0.1153},{"점프력 +6",0.1153},{"방어력 +100",0.1153},
-						{"STR +12",0.1153},{"DEX +12",0.1153},{"INT +12",0.1153},{"LUK +12",0.1153},
-						{"공격력 +12",0.07689},{"마력 +12",0.07689},
-						{"최대 HP +2%",0.07689},{"최대 MP +2%",0.07689},
-						{"STR +3%",0.07689},{"DEX +3%",0.07689},{"INT +3%",0.07689},{"LUK +3%",0.07689},
-						{"공격력 +3%",0.03845},{"마력 +3%",0.03845},
-						{"크리티컬 확률 +4%",0.07689},{"데미지 +3%",0.03845},{"올스탯 +5",0.1153}
-					}
-				else
-					pool = {
-						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
-						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
-						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},{"방어력 +60",10.8932},
-						{"공격력 +6",7.2622},{"마력 +6",7.2622},
-						{"최대 HP +100",0.1153},{"최대 MP +100",0.1153},
-						{"이동속도 +6",0.1153},{"점프력 +6",0.1153},{"방어력 +100",0.1153},
-						{"STR +12",0.1153},{"DEX +12",0.1153},{"INT +12",0.1153},{"LUK +12",0.1153},
-						{"공격력 +12",0.07689},{"마력 +12",0.07689},
-						{"최대 HP +2%",0.07689},{"최대 MP +2%",0.07689},
-						{"STR +3%",0.07689},{"DEX +3%",0.07689},{"INT +3%",0.07689},{"LUK +3%",0.07689},
-						{"공격력 +3%",0.03845},{"마력 +3%",0.03845},
-						{"크리티컬 확률 +4%",0.07689},{"데미지 +3%",0.03845},{"올스탯 +5",0.1153}
-					}
-				end
-			else
-				-- 모자/상의/하의/신발/기타 방어구 공통 에디셔널 레어
-				if optSlot == 1 then
-					pool = {
-						{"STR +10",6.3830},{"DEX +10",6.3830},{"INT +10",6.3830},{"LUK +10",6.3830},
-						{"최대 HP +100",6.3830},{"최대 MP +100",6.3830},
-						{"이동속도 +6",6.3830},{"점프력 +6",6.3830},
-						{"공격력 +10",4.2553},{"마력 +10",4.2553},{"방어력 +100",6.3830},
-						{"STR +2%",4.2553},{"DEX +2%",4.2553},{"INT +2%",4.2553},{"LUK +2%",4.2553},
-						{"최대 HP +2%",4.2553},{"최대 MP +2%",4.2553},{"방어력 +2%",4.2553},{"올스탯 +3",4.2553}
-					}
-				elseif optSlot == 2 then
-					pool = {
-						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
-						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
-						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},
-						{"공격력 +3",7.2622},{"마력 +3",7.2622},{"방어력 +60",10.8932},
-						{"STR +10",0.1252},{"DEX +10",0.1252},{"INT +10",0.1252},{"LUK +10",0.1252},
-						{"최대 HP +100",0.1252},{"최대 MP +100",0.1252},
-						{"이동속도 +6",0.1252},{"점프력 +6",0.1252},
-						{"공격력 +10",0.08344},{"마력 +10",0.08344},{"방어력 +100",0.1252},
-						{"STR +2%",0.08344},{"DEX +2%",0.08344},{"INT +2%",0.08344},{"LUK +2%",0.08344},
-						{"최대 HP +2%",0.08344},{"최대 MP +2%",0.08344},{"방어력 +2%",0.08344},{"올스탯 +3",0.08344}
-					}
-				else
-					pool = {
-						{"STR +6",7.2622},{"DEX +6",7.2622},{"INT +6",7.2622},{"LUK +6",7.2622},
-						{"최대 HP +60",10.8932},{"최대 MP +60",10.8932},
-						{"이동속도 +4",10.8932},{"점프력 +4",10.8932},
-						{"공격력 +3",7.2622},{"마력 +3",7.2622},{"방어력 +60",10.8932},
-						{"STR +10",0.1252},{"DEX +10",0.1252},{"INT +10",0.1252},{"LUK +10",0.1252},
-						{"최대 HP +100",0.1252},{"최대 MP +100",0.1252},
-						{"이동속도 +6",0.1252},{"점프력 +6",0.1252},
-						{"공격력 +10",0.08344},{"마력 +10",0.08344},{"방어력 +100",0.1252},
-						{"STR +2%",0.08344},{"DEX +2%",0.08344},{"INT +2%",0.08344},{"LUK +2%",0.08344},
-						{"최대 HP +2%",0.08344},{"최대 MP +2%",0.08344},{"방어력 +2%",0.08344},{"올스탯 +3",0.08344}
-					}
-				end
-			end
-		end
-		if #pool == 0 then return "" end
-		return self:RollOneOption(pool)
+		local opt = self:RollPotOption(equipType, grade, optSlot)
+		if opt == "" then return "" end
+		local numStr = string.match(opt, "%+(%d+)")
+		if numStr == nil then return opt end
+		local n = tonumber(numStr) or 0
+		local h = math.floor(n / 2 + 0.5)
+		if h < 1 then h = 1 end
+		local halved = string.gsub(opt, "%+%d+", "+" .. tostring(h), 1)
+		return halved
 	end
 
 	-- 등급 색상 반환 (Rich Text용 hex)
@@ -1719,6 +1610,8 @@ script UIEquipInventoryManager extends Logic
 		self._T.tabData["consume"][21] = "공격력 물약|" .. level70PotionRUID .. "|0|0|0|0|999"
 		-- (테스트용) 1억 메소 주머니 10개 → 소비 탭 슬롯 22: 더블클릭 시 메소 +1억
 		self._T.tabData["consume"][22] = "1억 메소 주머니|f0aa7764ff5344848d59accafa2dbf6e|0|0|0|0|10"
+		-- 허수아비 생성 999개 → 소비 탭 슬롯 23: 더블클릭 시 발밑에 허수아비 소환 (전투분석 DPS 측정용)
+		self._T.tabData["consume"][23] = "허수아비 생성|c9c6022d09854016b0c7f8422441ba2a|0|0|0|0|999"
 		-- 치장 아이템 → 치장 탭
 		self:SeedDecoItems()
 		self:RefreshUI()
@@ -1793,6 +1686,8 @@ script UIEquipInventoryManager extends Logic
 			{ name = "드롭 아이템",       ruid = "47841bc4d3554cf0a68bd05f19de1f18" },
 			{ name = "공격 속도의 비약",  ruid = "9d6404b526184e85aeddfd6728e39fdb" },
 			{ name = "연두색주문서",      ruid = "314215aface349c48b81eee58065e1b7" },
+			-- 허수아비 생성(전투분석 DPS 측정용) - 기존 캐릭터도 접속 시 999개 채워준다
+			{ name = "허수아비 생성",     ruid = "c9c6022d09854016b0c7f8422441ba2a" },
 		}
 		for _, w in ipairs(wanted) do
 			-- 이미 갖고 있으면 그 슬롯을 999로 채우고, 하나도 없으면 빈 슬롯에 새로 넣는다.
@@ -2544,32 +2439,17 @@ script UIEquipInventoryManager extends Logic
 			end
 		end
 
-		-- 스타포스 누적 수치 계산 (각 레벨별 증가량 합산)
-		local str_sf, dex_sf, int_sf, luk_sf, hp_sf, atk_sf, matk_sf = 0, 0, 0, 0, 0, 0, 0
-		for i = 0, stars - 1 do
-			if i < 5 then
-				str_sf = str_sf + 3; dex_sf = dex_sf + 3
-				int_sf = int_sf + 3; luk_sf = luk_sf + 3
-				hp_sf  = hp_sf  + 25
-			elseif i < 10 then
-				str_sf = str_sf + 4; dex_sf = dex_sf + 4
-				int_sf = int_sf + 4; luk_sf = luk_sf + 4
-				hp_sf  = hp_sf  + 50
-			elseif i < 15 then
-				str_sf = str_sf + 5; dex_sf = dex_sf + 5
-				int_sf = int_sf + 5; luk_sf = luk_sf + 5
-			elseif i < 20 then
-				str_sf = str_sf + 7; dex_sf = dex_sf + 7
-				int_sf = int_sf + 7; luk_sf = luk_sf + 7
-				atk_sf = atk_sf + 7; matk_sf = matk_sf + 7
-			elseif i < 22 then
-				str_sf  = str_sf  + 22; dex_sf  = dex_sf  + 22
-				int_sf  = int_sf  + 22; luk_sf  = luk_sf  + 22
-				atk_sf  = atk_sf  + 21; matk_sf = matk_sf + 21
-			else
-				atk_sf  = atk_sf  + (i + 1)
-				matk_sf = matk_sf + (i + 1)
-			end
+		-- 스타포스 누적 수치 계산 (전투력 개편 2026-08-08: 1성당 직업 주스탯 +4, 공격력 +3 균일 -
+		-- CharInfoManager.CalcStarforceStats와 반드시 같은 값이어야 한다)
+		local str_sf, dex_sf, int_sf, luk_sf, atk_sf = 0, 0, 0, 0, 0
+		if stars > 0 then
+			local mainName = _CharInfoManager:GetMainStatName()
+			local mainVal = stars * 4
+			atk_sf = stars * 3
+			if mainName == "STR" then str_sf = mainVal
+			elseif mainName == "DEX" then dex_sf = mainVal
+			elseif mainName == "INT" then int_sf = mainVal
+			else luk_sf = mainVal end
 		end
 
 		-- 분류는 툴팁 알약(Pill)으로 표시하므로 본문에서는 생략한다 (equipType은 옵션 분기용으로만 사용)
@@ -2588,14 +2468,11 @@ script UIEquipInventoryManager extends Logic
 		if luk_sf > 0 then
 			text = text .. "LUK : +" .. tostring(luk_b + luk_sf) .. " (" .. tostring(luk_b) .. " +" .. tostring(luk_sf) .. ")\n"
 		end
-		if hp_sf > 0 then
-			text = text .. "최대 HP : +" .. tostring(hp_b + hp_sf) .. " (" .. tostring(hp_b) .. " +" .. tostring(hp_sf) .. ")\n"
-		end
 		if atk_b + atk_sf > 0 then
 			text = text .. "공격력 : +" .. tostring(atk_b + atk_sf) .. " (" .. tostring(atk_b) .. " +" .. tostring(atk_sf) .. ")\n"
 		end
-		if matk_b + matk_sf > 0 then
-			text = text .. "마력 : +" .. tostring(matk_b + matk_sf) .. " (" .. tostring(matk_b) .. " +" .. tostring(matk_sf) .. ")\n"
+		if matk_b > 0 then
+			text = text .. "마력 : +" .. tostring(matk_b) .. "\n"
 		end
 
 		if def_b > 0 then
@@ -2637,7 +2514,7 @@ script UIEquipInventoryManager extends Logic
 		elseif name == "에디셔널 잠재능력 부여주문서" then
 			return "장비에 에디셔널 잠재능력을 부여합니다.\n성공률: 70%\n실패 시 아이템 파괴\n1번 성공하면 재사용 불가"
 		elseif name == "공격 속도의 비약" then
-			return "사용 시 공격속도가 1단계 증가합니다.\n(더블클릭으로 사용)"
+			return "사용 시 공격속도가 10% 증가합니다.\n(더블클릭으로 사용)"
 		elseif name == "공격력 물약" then
 			return "사용 시 공격력이 500 증가합니다.\n효과는 게임 종료 시 사라집니다.\n(더블클릭으로 사용)"
 		elseif name == "레벨 70 물약" then
@@ -3273,6 +3150,8 @@ script UIEquipInventoryManager extends Logic
 			return Vector2(350, 0)
 		elseif path == "/ui/DefaultGroup/DecoWindow" then
 			return Vector2(-230, 0)
+		elseif path == "/ui/DefaultGroup/BattleStatsWindow" then
+			return Vector2(-470, 200)
 		end
 		return Vector2(0, 0)
 	end
@@ -3305,7 +3184,8 @@ script UIEquipInventoryManager extends Logic
 			"/ui/DefaultGroup/TooltipPanel",
 			"/ui/DefaultGroup/ItemTypeSelectPopup",
 			"/ui/DefaultGroup/BoxQuantityPopup",
-			"/ui/DefaultGroup/KeySettingWindow"
+			"/ui/DefaultGroup/KeySettingWindow",
+			"/ui/DefaultGroup/BattleStatsWindow"
 		}
 		local maxIdx = 0
 		for _, p in ipairs(paths) do

@@ -1,0 +1,716 @@
+@Logic
+script BattleStatsManager extends Logic
+
+	-- 전투분석(BATTLE STATISTICS): 키설정 기능 "battlestats"(기본 F8)로 창 토글.
+	-- · 서버: Monster.HandleHitEvent/Dead()에서 ReportHit/ReportKill로 플레이어별 누적
+	--   데미지·처치 수를 집계하고 0.25초 주기로 해당 클라이언트에 밀어준다(PushTotals).
+	--   공격자 역추적은 투사체/소환수의 OwnerEntity를 일반화 목록으로 되짚는다
+	--   (표창 재고용 RememberLastAttacker보다 넓은 커버리지 - 전 직업 스킬 대상).
+	-- · 클라: 측정시작 시점의 누적값을 기준선으로 잡고 "이번 측정" 구간의
+	--   전투 시간/총합 데미지/마릿수를 표시한다. 측정종료는 시간을 멈추고 값은 유지.
+	-- · 창 드래그/전면화/겹침 판정은 기존 창 공용 체계(UIEquipInventoryManager.StartWindowDrag,
+	--   UIClickArbiter)를 그대로 재사용한다. ESC 확인 다이얼로그는 UIEquipInventoryManager의
+	--   ESC 분기가 HandleEscape()를 호출해 준다.
+
+	property any keyHandler = nil
+	property table touchHandlers = {}
+	property integer uiTimer = 0
+	property integer flushTimer = 0
+	-- 서버가 밀어준 "이 캐릭터의 세션 누적" 값 (클라 표시용)
+	property number totalDmg = 0
+	property integer totalKills = 0
+
+	-- ── 공통 상수 ─────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method string WinPath()
+		-- 전투분석 창 루트 경로 (UIClickArbiter/BringWindowToFront 목록에도 등록돼 있다)
+		return "/ui/DefaultGroup/BattleStatsWindow"
+	end
+
+	-- ── 라이프사이클 ──────────────────────────────────────────────────
+
+	method void OnBeginPlay()
+		-- 클라: UI 초기화 / 서버: 집계 플러시 타이머 (UIMyInfoManager와 같은 분기 관용구)
+		if self:IsClient() then
+			self:InitClient()
+		end
+		if self:IsServer() then
+			self.flushTimer = _TimerService:SetTimerRepeat(self.FlushDirty, 0.25)
+		end
+	end
+
+	method void OnEndPlay()
+		-- 클라/서버 각자 자기 몫의 핸들러·타이머를 정리한다 (OnBeginPlay와 짝맞춤)
+		if self:IsClient() then
+			self:CleanupClient()
+		end
+		if self:IsServer() and self.flushTimer ~= 0 then
+			_TimerService:ClearTimer(self.flushTimer)
+			self.flushTimer = 0
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void InitClient()
+		-- 창/다이얼로그 초기 숨김(.ui에는 enable=true로 저장 - 비활성 부모의 깊은 자식이
+		-- 생성되지 않는 엔진 문제 회피) + 키/터치 핸들러 연결 + 표시 갱신 타이머 시작
+		local w = _EntityService:GetEntityByPath(self:WinPath())
+		if isvalid(w) then w.Enable = false end
+		local dlg = _EntityService:GetEntityByPath(self:WinPath() .. "/ConfirmDialog")
+		if isvalid(dlg) then dlg.Enable = false end
+
+		self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+
+		local dp = _EntityService:GetEntityByPath(self:WinPath() .. "/DetailPanel")
+		if isvalid(dp) then dp.Enable = false end
+
+		self:ConnectTouch("/TitleBar", self.OnTitleDown)
+		self:ConnectTouch("/TitleBar/BtnClose", self.OnCloseDown)
+		self:ConnectTouch("/TitleBar/BtnDetail", self.OnDetailDown)
+		self:ConnectTouch("/BtnToggle", self.OnToggleDown)
+		self:ConnectTouch("/ConfirmDialog/BtnYes", self.OnConfirmYesDown)
+		self:ConnectTouch("/ConfirmDialog/BtnNo", self.OnConfirmNoDown)
+
+		self.uiTimer = _TimerService:SetTimerRepeat(self.UpdateTick, 0.25)
+		log("[BattleStats] ready (키설정 기능 battlestats, 기본 F8)")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CleanupClient()
+		-- 클라 핸들러/타이머 정리 (InitClient와 짝맞춤)
+		if self.keyHandler ~= nil then
+			_InputService:DisconnectEvent(KeyDownEvent, self.keyHandler)
+			self.keyHandler = nil
+		end
+		for _, rec in ipairs(self.touchHandlers) do
+			if isvalid(rec.ent) then
+				rec.ent:DisconnectEvent(UITouchDownEvent, rec.h)
+			end
+		end
+		self.touchHandlers = {}
+		if self.uiTimer ~= 0 then
+			_TimerService:ClearTimer(self.uiTimer)
+			self.uiTimer = 0
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConnectTouch(string subPath, any fn)
+		-- 창 내부 상대 경로 엔티티에 UITouchDownEvent 핸들러를 연결하고 장부에 기록한다
+		local ent = _EntityService:GetEntityByPath(self:WinPath() .. subPath)
+		if not isvalid(ent) then
+			log_warning("[BattleStats] 터치 대상 없음: " .. subPath)
+			return
+		end
+		local h = ent:ConnectEvent(UITouchDownEvent, fn)
+		table.insert(self.touchHandlers, { ent = ent, h = h })
+	end
+
+	-- ── 키 입력 / 창 토글 ─────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent event)
+		-- 전투분석 토글 키는 키설정창(기능 "battlestats", 기본 F8)에서 바꿀 수 있다
+		if _KeySettingManager:IsCapturingKey() then return end
+		if _KeySettingManager:GetFuncForKeyEnum(event.key) ~= "battlestats" then return end
+		self:ToggleWindow()
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsWindowOpen()
+		-- 창 표시 여부 (ESC 우선순위 판정 등 외부 조회용)
+		local w = _EntityService:GetEntityByPath(self:WinPath())
+		return isvalid(w) and w.Enable
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleWindow()
+		-- 토글 키: 열려있으면 (확인 없이) 닫고, 닫혀있으면 연다
+		if self:IsWindowOpen() then
+			self:CloseWindow()
+		else
+			self:OpenWindow()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenWindow()
+		-- 창 열기: 화면 밖으로 나가 있으면 기본 위치로 복구하고 다른 창들보다 앞으로 올린다
+		local w = _EntityService:GetEntityByPath(self:WinPath())
+		if not isvalid(w) then return end
+		local tr = w.UITransformComponent
+		if math.abs(tr.anchoredPosition.x) > 1000 or math.abs(tr.anchoredPosition.y) > 560 then
+			tr.anchoredPosition = Vector2(-470, 200)
+		end
+		w.Enable = true
+		self:HideConfirm()
+		_UIEquipInventoryManager:BringWindowToFront(self:WinPath())
+		self:RefreshStats()
+		log("[BattleStats] 창 열림")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseWindow()
+		-- 창 닫기 (측정 상태는 유지 - 다시 열면 이어서 표시된다)
+		self:HideConfirm()
+		local w = _EntityService:GetEntityByPath(self:WinPath())
+		if isvalid(w) then w.Enable = false end
+		log("[BattleStats] 창 닫힘")
+	end
+
+	-- ── ESC / 종료 확인 다이얼로그 ────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method boolean IsFrontmostWindow()
+		-- 열려 있는 등록 창들(UIClickArbiter 목록) 중 전투분석 창의 형제 순서가 최대인가.
+		-- (신고 수정) 다른 창이 앞에 있는데도 ESC를 전투분석이 가로채던 문제 - 앞 창부터 닫히려면
+		-- "내가 제일 앞일 때만" ESC를 전담해야 한다. 앞뒤 판정은 BringWindowToFront 체계와 동일한
+		-- 형제 인덱스 기준.
+		local myWin = _EntityService:GetEntityByPath(self:WinPath())
+		if not isvalid(myWin) then return false end
+		local myIdx = _UILogic:GetSiblingIndex(myWin.UITransformComponent)
+		for _, p in ipairs(_UIClickArbiter:GetWindowPaths()) do
+			if p ~= self:WinPath() then
+				local w = _EntityService:GetEntityByPath(p)
+				if isvalid(w) and w.Enable then
+					if _UILogic:GetSiblingIndex(w.UITransformComponent) > myIdx then
+						return false
+					end
+				end
+			end
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HandleEscape()
+		-- UIEquipInventoryManager의 ESC 분기에서 호출된다. 소비했으면 true.
+		-- 전투분석 창이 "제일 앞"일 때만 전담한다 - 아니면 false를 돌려 앞 창부터 닫히게 한다.
+		-- 다이얼로그가 열려 있으면 취소로 닫고, 창만 열려 있으면 종료 확인을 띄운다.
+		if not self:IsWindowOpen() then return false end
+		if not self:IsFrontmostWindow() then return false end
+		if self:IsConfirmOpen() then
+			self:HideConfirm()
+		else
+			self:ShowConfirm()
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsConfirmOpen()
+		-- 종료 확인 다이얼로그 표시 여부
+		local dlg = _EntityService:GetEntityByPath(self:WinPath() .. "/ConfirmDialog")
+		return isvalid(dlg) and dlg.Enable
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowConfirm()
+		-- "전투분석을 종료하시겠습니까?" 다이얼로그 표시
+		local dlg = _EntityService:GetEntityByPath(self:WinPath() .. "/ConfirmDialog")
+		if isvalid(dlg) then dlg.Enable = true end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideConfirm()
+		-- 종료 확인 다이얼로그 숨김
+		local dlg = _EntityService:GetEntityByPath(self:WinPath() .. "/ConfirmDialog")
+		if isvalid(dlg) then dlg.Enable = false end
+	end
+
+	-- ── 창 내부 클릭 핸들러 (UITouchDownEvent + 공용 겹침 게이트) ─────
+
+	@ExecSpace("ClientOnly")
+	method void OnTitleDown(UITouchDownEvent e)
+		-- 타이틀바: 창 공용 드래그 시작 (이동은 UIEquipInventoryManager의 드래그 루프가 담당)
+		if self:IsConfirmOpen() then return end
+		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:WinPath()) then return end
+		_UIEquipInventoryManager:StartWindowDrag(self:WinPath())
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseDown(UITouchDownEvent e)
+		-- X 버튼: ESC와 동일하게 종료 확인을 띄운다
+		if self:IsConfirmOpen() then return end
+		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:WinPath()) then return end
+		self:ShowConfirm()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnToggleDown(UITouchDownEvent e)
+		-- 측정시작 ↔ 측정종료 토글 버튼
+		if self:IsConfirmOpen() then return end
+		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:WinPath()) then return end
+		if self._T.measuring == true then
+			self:StopMeasure()
+		else
+			self:StartMeasure()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirmYesDown(UITouchDownEvent e)
+		-- 종료 확인 - 확인: 창을 닫는다
+		if e.TouchId ~= -1 then return end
+		if not self:IsConfirmOpen() then return end
+		self:CloseWindow()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirmNoDown(UITouchDownEvent e)
+		-- 종료 확인 - 취소: 다이얼로그만 닫는다
+		if e.TouchId ~= -1 then return end
+		if not self:IsConfirmOpen() then return end
+		self:HideConfirm()
+	end
+
+	-- ── 측정 시작/종료 ────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void StartMeasure()
+		-- 지금 시점의 서버 누적값을 기준선으로 잡고 새 측정을 시작한다 (메소/스킬별 상세 포함)
+		self._T.measuring = true
+		self._T.baseDmg = self.totalDmg
+		self._T.baseKills = self.totalKills
+		self._T.baseMeso = _UIEquipInventoryManager.meso or 0
+		local baseSkills = {}
+		for _, s in ipairs(self._T.totalSkills or {}) do
+			baseSkills[s.name] = { dmg = s.dmg, hits = s.hits, casts = s.casts }
+		end
+		self._T.baseSkills = baseSkills
+		self._T.measureStart = _UtilLogic.ElapsedSeconds
+		self._T.frozenElapsed = 0
+		self:SetToggleButton(true)
+		self:RefreshStats()
+		self:RefreshDetail()
+		log("[BattleStats] 측정 시작")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopMeasure()
+		-- 측정 종료: 시간을 멈추고 종료 시점 값을 고정(프리즈)해 화면에 유지한다.
+		-- (프리즈가 없으면 종료 후에도 사냥이 이어질 때 창을 다시 열면 값이 계속 자란다.)
+		if self._T.measuring ~= true then return end
+		self._T.measuring = false
+		self._T.frozenElapsed = _UtilLogic.ElapsedSeconds - (self._T.measureStart or _UtilLogic.ElapsedSeconds)
+		self._T.frozenDmg = self.totalDmg - (self._T.baseDmg or self.totalDmg)
+		self._T.frozenKills = self.totalKills - (self._T.baseKills or self.totalKills)
+		self._T.frozenMeso = (_UIEquipInventoryManager.meso or 0) - (self._T.baseMeso or 0)
+		self._T.frozenDetail = self:BuildDetailRows()
+		self:SetToggleButton(false)
+		self:RefreshStats()
+		self:RefreshDetail()
+		log("[BattleStats] 측정 종료 (경과 " .. tostring(math.floor(self._T.frozenElapsed)) .. "초)")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetToggleButton(boolean measuring)
+		-- 버튼 라벨/색: 측정시작(초록) ↔ 측정종료(주황빨강)
+		local btn = _EntityService:GetEntityByPath(self:WinPath() .. "/BtnToggle")
+		if not isvalid(btn) then return end
+		local txt = btn.TextGUIRendererComponent
+		if isvalid(txt) then
+			txt.Text = measuring and "측정종료" or "측정시작"
+		end
+		local spr = btn.SpriteGUIRendererComponent
+		if isvalid(spr) then
+			if measuring then
+				spr.Color = Color(0.82, 0.33, 0.12, 1)
+			else
+				spr.Color = Color(0.42, 0.72, 0.18, 1)
+			end
+		end
+	end
+
+	-- ── 표시 갱신 ─────────────────────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTick()
+		-- 0.25초 주기: 측정 중이면 경과 시간과 수치(상세 포함)를 갱신한다
+		if not self:IsWindowOpen() then return end
+		if self._T.measuring ~= true then return end
+		self:RefreshStats()
+		self:RefreshDetail()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshStats()
+		-- 전투 시간/총합 데미지/마릿수/획득 메소 표시 갱신.
+		-- 측정 중 = 실시간 차분, 종료 후 = 종료 시점 프리즈 값, 측정 이력 없음 = 0.
+		local elapsed, dmg, kills, meso = 0, 0, 0, 0
+		if self._T.measuring == true then
+			elapsed = _UtilLogic.ElapsedSeconds - (self._T.measureStart or _UtilLogic.ElapsedSeconds)
+			dmg = self.totalDmg - (self._T.baseDmg or self.totalDmg)
+			kills = self.totalKills - (self._T.baseKills or self.totalKills)
+			meso = (_UIEquipInventoryManager.meso or 0) - (self._T.baseMeso or 0)
+		elseif self._T.measureStart ~= nil then
+			elapsed = self._T.frozenElapsed or 0
+			dmg = self._T.frozenDmg or 0
+			kills = self._T.frozenKills or 0
+			meso = self._T.frozenMeso or 0
+		end
+		self:SetRowText("Time", self:FormatTime(elapsed))
+		self:SetRowText("Dmg", self:FormatComma(dmg))
+		self:SetRowText("Kill", self:FormatComma(kills))
+		self:SetRowText("Meso", self:FormatComma(meso))
+	end
+
+	-- ── 자세히 보기 (스킬별 상세) ─────────────────────────────────────
+
+	@ExecSpace("ClientOnly")
+	method table BuildDetailRows()
+		-- 측정 구간(현재 누적 - 기준선)의 스킬별 {name, dmg, hits, casts} 목록을
+		-- 데미지 내림차순으로 만든다.
+		local rows = {}
+		local base = self._T.baseSkills or {}
+		for _, s in ipairs(self._T.totalSkills or {}) do
+			local b = base[s.name]
+			local d = s.dmg - (b ~= nil and b.dmg or 0)
+			local h = s.hits - (b ~= nil and b.hits or 0)
+			local c = s.casts - (b ~= nil and b.casts or 0)
+			if d > 0 or c > 0 then
+				table.insert(rows, { name = s.name, dmg = d, hits = h, casts = c })
+			end
+		end
+		table.sort(rows, function(a, b2) return a.dmg > b2.dmg end)
+		return rows
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsDetailOpen()
+		-- 상세 패널 표시 여부
+		local p = _EntityService:GetEntityByPath(self:WinPath() .. "/DetailPanel")
+		return isvalid(p) and p.Enable
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleDetail()
+		-- 자세히 보기 접기/펼치기 - 창 높이를 늘리고 상세 패널을 켠다
+		local w = _EntityService:GetEntityByPath(self:WinPath())
+		local p = _EntityService:GetEntityByPath(self:WinPath() .. "/DetailPanel")
+		if not isvalid(w) or not isvalid(p) then return end
+		local opening = not p.Enable
+		p.Enable = opening
+		w.UITransformComponent.RectSize = Vector2(380, opening and 560 or 300)
+		if opening then self:RefreshDetail() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshDetail()
+		-- 상세 패널 8행 갱신: 스킬명 | 사용(시전) | 데미지 | 점유율(총합 대비 %), 데미지 내림차순.
+		-- 측정 중 = 실시간, 종료 후 = 프리즈 스냅샷.
+		if not self:IsDetailOpen() then return end
+		local rows
+		if self._T.measuring == true then
+			rows = self:BuildDetailRows()
+		elseif self._T.measureStart ~= nil then
+			rows = self._T.frozenDetail or {}
+		else
+			rows = {}
+		end
+		local totalDmg = 0
+		for _, r in ipairs(rows) do totalDmg = totalDmg + r.dmg end
+		for i = 1, 8 do
+			local base = self:WinPath() .. "/DetailPanel/Row" .. tostring(i)
+			local r = rows[i]
+			local nameTxt, castTxt, dmgTxt, pctTxt = "", "", "", ""
+			if r ~= nil then
+				nameTxt = r.name
+				castTxt = (r.casts > 0) and (self:FormatComma(r.casts) .. "회") or (self:FormatComma(r.hits) .. "타")
+				dmgTxt = self:FormatComma(r.dmg)
+				if totalDmg > 0 then
+					pctTxt = string.format("%.1f%%", r.dmg / totalDmg * 100)
+				end
+			end
+			self:SetDetailCell(base .. "/Name", nameTxt)
+			self:SetDetailCell(base .. "/Casts", castTxt)
+			self:SetDetailCell(base .. "/Dmg", dmgTxt)
+			self:SetDetailCell(base .. "/Pct", pctTxt)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetDetailCell(string path, string value)
+		-- 상세 패널 셀 텍스트 갱신
+		local ent = _EntityService:GetEntityByPath(path)
+		if not isvalid(ent) then return end
+		local txt = ent.TextGUIRendererComponent
+		if isvalid(txt) then txt.Text = value end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnDetailDown(UITouchDownEvent e)
+		-- + (자세히 보기) 버튼
+		if self:IsConfirmOpen() then return end
+		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:WinPath()) then return end
+		self:ToggleDetail()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetRowText(string key, string value)
+		-- Stats 행의 값 텍스트를 갱신한다
+		local ent = _EntityService:GetEntityByPath(self:WinPath() .. "/Stats/Value" .. key)
+		if not isvalid(ent) then return end
+		local txt = ent.TextGUIRendererComponent
+		if isvalid(txt) then txt.Text = value end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FormatTime(number seconds)
+		-- 00:00:00 (시:분:초) 포맷
+		local total = math.floor(math.max(0, seconds))
+		local h = math.floor(total / 3600)
+		local m = math.floor((total % 3600) / 60)
+		local s = total % 60
+		return string.format("%02d:%02d:%02d", h, m, s)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string FormatComma(number n)
+		-- 천 단위 콤마 포맷 (예: 1,234,567)
+		local s = tostring(math.floor(math.max(0, n)))
+		while true do
+			local replaced, cnt = string.gsub(s, "^(%d+)(%d%d%d)", "%1,%2")
+			s = replaced
+			if cnt == 0 then break end
+		end
+		return s
+	end
+
+	@ExecSpace("Client")
+	method void PushTotalsV2(number dmg, integer kills, table skills)
+		-- 서버가 밀어주는 세션 누적값 수신(스킬별 상세 포함). 측정 중이면 즉시 화면 반영.
+		-- (구 PushTotals에서 skills 인자 추가로 개명 - RPC 시그니처 변경 관례)
+		self.totalDmg = dmg
+		self.totalKills = kills
+		self._T.totalSkills = skills or {}
+		if self:IsWindowOpen() and self._T.measuring == true then
+			self:RefreshStats()
+			self:RefreshDetail()
+		end
+	end
+
+	-- ── 서버 집계 ─────────────────────────────────────────────────────
+
+	@ExecSpace("ServerOnly")
+	method table OwnerComponentNames()
+		-- 투사체/소환수 판정 컴포넌트 중 OwnerEntity(시전자)를 들고 있는 것들.
+		-- 새 투사체/소환수 스킬을 추가하면 여기에도 등록해야 전투분석에 잡힌다.
+		if self._T.ownerComps ~= nil then return self._T.ownerComps end
+		self._T.ownerComps = {
+			"script.LuckySevenProjectileAttack",
+			"script.AvengerProjectileAttack",
+			"script.DoubleShotProjectileAttack",
+			"script.StrafeProjectileAttack",
+			"script.StrafeProjectile",
+			"script.FireArrowProjectileAttack",
+			"script.IceShotProjectile",
+			"script.FireShotProjectile",
+			"script.IronArrowProjectileAttack",
+			"script.ArrowBlowProjectileAttack",
+			"script.ArrowBombProjectileAttack",
+			"script.HolyArrowProjectileAttack",
+			"script.AngelRayProjectileAttack",
+			"script.PiercingProjectileAttack",
+			"script.HurricaneProjectileAttack",
+			"script.RapidFireProjectileAttack",
+			"script.SnipingProjectileAttack",
+			"script.SnailSkillProjectileAttack",
+			"script.MagicMissileBall",
+			"script.AmhaengShuriken",
+			"script.PoisonMistAttack",
+			"script.HeroSummon",
+			"script.HealerSummon",
+			"script.ShadowClone",
+			"script.SummonDragon",
+			"script.DarkDragon",
+			"script.RidingDragon",
+			"script.BahamutSummon",
+			"script.IfritSummon",
+			"script.ElquinesSummon",
+			"script.FreezerSummon",
+			"script.PhoenixSummon",
+		}
+		return self._T.ownerComps
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity ResolveOwner(Entity attacker)
+		-- HitEvent.AttackerEntity에서 실제 플레이어를 되짚는다.
+		-- 직접 타격은 공격자 자신이 플레이어, 투사체/소환수는 판정 컴포넌트의 OwnerEntity.
+		if not isvalid(attacker) then return nil end
+		if isvalid(attacker:GetComponent("script.PlayerAttack")) then return attacker end
+		for _, compName in ipairs(self:OwnerComponentNames()) do
+			local c = attacker:GetComponent(compName)
+			if isvalid(c) and isvalid(c.OwnerEntity) then
+				local owner = c.OwnerEntity
+				if isvalid(owner:GetComponent("script.PlayerAttack")) then
+					return owner
+				end
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EnsureServerState()
+		-- 서버 집계 테이블 지연 초기화 (Monster 훅이 OnBeginPlay보다 먼저 부를 수 있다)
+		if self._T.svTotals == nil then self._T.svTotals = {} end
+		if self._T.svDirty == nil then self._T.svDirty = {} end
+		if self._T.svLastOwner == nil then self._T.svLastOwner = {} end
+	end
+
+	@ExecSpace("ServerOnly")
+	method string SkillNameForTag(any extraInfo)
+		-- HitEvent.Extra(= Attack()의 attackInfo 태그) → 표시용 스킬명.
+		-- 미등록 태그는 접두("skill."/"dot.")만 떼고 그대로 표시(새 스킬 추가 시에도 식별 가능).
+		if extraInfo == nil or type(extraInfo) ~= "string" or extraInfo == "" then
+			return "기본 공격"
+		end
+		if self._T.tagNames == nil then
+			self._T.tagNames = {
+				["skill.powerstrike"] = "파워스트라이크", ["skill.powerstrike.final"] = "파이널어택",
+				["skill.slashblast"] = "슬래시블러스트", ["skill.slashblast.final"] = "파이널어택",
+				["skill.rush"] = "돌진", ["skill.chainshot"] = "체인샷·섬광", ["skill.parry"] = "패링 반격",
+				["skill.brandish"] = "브랜디쉬", ["skill.brandish.finish"] = "브랜디쉬(마무리)",
+				["skill.panic"] = "패닉", ["skill.coma"] = "코마",
+				["skill.spearburst"] = "스피어 버스터", ["skill.dragonroar"] = "드래곤 로어",
+				["skill.darkdragon"] = "서먼 다크드래곤", ["skill.ridingdragon"] = "드래곤 라이딩",
+				["skill.summondragon"] = "용 소환",
+				["skill.doublestab"] = "더블스탭", ["skill.savageblow"] = "새비지블로우",
+				["skill.assaulter"] = "어썰터", ["skill.assassinate"] = "암살",
+				["skill.amhaeng"] = "암행", ["skill.amhaeng2"] = "암행2", ["skill.shadowclone"] = "분신",
+				["skill.magicclaw"] = "매직클로", ["skill.magicmissile"] = "매직 미사일",
+				["skill.heal"] = "힐", ["skill.shiningray"] = "샤이닝 레이", ["skill.genesis"] = "제네시스",
+				["skill.bahamut"] = "바하뮤트", ["skill.thunderbolt"] = "썬더볼트",
+				["skill.chainlightning"] = "체인 라이트닝",
+				["skill.blizzard"] = "블리자드", ["skill.blizzard.pillar"] = "블리자드(기둥)",
+				["skill.blizzard.shard"] = "블리자드(조각)",
+				["skill.ifrit"] = "이프리트", ["skill.elquines"] = "엘퀴네스",
+				["skill.explosion"] = "익스플로젼", ["skill.meteor"] = "메테오",
+				["skill.strafe.lock"] = "스트레이프", ["skill.iceshot"] = "아이스 샷",
+				["skill.fireshot"] = "파이어 샷", ["skill.freezer"] = "프리져", ["skill.phoenix"] = "피닉스",
+				["skill.herosummon"] = "소환 용사", ["skill.herosummon.stab"] = "소환 용사",
+				["skill.archersupport"] = "궁병 지원",
+				["dot.chargeblow.burn"] = "화상(디바인)", ["dot.chargeblow.shock"] = "전기 장판",
+				["dot.chargeblow.curse"] = "저주 장판",
+				["dot.firezone"] = "불의 영역", ["dot.glacierzone"] = "빙하지대",
+			}
+		end
+		local mapped = self._T.tagNames[extraInfo]
+		if mapped ~= nil then return mapped end
+		local stripped, cnt1 = string.gsub(extraInfo, "^skill%.", "")
+		local stripped2, cnt2 = string.gsub(stripped, "^dot%.", "")
+		return stripped2
+	end
+
+	-- (개명 관례) 인자 추가로 ReportHit → ReportHitTagged - 서버 메서드 시그니처 변경은 개명이 안전.
+	@ExecSpace("ServerOnly")
+	method void ReportHitTagged(Entity monsterEntity, Entity attacker, number damage, any extraInfo)
+		-- Monster.HandleHitEvent에서 호출: 데미지를 시전자 플레이어에게 귀속시킨다.
+		-- 처치 귀속용으로 "이 몬스터를 마지막으로 때린 플레이어"도 기억하고,
+		-- 스킬 상세(자세히 보기)용으로 스킬별 누적 데미지/타격 수도 집계한다.
+		self:EnsureServerState()
+		local owner = self:ResolveOwner(attacker)
+		if owner == nil then return end
+		local pc = owner.PlayerComponent
+		if not isvalid(pc) then return end
+		local uid = pc.UserId
+		if self._T.svTotals[uid] == nil then
+			self._T.svTotals[uid] = { dmg = 0, kills = 0, skills = {} }
+		end
+		local t = self._T.svTotals[uid]
+		t.dmg = t.dmg + damage
+		if t.skills == nil then t.skills = {} end
+		local sname = self:SkillNameForTag(extraInfo)
+		if t.skills[sname] == nil then
+			t.skills[sname] = { dmg = 0, hits = 0, casts = 0 }
+		end
+		t.skills[sname].dmg = t.skills[sname].dmg + damage
+		t.skills[sname].hits = t.skills[sname].hits + 1
+		self._T.svDirty[uid] = true
+		if isvalid(monsterEntity) then
+			self._T.svLastOwner[monsterEntity.Id] = uid
+		end
+	end
+
+	@ExecSpace("Server")
+	method void ReportCast(string skillName)
+		-- 클라 시전 확정 시점(SkillManager.GetEffectiveCombatPower)에서 호출 - 스킬별 사용 횟수 집계.
+		if skillName == nil or skillName == "" then return end
+		self:EnsureServerState()
+		local uid = senderUserId
+		if self._T.svTotals[uid] == nil then
+			self._T.svTotals[uid] = { dmg = 0, kills = 0, skills = {} }
+		end
+		local t = self._T.svTotals[uid]
+		if t.skills == nil then t.skills = {} end
+		if t.skills[skillName] == nil then
+			t.skills[skillName] = { dmg = 0, hits = 0, casts = 0 }
+		end
+		t.skills[skillName].casts = t.skills[skillName].casts + 1
+		self._T.svDirty[uid] = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ReportKill(Entity monsterEntity)
+		-- Monster.Dead()에서 호출: 마지막으로 때린 플레이어에게 처치 1을 귀속시킨다
+		self:EnsureServerState()
+		if not isvalid(monsterEntity) then return end
+		local uid = self._T.svLastOwner[monsterEntity.Id]
+		if uid == nil then return end
+		self._T.svLastOwner[monsterEntity.Id] = nil
+		if self._T.svTotals[uid] == nil then
+			self._T.svTotals[uid] = { dmg = 0, kills = 0 }
+		end
+		self._T.svTotals[uid].kills = self._T.svTotals[uid].kills + 1
+		self._T.svDirty[uid] = true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlushDirty()
+		-- 0.25초 주기: 변경된 유저의 누적값만 해당 클라이언트로 push (스킬별 상세 포함)
+		self:EnsureServerState()
+		for uid, _ in pairs(self._T.svDirty) do
+			local t = self._T.svTotals[uid]
+			if t ~= nil then
+				local skillsArr = {}
+				if t.skills ~= nil then
+					for sname, s in pairs(t.skills) do
+						table.insert(skillsArr, { name = sname, dmg = s.dmg, hits = s.hits, casts = s.casts })
+					end
+				end
+				self:PushTotalsV2(t.dmg, t.kills, skillsArr, uid)
+			end
+		end
+		self._T.svDirty = {}
+	end
+
+	-- ── 허수아비 소환 (인벤토리 "허수아비 생성" 아이템) ──────────────
+
+	@ExecSpace("Server")
+	method void RequestSpawnDummy()
+		-- 요청한 플레이어 발밑에 허수아비(trainingdummy 모델)를 소환한다
+		local user = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(user) then return end
+		local map = user.CurrentMap
+		if not isvalid(map) then return end
+		local pos = user.TransformComponent.WorldPosition
+		self._T.dummySeq = (self._T.dummySeq or 0) + 1
+		local name = "TrainingDummy_" .. tostring(self._T.dummySeq)
+		local e = _SpawnService:SpawnByModelId("trainingdummy", name, Vector3(pos.x, pos.y + 0.2, 0), map)
+		if e == nil then
+			log_error("[BattleStats] 허수아비 스폰 실패 - model trainingdummy 미등록?")
+			return
+		end
+		-- 20분(1200초) 뒤 자동 소멸 - Destroy 경로라 Dead()를 타지 않아 드랍/처치 집계에 안 잡힌다.
+		e:Destroy(1200.0)
+		local pc = user.PlayerComponent
+		if isvalid(pc) then
+			_UIToast:ShowMessage("허수아비 소환 (20분 후 자동 소멸)", pc.UserId)
+		end
+		log("[BattleStats] 허수아비 소환: " .. name .. " at (" .. tostring(pos.x) .. "," .. tostring(pos.y) .. ") - 1200초 후 소멸 예약")
+	end
+
+end

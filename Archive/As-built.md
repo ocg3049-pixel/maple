@@ -8,7 +8,8 @@
 | 로그인→캐릭터 선택/생성(12슬롯 페이징)→입장 | @Component + .ui | `CharacterSelectComponent` · `CreateCharacterok` · `loginbutton` · `ui/DefaultGroup.ui` | 직업 10종 선택 저장(slotData 8번째 필드). DefaultGroup.ui는 2300+ 엔티티 — UIBuilder write는 반드시 `strict:false` |
 | 인벤/장비창 (활성 9슬롯: 1얼굴~7모자+8망토+9장갑 / 회색 예비 16칸 GS_1~18 중 잠금 16종) + 메소 | @Logic | `UIEquipInventoryManager.mlua` | 인벤 상태는 **클라이언트 전용** — 서버엔 장비 데이터 없음(전투력은 RPC 인자로 전달). 망토(8)·장갑(9)은 **장착까지 구현**됐으나 CharInfoManager 합산 루프가 1~7이라 스탯 미반영. 회색 칸 실측: 반지×4·귀고리·펜던트·벨트·포켓·어깨장식·훈장·안드로이드·하트·칭호·뱃지·보조무기·엠블렘 (GS_9망토/GS_10장갑은 승격돼 disabled) — 내부 번호 10~25는 M1 GDD §4.6에 확정 |
 | 강화창 (스타포스/주문서/잠재/에디셔널) | @Logic | `Enhancement/EnhancementManager.mlua` | (M1 개편) 구간별 확률 11밴드(성공/유지/하락/파괴, `Balance/StarforceTable.csv`), 파괴→기본템 재구매 다이얼로그, 클릭-클릭 배정+장착 중 장비 강화(`enhanceTargetEquipSlot`), 잠재 메소 부여 2만/재설정 10만·15만, Space=즉시 강화. ConfirmDialog 3모드(`confirmInfoOnly`/`pendingRebuySlot`/`pendingGrantTab`). 전부 클라 판정 |
-| 밸런스 데이터 (CSV 5종) | dataset | `Balance/{LevelCurve,StarforceTable,RegionTier,HeroSkillTable,ShopPrice}.{userdataset,csv}` | CSV가 진실의 원천, 각 로더는 pcall+하드코딩 폴백. 레벨 커브 계수 26 (1,000처치/h 시뮬 보정). CSV 수정 후 재접속 필요(_T 캐싱) |
+| 밸런스 데이터 (CSV **6종**) | dataset | `Balance/{LevelCurve,StarforceTable,RegionTier,HeroSkillTable,ShopPrice,**MonsterHpTable**}.{userdataset,csv}` | CSV가 진실의 원천, 각 로더는 pcall+하드코딩 폴백. 레벨 커브 계수 26 (1,000처치/h 시뮬 보정). CSV 수정 후 재접속 필요(_T 캐싱). MonsterHpTable = 2026-08-09 몬스터 HP 레벨 곡선 (일괄 3000 폐지) |
+| 밸런스 워크시트 | doc | `Docs/MapleIdle-Balance-Worksheet.md` | **직업 밸런스 작업의 진실의 원천** — 전 스킬 배율·쿨다운 코드 추출본(2026-08-09)·이론 DPS표·조정 이력(43건). 스킬 수치를 고칠 때 반드시 동기화 |
 | 지역 티어/게이트 | @Logic | `Balance/RegionTierLogic.mlua` + `MapPortalSystem`/`PortalManager` 게이트 + `Monster.Dead()` 메소 | 3지역 87맵 체인 인덱스→T1~T10, 몬스터 메소=티어 기본값±20%, 서버 레벨=MaxHp(50+10L) 역산, 차단 시 UIToast |
 | 스킬포인트/위력 배율 | @Logic | `Skills/SkillManager.mlua` | SP 총량=3×레벨, 히어로 14스킬 spendable(레벨 제한 10~150), 위력=유효pt 비율×(0.6+0.4×pt/마스터)×제한 미달 페널티(하한 0.3) — `UseSkillInSlot`→`GetEffectiveCombatPower` 1회성 훅. 투자는 세이브 "SP" 라인 |
 | 전투력/스탯/레벨 표시 | @Logic | `CharInfo/CharInfoManager.mlua` · `UI/UIMyInfoManager.mlua` | (M1 개편) 레벨 = `CalcEquipCombatPower()`(장비만·기저 스탯 10·슬롯 1~25)의 CP(L) 테이블 환산 — 물약/버프/스킬 보너스는 표시 전투력에만. 기본 크확 10%. 잠재 파서: 크뎀→데미지 오합산 버그 수정, 보스뎀 보유 전용, 쿨감 "-N초" 인식 |
@@ -16,7 +17,11 @@
 | 스킬 시스템 (100+ 스킬, 10직업 탭) | @Logic + @Component | `Skills/SkillManager.mlua`(6.8k줄) + `Skills/*` 60여 파일 | 퀵슬롯 Q~8, 직업별 탭 필터(GetJobSkillNames), 스킬포인트 일부 구현(표창+ 공+2/pt). 쿨타임/버프 UI 40여 종 |
 | 영속 저장 | @Logic | `Persistence/CharacterPersistence.mlua` | 자체 텍스트 포맷(줄+탭) — TableToString 중첩 불가 때문 |
 | 상점/포탈/드랍 | @Logic·@Component | `Shop/PotionShopManager` · `Portal/*` · `Item/*` | ⚠️ PotionShopManager에 레거시 별도 메소 저장소 있음 — 인벤창 열 때 실제 메소를 1000으로 덮은 전적(수정됐는지 ⚠️confirm) |
-| 맵 | .map | `map/` — map01 · monsterzone 등 | MapleTile(0). 사냥터 티어 구조는 미구현 (M1 Phase 3 대상) |
+| 맵 | .map | `map/` — **92개** (map01 · monsterzone · hunting01~03 · 원작 맵 다수) | 전 맵 MapleTile(0) 실측 확인. 지역 티어는 `RegionTierLogic` 체인 인덱스로 판정 |
+| MP 시스템 | @Logic | `CharInfo/MpManager.mlua` | 최대 MP = 50 + 레벨. 텔레포트가 첫 소비자, 이후 러시(5)·파워스트라이크(10)·슬블(5+HP5) 등으로 확산 |
+| 미니맵 | .ui + @Logic | `ui/MiniMapUI.ui` · `UI/MiniMapUI.mlua` | 발판/몬스터/소환수/플레이어 실시간, 풀 재배치 방식. 보드 450×270 |
+| 전투 분석 창 (F8) | @Logic | `BattleStats/BattleStatsManager.mlua` + `TestTools/`(허수아비) | 스킬별 DPS 실측용. **새 투사체를 만들면 `OwnerComponentNames`에 등록해야 집계됨** |
+| 자동사냥 지형 내비게이션 | @Logic | `AutoHunt/AutoHuntManager.mlua` | M2 Phase 3 — 벽/턱 앞점프 등반·로프 등반·등반 후 층 고정·위층 도달 사전판정·대상 잠금 5초·러시 발판 이탈 방지. **`PredictFootholdEnd`는 "갈 수 있으면 true"**(끝 감지 아님 — 극성 주의) |
 | 자동사냥 (M2 P1) | @Logic | `AutoHunt/AutoHuntManager.mlua` | F7 토글. ClientOnly OnUpdate: 0.3s 대상 캐시(같은 높이 우선·5s 타임아웃 제외) → 접근(**PlayerController 비활성 필수** — 입력 0이 이동을 덮음, 정지 시 복구) + **걷기 모션 ChangeState("MOVE")**(플레이어 이동 상태명 MOVE — "WALK"는 LEA-3005) + 위/아래 발판 점프/다운점프 → 방향 보정 → **스킬바 전체 용도별 로테이션**(GetSkillRole 분류표: buff 270s 유지/summon 290s/aoe 주변 3마리↑/single, 미분류="manual" 미사용). **하강 순환 동선**(2026-08-04): monsterzone SpawnLocation을 맨 위 전폭 발판(0, 7.65)으로 이동, 같은 층 적 x거리가 아래층 적 거리의 3배↑면 아래층 대상 선택→다운점프 하강, 맨아래(발밑 레이캐스트 무발판, 0.6 선반 위도 아래 바닥이 맨아래면 포함) + 대상 없음/x거리 8유닛↑이면 SpawnLocation으로 순간이동 복귀(`rb:SetWorldPosition` 1회+`PositionReset`, 쿨 4s, SpawnLocation 없는 맵은 미동작) |
 
 ## Standing issues & handoff rules   (update in place — never re-append)
@@ -27,6 +32,14 @@
 | 밀집 몬스터 구역에서 박스 판정 다중히트 | 단일 대상 스킬은 CurrentTarget 포인터 패턴(목록 필터 금지) | 3+ | 07-02 → 07-04 |
 
 ## Log
+### 2026-08-10 기록 정합화 — 08-04~08-10 미기록 작업 반영
+- **7일간 계획 문서가 정체**한 채 구현만 진행됐다. 실측(git 이력 · `Balance/` · `RootDesk/MyDesk/` 구조)으로 대조해 반영.
+- **M2(자동사냥)**: 지형 대응 전면 개편(PredictFootholdEnd 극성 · 벽/턱 앞점프 · 로프 등반 · 등반 후 층 고정 · 위층 도달 사전판정 · 대상 잠금 5초 · 러시 이탈 방지 · 전방 박스 헛방) + 직업별 로테이션 9종 + 코마/패닉 전용 규칙 → **M2 GDD §6 Phase 3으로 신설**(전부 🟡).
+- **M3 영역 선구현**: 10직업 스킬 트리 전면 구현 · 직업별 이론 DPS표 · 몬스터 HP 커브(MonsterHpTable) · 전투력 대개편(CP=base²). → 사용자 결정으로 **M3을 "밸런스 수렴"으로 재정의**(만드는 일이 아니라 맞추는 일만 남음). 로드맵 Backlog의 "밸런스 실측 재보정"은 M3 본체로 흡수.
+- **신규 시스템**: MP · 미니맵 · 전투분석 창(F8) · TestTools(허수아비) · Materials/ · Models/Monsters/.
+- 안정성 감사(08-04): 세이브 유실 차단 · MonsterStatusLedger(멀티 상태 중복) · 강화 연타 게이트 · SectorConfig maxUserNo 5.
+- ⚠️ 이 시기의 상세 근거는 `Docs/MapleIdle-Balance-Worksheet.md` §5 조정 이력(43건)과 git 커밋이 원본 — As-built는 요약만 유지.
+
 ### 2026-08-03 M1 Phase 1~5 구현 완료 — ⏳ user-test pending
 - Phase1 레벨=장비CP(슬롯 25종 선확장·망토/장갑 반영·강화 6부위 제한·클릭-클릭 배정) / Phase2 스타포스 11구간+파괴 재구매+Space 연타 / Phase3 잠재 옵션 풀 교체·메소 부여/재설정·이중 메소 폐기·지역 티어+게이트 / Phase4 SP=3×레벨·위력 배율·크확 10%·쿨감 실적용·투자 저장 / Phase5 CSV 5종 이관+커브 시뮬 보정(계수 26).
 - 사용자 테스트 대기: 각 Phase 문서 🟡 항목 — 육안(고스트/토스트/HUD)·체감(연타/템포)·실플레이(파괴→레벨 하락, 재로그인 투자 유지, 포션 실메소 구매).

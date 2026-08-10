@@ -26,25 +26,26 @@ script MpManager extends Logic
 	-- 최대 MP 기본값(레벨 0 기준). 레벨당 증가분과 함께 이 두 상수가 최대치 공식의 전부다.
 	-- ⚠ (버그 수정 2026-08-08) 레벨당 +10은 **너무 컸다**. 레벨 137에서 최대 1420이 되는데 텔레포트
 	--   소모는 레벨과 무관한 10 고정이라, 한 번 써도 게이지가 0.7%밖에 안 줄어 "소모가 안 보인다"는
-	--   신고가 났다(신고 문구: "mp를 소모해도 바로 풀로 찬다"). 레벨당 +1로 낮춰 10 MP가 체감되게 한다
-	--   (레벨 137 → 187, 텔레포트 1회 = 게이지의 5.3%).
+	--   신고가 났다(신고 문구: "mp를 소모해도 바로 풀로 찬다"). 한때 +1까지 낮췄으나
+	--   (요청 2026-08-09) 레벨당 +5로 조정한다(HP와 동일 증가폭). 레벨 137 → 735.
 	property integer mpBase = 50
-	property integer mpPerLevel = 1
+	property integer mpPerLevel = 5
 
 	-- 자연 회복 속도: 1초에 최대 MP의 몇 %를 채우는가.
-	-- ⚠ (버그 수정 2026-08-08) 3%/초는 소모 속도를 완전히 앞질렀다. 텔레포트는 자체 쿨 0.54초라
-	--   초당 약 1.85회(=18.5 MP/초) 쓸 수 있는데, 구 설정은 초당 42 MP를 채워 아무리 써도 항상 가득이었다.
-	--   2%/초로 낮춰(187 기준 3.7 MP/초) 연타하면 실제로 바닥나게 한다.
-	property number regenPercentPerSecond = 2.0
+	-- (요청 2026-08-09) HP와 동일하게 **초당 1%**로 통일한다 - HP 회복은 PlayerHit(서버)가 같은 비율로 처리.
+	-- ⚠ 이력: 3%/초는 소모 속도를 완전히 앞질러 "아무리 써도 항상 가득"이었고, 2%/초로 낮췄었다.
+	--   레벨당 최대 MP가 +1 → +5로 오르면서 같은 %라도 실수치 회복량이 5배가 되었으므로 1%로 조정한다.
+	property number regenPercentPerSecond = 1.0
 
 	-- 회복 타이머 주기(초). 0.25초마다 조금씩 채워야 게이지가 뚝뚝 끊기지 않는다.
 	property number regenTickSeconds = 0.25
 
 	-- MP를 쓴 뒤 자연 회복이 다시 시작되기까지의 지연(초).
-	-- (버그 수정 2026-08-08) 지연이 없으면 소모한 그 다음 틱(0.25초)에 곧바로 되채워져 게이지가
-	-- 깜빡이지도 않는다. 연타 중에는 회복이 멈춰야 "쓰고 있다"는 게 보인다.
-	-- ⚠ 지연은 **자연 회복에만** 걸린다 - 포션/스킬 회복(RestoreMp)은 즉시 들어가야 한다.
-	property number regenDelaySeconds = 2.0
+	-- (요청 2026-08-09) **0 = 멈춤 없음** - 소모 직후에도 회복이 끊기지 않고 계속 돌아간다.
+	--   0이면 regenBlockedUntil이 항상 현재 시각 이하가 되어 RegenTick의 게이트를 그대로 통과한다.
+	-- ⚠ 이력: 예전에는 2초 지연을 걸어 "연타 중에는 회복이 멈춰야 쓰고 있는 게 보인다"를 만족시켰다.
+	--   되살리려면 이 값만 0보다 크게 올리면 된다(게이트 코드는 그대로 유지해 두었다).
+	property number regenDelaySeconds = 0.0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
@@ -63,12 +64,15 @@ script MpManager extends Logic
 		end
 	end
 
-	-- 최대 MP: 50 + 레벨 × 1 (레벨 10에서 60, 레벨 137에서 187, 레벨 200에서 250).
+	-- 최대 MP: (50 + 레벨 × 1 + 잠재 최대MP 플랫) × (1 + 잠재 최대MP%/100).
+	-- (전투력 개편 2026-08-08) 잠재 "최대 MP +N%/+N" 옵션이 실수치로 반영된다.
 	@ExecSpace("ClientOnly")
 	method integer GetMaxMp()
 		-- 레벨은 장비 전투력 환산 표시 레벨(GetDisplayLevel) - 이 프로젝트에서 "레벨"의 단일 진입점이다.
 		local level = _CharInfoManager:GetDisplayLevel()
-		return self.mpBase + self.mpPerLevel * math.max(0, math.floor(level))
+		local base = self.mpBase + self.mpPerLevel * math.max(0, math.floor(level))
+		local extras = _CharInfoManager:CollectPotentialExtras()
+		return math.floor((base + extras.mpFlat) * (1 + extras.mpPct / 100))
 	end
 
 	-- 현재 MP(정수로 내림 - 표시/소모 판정 모두 이 값을 쓴다).
@@ -90,7 +94,7 @@ script MpManager extends Logic
 			return false
 		end
 		self.currentMp = math.max(0, self.currentMp - need)
-		-- 소모 직후에는 자연 회복을 잠시 멈춘다(연타 중 게이지가 실제로 줄어들도록).
+		-- 소모 직후 회복 지연 - regenDelaySeconds가 0이면 지연 없이 계속 회복된다(현재 설정).
 		self._T.regenBlockedUntil = _UtilLogic.ElapsedSeconds + self.regenDelaySeconds
 		self:RefreshHud()
 		log("[MpManager] MP 소모 " .. tostring(need) .. " → 잔여 " .. tostring(self:GetCurrentMp()) .. " / " .. tostring(self:GetMaxMp()))

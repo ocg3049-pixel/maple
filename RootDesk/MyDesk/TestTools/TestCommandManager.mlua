@@ -1,0 +1,266 @@
+@Logic
+script TestCommandManager extends Logic
+
+	-- (테스트 도구) 명령 처리.
+	-- 주 입력 경로: **명령 입력 바** - 키설정 기능 "command"(기본 `)로 토글되는 전용 TextInput.
+	--   (엔진 기본 채팅은 사용자 코드로 ChatEvent/ChatBalloonEvent를 발행하지 않음을 실측 확인 -
+	--    자체 ChatComponent를 소유해야만 이벤트가 오므로, command-package와 같은 입력창 방식을 쓴다.)
+	-- 보조 경로: 채팅 훅(말풍선/ChatEvent)도 유지 - 미래에 자체 채팅 엔티티가 생기면 그대로 동작.
+	-- 지원 명령:
+	--   /lv <숫자>       : 그 레벨로 오버라이드 (전투력 = (레벨×7)² 자동 연동, 1~200). /lv 0 = 해제
+	--   /전직 <직업명>   : 직업 오버라이드 (스킬창 필터·주스탯·직업명 연동). /전직 해제 = 원복
+	--                      직업명: 히어로/팔라딘/다크나이트/비숍/썬콜/불독/신궁/보우마스터/나이트로드/섀도어
+
+	property integer watchTimer = 0
+	property any keyHandler = nil
+	property any submitHandler = nil
+	property any endEditHandler = nil
+
+	method void OnBeginPlay()
+		-- 클라: 채팅 훅 자가치유 타이머 + 명령 입력 바 초기화
+		-- (게이트 견고화 2026-08-09) 0.25초 주기 - 로그인/캐릭터선택 화면을 놓치지 않고 게이트에 반영하기 위함.
+		if self:IsClient() then
+			self.watchTimer = _TimerService:SetTimerRepeat(self.EnsureChatHook, 0.25)
+			self:InitCommandBar()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void InitCommandBar()
+		-- 입력 바 숨김 + 키/제출 핸들러 연결
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar")
+		if isvalid(bar) then bar.Enable = false end
+		self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+		local input = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar/Input")
+		if isvalid(input) then
+			self.submitHandler = input:ConnectEvent(TextInputSubmitEvent, self.OnCommandSubmit)
+			-- ESC/포커스 이탈로 편집이 끝나면 바를 닫는다 (제출은 OnCommandSubmit이 먼저 처리)
+			self.endEditHandler = input:ConnectEvent(TextInputEndEditEvent, self.OnCommandEndEdit)
+		else
+			log_warning("[TestCommand] CommandInputBar/Input 엔티티 없음")
+		end
+		log("[TestCommand] 명령 입력 바 준비 (키설정 기능 command, 기본 `)")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCommandEndEdit(TextInputEndEditEvent event)
+		-- ESC나 포커스 이탈로 입력이 끝났을 때 바를 닫는다
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar")
+		if isvalid(bar) then bar.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent event)
+		-- 명령 입력 바 열기: Enter(메이플 채팅처럼 즉시 열림+포커스) 또는 키설정 기능 "command"(기본 백쿼트).
+		if _KeySettingManager:IsCapturingKey() then return end
+		-- (실사용 버그 수정 2026-08-09) Enter로 명령 바를 열면 로그인/입장 트리거 Enter의 잔여 입력이
+		-- 입장 직후 바를 열어버리고, 열린 TextInput 포커스가 이후 모든 키(F7/F8 등)를 흡수해 조작이
+		-- 막히는 문제가 있었다(실측). Enter 열기는 폐기하고 키설정 기능 "command"(기본 `)로만 연다.
+		-- 바가 이미 열려 있을 때의 Enter는 OnCommandSubmit(TextInput)이 제출로 처리한다.
+		if _KeySettingManager:GetFuncForKeyEnum(event.key) ~= "command" then return end
+		self:ToggleCommandBar()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleCommandBar()
+		-- 입력 바 열기/닫기. 열 때 자동 포커스.
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar")
+		if not isvalid(bar) then return end
+		local opening = not bar.Enable
+		bar.Enable = opening
+		if opening then
+			local input = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar/Input")
+			if isvalid(input) then
+				local tic = input.TextGUIRendererInputComponent
+				if isvalid(tic) then
+					tic.Text = ""
+					tic:ActivateInputField()
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCommandSubmit(TextInputSubmitEvent event)
+		-- Enter 제출: 명령 파싱 후 입력 바를 닫는다
+		local text = event.Text
+		local bar = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar")
+		if isvalid(bar) then bar.Enable = false end
+		if text == nil or text == "" then return end
+		self:HandleChatMessage(text, "cmdbar")
+	end
+
+	method void OnEndPlay()
+		-- 타이머/훅 정리 (OnBeginPlay와 짝맞춤)
+		if self:IsClient() then
+			if self.watchTimer ~= 0 then
+				_TimerService:ClearTimer(self.watchTimer)
+				self.watchTimer = 0
+			end
+			if self.keyHandler ~= nil then
+				_InputService:DisconnectEvent(KeyDownEvent, self.keyHandler)
+				self.keyHandler = nil
+			end
+			local input = _EntityService:GetEntityByPath("/ui/DefaultGroup/CommandInputBar/Input")
+			if isvalid(input) then
+				if self.submitHandler ~= nil then input:DisconnectEvent(TextInputSubmitEvent, self.submitHandler) end
+				if self.endEditHandler ~= nil then input:DisconnectEvent(TextInputEndEditEvent, self.endEditHandler) end
+			end
+			self.submitHandler = nil
+			self.endEditHandler = nil
+			if self._T.hookedEntity ~= nil and self._T.chatHandler ~= nil and isvalid(self._T.hookedEntity) then
+				self._T.hookedEntity:DisconnectEvent(ChatBalloonEvent, self._T.chatHandler)
+			end
+			self._T.hookedEntity = nil
+			self._T.chatHandler = nil
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureChatHook()
+		-- (1초 주기 겸용) 로그인/캐릭터선택 화면이 보이는 동안엔 "화면 전환 게이트"를 갱신한다 -
+		-- 입장 트리거 Enter의 잔여 입력이 전환 직후 게임 화면에서 명령 바를 열어버리고, 열린
+		-- TextInput 포커스가 이후 모든 키를 흡수하던 문제(실측)의 방지막.
+		local login = _EntityService:GetEntityByPath("/ui/DefaultGroup/LoginGroup")
+		local sel = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup")
+		if (isvalid(login) and login.Enable) or (isvalid(sel) and sel.Enable) then
+			self._T.screenGateUntil = _UtilLogic.ElapsedSeconds + 1.5
+		end
+		-- 채팅 수신 경로를 다중으로 연결한다(엔진 기본 채팅이 어느 경로로 이벤트를 쏘는지가
+		-- 문서상 불명확해서, 실제로 발화하는 경로를 로그 태그로 식별한다):
+		--   ① 플레이어 엔티티 ChatBalloonEvent (말풍선 - ChatModeEnabled 필요, 아래에서 강제 활성)
+		--   ② 플레이어 엔티티 ChatEvent
+		--   ③ 맵 엔티티 ChatEvent
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		if self._T.hookedEntity == player and self._T.chatHandler ~= nil then return end
+		if self._T.hookedEntity ~= nil and isvalid(self._T.hookedEntity) then
+			if self._T.chatHandler ~= nil then
+				self._T.hookedEntity:DisconnectEvent(ChatBalloonEvent, self._T.chatHandler)
+			end
+			if self._T.chatHandler2 ~= nil then
+				self._T.hookedEntity:DisconnectEvent(ChatEvent, self._T.chatHandler2)
+			end
+		end
+		if self._T.hookedMap ~= nil and isvalid(self._T.hookedMap) and self._T.chatHandler3 ~= nil then
+			self._T.hookedMap:DisconnectEvent(ChatEvent, self._T.chatHandler3)
+			self._T.chatHandler3 = nil
+			self._T.hookedMap = nil
+		end
+		self._T.hookedEntity = player
+		self._T.chatHandler = player:ConnectEvent(ChatBalloonEvent, self.OnChatBalloon)
+		self._T.chatHandler2 = player:ConnectEvent(ChatEvent, self.OnChatDirect)
+		local map = player.CurrentMap
+		if isvalid(map) then
+			self._T.hookedMap = map
+			self._T.chatHandler3 = map:ConnectEvent(ChatEvent, self.OnChatDirect)
+		end
+		-- 말풍선 경로 활성화: 채팅창 대화를 말풍선으로 동시 표시(ChatModeEnabled). 꺼져 있으면
+		-- ChatBalloonEvent 자체가 발생하지 않는다(실사용 신고로 확인).
+		local balloon = player.ChatBalloonComponent
+		local balloonInfo = "없음"
+		if isvalid(balloon) then
+			balloonInfo = "ChatModeEnabled=" .. tostring(balloon.ChatModeEnabled) .. " ShowDuration=" .. tostring(balloon.ShowDuration)
+			balloon.ChatModeEnabled = true
+			if (balloon.ShowDuration or 0) <= 0 then balloon.ShowDuration = 5.0 end
+		end
+		log("[TestCommand] 채팅 훅 연결: " .. tostring(player.Name) .. " (말풍선 " .. balloonInfo .. ")")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnChatBalloon(ChatBalloonEvent event)
+		-- 경로① 말풍선 이벤트
+		self:HandleChatMessage(event.Message, "balloon")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnChatDirect(ChatEvent event)
+		-- 경로②③ ChatEvent - 본인 메시지만 처리
+		local player = _UserService.LocalPlayer
+		if isvalid(player) and isvalid(player.PlayerComponent) then
+			if event.UserId ~= nil and event.UserId ~= "" and event.UserId ~= player.PlayerComponent.UserId then
+				return
+			end
+		end
+		self:HandleChatMessage(event.Message, "chatevent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleChatMessage(string msg, string via)
+		-- /lv 명령 파싱 (수신 경로 태그를 로그로 남겨 실제 발화 경로를 식별한다)
+		if msg == nil or msg == "" then return end
+		if string.sub(msg, 1, 1) == "/" then
+			log("[TestCommand] 명령형 채팅 수신(via=" .. via .. "): " .. msg)
+		end
+		-- 같은 메시지가 여러 경로로 동시에 들어와도 한 번만 적용 (0.5초 중복 게이트)
+		local now = _UtilLogic.ElapsedSeconds
+		if self._T.lastCmdMsg == msg and (now - (self._T.lastCmdAt or -10)) < 0.5 then return end
+		self._T.lastCmdMsg = msg
+		self._T.lastCmdAt = now
+
+		-- /lv <숫자>
+		local lvStr = string.match(msg, "^/lv%s+(%d+)")
+		if lvStr == nil then
+			lvStr = string.match(msg, "^/레벨%s+(%d+)")
+		end
+		if lvStr ~= nil then
+			local lv = math.floor(tonumber(lvStr) or 0)
+			log("[TestCommand] /lv 명령 수신: " .. tostring(lv))
+			_CharInfoManager:SetTestLevelOverride(lv)
+			return
+		end
+
+		-- /전직 <직업명|해제>  (/job도 허용)
+		local jobArg = string.match(msg, "^/전직%s+(%S+)")
+		if jobArg == nil then
+			jobArg = string.match(msg, "^/job%s+(%S+)")
+		end
+		if jobArg ~= nil then
+			self:ApplyJobCommand(jobArg)
+			return
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyJobCommand(string jobArg)
+		-- 직업명 → 인덱스 매핑 (약칭 포함). "해제"/"0" = 원복.
+		local jobs = {
+			["히어로"] = 1,
+			["팔라딘"] = 2,
+			["다크나이트"] = 3, ["다크"] = 3, ["dk"] = 3,
+			["비숍"] = 4,
+			["썬콜"] = 5,
+			["불독"] = 6,
+			["신궁"] = 7,
+			["보우마스터"] = 8, ["보마"] = 8,
+			["나이트로드"] = 9, ["나로"] = 9,
+			["섀도어"] = 10,
+		}
+		local names = { "히어로", "팔라딘", "다크나이트", "비숍", "썬콜", "불독", "신궁", "보우마스터", "나이트로드", "섀도어" }
+		if jobArg == "해제" or jobArg == "0" then
+			_UIMyInfoManager:SetTestJobOverride(0)
+			_UIToast:ShowMessage("직업 오버라이드 해제 - 원래 직업으로 복귀")
+			log("[TestCommand] 직업 오버라이드 해제")
+		else
+			local idx = jobs[string.lower(jobArg)] or jobs[jobArg] or math.floor(tonumber(jobArg) or 0)
+			if idx < 1 or idx > 10 then
+				_UIToast:ShowMessage("알 수 없는 직업: " .. jobArg .. " (히어로/팔라딘/다크나이트/비숍/썬콜/불독/신궁/보우마스터/나이트로드/섀도어)")
+				return
+			end
+			_UIMyInfoManager:SetTestJobOverride(idx)
+			_UIToast:ShowMessage("테스트 전직: " .. names[idx] .. " (스킬창을 다시 열어 SP를 분배하세요)")
+			log("[TestCommand] 직업 오버라이드 " .. tostring(idx) .. " (" .. names[idx] .. ")")
+		end
+		-- 주스탯(스타포스)이 직업에 따라 바뀌므로 스탯/전투력 재계산 + 서버 캐시 즉시 동기화
+		_CharInfoManager:UpdateStats()
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			---@type PlayerAttack
+			local pa = player:GetComponent("script.PlayerAttack")
+			if isvalid(pa) then
+				pa:SyncCombatPower(_SkillManager:PeekEffectiveCombatPower())
+			end
+		end
+	end
+
+end
