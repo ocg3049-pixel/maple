@@ -26,8 +26,34 @@ script CharInfoManager extends Logic
 	-- 블레스는 "분배 1포인트당 각 +3"이므로 마스터 30에서 90이 들어온다.
 	property integer buffStatBonus = 0
 
-	-- (발도술) 처치 중첩 버프의 크리티컬 확률 보너스(+3%×중첩). CalcCritRate/UpdateStats 두 곳에서 가산된다.
+	-- (신고 수정 2026-08-13 / 확장 2026-08-14) **"실효 버프" 보너스 통.** 위의 buffAttackBonus /
+	-- buffStatBonus는 `_T.cpIncludeBuffs`가 켜진 **표시 경로에서만** 전투력에 들어간다 - 그래서 버프를
+	-- 걸어도 스탯창 숫자만 오르고 스킬이 서버로 넘기는 전투력(= 실제 데미지)은 그대로였다
+	-- (신고: "블레스의 공격력·스탯 상승이 실제 전투력 상승으로 오르지 않는다" / 요청 08-14: 메디테이션도
+	--  "사용 시 마력에 따라 전투력이 오르게").
+	-- 이 통에 들어온 버프만 CalcCombatPowerBase가 **항상** 합산한다(표시·스킬·기본공격 공통).
+	-- 지금 쓰는 버프: **블레스**(공마 + 4스탯) / **메디테이션**(마력).
+	-- ⚠ 레벨 환산(CalcEquipCombatPower)에서는 `_T.cpExcludeRealBuff` 플래그로 제외한다 -
+	--   "레벨은 순수 장비 성능"(GDD §4.1)이 깨지면 최대 MP·매직 미사일 구체 수·SP 예산이 함께 흔들린다.
+	-- ⚠ 그래서 이 버프들은 ApplyAttackBuff/ApplyStatBuff 공용 코어를 쓰지 않는다(쓰면 이중 합산).
+	--   나머지 버프(파워가드·부스터·드래곤 블러드·발도술·드래곤이 걸어주는 분노/메디테이션 등)는
+	--   요청 범위 밖이라 종전대로 표시 전용 통에 남아 있다 - 옮기면 전부 조용히 강해진다.
+	property integer realBuffAttackBonus = 0
+	property integer realBuffStatBonus = 0
+
+	-- (발도술) 공격 중첩 버프의 크리티컬 확률 보너스(+3%×중첩). CalcCritRate/UpdateStats 두 곳에서 가산된다.
 	property integer battoCritBonus = 0
+	-- (발도술, 요청 2026-08-12) 공격 중첩 버프의 공격속도 보너스(+3%×중첩). 단계(10%)로는 3%를 표현할 수
+	-- 없어 GetAttackSpeedPercent의 퍼센트 항에 직접 더한다(잠재 "공격속도 +N%"와 같은 자리).
+	property integer battoStackAtkSpdPct = 0
+	-- (요청 2026-08-12) 스탯창 "최종 데미지" 줄의 **장비+버프 몫 캐시**. UpdateStats가 25슬롯을 훑어
+	-- 계산한 값을 담아두고, 콤보 구슬만 바뀔 때는 경량 경로(RefreshFinalDamageRow)가 이 값을 재사용한다.
+	property integer equipBuffFinalDmgPct = 0
+	-- (요청 2026-08-12) 초보자 패시브 "민첩 훈련"의 공격속도 보너스(5포인트당 +1%). 발도술 중첩과 같은
+	-- 퍼센트 항에 더한다(단계 10% 단위로는 1%를 표현할 수 없다). SkillManager.ApplyBeginnerPassives가 대입.
+	property integer beginnerAtkSpdPct = 0
+	-- 콤보 감시 타이머 id(OnBeginPlay에서 걸고 OnEndPlay에서 푼다 - LEA-3051 방지).
+	property integer comboWatchTimerId = 0
 
 	-- (표창+ 개편 2026-08-05) 지금 고른 표창 종류가 주는 상시 효과. 표창을 바꾸거나 표창+ 계열 스킬에
 	-- 포인트를 찍을 때 SkillManager.ApplyShurikenAttackBonus가 통째로 다시 대입한다(누적이 아니다).
@@ -46,9 +72,18 @@ script CharInfoManager extends Logic
 	property integer sharpEyesCritBonus = 0
 	property integer sharpEyesCritDmgBonus = 0
 
-	-- 스킬 포인트 투자로 얻는 상시 공격력 보너스. 지금은 "표창+"(포인트 1당 +2)만 쓴다.
+	-- 스킬 투자·표창 선택으로 얻는 상시 공격력 보너스. 표창+ 4차수 투자(포인트 1당 +1) +
+	-- 지금 고른 표창의 공격력(아대 장착 시) + 트레이닝 1차(×2)·3차(×4)가 전부 여기 합산된다.
+	-- 계산은 SkillManager.ApplyShurikenAttackBonus 한 곳에서 통째로 다시 대입한다(누적 아님).
 	-- 버프(buffAttackBonus)와 달리 켜고 끄는 것이 아니라 투자 포인트에 따라 고정으로 유지된다.
+	-- ⚠ (요청 2026-08-14 5차) **실효 보너스로 승격됐다** - CalcCombatPowerBase의
+	--   `cpExcludeRealBuff` 블록에서 더해지므로 스탯창 표시뿐 아니라 **스킬 데미지가 쓰는 전투력에도
+	--   반영**된다(종전에는 cpIncludeBuffs 표시 전용이라 숫자만 올랐다). 레벨 환산
+	--   (CalcEquipCombatPower)에서만 제외된다 - 스킬 투자분이 레벨로 되먹임되면 순환하기 때문.
 	property integer skillAttackBonus = 0
+	-- (요청 2026-08-12) **공격력·마력 둘 다** 올리는 상시 보너스(현재는 초보자 "무기 숙련"만).
+	-- skillAttackBonus(표창+·표창 효과·트레이닝 = 공격력 전용)와 구분해 두 줄에 각각 옳게 표시한다.
+	property integer commonAttackBonus = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
@@ -56,7 +91,36 @@ script CharInfoManager extends Logic
 		if isvalid(detailBtn) then
 			detailBtn:ConnectEvent(ButtonClickEvent, self.OnToggleDetail)
 		end
+		-- (요청 2026-08-12) 콤보 구슬 수가 바뀌면 스탯창 "최종 데미지" 줄을 실시간으로 따라가게 한다.
+		-- 창이 닫혀 있거나 구슬 수가 그대로면 아무것도 하지 않는다(0.5초 주기·비교 후 그 한 줄만 갱신).
+		-- ⚠ OnBeginPlay에서 건 타이머는 OnEndPlay에서 반드시 푼다 - 안 그러면 [LEA-3051] MemoryLeak(실측).
+		self.comboWatchTimerId = _TimerService:SetTimerRepeat(self.ComboRowWatchTick, 0.5, 0.5)
 		log("[CharInfo] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 콤보 감시 타이머 해제(OnBeginPlay와 짝).
+		if self.comboWatchTimerId ~= 0 then
+			_TimerService:ClearTimer(self.comboWatchTimerId)
+			self.comboWatchTimerId = 0
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ComboRowWatchTick()
+		-- 구슬 수가 바뀌면 ① 서버 캐시 전투력을 갱신하고(기본공격/서버 발동 패시브는 동기화된 값만 본다 -
+		-- 콤보가 전투력 배율에 합류한 2026-08-12 2차 개편 이후 필수) ② 스탯창이 열려 있으면 그 한 줄을 다시 쓴다.
+		-- 스킬 시전은 매번 자기 전투력을 넘기므로 이 동기화와 무관하다.
+		local cur = self:GetComboFinalDamagePct()
+		if cur == (self._T.lastComboRowPct or -1) then return end
+		self._T.lastComboRowPct = cur
+		_SkillManager:SyncDarkSightStats()
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if not isvalid(cw) or not cw.Enable then return end
+		local panel = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow/DetailPanel")
+		if not isvalid(panel) or not panel.Enable then return end
+		self:RefreshFinalDamageRow()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -207,6 +271,11 @@ script CharInfoManager extends Logic
 		-- Accumulate bonuses from all equipped items (slots 1-25; 10~25는 잠금 칸이라 빈 문자열로 스킵됨)
 		local flatSTR, flatDEX, flatINT, flatLUK = 0, 0, 0, 0
 		local pctSTR,  pctDEX,  pctINT,  pctLUK  = 0, 0, 0, 0
+		-- (요청 2026-08-12 3차) 아이템 유래 무기 성능은 **단일 값**이다 - 스타포스·무기 기본옵션·잠재
+		-- 「공격력 +N」·「마력 +N」이 모두 여기 합산되고, **착용자 직업에 따라 공격력 또는 마력 중
+		-- 한쪽으로만** 표시·적용된다(마법 직업 = 비숍/썬콜/불독은 마력, 그 외는 공격력).
+		-- ⚠ 종전엔 스타포스·무기 기본을 양쪽에 넣어 "아이템 공격력이 오르면 공격력·마력이 동시에
+		--   오르는" 문제가 있었다(신고).
 		local flatATK, pctATK   = 0, 0
 		local dmgPct            = 0
 		local defIgnoreAdd      = 0
@@ -264,6 +333,8 @@ script CharInfoManager extends Logic
 				elseif string.match(opt, "LUK") then
 					if isPct then pctLUK += val else flatLUK += val end
 				elseif string.match(opt, "공격력") or string.match(opt, "마력") then
+					-- (요청 2026-08-12 3차) 「공격력」과 「마력」 옵션은 같은 무기 성능 통에 합산된다 -
+					-- 어느 쪽 태그로 굴렸든 착용자 직업이 쓰는 스탯(공격력/마력)으로 나타난다.
 					if isPct then pctATK += val else flatATK += val end
 				elseif string.match(opt, "크리티컬 데미지") then
 					-- (Phase 3 버그 수정) "크리티컬 데미지"는 "데미지"의 상위 문자열이라 데미지 분기보다
@@ -284,22 +355,41 @@ script CharInfoManager extends Logic
 		end
 
 		-- Final stat values
-		flatATK += self.potionAttackBonus
-		flatATK += self.buffAttackBonus
-		-- 표창+ 등 스킬 포인트 투자로 얻는 상시 공격력(포인트 1당 +2)
-		flatATK += self.skillAttackBonus
+		-- (요청 2026-08-12 4차) **아이템 몫과 공용 몫을 나눈다.**
+		--   · 아이템(스타포스·무기 기본·잠재) → 직업이 쓰는 **한 줄에만**(마법=마력 / 그 외=공격력).
+		--   · 물약·버프·스킬(무기 숙련·표창+·분노 등) → "공격력과 마력 둘 다 오른다"가 사양이므로 **양쪽에**.
+		-- 전투력은 두 값 중 높은 쪽(=아이템이 실린 쪽)을 쓰므로 아래 표시 분배와 무관하게 정확하다.
+		--   ⚠ 표창 계열(skillAttackBonus)은 **공격력 전용**이라 공용 몫에 넣지 않는다(요청 2026-08-12).
+		local itemFlatATK = flatATK
+		-- (신고 수정 2026-08-13) 블레스·메디테이션은 buffAttackBonus가 아니라 실효 통
+		-- (realBuffAttackBonus)에 있으므로 표시 줄에도 여기서 함께 더한다 - 안 더하면 스탯창
+		-- 공격력/마력 줄에서만 그 버프들이 사라진다.
+		local commonFlatATK = self.potionAttackBonus + self.buffAttackBonus + self.commonAttackBonus
+			+ self.realBuffAttackBonus
+		local atkOnlyFlat = self.skillAttackBonus
 		-- (블레스 개편 2026-08-08) 4스탯 버프 보너스. 공마(buffAttackBonus)와 달리 STR/DEX/INT/LUK에
-		-- 똑같이 얹히는 값이라 별도 프로퍼티로 둔다. 지금은 블레스만 쓰지만 같은 형태의 스탯 버프가
-		-- 생기면 여기 합산된다.
-		flatSTR += self.buffStatBonus; flatDEX += self.buffStatBonus
-		flatINT += self.buffStatBonus; flatLUK += self.buffStatBonus
+		-- 똑같이 얹히는 값이라 별도 프로퍼티로 둔다. 실효 통 몫(realBuffStatBonus)도 같은 자리에 더한다.
+		local statBuffAll = self.buffStatBonus + self.realBuffStatBonus
+		flatSTR += statBuffAll; flatDEX += statBuffAll
+		flatINT += statBuffAll; flatLUK += statBuffAll
 		local baseVal  = 4 + level * 5
 		local strFinal = math.floor((baseVal + flatSTR) * (1 + pctSTR / 100))
 		local dexFinal = math.floor((baseVal + flatDEX) * (1 + pctDEX / 100))
 		local intFinal = math.floor((baseVal + flatINT) * (1 + pctINT / 100))
 		local lukFinal = math.floor((baseVal + flatLUK) * (1 + pctLUK / 100))
 
-		local statATK      = (1 + flatATK) * (1 + pctATK / 100)
+		-- (요청 2026-08-12 4차) 아이템 몫은 직업이 쓰는 줄에만, 공용 몫(물약·버프·스킬)은 양쪽에.
+		--   예) 히어로가 무기 숙련 50pt → 공격력·마력 두 줄 모두 +50, 아이템 성능은 공격력 줄에만.
+		-- 표창 계열(atkOnlyFlat)은 공격력 줄에만 더한다 - 표창은 마력을 올리지 않는다(요청).
+		local atkFlat  = commonFlatATK + atkOnlyFlat
+		local matkFlat = commonFlatATK
+		if self:IsMagicJob() then
+			matkFlat += itemFlatATK
+		else
+			atkFlat += itemFlatATK
+		end
+		local statATK      = (1 + atkFlat) * (1 + pctATK / 100)
+		local statMATK     = (1 + matkFlat) * (1 + pctATK / 100)
 
 		-- (버그 수정) "전투력에 직접 곱하면 안 되고, 데미지% 스탯이 콤보당 20%씩 합산으로 올라야
 		-- 한다 - 그러면 전투력은 그 데미지%를 반영하는 기존 공식에서 자동으로 계산된다"는 피드백.
@@ -310,7 +400,8 @@ script CharInfoManager extends Logic
 		if isvalid(player) then
 			local pa = player:GetComponent(PlayerAttack)
 			if isvalid(pa) then
-				comboDmgPct = 20 * (pa.ComboOrbCount or 0)
+				-- (요청 2026-08-12) 구슬당 최종 데미지 2% 고정 (PlayerAttack.ApplyComboAttackBonus와 동일 수치).
+				comboDmgPct = 2 * (pa.ComboOrbCount or 0)
 			end
 		end
 		local totalDmgPct = dmgPct + comboDmgPct
@@ -325,13 +416,35 @@ script CharInfoManager extends Logic
 		-- (샤프 아이즈) 버프 지속 중 +8%p(전 구간 공통)도 함께 반영한다(CalcCritDamage와 동일 가산).
 		local critDamage   = 125 + critDmgAdd + self.sharpEyesCritDmgBonus
 
-		-- Defense ignore: base 50% + additional compounded
-		local defIgnore = 100 - (1 - 0.5) * (1 - defIgnoreAdd / 100) * 100
-
-		-- (전투력 개편 2026-08-08) 전투력은 단일 구현(CalcCombatPowerUnified)으로 위임한다 -
-		-- {(아이템 공격력합×공격력%) + (아이템 스탯합×스탯%합)/4} × (1+추가공속%) × 크리티컬 증가율의 제곱.
-		-- 아이템만 계산(버프/물약/스킬 제외 - 사양).
+		-- (요청 2026-08-12) 방어율 무시 표시는 삭제됐다(.ui 라벨/값 엔티티 제거) - 파서(defIgnoreAdd)는
+		-- 기존 저장 옵션 호환을 위해 남겨둔다.
+		-- (전투력 개편 2026-08-08 + 추가 전투력 2026-08-12) 표시 전투력 = CalcCombatPower() -
+		-- 장비 총합² × (1 + 추가 전투력%/100). 추가 전투력 = 잠재 데미지/보스뎀(장비) + 분노(버프).
+		-- 버프가 켜지면 이 표시 전투력이 그대로 올라간다(레벨은 CalcEquipCombatPower 기준이라 불변).
+		-- 스탯창 **"최종 데미지"** 줄(요청 2026-08-12로 "추가 전투력"에서 개명) = 실제 데미지에 곱해지는
+		-- 총 배율. 적용 경로가 둘로 나뉘어 있다:
+		--   · 장비(잠재 데미지/보스뎀) + 분노 → **전투력에 직접 곱해**진다(아래 combat).
+		--   · 콤보 어택 구슬 → 서버가 최종 데미지에 곱한다(PlayerAttack.ApplyComboAttackBonus).
+		-- 표시는 둘을 합쳐 보여주되(사용자가 체감하는 값은 합계다), **전투력 배율에는 콤보를 넣지 않는다**
+		-- - 넣으면 시전 전투력에 이미 콤보가 실린 채 서버가 또 곱해 이중 적용된다.
+		-- ⚠ (버그 수정 2026-08-12) 여기서 `CalcCombatPower()`를 부르면 그 안에서 CollectBonusCombatPowerPct가
+		--   또 25슬롯을 훑어 **한 프레임에 25슬롯 스캔이 4회**(GetDisplayLevel + Unified + Collect×2)가 된다.
+		--   실측: 그 지점에서 UpdateStats가 조용히 중단돼 이후 코드(sv 표시)와 **호출자의 남은 코드까지
+		--   통째로 죽었다**(분노 UseRage가 UpdateStats 뒤의 `_RageBuffUI:ShowBuff()`에 도달 못 해 버프
+		--   아이콘이 아예 안 뜨던 신고의 진짜 원인). bonusCpPct를 먼저 구해 놓고 배율만 직접 곱한다.
+		-- (요청 2026-08-12 3차) **표시 전투력은 버프를 포함한다.** 레벨 산정(CalcEquipCombatPower)만
+		-- 아이템 전용이고, 이 줄은 사용자가 체감하는 "지금 내 전투력"이라 버프가 빠지면 분노는 오르는데
+		-- 발도술 공속·콤보 구슬은 안 오르는 불일치가 생긴다(신고).
+		--   · 최종 데미지%(장비 + 분노 + **콤보 구슬**) → 배율로 곱한다.
+		--   · 버프 공격력/공속/크리티컬 → cpIncludeBuffs 플래그로 전투력 공식 안에서 직접 반영한다.
+		local bonusCpPct = self:CollectBonusCombatPowerPct(0, "") + self:GetBuffBonusCombatPowerPct()
+			+ self:GetComboFinalDamagePct()
+		self._T.cpIncludeBuffs = true
 		local combat = self:CalcCombatPowerUnified(0, "")
+		self._T.cpIncludeBuffs = false
+		if bonusCpPct ~= 0 then
+			combat = math.floor(combat * (1 + bonusCpPct / 100))
+		end
 
 		-- Update stat value text entities
 		local base = "/ui/DefaultGroup/CharInfoWindow/DetailPanel/"
@@ -342,8 +455,14 @@ script CharInfoManager extends Logic
 
 		sv("Combat",    tostring(math.floor(combat)))
 		sv("StatATK",   string.format("%.1f", statATK))
-		sv("TotalDmg",  tostring(totalDmgPct) .. "%")
-		sv("DefIgnore", string.format("%.0f%%", defIgnore))
+		-- (요청 2026-08-12) "최종 데미지" 줄 - 장비/분노(전투력 경유) + 콤보 구슬(서버 경유) 합계.
+		-- 장비 몫은 25슬롯 스캔이라 여기서 구한 값을 필드에 캐시해 두고, 전투 중 수시로 바뀌는 콤보 몫은
+		-- 경량 경로(RefreshFinalDamageRow)가 이 캐시를 재사용해 그 한 줄만 갱신한다.
+		self.equipBuffFinalDmgPct = bonusCpPct
+		sv("TotalDmg",  "+" .. tostring(bonusCpPct + self:GetComboFinalDamagePct()) .. "%")
+		-- (요청 2026-08-12 2차) 마력은 공격력과 **별개 수치**다 - 마력 태그 옵션만 반영된다.
+		-- 마법 직업(주스탯 INT)은 이 값이 데미지·전투력의 근거가 되고, 그 외 직업은 공격력을 쓴다.
+		sv("MagicATK",  string.format("%.1f", statMATK))
 		sv("HP",        tostring(hp) .. " / " .. tostring(maxHp))
 		-- (2026-08-08) MP가 실제 자원이 되면서 고정 "0 / 0" 표시를 MpManager 값으로 교체.
 		sv("MP",        tostring(_MpManager:GetCurrentMp()) .. " / " .. tostring(_MpManager:GetMaxMp()))
@@ -357,9 +476,12 @@ script CharInfoManager extends Logic
 		sv("CDImmune",  "0%")
 		-- (전투력 개편) 공격속도는 단계 대신 퍼센트로 표기 (기본 4단계 = 100%, 1단계당 +10%p)
 		sv("AtkSpeed",  tostring(self:GetAttackSpeedPercent()) .. "%")
-		sv("Meso",      "0%")
-		sv("Drop",      "0%")
-		sv("ExpBonus",  "0%")
+		-- (요청 2026-08-12) 초보자 패시브 "아이템 감각"이 **드롭률과 메소 획득량을 함께** 올린다
+		-- (분배당 +1%, 마스터 100 = +100%). 종전엔 두 줄 모두 "0%" 하드코딩이라 올라도 표시되지 않았다.
+		local itemSensePct = _SkillManager:GetBeginnerDropRatePct()
+		sv("Meso",      "+" .. tostring(itemSensePct) .. "%")
+		sv("Drop",      "+" .. tostring(itemSensePct) .. "%")
+		-- (요청 2026-08-12) "추가 경험치 획득" 줄은 삭제됐다(.ui Label/StatVal_ExpBonus 엔티티 제거).
 	end
 
 	-- (요청) 무기 특성에 의한 공격속도 보너스 단계. **한손검**은 가볍고 빠른 무기라 장착 중 +2단계.
@@ -389,7 +511,10 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method number GetAttackSpeedPercent()
 		local extras = self:CollectPotentialExtras()
-		return math.floor(100 + (self:GetAttackSpeedStage() - 4) * 10 + extras.atkSpdPct)
+		-- (발도술 개편 2026-08-12) 중첩당 +3%는 단계가 아니라 퍼센트 항에 직접 얹힌다.
+		-- (초보자 패시브 2026-08-12) "민첩 훈련" 5포인트당 +1%도 같은 자리에 더한다.
+		return math.floor(100 + (self:GetAttackSpeedStage() - 4) * 10 + extras.atkSpdPct
+			+ self.battoStackAtkSpdPct + self.beginnerAtkSpdPct)
 	end
 
 	-- (전투력 개편 2026-08-08) 스탯 합산 루프(UpdateStats 계열)가 다루지 않는 특수 잠재 옵션 수집기.
@@ -430,6 +555,13 @@ script CharInfoManager extends Logic
 		if jobIdx == 7 or jobIdx == 8 then return "DEX" end
 		if jobIdx == 9 or jobIdx == 10 then return "LUK" end
 		return "STR"
+	end
+
+	-- (요청 2026-08-12) 마법 직업 판정 - 주스탯이 INT인 직업(비숍/썬콜/불독)이 곧 마력 사용 직업이다.
+	-- 전투력 공식(CalcCombatPowerBase)이 공격력/마력 중 무엇을 쓸지 이 한 곳에서 가른다.
+	@ExecSpace("ClientOnly")
+	method boolean IsMagicJob()
+		return self:GetMainStatName() == "INT"
 	end
 
 	-- 공격속도 → 시간 배율. "공격속도 100%"=1.0, 110%면 시간이 100/110로 줄어든다(=10% 빨라짐).
@@ -592,18 +724,21 @@ script CharInfoManager extends Logic
 	-- 보므로 다크사이트와 같은 즉시 재동기화(SyncDarkSightStats - 이름과 달리 범용 스탯 재동기화)를 태운다.
 	@ExecSpace("ClientOnly")
 	method void UseBattoStackBuff(number remain, integer stacks)
+		-- (요청 2026-08-12) 중첩당 **공격력 +10 → 공격속도 +3%**. 공속은 단계(10%)가 아니라 퍼센트로
+		-- 직접 얹어야 3%가 표현되므로, 잠재 "공격속도 +N%"와 같은 자리(GetAttackSpeedPercent의 퍼센트 항)에
+		-- 더하는 전용 필드를 쓴다 - 부스터/비약의 단계 증감과 겹쳐도 서로 간섭하지 않는다.
 		if self._T.battoStackActive then
-			self.buffAttackBonus = self.buffAttackBonus - (self._T.battoStackAtk or 0)
+			self.battoStackAtkSpdPct = self.battoStackAtkSpdPct - (self._T.battoStackSpd or 0)
 			self.battoCritBonus = self.battoCritBonus - (self._T.battoStackCrit or 0)
 		end
-		local atkBonus = 10 * stacks
+		local spdBonus = 3 * stacks
 		local critBonus = 3 * stacks
-		self.buffAttackBonus = self.buffAttackBonus + atkBonus
+		self.battoStackAtkSpdPct = self.battoStackAtkSpdPct + spdBonus
 		self.battoCritBonus = self.battoCritBonus + critBonus
-		self._T.battoStackAtk = atkBonus
+		self._T.battoStackSpd = spdBonus
 		self._T.battoStackCrit = critBonus
 		self._T.battoStackActive = true
-		log("[CharInfo] 발도술 중첩 프록 - 공격력 +" .. tostring(atkBonus) .. " 크확 +" .. tostring(critBonus) .. "% (" .. string.format("%.1f", remain) .. "초)")
+		log("[CharInfo] 발도술 중첩 프록 - 공격속도 +" .. tostring(spdBonus) .. "% 크확 +" .. tostring(critBonus) .. "% (" .. string.format("%.1f", remain) .. "초)")
 		local cwBS = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 		if isvalid(cwBS) and cwBS.Enable then
 			self:UpdateStats()
@@ -623,10 +758,10 @@ script CharInfoManager extends Logic
 	method void CancelBattoStackBuff()
 		if not self._T.battoStackActive then return end
 		self._T.battoStackToken = (self._T.battoStackToken or 0) + 1
-		self.buffAttackBonus = self.buffAttackBonus - (self._T.battoStackAtk or 0)
+		self.battoStackAtkSpdPct = self.battoStackAtkSpdPct - (self._T.battoStackSpd or 0)
 		self.battoCritBonus = self.battoCritBonus - (self._T.battoStackCrit or 0)
 		self._T.battoStackActive = false
-		log("[CharInfo] 발도술 중첩 프록 종료 - 공격력/크확 원복 (buffAttackBonus=" .. tostring(self.buffAttackBonus) .. " battoCritBonus=" .. tostring(self.battoCritBonus) .. ")")
+		log("[CharInfo] 발도술 중첩 프록 종료 - 공격속도/크확 원복 (battoStackAtkSpdPct=" .. tostring(self.battoStackAtkSpdPct) .. " battoCritBonus=" .. tostring(self.battoCritBonus) .. ")")
 		local cwBS = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 		if isvalid(cwBS) and cwBS.Enable then
 			self:UpdateStats()
@@ -799,6 +934,24 @@ script CharInfoManager extends Logic
 	-- ApplyAttackBuff의 자연 만료 본문과 동일한 정리를 지금 수행하고, 토큰을 올려 예약 타이머를 무효화한다.
 	@ExecSpace("ClientOnly")
 	method void CancelAttackBuff(string key)
+		-- (버그 수정 2026-08-12) 분노는 개편으로 공마 장부(buff_rage_*)가 아니라 **추가 전투력% 장부**
+		-- (_T.rageUntil/rageFinalPct)를 쓴다. 우클릭 취소가 아래 공마 경로만 타고 조기 return 해서
+		-- 전투력 +20%가 그대로 남아 있었다(신고). 분노는 여기서 먼저 배율을 끈다.
+		if key == "rage" then
+			if (self._T.rageUntil or 0) > _UtilLogic.ElapsedSeconds then
+				self._T.rageUntil = 0
+				self._T.rageFinalPct = 0
+				-- 토큰을 올려 예약된 만료 타이머가 나중에 또 건드리지 않게 무효화한다(공마 취소와 같은 구조).
+				self._T.rageToken = (self._T.rageToken or 0) + 1
+				log("[CharInfo] 분노 취소(우클릭) - 전투력 배율 원복")
+				-- 서버 캐시 전투력(기본공격이 읽는 값)도 즉시 되돌린다.
+				_SkillManager:SyncDarkSightStats()
+				local cwR = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+				if isvalid(cwR) and cwR.Enable then self:UpdateStats() end
+			end
+			-- 드래곤이 걸어준 공마 +30 분노(ApplyDragonStatBuff)가 동시에 켜져 있을 수 있으므로
+			-- 아래 공용 공마 경로도 그대로 이어서 탄다.
+		end
 		local activeKey = "buff_" .. key .. "_active"
 		local bonusKey = "buff_" .. key .. "_bonus"
 		local tokenKey = "buff_" .. key .. "_token"
@@ -811,20 +964,45 @@ script CharInfoManager extends Logic
 		if isvalid(cw) and cw.Enable then self:UpdateStats() end
 	end
 
-	-- 분노(2차 버프): 5분간 공마 +30.
+	-- 분노(2차 버프): (개편 2026-08-12 2차) **전투력 +1%/분배** 버프 - "추가 전투력%"에 합산되어
+	-- 전투력(표시 포함)에 직접 곱해진다(GetBuffBonusCombatPowerPct → CalcCombatPowerSwap).
 	@ExecSpace("ClientOnly")
-	method void UseRage(number duration, integer atkBonus)
-		-- (스킬 효과 개편) 공마 보너스(분배당 +2, 마스터 +40)·지속시간을 호출부가 투자 레벨로 계산해 넘긴다.
-		self:ApplyAttackBuff("rage", atkBonus, duration)
+	method void UseRage(number duration, integer bonusCpPct)
+		-- 표시 전투력·스킬 시전·기본공격 동기화 전투력이 전부 CalcCombatPower 경유라 한 곳에서 반영된다.
+		-- 레벨은 CalcEquipCombatPower(배율 미적용) 기준이라 버프로는 오르내리지 않는다(사양).
+		-- 드래곤이 걸어주는 분노(ApplyDragonStatBuff "rage")는 기존 공마+30 그대로다(토큰 키가 달라 충돌 없음).
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.rageFinalPct = bonusCpPct
+		self._T.rageUntil = now + duration
+		self._T.rageToken = (self._T.rageToken or 0) + 1
+		local myToken = self._T.rageToken
+		log("[CharInfo] 분노 발동 - 전투력 +" .. tostring(bonusCpPct) .. "% (" .. tostring(duration) .. "초)")
+		-- 기본공격은 서버가 "동기화해둔 전투력"만 보므로 켜고 끌 때 즉시 밀어넣는다
+		-- (다크사이트·발도술 중첩과 같은 이유·같은 경로). 스탯창이 열려 있으면 표시도 즉시 갱신.
+		_SkillManager:SyncDarkSightStats()
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then self:UpdateStats() end
+		_TimerService:SetTimerOnce(function()
+			if self._T.rageToken ~= myToken then return end
+			self._T.rageFinalPct = 0
+			log("[CharInfo] 분노 종료 - 전투력 원복")
+			_SkillManager:SyncDarkSightStats()
+			local cw2 = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+			if isvalid(cw2) and cw2.Enable then self:UpdateStats() end
+		end, duration)
 		_RageBuffUI:ShowBuff(duration)
 	end
 
 	-- 메디테이션(2차 버프): 마력 보너스·지속시간을 호출부(SkillManager)가 투자 레벨로 계산해 넘긴다.
 	@ExecSpace("ClientOnly")
 	method void UseMeditation(number duration, integer atkBonus)
-		-- (썬콜 개편 2026-08-08) 고정 +30/5분 → 마력 +2/분배(마스터 +40), 지속 30초+분배당 10초.
-		-- 분노(UseRage)와 같은 패턴 - 공마 보너스는 공용 버프 코어(토큰 패턴)를 그대로 쓴다.
-		self:ApplyAttackBuff("meditation", atkBonus, duration)
+		-- (썬콜 개편 2026-08-08) 고정 +30/5분 → 마력 +2/분배(마스터 +40).
+		-- (요청 2026-08-14) 지속시간은 **블레스와 동일**(SkillManager.GetMeditationDuration이 블레스
+		-- 헬퍼를 위임받는다 - 호출부가 계산해 넘겨준다), 그리고 **오른 마력이 실제 전투력에 반영**되도록
+		-- 공용 버프 코어(ApplyAttackBuff = 표시 전용) 대신 **실효 버프 통**(ApplyRealBuff)을 쓴다.
+		-- ⚠ 다크드래곤이 걸어주는 메디테이션(ApplyDragonStatBuff "meditation", +30/30초)은 별개 사양이라
+		--   여전히 공용 통을 쓴다 - 우클릭 취소가 두 경로를 모두 부르는 이유(BuffBarManager 참고).
+		self:ApplyRealBuff("meditation", atkBonus, 0, duration)
 		_MeditationBuffUI:ShowBuff(duration)
 	end
 
@@ -846,12 +1024,80 @@ script CharInfoManager extends Logic
 	-- (PlayerAttack.AttackBless)가 처리한다.
 	-- (비숍 개편 2026-08-08) 고정 +30이던 것을 **분배 레벨 비례**로 바꿨다 - 호출부(SkillManager
 	-- 시전 분기)가 GetBlessAttackBonus / GetBlessStatBonus로 계산해 넘겨준다.
+	-- (신고 수정 2026-08-13) 블레스는 공용 버프 코어(ApplyAttackBuff/ApplyStatBuff)를 쓰지 않고
+	-- **실효 버프 통**(realBuffAttackBonus / realBuffStatBonus)에 담는다 - 공용 통은 표시 전용 경로에서만
+	-- 전투력에 실려서 "스탯창은 오르는데 데미지는 그대로"였다(신고). 실효 통은 CalcCombatPowerBase가
+	-- 항상 합산하므로 표시·스킬 시전·기본공격이 한 값을 본다.
+	-- (요청 2026-08-14 2차) 지속시간이 투자 레벨 비례(20초 + 분배당 10초)가 되면서 호출부가 계산해
+	-- 넘겨준다 - 공식의 유일한 출처는 여전히 SkillManager.GetBlessBuffDurationLv 한 곳이다.
+	-- ⚠ 인자 없던 UseBless에 duration을 더하지 않고 이름을 새로 지었다(LEA-1102 회피 관례).
 	@ExecSpace("ClientOnly")
-	method void UseBless(integer atkBonus, integer statBonus)
-		-- 공마는 기존 공용 버프 코어(토큰 패턴)를 그대로 쓰고, 4스탯만 여기서 따로 관리한다.
-		self:ApplyAttackBuff("bless", atkBonus, 300)
-		self:ApplyStatBuff("bless", statBonus, 300)
-		_BlessBuffUI:ShowBuff(300)
+	method void UseBlessLv(integer atkBonus, integer statBonus, number duration)
+		self:ApplyRealBuff("bless", atkBonus, statBonus, duration)
+		_BlessBuffUI:ShowBuff(duration)
+	end
+
+	-- 실효 버프 적용 코어. ApplyAttackBuff와 **같은 토큰/타이머 패턴**이지만(재시전 시 중첩 없이
+	-- 지속시간만 갱신) 합산 대상이 실효 통이라 전투력·데미지에 곧바로 반영된다.
+	-- key로 버프별 장부를 분리해 블레스와 메디테이션이 서로를 지우지 않는다.
+	@ExecSpace("ClientOnly")
+	method void ApplyRealBuff(string key, integer atkBonus, integer statBonus, number duration)
+		local atkKey = "realbuff_" .. key .. "_atk"
+		local statKey = "realbuff_" .. key .. "_stat"
+		local tokenKey = "realbuff_" .. key .. "_token"
+		local newAtk = math.max(0, atkBonus or 0)
+		local newStat = math.max(0, statBonus or 0)
+		-- 재시전이면 이전 몫을 빼고 새 몫을 넣는다(중첩 방지 - 지속시간만 갱신되는 효과).
+		self.realBuffAttackBonus = self.realBuffAttackBonus - (self._T[atkKey] or 0) + newAtk
+		self.realBuffStatBonus = self.realBuffStatBonus - (self._T[statKey] or 0) + newStat
+		self._T[atkKey] = newAtk
+		self._T[statKey] = newStat
+		self._T[tokenKey] = (self._T[tokenKey] or 0) + 1
+		local myToken = self._T[tokenKey]
+		log("[CharInfo] 실효 버프 발동(" .. key .. ") 공마 +" .. tostring(newAtk) .. " / 4스탯 각 +" .. tostring(newStat)
+			.. " (" .. tostring(math.floor(duration)) .. "초, 합계 공마=" .. tostring(self.realBuffAttackBonus)
+			.. " 스탯=" .. tostring(self.realBuffStatBonus) .. ")")
+		self:RefreshAfterRealBuffChange()
+		_TimerService:SetTimerOnce(function()
+			if self._T[tokenKey] ~= myToken then return end
+			self.realBuffAttackBonus = self.realBuffAttackBonus - (self._T[atkKey] or 0)
+			self.realBuffStatBonus = self.realBuffStatBonus - (self._T[statKey] or 0)
+			self._T[atkKey] = 0
+			self._T[statKey] = 0
+			log("[CharInfo] 실효 버프 종료(" .. key .. ") 전투력 원복")
+			self:RefreshAfterRealBuffChange()
+		end, duration)
+	end
+
+	-- 실효 버프 보너스가 바뀐 직후의 공통 갱신(발동/만료/우클릭 취소 세 경로가 공유한다).
+	@ExecSpace("ClientOnly")
+	method void RefreshAfterRealBuffChange()
+		-- 서버 캐시 전투력(기본공격이 읽는 값) + 스탯창 표시를 한 번에 맞춘다 - 분노(UseRage)와 같은 경로.
+		_SkillManager:SyncDarkSightStats()
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then self:UpdateStats() end
+	end
+
+	-- 실효 버프 즉시 종료(버프 아이콘 우클릭 취소). 토큰을 올려 예약된 만료 타이머를 무효화한다.
+	@ExecSpace("ClientOnly")
+	method void CancelRealBuff(string key)
+		local atkKey = "realbuff_" .. key .. "_atk"
+		local statKey = "realbuff_" .. key .. "_stat"
+		local tokenKey = "realbuff_" .. key .. "_token"
+		if (self._T[atkKey] or 0) == 0 and (self._T[statKey] or 0) == 0 then return end
+		self._T[tokenKey] = (self._T[tokenKey] or 0) + 1
+		self.realBuffAttackBonus = self.realBuffAttackBonus - (self._T[atkKey] or 0)
+		self.realBuffStatBonus = self.realBuffStatBonus - (self._T[statKey] or 0)
+		self._T[atkKey] = 0
+		self._T[statKey] = 0
+		log("[CharInfo] 실효 버프 취소(우클릭, " .. key .. ") 전투력 원복")
+		self:RefreshAfterRealBuffChange()
+	end
+
+	-- 블레스 즉시 종료(버프 아이콘 우클릭 취소) - BuffBarManager 호출부 호환용 얇은 별칭.
+	@ExecSpace("ClientOnly")
+	method void CancelBless()
+		self:CancelRealBuff("bless")
 	end
 
 	-- 4스탯(STR/DEX/INT/LUK) 공통 버프 보너스 적용 코어. ApplyAttackBuff와 **완전히 같은 토큰 패턴**이라
@@ -906,8 +1152,8 @@ script CharInfoManager extends Logic
 	-- (스탯 버프는 클라 전용이지만 피해 회복은 서버 피격 파이프라인에서 일어나므로).
 	@ExecSpace("ClientOnly")
 	method void UsePowerGuard(number duration)
-		-- (스킬 효과 개편) 지속시간을 호출부가 투자 레벨로 계산해 넘긴다. 공격력 +10은 고정.
-		self:ApplyAttackBuff("powerguard", 10, duration)
+		-- (개편 2026-08-12) 공격력 +10 폐지 - 효과는 전부 서버(PlayerHit: 지연 회복 + 받는 피해
+		-- 상시 감소, StartPowerGuardLv). 여기는 버프바 표시만 남는다.
 		_PowerGuardBuffUI:ShowBuff(duration)
 	end
 
@@ -1067,6 +1313,9 @@ script CharInfoManager extends Logic
 		if (self._T.testLevelOverride or 0) > 0 then
 			return self._T.testLevelOverride * 7
 		end
+		-- (요청 2026-08-12 3차) 무기 성능은 **단일 값**이다 - 스타포스·무기 기본·잠재 공격력/마력 옵션이
+		-- 모두 여기 합산되고, 표시(UpdateStats)에서만 직업에 따라 공격력/마력 줄로 갈린다.
+		-- 전투력 공식은 어차피 그 단일 값을 쓰므로 직업 분기가 필요 없다.
 		local flatATK, atkPct   = 0, 0
 		local statFlat, statPct = 0, 0
 		local critAdd, critDmgAdd = 0, 0
@@ -1078,6 +1327,7 @@ script CharInfoManager extends Logic
 			if s == "" then continue end
 
 			-- 무기 슬롯 기본옵션: 직업별 드롭박스 지급 무기는 공격력/마력 +30 고정 (잠재능력과 별개)
+			-- (요청 2026-08-12) 마력 분리 후에도 무기 자체 성능은 공격력·마력 양쪽에 붙는다(원작 무기와 동일).
 			if slot == 6 then
 				local baseName = _UIEquipInventoryManager:ParseName(s)
 				if _UIEquipInventoryManager:IsJobDropWeapon(baseName) then
@@ -1085,7 +1335,7 @@ script CharInfoManager extends Logic
 				end
 			end
 
-			-- Starforce bonus (field 4): 1성당 직업 주스탯 +4, 공격력 +3
+			-- Starforce bonus (field 4): 1성당 직업 주스탯 +4, 무기 성능 +3
 			local stars = self:ParseFieldNum(s, 4)
 			if stars > 0 then
 				local sf = self:CalcStarforceStats(stars)
@@ -1112,6 +1362,7 @@ script CharInfoManager extends Logic
 				elseif string.match(opt, "공격속도") then
 					if isPct then atkSpdPct += val end
 				elseif string.match(opt, "공격력") or string.match(opt, "마력") then
+					-- (요청 2026-08-12 3차) 두 태그 모두 같은 무기 성능 통에 합산된다.
 					if isPct then atkPct += val else flatATK += val end
 				elseif string.match(opt, "크리티컬 데미지") then
 					critDmgAdd += val
@@ -1124,6 +1375,47 @@ script CharInfoManager extends Logic
 		-- (요청 2026-08-08) 단계마다 정수로 내림한 뒤 마지막 정수를 제곱한다 - 전투력이 항상
 		-- "총합×총합"의 완전제곱수가 되어 눈으로 검산된다. 예) 총합 1004, 공속 12%면
 		-- floor(1004×1.12)=1124 → 전투력 1124×1124=1,263,376.
+		-- (요청 2026-08-12) 마법 직업(비숍/썬콜/불독 = 주스탯 INT)은 **마력**이, 그 외 직업은
+		-- **공격력**이 전투력의 근거다. 주스탯 판정(GetMainStatName)을 그대로 재사용해 한 곳에서 가른다.
+		-- (요청 2026-08-12 3차) **표시 전용 버프 반영.** `_T.cpIncludeBuffs`가 켜져 있을 때만 버프/물약/스킬
+		-- 유래 성능을 함께 넣는다 - 레벨 산정(CalcEquipCombatPower)과 스킬 시전 전투력은 이 플래그를
+		-- 켜지 않으므로 **아이템만**이라는 기존 사양이 그대로 유지된다("레벨은 순수 장비 성능" - GDD §4.1).
+		-- 시그니처를 바꾸면 호출부 전수 수정 + LEA-1102 위험이 있어 플래그 방식으로 뒀다(단일 스레드라 안전).
+		if self._T.cpIncludeBuffs == true then
+			-- 전투력은 "공격력·마력 중 높은 쪽"을 쓰는 단일 값이라 두 축을 모두 더한다.
+			-- ⚠ (요청 2026-08-14 5차) **표창 계열(skillAttackBonus)은 여기서 뺐다** - 아래 실효 버프
+			--   블록으로 옮겨 표시/스킬 구분 없이 항상 반영된다. 여기 남겨두면 표시 경로에서 두 번 더해진다.
+			flatATK += self.potionAttackBonus + self.buffAttackBonus
+				+ self.commonAttackBonus
+			-- 공격속도: 잠재 옵션만 보던 것을 **실제 표시 공속 초과분**으로 바꾼다 - 부스터 단계·발도술
+			-- 중첩(+3%/스택)·무기 보너스가 모두 여기 들어온다(신고: 발도술 공속이 전투력에 안 잡힌다).
+			atkSpdPct = self:GetAttackSpeedPercent() - 100
+			-- 크리티컬도 버프분(발도술 중첩·표창+·샤프 아이즈)을 함께 반영한다.
+			critAdd += self.battoCritBonus + self.shurikenCritBonus + self.sharpEyesCritBonus
+			critDmgAdd += self.sharpEyesCritDmgBonus
+		end
+
+		-- (신고 수정 2026-08-13 / 확장 08-14) **실효 버프(블레스·메디테이션)는 표시/스킬 구분 없이 항상
+		-- 반영한다.** 위 cpIncludeBuffs 블록은 표시 전용이라, 그 통에 담아 두면 스탯창 숫자만 오르고
+		-- 스킬이 넘기는 전투력(=데미지)은 그대로였다(신고: "블레스의 공격력·스탯 상승이 실제 전투력
+		-- 상승으로 오르지 않는다" / 요청: 메디테이션도 "마력에 따라 전투력이 오르게").
+		-- (요청 2026-08-14 5차) **표창 계열(skillAttackBonus)도 같은 이유로 여기로 승격**했다 -
+		--   표창+ 4차수 투자 + 지금 고른 표창의 공격력 + 트레이닝 1·3차가 전부 이 통에 들어 있는데,
+		--   종전엔 표시 전용이라 스탯창 숫자만 오르고 실제 스킬 데미지는 그대로였다(신고: "표창+에서
+		--   오르는 공격력이 전투력에 적용되지 않는다"). ⚠ 승격 대상은 **공격력뿐**이다 - 같은 통에서
+		--   나오는 표창 크확(shurikenCritBonus)·공속(shurikenAtkSpeedStage)은 위 표시 블록에 그대로 둔다.
+		-- ⚠ 단 **레벨 환산 경로(CalcEquipCombatPower)만은 제외**한다 - "레벨은 순수 장비 성능"이라
+		--   여기 넣으면 버프로 표시 레벨이 출렁이고 최대 MP·매직 미사일 구체 수·SP 예산이 함께 흔들린다.
+		--   (표창+·트레이닝도 스킬 투자분이라 레벨로 되먹임되면 순환한다 - 반드시 이 블록 안에 둔다.)
+		-- ⚠ 4스탯은 아래 statTerm에서 ÷4 되므로 네 스탯 각 +N은 statFlat에 4N을 더해야 한다
+		--   (장비 "올스탯 +N"이 statFlat += N*4인 것과 같은 규칙).
+		if self._T.cpExcludeRealBuff ~= true then
+			flatATK += self.realBuffAttackBonus + self.skillAttackBonus
+			statFlat += self.realBuffStatBonus * 4
+		end
+
+		-- (요청 2026-08-12 3차) 무기 성능이 단일 값이 되면서 직업 분기가 사라졌다 - 마법 직업이든
+		-- 아니든 같은 값을 쓰고, 그 값이 상태창에서 공격력/마력 중 어느 줄로 보이는지만 다르다.
 		local atkTerm  = flatATK * (1 + atkPct / 100)
 		local statTerm = statFlat * (1 + statPct / 100) / 4
 		local total = math.floor(atkTerm + statTerm)
@@ -1183,9 +1475,93 @@ script CharInfoManager extends Logic
 
 	-- 장비 slot(1~7)을 swapStr로 교체했다고 가정한 전투력. swapSlot=0이면 현재 장비 그대로.
 	-- 툴팁의 "전투력 증가량" 계산용 - (전투력 개편 2026-08-08) 공식은 CalcCombatPowerUnified 단일 구현.
+	-- (요청 2026-08-12) **추가 전투력%** 신설 - 잠재 "데미지/보스 데미지 +N%"(장비)와 분노(버프)가
+	-- 전투력(총합²)에 **직접 곱해진다**. 레벨 경로(CalcEquipCombatPower)는 이 배율을 받지 않으므로
+	-- 추가 전투력·버프는 레벨과 무관하다(사양). 잠재 데미지%는 08-08 개편 때 공식에서 빠져 표시
+	-- 전용이던 죽은 옵션이었는데, 이 배율로 실효화된다.
 	@ExecSpace("ClientOnly")
 	method number CalcCombatPowerSwap(number swapSlot, string swapStr)
-		return self:CalcCombatPowerUnified(swapSlot, swapStr)
+		-- (요청 2026-08-12 2차) **최종 데미지%가 전투력에 곱해진다.** 구성: 장비(잠재 데미지/보스뎀) +
+		-- 분노(버프) + **콤보 구슬(2%/개)**. 콤보가 합류하면서 서버 ApplyComboAttackBonus는 항등이 됐다.
+		-- ⚠ 패닉/코마는 데미지 공식에 구슬 수를 직접 곱하므로 여기 실린 콤보 배율을 빼고 넘겨야 한다
+		--   (SkillManager.GetEffectiveCombatPowerNoCombo) - 안 그러면 구슬 수가 두 번 곱해진다.
+		local cp = self:CalcCombatPowerUnified(swapSlot, swapStr)
+		local pct = self:CollectBonusCombatPowerPct(swapSlot, swapStr) + self:GetBuffBonusCombatPowerPct()
+			+ self:GetComboFinalDamagePct()
+		if pct ~= 0 then
+			cp = math.floor(cp * (1 + pct / 100))
+		end
+		return cp
+	end
+
+	-- (요청 2026-08-12) 장비 유래 추가 전투력% 합 - 잠재/에디셔널의 "데미지 +N%"·"보스 몬스터 데미지 +N%".
+	-- "크리티컬 데미지"는 별도 스탯이라 먼저 걸러낸다(상위 문자열 함정 - UpdateStats 파서와 동일).
+	@ExecSpace("ClientOnly")
+	method number CollectBonusCombatPowerPct(number swapSlot, string swapStr)
+		local pct = 0
+		for slot = 1, 25 do
+			local s = _UIEquipInventoryManager:GetEquip(slot)
+			if slot == swapSlot then s = swapStr end
+			if s == "" then continue end
+			for _, fi in ipairs({10, 11, 12, 14, 15, 16}) do
+				local opt = self:GetField(s, fi)
+				if opt == "" or opt == "0" then continue end
+				local numStr = string.match(opt, "%+(%d+)")
+				if numStr == nil then continue end
+				if string.sub(opt, -1) ~= "%" then continue end
+				if string.match(opt, "크리티컬") then continue end
+				if string.match(opt, "보스") or string.match(opt, "데미지") then
+					pct += tonumber(numStr) or 0
+				end
+			end
+		end
+		return pct
+	end
+
+	-- (요청 2026-08-12) 버프 유래 추가 전투력% - 현재는 분노(분배당 +1%)만. 레벨에는 반영되지 않는다.
+	@ExecSpace("ClientOnly")
+	method number GetBuffBonusCombatPowerPct()
+		if (self._T.rageUntil or 0) <= _UtilLogic.ElapsedSeconds then return 0 end
+		return self._T.rageFinalPct or 0
+	end
+
+	-- (요청 2026-08-12 2차) 콤보 어택 구슬이 주는 최종 데미지% = **구슬 1개당 2% 고정**.
+	-- 어드밴스드 콤보의 "구슬당 +2%/분배"는 폐지됐다(어드콤은 구슬 상한·2개 동시 획득만 담당).
+	-- 이 값은 이제 **전투력 배율에 합류**한다(CalcCombatPowerSwap) - 서버 ApplyComboAttackBonus는
+	-- 항등 함수가 되어 이중 적용이 없다. 스킬 레벨 조회가 빠져 매우 가벼우므로 전투력 경로에서 매번 불러도 된다.
+	@ExecSpace("ClientOnly")
+	method number GetComboFinalDamagePct()
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return 0 end
+		---@type PlayerAttack
+		local pa = player:GetComponent(PlayerAttack)
+		if not isvalid(pa) then return 0 end
+		local orbs = pa.ComboOrbCount or 0
+		if orbs <= 0 then return 0 end
+		return 2 * orbs
+	end
+
+	-- (요청 2026-08-12) 스탯창 "최종 데미지" 줄만 가볍게 다시 쓴다. 콤보 구슬은 전투 중 수시로 바뀌는데
+	-- UpdateStats 전체는 25슬롯을 여러 번 훑어 무겁다(그 중첩 호출이 조용한 중단을 일으킨 전례가 있다).
+	-- 장비/버프 몫은 UpdateStats가 캐시해둔 값(equipBuffFinalDmgPct)을 재사용하고 콤보 몫만 새로 구한다.
+	@ExecSpace("ClientOnly")
+	method void RefreshFinalDamageRow()
+		local base = "/ui/DefaultGroup/CharInfoWindow/DetailPanel/"
+		local pct = self.equipBuffFinalDmgPct + self:GetComboFinalDamagePct()
+		local e = _EntityService:GetEntityByPath(base .. "StatVal_TotalDmg")
+		if isvalid(e) then
+			e.TextComponent.Text = "+" .. tostring(pct) .. "%"
+		end
+		-- (요청 2026-08-12 3차) 콤보 구슬이 전투력 배율에 들어가므로 **전투력 줄도 함께** 따라가야 한다.
+		-- 25슬롯을 훑는 계산이라 스탯창이 열려 있고 구슬 수가 실제로 바뀐 순간에만 호출된다(감시 틱 조건).
+		local c = _EntityService:GetEntityByPath(base .. "StatVal_Combat")
+		if isvalid(c) then
+			self._T.cpIncludeBuffs = true
+			local cp = self:CalcCombatPowerUnified(0, "")
+			self._T.cpIncludeBuffs = false
+			if pct ~= 0 then cp = math.floor(cp * (1 + pct / 100)) end
+			c.TextComponent.Text = tostring(math.floor(cp))
+		end
 	end
 
 	-- (Phase 1) 레벨 산정 전용 "장비 전투력(EquipCP)". 장착 장비(슬롯 1~25)에서 유래한 성능만 합산한다.
@@ -1197,7 +1573,19 @@ script CharInfoManager extends Logic
 	method number CalcEquipCombatPower()
 		-- (요청 2026-08-08) 전투력이 아이템만으로 계산되면서 표시 전투력과 완전히 같은 값이 됐다 -
 		-- 호출부 호환을 위해 별칭으로 남긴다.
-		return self:CalcCombatPowerUnified(0, "")
+		-- (신고 수정 2026-08-13) 실효 버프(블레스·메디테이션)는 표시/스킬 전투력에 항상 실리므로,
+		-- **레벨 경로인 여기서는 명시적으로 제외**한다 - 안 그러면 버프를 걸 때마다 표시 레벨이 오르내리고
+		-- 최대 MP·매직 미사일 구체 수·SP 예산·스킬 레벨 제한 페널티가 함께 흔들린다("레벨은 순수 장비 성능").
+		-- ⚠ (버그 수정 2026-08-14) 플래그는 **끝나면 원래 값으로 되돌린다**(false로 못 박지 않는다).
+		--   이 계산 도중 다시 이 메서드가 불릴 수 있다 - CalcCombatPowerBase → GetAttackSpeedPercent /
+		--   GetSkillPowerMultiplier → GetDisplayLevel → 여기, 하는 경로가 있다. 안쪽 호출이 끝나며
+		--   플래그를 false로 눕히면 **바깥 계산이 그 뒤부터 버프를 포함**해서, 레벨이 버프만큼 올라갔다
+		--   (실측: 실효 버프 +40에서 표시 레벨 33 → 39).
+		local prevExclude = self._T.cpExcludeRealBuff
+		self._T.cpExcludeRealBuff = true
+		local cp = self:CalcCombatPowerUnified(0, "")
+		self._T.cpExcludeRealBuff = prevExclude
+		return cp
 	end
 
 	-- (레벨 환산 개편 2026-08-08) 레벨 = 전투력 총합(제곱 전 정수) ÷ 7 (내림). 사용자 확정 사양 -

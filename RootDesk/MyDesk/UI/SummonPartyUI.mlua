@@ -1,0 +1,121 @@
+@Logic
+@ExecSpace("ClientOnly")
+script SummonPartyUI extends Logic
+
+	-- (요청 2026-08-11) 소환수 파티 UI: 내(로컬 플레이어) 소환수(전사/도적/궁수 계열 HeroSummon +
+	-- 힐러 HealerSummon)가 있으면 좌측 보드에 닉네임 + 빨간 HP바를 한 줄씩 표시한다(최대 4행).
+	-- 구조는 BuffBarManager와 같은 관례 - @Logic + 경로 접근 + 0.3초 폴링(풀 재배치 방식).
+	-- HP는 HeroSummon.HeroHp/HeroMaxHp, HealerSummon.HealerHp/HealerMaxHp(@Sync 승격)를 읽고,
+	-- 이름은 소환수 엔티티의 NameTagComponent.Name(네이티브 @Sync)을 그대로 쓴다.
+
+	property integer timerId = 0
+	property any dragHandler = nil
+
+	method void OnBeginPlay()
+		-- 0.3초 폴링 시작. 소환수가 하나도 없으면 보드 전체를 숨긴다.
+		-- (요청 2026-08-11) 보드는 드래그로 옮길 수 있다 - 보드 패널(raycast)+UITouchReceiveComponent에
+		-- UITouchDragEvent를 걸어 anchoredPosition을 델타만큼 움직인다. UI 엔티티는 세션 내내 유지되므로
+		-- 소환수가 사라져 보드가 숨었다가 재소환으로 다시 떠도 사용자가 옮긴 그 자리에서 뜬다.
+		if not self:IsClient() then return end
+		self.timerId = _TimerService:SetTimerRepeat(self.Refresh, 0.3)
+		local board = _EntityService:GetEntityByPath("/ui/SummonPartyUI/Board")
+		if isvalid(board) then
+			self.dragHandler = board:ConnectEvent(UITouchDragEvent, self.OnBoardDrag)
+		end
+		log("[SummonPartyUI] ready (0.3s polling + drag)")
+	end
+
+	method void OnEndPlay()
+		-- 타이머/드래그 핸들러 정리.
+		if self.timerId ~= 0 then
+			_TimerService:ClearTimer(self.timerId)
+			self.timerId = 0
+		end
+		if self.dragHandler ~= nil then
+			local board = _EntityService:GetEntityByPath("/ui/SummonPartyUI/Board")
+			if isvalid(board) then
+				board:DisconnectEvent(UITouchDragEvent, self.dragHandler)
+			end
+			self.dragHandler = nil
+		end
+	end
+
+	method void OnBoardDrag(UITouchDragEvent event)
+		-- 보드 드래그 이동. TouchDelta(화면 픽셀)를 anchoredPosition에 그대로 더한다.
+		-- ⚠ Maker 시뮬 mouse_input은 표준 UI 이벤트를 발동하지 못해(도구 한계) 실기기/실마우스로 확인한다.
+		self:MoveBoardBy(event.TouchDelta.x, event.TouchDelta.y)
+	end
+
+	method void MoveBoardBy(number dxPx, number dyPx)
+		-- 보드 위치 이동 공용부(드래그 핸들러/검증 프로브 공용).
+		local board = _EntityService:GetEntityByPath("/ui/SummonPartyUI/Board")
+		if not isvalid(board) then return end
+		local ut = board.UITransformComponent
+		if not isvalid(ut) then return end
+		ut.anchoredPosition = Vector2(ut.anchoredPosition.x + dxPx, ut.anchoredPosition.y + dyPx)
+	end
+
+	method void Refresh()
+		-- 내 소환수 목록을 모아 행(최대 4)에 이름/HP를 그린다.
+		local board = _EntityService:GetEntityByPath("/ui/SummonPartyUI/Board")
+		if not isvalid(board) then return end
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then
+			board.Enable = false
+			return
+		end
+		local map = player.CurrentMap
+		if not isvalid(map) then
+			board.Enable = false
+			return
+		end
+		-- {이름, HP비율} 수집. 죽은 소환수(HP 0)는 회색 표현 대신 목록에서 뺀다(부활 대기 표시는 추후).
+		local rows = {}
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.HeroSummon", true)) do
+			---@type HeroSummon
+			local hs = comp
+			if isvalid(hs) and isvalid(hs.Entity) and hs.OwnerEntity == player and (hs.HeroMaxHp or 0) > 0 then
+				local nm = ""
+				local ntc = hs.Entity.NameTagComponent
+				if isvalid(ntc) then nm = ntc.Name end
+				table.insert(rows, { label = nm, ratio = math.max(0, math.min(1, hs.HeroHp / hs.HeroMaxHp)) })
+			end
+		end
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.HealerSummon", true)) do
+			---@type HealerSummon
+			local hl = comp
+			if isvalid(hl) and isvalid(hl.Entity) and hl.OwnerEntity == player and (hl.HealerMaxHp or 0) > 0 then
+				local nm = ""
+				local ntc = hl.Entity.NameTagComponent
+				if isvalid(ntc) then nm = ntc.Name end
+				table.insert(rows, { label = nm, ratio = math.max(0, math.min(1, hl.HealerHp / hl.HealerMaxHp)) })
+			end
+		end
+		if #rows == 0 then
+			board.Enable = false
+			return
+		end
+		board.Enable = true
+		for i = 1, 4 do
+			local rowE = _EntityService:GetEntityByPath("/ui/SummonPartyUI/Board/Row" .. tostring(i))
+			if isvalid(rowE) then
+				local data = rows[i]
+				if data == nil then
+					rowE.Enable = false
+				else
+					rowE.Enable = true
+					local nameE = rowE:GetChildByName("Name", false)
+					if isvalid(nameE) and isvalid(nameE.TextGUIRendererComponent) then
+						nameE.TextGUIRendererComponent.Text = data.label
+					end
+					local bgE = rowE:GetChildByName("HpBg", false)
+					local fillE = isvalid(bgE) and bgE:GetChildByName("HpFill", false) or nil
+					if isvalid(fillE) and isvalid(fillE.SpriteGUIRendererComponent) then
+						fillE.SpriteGUIRendererComponent.FillAmount = data.ratio
+					end
+				end
+			end
+		end
+	end
+
+end

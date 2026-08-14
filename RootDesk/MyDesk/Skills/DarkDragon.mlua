@@ -11,6 +11,9 @@ script DarkDragon extends Component
 
 	property Entity OwnerEntity = nil            -- 서버 전용(공격/버프 대상 주인). 클라는 부모로 충분.
 	property number Lifetime = 600               -- 서버 전용 수명(초). 플레이어 시전=200~600, 드래곤 버프 소환=50.
+	-- (요청 2026-08-10) 플레이어가 시전한 "주 소환"인가(SummonDarkDragon이 표시). 주 소환이 사라질 때만
+	-- 주인 클라에 소멸을 통보한다 - 버프로 나온 블랙드래곤(50초)의 소멸이 활성 창을 잘못 닫지 않게.
+	property boolean IsMainSummon = false        -- 서버 전용
 	@Sync property string AnimState = "idle"     -- idle / buf / stand
 	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
 	@Sync property number PhaseSeed = 0          -- 궤도 위상(드래곤마다 달라 겹치지 않게)
@@ -39,6 +42,20 @@ script DarkDragon extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- (요청 2026-08-10) 주 소환(플레이어 시전)이 사라지면 - 수명 만료 / 우클릭 취소 / 맵 이탈 등
+		-- 어떤 이유든 - 주인 클라의 "소환 중" 상태를 반드시 함께 정리한다(라이딩 NotifyRidingDragonGone과
+		-- 같은 규칙). 이게 없으면 드래곤이 일찍 사라져도 클라 활성 창(darkDragonActiveUntil)이 남아
+		-- 자동사냥이 "있는 줄 알고" 재소환을 미룬다.
+		if not self.IsMainSummon then return end
+		local owner = self.OwnerEntity
+		if not isvalid(owner) then return end
+		---@type PlayerAttack
+		local pa = owner:GetComponent("script.PlayerAttack")
+		if isvalid(pa) then pa:NotifyDarkDragonGone() end
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ScheduleHealCheck()
 		-- (요청 2026-08-04) 랜덤 버프와 별도의 상시 힐: 15~30초마다 주인 HP를 확인해 풀피가 아니면
 		-- 힐을 1회 사용한다(연출/회복 공식은 버프 힐과 동일).
@@ -47,6 +64,16 @@ script DarkDragon extends Component
 			self:TryHealOwner()
 			self:ScheduleHealCheck()
 		end, 15.0 + _UtilLogic:RandomDouble() * 15.0)
+	end
+
+	-- (요청 2026-08-12) 다크드래곤 힐의 회복량 = **주인 최대 HP의 5% 고정**.
+	-- ⚠ 종전엔 비숍 힐과 같은 ApplyHealToPlayer를 불렀는데, 그 함수는 회복률을
+	--   `_T.pendingHealPercent`(비숍 "힐" 시전이 채워두는 분배 레벨)에서 읽는다. 비숍이 아닌 주인은
+	--   그 값이 비어 있어 폴백 1%로 회복됐다(신고). 이제 회복률을 직접 넘기는 ApplyHealToPlayerPct를 쓴다.
+	-- 상시 힐(15~30초 체크)과 랜덤 버프 힐이 같은 값을 쓰도록 여기 한 곳에만 둔다.
+	method number GetHealPercent()
+		-- 다크드래곤 힐 회복률(주인 최대 HP 대비 %).
+		return 5.0
 	end
 
 	@ExecSpace("ServerOnly")
@@ -63,7 +90,7 @@ script DarkDragon extends Component
 		end, 1.2)
 		log("[DarkDragon] 상시 힐(15~30초 체크): 주인 HP " .. tostring(math.floor(pc.Hp)) .. "/" .. tostring(math.floor(pc.MaxHp)))
 		self:PlayHealCastAtDragon()
-		pa:ApplyHealToPlayer(self.OwnerEntity, pa:GetDarkDragonCombatPower())
+		pa:ApplyHealToPlayerPct(self.OwnerEntity, self:GetHealPercent())
 	end
 
 	@ExecSpace("ServerOnly")
@@ -133,7 +160,13 @@ script DarkDragon extends Component
 					self:PlayAttackTrail(clip, Vector3(p.x, p.y + 0.3, 0), 0)
 					local tt = t
 					_TimerService:SetTimerOnce(function()
-						if isvalid(tt) then pa:DealDarkDragonHit(tt) end
+						if isvalid(tt) then
+							pa:DealDarkDragonHit(tt)
+							-- (요청 2026-08-12 5차) **서먼 다크드래곤 공격에도 드래곤 블러드가 적용된다.**
+							-- 종전엔 용 소환(SummonDragon)/드래곤 라이딩(RidingDragon)만 이 훅을 불렀다.
+							-- 회복률은 드래곤 블러드 투자 레벨 구간(1~9레벨 2% / 10~19 4% / 20+ 6%).
+							pa:OnDragonAttackHeal()
+						end
 					end, (i - 1) * 0.08)
 				end
 			end
@@ -196,11 +229,11 @@ script DarkDragon extends Component
 		local userId = isvalid(pc) and pc.UserId or ""
 		local roll = _UtilLogic:RandomDouble() * 110
 		if roll < 30 then
-			-- 힐(30/110): 비숍 힐 공식(전투력 5~15%)으로 주인 회복 + 회복 숫자. 시전 이펙트는 드래곤
+			-- 힐(30/110): **주인 최대 HP의 5%**(GetHealPercent) 회복 + 회복 숫자. 시전 이펙트는 드래곤
 			-- 위치에서 2/3 크기, 주인에게는 전용 수혜 클립(e81f0ba3, PlayHealCastAtDragon 안에서 재생 -
 			-- ApplyHealToPlayer의 공용 머리 위 이펙트는 본인 대상이라 자동 생략됨).
 			self:PlayHealCastAtDragon()
-			pa:ApplyHealToPlayer(self.OwnerEntity, pa:GetDarkDragonCombatPower())
+			pa:ApplyHealToPlayerPct(self.OwnerEntity, self:GetHealPercent())
 			log("[DarkDragon] 버프: 힐")
 		elseif roll < 50 then
 			-- 콤보어택(20/110, 30초): 구슬 회전은 캐릭터에게, 시전 마법진 버스트는 드래곤 위치에서.

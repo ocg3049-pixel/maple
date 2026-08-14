@@ -23,10 +23,13 @@ script HeroSummon extends Component
 	-- 아바타 모션은 상태머신 없이 클라이언트가 @Sync 값(LocoState/MotionCmd)을 보고 body 엔티티에
 	-- ActionStateChangedEvent를 직접 보내 재생한다(컨트롤러가 없어 엔진 자동 재생과 충돌하지 않는다).
 
-	property Entity OwnerEntity = nil            -- 서버 전용(소환한 플레이어)
+	-- (요청 2026-08-11) 소환수 파티 UI가 클라에서 "내 소환수인가"를 판정해야 해서 @Sync로 승격.
+	@Sync property Entity OwnerEntity = nil      -- 소환한 플레이어(대입은 서버만)
 	property number Lifetime = 300               -- 서버 전용 수명(초)
-	property number HeroMaxHp = 100              -- 서버 전용: 최대 HP(주인 최대 HP의 2/3)
-	property number HeroHp = 100                 -- 서버 전용: 현재 HP
+	-- (요청 2026-08-11) 소환수 파티 UI(SummonPartyUI)가 클라에서 HP를 읽어야 해서 @Sync로 승격.
+	-- 대입은 전부 서버라 단방향 동기화 규칙에 안전하다.
+	@Sync property number HeroMaxHp = 100        -- 최대 HP(주인 최대 HP의 2/3)
+	@Sync property number HeroHp = 100           -- 현재 HP
 	@Sync property number HeroLevel = 1          -- 용사 레벨(주인 레벨의 N% - 용사 소환 투자 레벨이 정한다: 1레벨 50% → 마스터 30에서 65%)
 	-- 용사 레벨에 맞는 전투력. 소환 시점에 클라(SkillManager)가 레벨 곡선으로 환산해 서버로 넘긴다.
 	-- 스킬 데미지는 전부 이 값 × 직업 스킬 배율(파워스트라이크 100~200% 등)로 계산된다.
@@ -63,13 +66,9 @@ script HeroSummon extends Component
 			ntc.Name = self:MakeRandomName() .. "lv" .. tostring(math.floor(self.HeroLevel))
 		end
 		-- 수명 만료 시 제거 (만료 시각은 리저렉션 부활 시 버프바 잔여시간 복원에도 쓴다)
-		self._T.lifetimeEndAt = now + self.Lifetime
-		_TimerService:SetTimerOnce(function()
-			if isvalid(self.Entity) then
-				log("[HeroSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)")
-				self.Entity:Destroy()
-			end
-		end, self.Lifetime)
+		-- ⚠ (요청 2026-08-13) 리저렉션으로 되살아나면 수명이 **처음 소환했을 때 값으로 되돌아간다** -
+		--   그때 이 타이머를 취소하고 다시 걸어야 하므로 id와 재사용 가능한 예약 헬퍼를 둔다.
+		self:ScheduleLifetime()
 		self:ScheduleBuff(true)
 		self:SpawnHpBar()
 		-- 몬스터 공격 피격(HitEvent) 수신 - 런타임 AddComponent라 정적 @EventSender 대신 명시 연결.
@@ -402,7 +401,8 @@ script HeroSummon extends Component
 					if self.HeroLine == "darkknight" and isvalid(self._T.rideDragonEnt) then
 						keepUp = 5.0
 					end
-					if (ddx * ddx + ddy * ddy) <= 42.25 and ddy <= keepUp and ddy >= keepDown then
+					-- (신고 2026-08-11) 탐색 반경 확대(6→9)에 맞춰 유지 사거리도 6.5 → 10으로 함께 넓힌다.
+					if (ddx * ddx + ddy * ddy) <= 100.0 and ddy <= keepUp and ddy >= keepDown then
 						keep = true
 					end
 				end
@@ -419,26 +419,28 @@ script HeroSummon extends Component
 				local paS = self:GetOwnerAttack()
 				local nearAny = false
 				if isvalid(paS) then
-					local anyList = paS:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 6.0, 1)
+					local anyList = paS:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 9.0, 1)
 					nearAny = (anyList ~= nil and #anyList > 0)
 				end
 				if nearAny then
 					if self._T.unreachableSince == nil then self._T.unreachableSince = now end
-					if now - self._T.unreachableSince > 3.0 and (self._T.droppingUntil or 0) <= now then
+					-- (신고 2026-08-11 2차 "다음 적을 탐지해서 가기까지 오래 걸린다") 사거리 밖 적만 남았을 때
+					-- 로프/비행/하강 같은 이동 수단을 꺼내기까지의 대기 창 3.0 → 1.2초. 3초는 "혹시 이 층에서
+					-- 잡히나" 지켜보는 시간이었는데, 대상 유지/선정이 안정된 지금은 헛대기에 가깝다.
+					if now - self._T.unreachableSince > 1.2 and (self._T.droppingUntil or 0) <= now then
 						-- (요청 2026-08-08) 위층에만 적이 있으면 하강 대신 **올라가는 수단**을 먼저 쓴다 -
 						-- 히어로는 섬광 도약, 드래곤을 가진 다크나이트는 탑승 비행. 그 외에만 하강 재배치.
 						local above = nil
-						local listAll = paS:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 6.0, 8)
+						local listAll = paS:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 9.0, 8)
 						for _, tA in ipairs(listAll or {}) do
 							if isvalid(tA) then
 								local dyA = tA.TransformComponent.WorldPosition.y - myPos.y
 								if dyA > 1.0 and dyA <= 5.0 then above = tA break end
 							end
 						end
-						if above ~= nil and self.HeroLine == "hero" and self:GetStage() >= 2 then
-							self._T.unreachableSince = nil
-							self:CastFlashUpTo(above)
-						elseif above ~= nil and self:IsArcherLine() and self:GetStage() >= 2 then
+						-- (요청 2026-08-11) 히어로의 섬광 도약(CastFlashUpTo)은 본체 트리에서 섬광이 빠진
+						-- 상태와 동기화해 제거 - 히어로도 아래 로프 등반 경로를 쓴다.
+						if above ~= nil and self:IsArcherLine() and self:GetStage() >= 2 then
 							-- (신고 2026-08-08 3차 "궁수가 위로 올라갈 때 체인샷을 안 쓴다")
 							self._T.unreachableSince = nil
 							self:CastChainShotUpTo(above)
@@ -446,6 +448,10 @@ script HeroSummon extends Component
 							self._T.unreachableSince = nil
 							self._T.target = above
 							log("[HeroSummon] 위층 적 발견 - 드래곤 탑승 비행으로 접근")
+						elseif above ~= nil and self:StartRopeClimb(above) then
+							-- (요청 2026-08-11 "로프를 못 탄다") 전용 상향 수단이 없는 직업(팔라딘/나이트로드/
+							-- 섀도어/1차 등)은 로프가 정식 경로다 - 하강 재배치보다 먼저 시도한다.
+							self._T.unreachableSince = nil
 						else
 							-- (신고 2026-08-08 "맨 아래까지 안 떨어진다") 창 4초, 아랫점프 간격 0.4초.
 							self._T.droppingUntil = now + 4.0
@@ -506,6 +512,12 @@ script HeroSummon extends Component
 			end
 			mv:MoveToDirection(Vector2(rdir, 0), 0)
 			self._T.moving = true
+			-- (신고 2026-08-11 "뒤로 걷는 모습") 대시 이동 방향으로 바라보는 방향도 못박는다 -
+			-- 여기서 갱신하지 않으면 이전 faceDir인 채 반대로 달리는 모습이 났다.
+			-- (2차) faceDir 갱신만으로는 부족했다 - 이 조기 return은 ServerTick 끝의 미러링에 도달하지
+			-- 못해 Scale이 그대로였다. 여기서도 즉시 반영한다.
+			self._T.faceDir = rdir
+			self:ApplyFacingTick(tr, now)
 			self:UpdateLoco(rb)
 			return
 		end
@@ -749,27 +761,218 @@ script HeroSummon extends Component
 				return
 			end
 		end
+		-- (요청 2026-08-11 "소환수가 로프를 못 탄다" / 2차 "플레이어와 같은 속도·과정으로") 로프 등반이
+		-- 진행 중이면 추적/배회보다 우선한다. 과정은 플레이어 자동사냥과 동일한 3단계다:
+		--   walk(로프 x 정렬) → attach(점프하며 붙기 0.22초) → climb(일정 속도 상승).
+		-- 소환수는 PlayerController가 없어 ActionClimb을 못 쓰므로, 상승은 소환 다크나이트 비행에서
+		-- 검증된 **KinematicMove(중력 무시) + MoveToDirection(y성분)** 방식으로 올린다.
+		-- 속도는 플레이어 로프 실측(약 1.14유닛/초)에 맞춘 걷기 0.6배. 어떤 경로로 끝나든
+		-- EndRopeClimbState가 KinematicMove/속도를 반드시 원복한다(잔존 시 영구 부유).
+		if self._T.ropeClimb ~= nil then
+			local rc = self._T.ropeClimb
+			if now > rc.deadline then
+				self:EndRopeClimbState(mv, rb, "타임아웃")
+			else
+				if rc.phase == nil then rc.phase = "walk" end
+				if rc.phase == "walk" then
+					-- (신고 2026-08-11 5차 "로프 위치에 완벽히 오기 전에 로프 자세로 미끄러지듯 붙는다")
+					-- 등반 중 대각 보정(좌우 이동)을 폐지하고, 정렬을 걷기 단계에서 끝낸다:
+					-- 로프 직전 0.3유닛만 걷기를 절반으로 줄여 **±0.08유닛까지 미세 정렬**한 뒤에만
+					-- 점프한다. 스냅(SetWorldPosition)도 없고(순간이동 없음), 이후 등반은 순수 수직이다.
+					-- (신고 2026-08-11 6차 "로프까지 가는 게 느려져 부자연") 감속 구간 0.6 → 0.3유닛,
+					-- 감속률 0.25 → 0.5배 - 감속 체감이 약 1.3초 → 0.2초로 줄어 거의 보이지 않는다
+					-- (ServerTick은 매 프레임이라 이 값에서도 문턱(0.08)을 지나치는 진동이 없다).
+					local rdx = rc.x - myPos.x
+					if math.abs(rdx) > 0.08 then
+						local rdir = (rdx > 0) and 1 or -1
+						if rc.restoreSpeed == nil then
+							if self._T.baseInputSpeed == nil then self._T.baseInputSpeed = mv.InputSpeed end
+							rc.restoreSpeed = mv.InputSpeed
+						end
+						if math.abs(rdx) < 0.3 then
+							mv.InputSpeed = self._T.baseInputSpeed * 0.5
+						else
+							mv.InputSpeed = rc.restoreSpeed
+						end
+						mv:MoveToDirection(Vector2(rdir, 0), 0)
+						self._T.moving = true
+						self._T.faceDir = rdir
+					elseif rb:IsOnGround() then
+						if rc.aligned ~= true then
+							rc.aligned = true
+							mv:Stop()
+							self._T.moving = false
+						else
+							mv:Jump()
+							rc.phase = "attach"
+							rc.attachAt = now + 0.22
+						end
+					end
+				elseif rc.phase == "attach" then
+					if now >= (rc.attachAt or 0) then
+						-- 부착 완료 - 중력을 끄고 등반 속도로 전환. 남은 높이에 맞춰 마감시각도 다시 잡는다.
+						if self._T.baseInputSpeed == nil then self._T.baseInputSpeed = mv.InputSpeed end
+						if rc.restoreSpeed == nil then rc.restoreSpeed = mv.InputSpeed end
+						-- (신고 2026-08-11 5차) 등반 속도 1.5배 요청 복원 - 플레이어 실측(0.6배)의 1.5배인 0.9배.
+						mv.InputSpeed = self._T.baseInputSpeed * 0.9
+						rb.KinematicMove = true
+						-- (신고 2026-08-11 4차) 순간 등반의 진짜 원인: 스냅과 함께 PositionReset까지 지워서
+						-- **부착 점프의 수직 관성이 KinematicMove 전환 후 감쇠 없이 남아** 등속 상승에 합산됐다.
+						-- 위치는 그대로 두고 물리 속도만 리셋한다(순간이동 아님).
+						mv:Stop()
+						rb:PositionReset()
+						rc.deadline = now + math.max(2.0, (rc.topY - myPos.y) / 1.0 + 2.0)
+						rc.phase = "climb"
+					end
+				elseif rc.phase == "climb" then
+					-- (신고 2026-08-11 "로프 높이를 넘어 허공을 탄다") 상한 여유 +0.3이 프레임 오버슈트와
+					-- 겹쳐 로프 위 허공에서 등반 자세가 보였다 - 상한을 topY로 좁히고, 도달 순간 정확히
+					-- 상단에 스냅해(1회 호출) 오버슈트를 제거한다. 착지는 해제 후 중력이 맡는다.
+					if myPos.y >= rc.topY - 0.05 then
+						rb:SetWorldPosition(Vector2(rc.x, rc.topY + 0.1))
+						self:EndRopeClimbState(mv, rb, "위층 도달 (y=" .. string.format("%.1f", rc.topY) .. ")")
+					else
+						-- (신고 2026-08-11 5차 "로프에서는 오로지 위아래로만") 대각 보정 폐지 - 순수 수직 상승.
+						-- x 정렬은 걷기 단계의 감속 미세 정렬(±0.08)이 이미 끝냈다.
+						mv:MoveToDirection(Vector2(0, 1), 0)
+						self._T.moving = true
+					end
+				end
+				-- (신고 2026-08-11 2차 "로프로 가는 길에 뒤를 보고 걷는다") 이 조기 return 경로는
+				-- ServerTick 끝의 미러링에 도달하지 못해 이전 방향인 채 걸었다 - 여기서도 반영한다.
+				self:ApplyFacingTick(tr, now)
+				self:UpdateLoco(rb)
+				return
+			end
+		end
 		local target = self._T.target
 		if isvalid(target) then
 			self:ChaseTick(myPos, target, now, mv, rb)
 		else
 			self:RoamTick(myPos, now, mv, rb)
 		end
-		-- (피드백) 좌우 방향 반영: 아바타 NPC에는 플레이어의 LookAt 경로가 없어 MoveToDirection으로는
-		-- 화면이 안 뒤집힌다(항상 왼쪽만 봄). 몬스터 관례대로 Scale.x 부호 반전으로 미러링한다
-		-- (기본 아트가 왼쪽을 보므로 오른쪽 볼 때 -1).
-		-- (피드백) 스킬 시전(잠금) 중에는 방향을 동결한다 - 시전 도중 방향이 홱홱 바뀌지 않게.
+		self:ApplyFacingTick(tr, now)
+		self:UpdateLoco(rb)
+	end
+
+	-- (피드백) 좌우 방향 반영: 아바타 NPC에는 플레이어의 LookAt 경로가 없어 MoveToDirection으로는
+	-- 화면이 안 뒤집힌다(항상 왼쪽만 봄). 몬스터 관례대로 Scale.x 부호 반전으로 미러링한다
+	-- (기본 아트가 왼쪽을 보므로 오른쪽 볼 때 -1).
+	-- (피드백) 스킬 시전(잠금) 중에는 방향을 동결한다 - 시전 도중 방향이 홱홱 바뀌지 않게.
+	-- (신고 2026-08-11 "로프로 가는 길에 뒤를 보고 걷는다") ServerTick 끝에만 있던 이 블록을 공용
+	-- 메서드로 빼서, 조기 return 하는 경로(로프 틱/대시 틱)도 return 전에 호출한다 - faceDir는
+	-- 갱신되는데 Scale 반영 지점에 도달하지 못해 이전 방향인 채 걷던 것이 원인.
+	-- (시전 시작용 즉시 반영 메서드 ApplyFacing(dir)과는 다른 것 - 이쪽은 매 틱 faceDir 반영판.)
+	@ExecSpace("ServerOnly")
+	method void ApplyFacingTick(TransformComponent tr, number now)
 		if (self._T.attackLockUntil or 0) <= now then
 			local face = self._T.faceDir or -1
 			local wantScaleX = 1
 			if face > 0 then wantScaleX = -1 end
-			if self._T.lastScaleX ~= wantScaleX then
+			if self._T.lastScaleX ~= wantScaleX and isvalid(tr) then
 				self._T.lastScaleX = wantScaleX
 				tr.Scale = Vector3(wantScaleX, 1, 1)
 				self:SyncHpBarMirror(wantScaleX)
 			end
 		end
-		self:UpdateLoco(rb)
+	end
+
+	-- (요청 2026-08-11) 로프 인덱스 - 플레이어 자동사냥 GetRopes와 같은 원리의 서버판.
+	-- 맵의 ClimbableComponent 세그먼트를 x별로 묶어 "논리 로프"(bot~top) 목록을 만들어 캐시한다.
+	@ExecSpace("ServerOnly")
+	method table FindRopeUp(Vector3 myPos, number targetY)
+		-- 내 발 높이에서 잡을 수 있고(bot ≤ 발+0.8) 대상 층까지 닿는(top ≥ 대상-0.8) 로프 중
+		-- 수평 최근접(10유닛 이내). 없으면 nil.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return nil end
+		if self._T.ropeCache == nil or self._T.ropeCacheMap ~= map then
+			local comps = map:GetChildComponentsByTypeName("ClimbableComponent", true)
+			local byX = {}
+			for _, c in ipairs(comps or {}) do
+				if isvalid(c) and isvalid(c.Entity) then
+					local wp = c.Entity.TransformComponent.WorldPosition
+					local cx = wp.x + c.BoxOffset.x
+					local half = c.BoxSize.y * 0.5
+					local key = string.format("%.1f", cx)
+					if byX[key] == nil then byX[key] = { x = cx, segs = {} } end
+					table.insert(byX[key].segs, {
+						bot = wp.y + c.BoxOffset.y - half,
+						top = wp.y + c.BoxOffset.y + half,
+					})
+				end
+			end
+			local out = {}
+			for _, group in pairs(byX) do
+				table.sort(group.segs, function(a, b) return a.bot < b.bot end)
+				local cur = nil
+				for _, s in ipairs(group.segs) do
+					if cur == nil then
+						cur = { x = group.x, bot = s.bot, top = s.top }
+					elseif s.bot <= cur.top + 0.4 then
+						if s.top > cur.top then cur.top = s.top end
+					else
+						table.insert(out, cur)
+						cur = { x = group.x, bot = s.bot, top = s.top }
+					end
+				end
+				if cur ~= nil then table.insert(out, cur) end
+			end
+			self._T.ropeCache = out
+			self._T.ropeCacheMap = map
+			log("[HeroSummon] 로프 인덱스 구성: " .. tostring(#out) .. "줄")
+		end
+		local best = nil
+		local bestD = 10.0
+		for _, r in ipairs(self._T.ropeCache) do
+			if r.bot <= myPos.y + 0.8 and r.top >= targetY - 0.8 and r.top > myPos.y + 0.5 then
+				local d = math.abs(r.x - myPos.x)
+				if d < bestD then
+					best = r
+					bestD = d
+				end
+			end
+		end
+		return best
+	end
+
+	-- 로프 등반 종료 공용부 - 어떤 경로(도달/타임아웃)로 끝나든 자유 이동(KinematicMove)과
+	-- 이동 속도를 반드시 원복한다(잔존 시 중력 무시 상태로 영구 부유).
+	@ExecSpace("ServerOnly")
+	method void EndRopeClimbState(MovementComponent mv, RigidbodyComponent rb, string reason)
+		local rc = self._T.ropeClimb
+		self._T.ropeClimb = nil
+		if isvalid(rb) and rb.KinematicMove then
+			rb.KinematicMove = false
+			rb:PositionReset()   -- 상단 스냅(SetWorldPosition) 직후 물리 예측이 되돌리지 않게 확정
+		end
+		if isvalid(mv) then
+			if rc ~= nil and rc.restoreSpeed ~= nil then mv.InputSpeed = rc.restoreSpeed end
+			mv:Stop()
+		end
+		self._T.moving = false
+		log("[HeroSummon] 로프 등반 종료 - " .. reason)
+	end
+
+	-- 위층 대상(above)을 향한 로프 등반 시작. 쓸 로프가 있으면 상태를 걸고 true.
+	@ExecSpace("ServerOnly")
+	method boolean StartRopeClimb(Entity above)
+		if not isvalid(above) then return false end
+		if self._T.ropeClimb ~= nil then return true end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local ty = above.TransformComponent.WorldPosition.y
+		local rope = self:FindRopeUp(myPos, ty)
+		if rope == nil then return false end
+		local topY = ty
+		if rope.top < topY then topY = rope.top end
+		-- (실측 2026-08-11) 마감 4초 고정은 먼 로프(6유닛+)로 걸어가는 도중에 만료됐다 -
+		-- 걷기 거리를 반영해 잡는다(걷기 약 2유닛/초 + 부착/여유 4초). 등반 진입 시 다시 연장된다.
+		local walkDist = math.abs(rope.x - myPos.x)
+		self._T.ropeClimb = { x = rope.x, topY = topY,
+			deadline = _UtilLogic.ElapsedSeconds + 4.0 + walkDist / 2.0 }
+		self._T.target = above   -- 올라가서 바로 이 대상과 싸운다
+		log("[HeroSummon] 로프 등반 시작 x=" .. string.format("%.1f", rope.x)
+			.. " → y=" .. string.format("%.1f", topY) .. " (" .. self:GetJobName() .. ")")
+		return true
 	end
 
 	@ExecSpace("ServerOnly")
@@ -782,7 +985,9 @@ script HeroSummon extends Component
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) then return nil end
-		local cands = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 6.0, 8)
+		-- (신고 2026-08-11 "몬스터가 보이는데도 추적보다 주인 곁으로 온다") 탐색 반경 6 → 9 -
+		-- 화면에 보이는 적(±6.4)이 반경 밖이라 대상을 못 잡고 주인 곁 대기로 빠지던 것.
+		local cands = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 9.0, 8)
 		-- (신고 2026-08-08 "닿지도 않는 위쪽 적에게 점프 공격을 반복한다") 위쪽 허용 폭을 실제 점프
 		-- 도달 높이(≈1.4)로 좁힌다. 활/표창은 수평으로만 나가므로 원거리 계열은 위아래를 더 좁게(±1.2).
 		local upLimit = 1.4
@@ -827,6 +1032,30 @@ script HeroSummon extends Component
 			pickN = math.max(1, sameH)
 		end
 		return reach[_UtilLogic:RandomIntegerRange(1, pickN)].ent
+	end
+
+	-- (신고 2026-08-11 4차 "부딪히기 전에 앞점프로 넘는 게 자연스럽다") 걷는 방향 전방 0.8유닛의
+	-- 지면 높이를 발판 레이캐스트(위→아래)로 미리 재서, 점프로 넘을 수 있는 낮은 턱(0.3~1.15유닛)이면
+	-- **부딪히기 전에 선제 점프**한다. 프로브는 0.25초 간격, 점프는 1초 쿨. 기존의 벽 정체 점프
+	-- (부딪힌 뒤 사후 감지)는 레이캐스트가 못 잡는 지형의 안전망으로 그대로 남긴다.
+	@ExecSpace("ServerOnly")
+	method void TryLedgeJump(Vector3 myPos, number dirSign, number now, MovementComponent mv, RigidbodyComponent rb)
+		if (self._T.nextLedgeProbeAt or 0) > now then return end
+		self._T.nextLedgeProbeAt = now + 0.25
+		if not rb:IsOnGround() then return end
+		if (self._T.nextLedgeJumpAt or 0) > now then return end
+		local mapF = self.Entity.CurrentMap
+		local fhF = isvalid(mapF) and mapF.FootholdComponent or nil
+		if fhF == nil then return end
+		local aheadX = myPos.x + dirSign * 0.8
+		local hit = fhF:Raycast(Vector2(aheadX, myPos.y + 1.4), Vector2(0, -1), 2.6)
+		if hit == nil or hit:IsVertical() then return end
+		local rise = hit:GetYByX(aheadX) - myPos.y
+		if rise > 0.3 and rise <= 1.15 then
+			self._T.nextLedgeJumpAt = now + 1.0
+			mv:Jump()
+			log("[HeroSummon] 전방 턱 감지 - 선제 점프 (높이 " .. string.format("%.2f", rise) .. ")")
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -904,6 +1133,8 @@ script HeroSummon extends Component
 		if adx > stopDist then
 			mv:MoveToDirection(Vector2(dir, 0), 0)
 			self._T.moving = true
+			-- (신고 2026-08-11 4차) 접근 걷기 중 전방 낮은 턱은 부딪히기 전에 선제 점프로 넘는다.
+			self:TryLedgeJump(myPos, dir, now, mv, rb)
 			-- (신고 2026-08-08 "벽에 부딪힌 채 제자리걸음") 0.5초마다 실제 전진량을 확인해,
 			-- 1초간 제자리면 점프로 벽을 넘어보고, 2초가 지나도 못 가면 대상을 포기하고 새로 고른다.
 			if (self._T.wallSampleAt or 0) <= now then
@@ -915,9 +1146,13 @@ script HeroSummon extends Component
 				else
 					self._T.wallStuck = 0
 				end
-				if (self._T.wallStuck or 0) == 2 and rb:IsOnGround() then
+				if ((self._T.wallStuck or 0) >= 1 and (self._T.wallStuck or 0) <= 3) and rb:IsOnGround() then
+					-- (요청 2026-08-11 "지형을 잘 못 넘는다") 점프 시도를 1회 → 2회로 - 한 번의 점프가
+					-- 착지 타이밍/모서리에 씹히는 경우가 잦아, 포기(블랙리스트) 전에 한 번 더 넘어본다.
+					-- (신고 2026-08-11 3차 "언덕 앞에서 벽에 부딪힌 채 걷는다") 첫 점프를 1초 정체가 아니라
+					-- **0.5초 정체(stuck 1)부터** 시도한다 - 낮은 턱은 대부분 첫 점프로 바로 넘는다.
 					mv:Jump()
-					log("[HeroSummon] 벽 감지 - 점프로 넘기 시도")
+					log("[HeroSummon] 벽 감지 - 점프로 넘기 시도 (" .. tostring(self._T.wallStuck) .. "/3)")
 				elseif (self._T.wallStuck or 0) >= 4 then
 					-- (신고 2026-08-08 "벽에서 계속 제자리걸음") 포기해도 다음 스캔이 같은 대상을 도로
 					-- 골라 무한 반복됐다 - 포기한 대상을 5초간 블랙리스트해 다른 대상/배회로 전환시킨다.
@@ -983,42 +1218,65 @@ script HeroSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void RoamTick(Vector3 myPos, number now, MovementComponent mv, RigidbodyComponent rb)
-		-- 대상이 없으면 발판 위를 돌아다닌다(끝에서 반전, 가끔 멈춰 쉬거나 방향 전환).
+		-- (신고 2026-08-11 "몬스터가 없는 곳인데도 걸어간다") 대상이 없으면 무작위 배회를 하지 않고
+		-- **주인 곁을 지킨다** - 주인에게서 1.6유닛 이상 떨어져 있으면 주인 쪽으로 걷고, 가까우면
+		-- 제자리에서 대기한다(가끔 깡총만). 대상 재탐색은 ServerTick의 0.3초 스캔이 담당하므로
+		-- 여기서 돌아다닐 이유가 없다(플레이어 자동사냥도 리젠 대기는 제자리 위주다).
 		if (self._T.attackLockUntil or 0) > now then
 			mv:Stop()
 			self._T.moving = false
 			return
 		end
-		-- (피드백) 더 활발하게: 멈춰 쉬는 확률을 낮추고(35%→10%) 방향 전환 주기도 짧게.
-		if self._T.roamDir == nil then self._T.roamDir = 1 end
-		if (self._T.roamToggleAt or 0) <= now then
-			self._T.roamToggleAt = now + 1.5 + _UtilLogic:RandomDouble() * 1.5
-			self._T.roamPaused = _UtilLogic:RandomDouble() < 0.1
-			if _UtilLogic:RandomDouble() < 0.5 then self._T.roamDir = -self._T.roamDir end
+		local owner = self.OwnerEntity
+		local odxR = 0
+		if isvalid(owner) then
+			odxR = owner.TransformComponent.WorldPosition.x - myPos.x
 		end
-		if self._T.roamPaused then
+		-- 주인 쪽으로 걷는데 벽에 막혀 제자리면(0.5초에 0.05 미만) 1.5초 쉰다 - 벽을 미는 모습 방지.
+		if (self._T.roamHoldUntil or 0) > now then
 			mv:Stop()
 			self._T.moving = false
 			return
 		end
-		-- 벽/막힘 감지: PredictFootholdEnd는 조각 발판 경계마다 true라 못 쓴다(실측).
-		-- 0.5초마다 실제 x 이동량을 재서, 걷는데도 거의 못 움직였으면 방향을 뒤집는다.
-		if (self._T.stuckCheckAt or 0) <= now then
-			if self._T.stuckLastX ~= nil and self._T.wasRoamMoving and math.abs(myPos.x - self._T.stuckLastX) < 0.05 then
-				self._T.roamDir = -self._T.roamDir
+		if math.abs(odxR) > 2.5 then
+			-- (신고 2026-08-11) 복귀 문턱 1.6 → 2.5 - 너무 자주 주인 쪽으로 걸어 "추적보다 주인 곁"으로
+			-- 보이던 습성 완화(대상이 잡히면 어차피 ChaseTick이 우선한다).
+			local rdir = (odxR > 0) and 1 or -1
+			if (self._T.stuckCheckAt or 0) <= now then
+				if self._T.stuckLastX ~= nil and self._T.wasRoamMoving
+					and math.abs(myPos.x - self._T.stuckLastX) < 0.05 then
+					-- (신고 2026-08-11 3차 "낮은 언덕을 점프로 안 넘고 벽에 부딪힌 채 걷는다") 막히면
+					-- 바로 포기(1.5초 홀드)하지 말고 먼저 **점프로 넘어본다**(2회) - ChaseTick의 벽 점프와
+					-- 같은 규칙. 두 번 뛰어도 제자리면 그때 1.5초 쉰다(못 넘는 진짜 벽을 미는 모습 방지).
+					self._T.roamStuck = (self._T.roamStuck or 0) + 1
+					if (self._T.roamStuck or 0) <= 2 then
+						if rb:IsOnGround() then mv:Jump() end
+					else
+						self._T.roamStuck = 0
+						self._T.roamHoldUntil = now + 1.5
+					end
+				else
+					self._T.roamStuck = 0
+				end
+				self._T.stuckCheckAt = now + 0.5
+				self._T.stuckLastX = myPos.x
 			end
-			self._T.stuckCheckAt = now + 0.5
-			self._T.stuckLastX = myPos.x
-		end
-		self._T.wasRoamMoving = true
-		mv:MoveToDirection(Vector2(self._T.roamDir, 0), 0)
-		self._T.moving = true
-		self._T.faceDir = self._T.roamDir
-		-- 배회 중에도 가끔 깡총 점프.
-		if rb:IsOnGround() and (self._T.nextHopAt or 0) <= now then
-			self._T.nextHopAt = now + 3.0 + _UtilLogic:RandomDouble() * 3.0
-			if _UtilLogic:RandomDouble() < 0.4 then
-				mv:Jump()
+			self._T.wasRoamMoving = true
+			mv:MoveToDirection(Vector2(rdir, 0), 0)
+			self._T.moving = true
+			self._T.faceDir = rdir
+			-- (신고 2026-08-11 4차) 주인 쪽으로 걷는 중에도 전방 낮은 턱은 선제 점프로 넘는다.
+			self:TryLedgeJump(myPos, rdir, now, mv, rb)
+		else
+			self._T.wasRoamMoving = false
+			mv:Stop()
+			self._T.moving = false
+			-- 대기 중에도 가끔 깡총 점프(살아있는 느낌만 남긴다).
+			if rb:IsOnGround() and (self._T.nextHopAt or 0) <= now then
+				self._T.nextHopAt = now + 4.0 + _UtilLogic:RandomDouble() * 4.0
+				if _UtilLogic:RandomDouble() < 0.3 then
+					mv:Jump()
+				end
 			end
 		end
 	end
@@ -1070,7 +1328,10 @@ script HeroSummon extends Component
 			local rdcL = rEntL:GetComponent("script.RidingDragon")
 			if isvalid(rdcL) and rdcL.Riding then want = "sit" end
 		end
-		if want ~= "sit" then
+		-- (신고 2026-08-11 "로프 타는 모션이 아니다") 등반(climb 단계) 중에는 본체처럼 로프 모션.
+		if want ~= "sit" and self._T.ropeClimb ~= nil and self._T.ropeClimb.phase == "climb" then
+			want = "rope"
+		elseif want ~= "sit" then
 			if not rb:IsOnGround() then want = "jump"
 			elseif self._T.moving then want = "walk" end
 		end
@@ -1166,6 +1427,9 @@ script HeroSummon extends Component
 		-- 0이 되면 소환 해제. 플레이어(PlayerHit)와 달리 자체 HP 프로퍼티를 직접 깎는다.
 		if self._T.dying then return end
 		local now = _UtilLogic.ElapsedSeconds
+		-- (요청 2026-08-11) 로프 등반 중에는 무적 - 플레이어의 등반 무적(SetClimbInvincible)과 같은 규칙.
+		-- 등반 중 피격으로 HP가 깎이며 매달려 죽는 상황을 막는다.
+		if self._T.ropeClimb ~= nil then return end
 		if (self._T.hitImmuneUntil or 0) > now then return end
 		self._T.hitImmuneUntil = now + 0.5
 		-- (팔라딘 가드) 패링 창 안에 맞으면 이 공격을 통째로 막고 2초 무적 + 10초 피해 30% 감소.
@@ -1245,6 +1509,24 @@ script HeroSummon extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void ScheduleLifetime()
+		-- 수명 타이머를 (다시) 건다. 소환 직후 1회, 그리고 리저렉션 부활 시 1회 더 호출된다 -
+		-- 두 번째 호출은 남은 수명을 버리고 **Lifetime 전체**로 되돌린다(요청 2026-08-13).
+		if self._T.lifetimeTimerId then
+			_TimerService:ClearTimer(self._T.lifetimeTimerId)
+			self._T.lifetimeTimerId = nil
+		end
+		self._T.lifetimeEndAt = _UtilLogic.ElapsedSeconds + self.Lifetime
+		self._T.lifetimeTimerId = _TimerService:SetTimerOnce(function()
+			self._T.lifetimeTimerId = nil
+			if isvalid(self.Entity) then
+				log("[HeroSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)")
+				self.Entity:Destroy()
+			end
+		end, self.Lifetime)
+	end
+
+	@ExecSpace("ServerOnly")
 	method void PrepareResurrect()
 		-- 리저렉션 시전 확정: 사망 소멸 타이머를 멈춰 부활 연출 도중 파괴되지 않게 한다.
 		if self._T.deathTimerId then
@@ -1268,12 +1550,15 @@ script HeroSummon extends Component
 		self._T.noChaseUntil = now + 1.0       -- 부활 직후 잠깐 제자리 정착
 		-- 클라이언트: 사망 스핀 중지 + 아바타 원복 + 이동 클립 재개(MotionCmd "revive" 특례).
 		self:PlayMotion("revive", 1.0)
-		-- 주인 버프바를 남은 소환 시간으로 복원한다.
+		-- (요청 2026-08-13) **되살아난 소환수의 지속시간은 처음 소환했을 때 값으로 되돌아간다.**
+		-- 종전에는 죽기 전에 흐른 시간이 그대로 남아 "부활시켰는데 곧바로 사라진다"가 됐다.
+		-- 수명 타이머를 통째로 다시 걸고(ScheduleLifetime), 버프바도 새 만료 시각으로 복원한다.
+		self:ScheduleLifetime()
 		local remaining = math.max(0, (self._T.lifetimeEndAt or now) - now)
 		if remaining > 0 and isvalid(self.OwnerEntity) and isvalid(self.OwnerEntity.PlayerComponent) then
 			self:NotifyResurrected(remaining, self.OwnerEntity.PlayerComponent.UserId)
 		end
-		log("[HeroSummon] 리저렉션 부활 - HP " .. tostring(math.floor(self.HeroMaxHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. " 잔여수명 " .. tostring(math.floor(remaining)) .. "초")
+		log("[HeroSummon] 리저렉션 부활 - HP " .. tostring(math.floor(self.HeroMaxHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. " 지속시간 초기화 " .. tostring(math.floor(remaining)) .. "초")
 	end
 
 	@ExecSpace("Client")
@@ -1404,11 +1689,12 @@ script HeroSummon extends Component
 		local stage = self:GetStage()
 		local pool = { "powerstrike", "slashblast" }
 		if self.HeroLine == "hero" and stage >= 4 then
-			-- (요청 2026-08-08) 4차 히어로 = 브랜디쉬 주력 + **돌진/섬광**(1차기는 가끔만).
-			pool = { "brandish", "brandish", "brandish", "rush", "flash" }
+			-- (요청 2026-08-08) 4차 히어로 = 브랜디쉬 주력 + **돌진**(1차기는 가끔만).
+			-- (요청 2026-08-11) **섬광 제거** - 본체 트리에서 섬광이 빠진 상태(2026-08-09 보류)와 동기화.
+			pool = { "brandish", "brandish", "brandish", "brandish", "rush" }
 		elseif self.HeroLine == "hero" and stage >= 2 then
-			-- (요청 2026-08-08) 히어로는 2차부터 **섬광**(자동 돌진기)을 섞어 쓴다.
-			pool = { "powerstrike", "slashblast", "flash" }
+			-- (요청 2026-08-11) 히어로 2~3차 = 1차기 로테이션(섬광 제거 - 본체 트리와 동기화).
+			pool = { "powerstrike", "slashblast" }
 		elseif self.HeroLine == "darkknight" and stage >= 4 then
 			-- (요청 2026-08-08) 4차 다크나이트 = 어드밴스드 스피어버스터 주력 + **돌진**.
 			pool = { "spearburst", "spearburst", "spearburst", "rush", "powerstrike" }
@@ -2543,8 +2829,8 @@ script HeroSummon extends Component
 			log("[HeroSummon] 속성필드 버프 시전(60초) (" .. self:GetJobName() .. ")")
 			return
 		end
-		-- (요청) 팔라딘 자동사냥의 속성 콤보(AutoHuntManager.ElementComboTick)와 **같은 사슬 순서**로
-		-- 고정한다: 불(2) → 얼음(1) → 전기(3) → 성(4, 복귀). 연계 쌍은
+		-- (요청) 속성 사슬 순서 고정: 불(2) → 얼음(1) → 전기(3) → 성(4, 복귀). (주인의 자동사냥도
+		-- 같은 순서로 순환한다 - AutoHuntManager.ElementChainTick.) 연계 쌍은
 		--   "불 화상/불 필드 + 얼음 차지 블로우 → 화상 저주 장판"
 		--   "얼음 빙결/얼음 필드 + 전기 차지 블로우 → 2배 + 감전 장판"
 		-- 둘뿐이라 이 순서로 **연속** 시전해야 앞 스텝의 결과가 다음 스텝에 소모된다.
@@ -3238,6 +3524,11 @@ script HeroSummon extends Component
 			-- 드래곤 탑승(본체 라이딩과 같은 앉은 자세).
 			ev.CoreActionName = "sit"
 			ev.PartsActionName = "sit"
+			ev.PlayType = SpriteAnimClipPlayType.Loop
+		elseif want == "rope" then
+			-- (신고 2026-08-11) 로프 등반 - 본체 CLIMB과 같은 로프 매달림 모션.
+			ev.CoreActionName = "rope"
+			ev.PartsActionName = "rope"
 			ev.PlayType = SpriteAnimClipPlayType.Loop
 		else
 			ev.CoreActionName = "stand1"

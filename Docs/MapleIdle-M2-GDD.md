@@ -1,7 +1,7 @@
 # 메이플 자동사냥 RPG — 자동사냥 시스템 설계서 (M2 GDD)
 
 > 🔖 **AI note — resuming?** If you're reading this in a new session to continue/resume this game, load the `msw-planning` skill FIRST and follow its resume flow (read `MapleIdle-Roadmap.md` + `Archive/As-built.md` → reconstruct state). **Before touching any `⬜/🟡/✅` state or running a completion, Read the skill's `references/build-management.md` IN FULL.**
-> Last updated: 2026-08-10 / Stage: Phase 3 — 지형 내비게이션·직업별 로테이션 구현 완료, 사용자 테스트 대기
+> Last updated: 2026-08-11 / Stage: Phase 3 — 지형 내비게이션·직업별 로테이션 구현 완료, 사용자 테스트 대기 (08-11 불독 미스트·로프 완주 개편은 §9 참고)
 > ※ M1(밸런스)은 ⏳ user-test pending 상태로 병행 — M1 테스트 결과는 M1 Phase 문서들에 반영한다.
 > ※ 2026-08-10 기록 정합화: 08-04~08-10 사이 구현된 M2 작업이 이 문서에 반영되지 않은 채 7일간 진행됐다.
 >    실측(git 이력·`Balance/` 데이터셋·`RootDesk/MyDesk/` 구조)으로 확인해 Phase 3 신설 + §2/§4 낡은 본문 갱신(§9 로그).
@@ -83,3 +83,4 @@ F7 ON → 최근접 몬스터 탐색 → 좌우 이동 접근 → 사거리 도�
 | 2026-08-03 | Modify | ⑧ 대상 선정 2-패스 — 같은 층(|dy|<1.5) 최근접이 4유닛 초과·부재 시 수직 페널티 `dy×10+100`→`dy×2` 완화(수직 적 적극 선택 → 섬광 기회↑, 실측 섬광 이동 시전 2회) ⑨ 파이널어택 모션 가드(IsBrandishMotionGuardOn) 중 자동사냥 이동/시전 전면 대기 ⑩ 공격 가중 재조정 — 광역: 다수 3.0 / **단일 0.15**, 단일기: 다수 **0.15** / 단일 1.0 (실측: 산개 구간 파스 45 vs 슬블 27 — 단독 대상 슬블 희소 확인), 돌진 전방 2마리↑ 부스트 ×5→**×4**(80%) ⑪ 접근 이동에 **대시(러시) 활용** — |dx|≥3·같은 층·3.5초 스로틀로 질주 진입(실측 53회, dir 좌28/우25, 제자리 헛시전 2회뿐) | 사용자 피드백 5건 — 수직 적 섬광 기회, 파이널 모션 무시, 단독/다수 확률 반전, 돌진 80%, 이동 대시 | AutoHunt FindTarget 2-패스/OnUpdate 가드/TryAttackCast 가중/대시 분기 + SkillManager TryEnterSprintFromSkill 자동사냥 분기 |
 | 2026-08-10 | 기록 정합화 | **Phase 3 신설** — 08-04~08-10에 구현됐으나 이 GDD에 전혀 반영되지 않았던 M2 작업 11항목을 체크리스트로 편입(전부 🟡 = 구현·로그 검증 완료, 사용자 테스트 대기). 함께 §2 "공격=Q 슬롯"·"대상 선정", §4 사거리/스로틀 수치를 실제 구현으로 갱신 | 계획 문서가 7일간 정체 — 다음 세션이 "Q 슬롯 단일 시전" 같은 낡은 전제를 물려받는 것을 차단 | §6에 Phase 3 추가, §2/§4 본문 갱신. 상세 수치·근거는 `Docs/MapleIdle-Balance-Worksheet.md` §5 조정 이력(2026-08-09~10, 43건)이 원본 |
 | 2026-08-03 | Fix | ⑫ 공격 사거리 판정에 수직 거리 추가 — `|dx|`만 보던 판정이 아래/위층 몬스터를 "사거리 내"로 오인해 허공에 파스/슬블 발동 → 같은 층(`|dy|<1.2`)일 때만 공격, 수평 정렬이 끝난 수직 대상에겐 제자리에서 점프/섬광 대기(좌우 떨림 방지) | 사용자 목격 — 범위 밖인데 발동 | AutoHunt 사거리 분기 (검증: 평지 시전 정상·에러 0) |
+| 2026-08-11 | Modify | 불독 자동사냥 3건 — ① 포이즌 미스트는 **HP 1까지만 깎고 죽이지 않음**(Zone.Tick HP≤1 스킵 + CalcDamage HP-1 클램프, 마무리는 익스플로젼 유폭 몫) ② 카펫이 **몬스터 리젠 자리에 선설치**(Monster.SpawnX/Y @Sync 신설 + 리젠 대기 스팟이 발밑 커버리지 안·미덮임이면 살아있는 적 없이도 설치) ③ 로프 **매달림(climb) 중 대상 사망 시 등반 완주** 후 재탐색 — 같은 날 오전의 "대상 사망 즉시 취소"를 뒤집음(RopeClimbTick target 인자 제거·`_T.target` 직접 읽기, approach만 즉시 취소 유지) | 사용자 지시 3건 | PoisonMistZone/PoisonMistAttack/Monster/AutoHuntManager. 서버 직접 스폰 실측: 첫 틱 MaxHp-1→Hp=1 고정·후속 틱 0·사망 0, 경계 틱 잔여-1 정확, 클라 SpawnX/Y 동기화·스팟 판정 true/false 정합. 상세·잔여 사용자 확인 항목은 워크시트 §5 (2026-08-11 포이즌 미스트·로프 완주 행) |
