@@ -34,12 +34,30 @@ script ChargeBlowCooldownUI extends Logic
 	end
 
 	method void ShowCooldownOnSlots(number duration, table slotKeys)
-		-- slotKeys = 쿨타임을 표시할 퀵슬롯 위치 목록(최대 4개). 각 칸 위로 오버레이를 옮겨 동시에 그린다.
+		-- slotKeys = 쿨타임을 표시할 퀵슬롯 위치 목록(최대 4개). 4칸 전부 같은 길이로 그리는 간편판 -
+		-- 실제 표시는 칸마다 길이가 다를 수 있는 ShowCooldownPerSlot에 위임한다.
+		local durations = {}
+		for i = 1, 4 do durations[i] = duration end
+		self:ShowCooldownPerSlot(slotKeys, durations)
+	end
+
+	method void ShowCooldownPerSlot(table slotKeys, table durations)
+		-- (요청 2026-08-15) 칸마다 **다른** 쿨타임을 그린다. 속성 전환 시 방금까지 쓰던 속성만 20초,
+		-- 나머지 3칸은 공용 0.5초가 되므로 칸별 남은 시간을 따로 센다.
+		-- slotKeys[i] / durations[i]는 같은 인덱스끼리 짝(1 스티그마 / 2 스윙 / 3 저지먼트 / 4 차지).
 		if not self:IsClient() then return end
-		if duration <= 0 then return end
-		self._T.totalDuration = duration
-		self._T.remaining = duration
+		local maxDur = 0
+		for i = 1, 4 do
+			if (durations[i] or 0) > maxDur then maxDur = durations[i] end
+		end
+		if maxDur <= 0 then return end
 		self._T.slotKeys = slotKeys
+		self._T.totals = {}
+		self._T.remains = {}
+		for i = 1, 4 do
+			self._T.totals[i] = durations[i] or 0
+			self._T.remains[i] = durations[i] or 0
+		end
 
 		for i = 1, 4 do
 			local gray = self:GetGray(i)
@@ -80,63 +98,68 @@ script ChargeBlowCooldownUI extends Logic
 			local now = _UtilLogic.ElapsedSeconds
 			local delta = now - preTime
 			preTime = now
-			self._T.remaining = self._T.remaining - delta
+			for i = 1, 4 do
+				if self._T.remains[i] > 0 then
+					self._T.remains[i] = self._T.remains[i] - delta
+				end
+			end
 			self:UpdateCooldownDisplay()
 		end, 1 / 60)
 
 		self:UpdateCooldownDisplay()
-		log("[ChargeBlowCooldownUI] 디바인 4종 공용 쿨타임 표시 시작 duration=" .. tostring(duration) .. " slots=" .. tostring(#slotKeys))
+		log("[ChargeBlowCooldownUI] 디바인 4종 쿨타임 표시 시작 maxDuration=" .. string.format("%.1f", maxDur) .. " slots=" .. tostring(#slotKeys))
 	end
 
 	method void UpdateCooldownDisplay()
-		-- 매 프레임 남은 시간에 따라 4칸의 오버레이(FillAmount)/카운트다운 텍스트를 함께 갱신한다.
-		local remaining = self._T.remaining
-		local total = self._T.totalDuration
+		-- 매 프레임 4칸을 **각자의** 남은 시간으로 갱신한다. 먼저 끝난 칸은 그 자리에서 오버레이를 끄고
+		-- 재사용 가능 깜빡임을 띄우며, 4칸이 모두 끝나야 타이머를 정리한다.
 		local keys = self._T.slotKeys or {}
+		local remains = self._T.remains or {}
+		local totals = self._T.totals or {}
+		local anyLeft = false
 
-		if remaining <= 0 then
-			if self._T.timerId then
-				_TimerService:ClearTimer(self._T.timerId)
-				self._T.timerId = nil
-			end
-			for i = 1, 4 do
-				local gray = self:GetGray(i)
-				local txt = self:GetText(i)
-				if isvalid(gray) then gray.Entity.Enable = false end
-				if isvalid(txt) then txt.Entity.Enable = false end
-			end
-			-- 쿨타임 완료: 배정된 슬롯들을 깜빡여 재사용 가능 알림(다른 쿨타임 스킬과 동일한 연출).
-			for i = 1, 4 do
-				local key = keys[i]
-				if key ~= nil and key ~= "" then
-					_SkillManager:BlinkSlotReady(key)
-				end
-			end
-			return
-		end
-
-		local ratio = math.max(0, math.min(1, remaining / total))
-		local label = tostring(math.ceil(remaining))
 		for i = 1, 4 do
 			local key = keys[i]
-			if key ~= nil and key ~= "" then
-				local gray = self:GetGray(i)
-				local txt = self:GetText(i)
-				if isvalid(gray) then gray.FillAmount = ratio end
-				if isvalid(txt) then
-					txt.FontColor = Color(1, 1, 1, 1)
-					txt.Text = label
+			local gray = self:GetGray(i)
+			local txt = self:GetText(i)
+			local remaining = remains[i] or 0
+			local total = totals[i] or 0
+			if key ~= nil and key ~= "" and total > 0 then
+				if remaining <= 0 then
+					-- 이 칸만 끝났다 - 한 번만 정리하고 깜빡인다(remains를 0 아래로 밀어 재진입 방지).
+					if remaining > -1 then
+						if isvalid(gray) then gray.Entity.Enable = false end
+						if isvalid(txt) then txt.Entity.Enable = false end
+						_SkillManager:BlinkSlotReady(key)
+						self._T.remains[i] = -99
+					end
+				else
+					anyLeft = true
+					local ratio = math.max(0, math.min(1, remaining / total))
+					if isvalid(gray) then gray.FillAmount = ratio end
+					if isvalid(txt) then
+						txt.FontColor = Color(1, 1, 1, 1)
+						txt.Text = tostring(math.ceil(remaining))
+					end
 				end
 			end
+		end
+
+		if not anyLeft and self._T.timerId then
+			_TimerService:ClearTimer(self._T.timerId)
+			self._T.timerId = nil
 		end
 	end
 
 	method void ResetCooldown()
-		-- (리커버리 오로라) 오로라 안으로 들어오면 남아있던 쿨타임을 즉시 초기화한다. 남은 시간을 0으로
-		-- 만들어 UpdateCooldownDisplay가 4칸의 오버레이/텍스트를 끄고 재사용 가능 깜빡임을 띄우게 한다.
+		-- (리커버리 오로라) 오로라 안으로 들어오면 남아있던 쿨타임을 즉시 초기화한다. 4칸의 남은 시간을
+		-- 전부 0으로 만들어 UpdateCooldownDisplay가 오버레이/텍스트를 끄고 재사용 가능 깜빡임을 띄우게 한다.
+		-- (속성별 20초 쿨타임 장부는 SkillManager 쪽에서 함께 비운다.)
 		if not self:IsClient() then return end
 		if self._T.timerId then
-			self._T.remaining = 0
+			for i = 1, 4 do
+				if self._T.remains ~= nil and (self._T.remains[i] or 0) > 0 then self._T.remains[i] = 0 end
+			end
 			self:UpdateCooldownDisplay()
 		end
 	end

@@ -2831,9 +2831,11 @@ script HeroSummon extends Component
 		end
 		-- (요청) 속성 사슬 순서 고정: 불(2) → 얼음(1) → 전기(3) → 성(4, 복귀). (주인의 자동사냥도
 		-- 같은 순서로 순환한다 - AutoHuntManager.ElementChainTick.) 연계 쌍은
-		--   "불 화상/불 필드 + 얼음 차지 블로우 → 화상 저주 장판"
-		--   "얼음 빙결/얼음 필드 + 전기 차지 블로우 → 2배 + 감전 장판"
+		--   "불 화상/불 필드 ↔ 얼음 차지 블로우 → 화상 저주 장판"
+		--   "얼음 빙결/얼음 필드 ↔ 전기 감전/전기 필드 → 2배 + 감전 장판"
 		-- 둘뿐이라 이 순서로 **연속** 시전해야 앞 스텝의 결과가 다음 스텝에 소모된다.
+		-- (2026-08-15) 연계가 **양방향**이 되어 역순(전기→얼음, 얼음→불)도 성립하지만, 이 순서는
+		-- 성(4)을 마지막에 한 번만 끼워 넣어 헛시전을 최소화하므로 그대로 둔다.
 		-- 구 구현("2~10초마다 임의 속성으로 전환")은 전기→불처럼 연계 불가 조합이 자주 나와
 		-- 상태이상만 걸고 아무것도 안 터지는 헛시전이 됐다.
 		local seq = { 2, 1, 3, 4 }
@@ -2867,8 +2869,11 @@ script HeroSummon extends Component
 			local myPos = self.Entity.TransformComponent.WorldPosition
 			local myCp = self:GetCombatPower()
 			local targets = pa2:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 2.0, 3)
-			-- 필드는 한 번 연계에 쓰이면 사라진다 - 이번 시전에서 한 장만 소모하도록 잠근다.
+			-- 필드는 한 번 연계에 쓰이면 사라진다 - 이번 시전에서 쌍당 한 장만 소모하도록 잠근다.
+			-- (양방향 연계) 화상 저주 쌍(불↔얼음)과 감전 쌍(얼음↔전기)은 소모하는 필드가 서로 달라
+			-- 잠금도 따로 둔다 - 얼음 한 방이 두 쌍 모두를 터뜨릴 수 있다.
 			local linked = false
+			local linkedShock = false
 			-- (실측 보정) 필드를 용사 발밑에 깔았더니 8사이클에 1번밖에 연계가 안 붙었다 - 용사는
 			-- 시전 사이에 재배치(0.35~0.7초 이동)를 하고 다음 스텝은 다른 자리에서 나가는데,
 			-- 필드 판정 범위가 ±1.6/±1.2로 좁아 자기가 깐 필드를 스스로 벗어난다. 몬스터는 그 자리에
@@ -2881,7 +2886,13 @@ script HeroSummon extends Component
 					if myMode == 4 then
 						factor = 1.3
 					elseif myMode == 3 and pa2:IsTargetFrozen(t) then
-						-- (요청) 속성 증폭은 빙결 2배 보정에도 곱해진다(주인 GetChargeBlowDamageFactor와 동일).
+						-- (요청) 속성 증폭은 빙결 2배 보정에도 곱해진다.
+						-- ⚠ (2026-08-15) 주인 쪽 속성 배율(성 ×5 / 기타 ×3 / 연계 ×3×증폭)은 표시-실제
+						-- 불일치로 폐지됐지만, 용사는 툴팁에 배율 %를 노출하지 않는 별개 계보(성 1.3 /
+						-- 연계 2.0×증폭)라 그대로 둔다 - 주인과 같은 값이었던 적이 없다.
+						factor = 2.0 * myAmp
+					elseif myMode == 1 and pa2:IsTargetShocked(t) then
+						-- (양방향 연계) 얼음으로 감전 대상을 때리는 반대 방향도 같은 보정을 받는다.
 						factor = 2.0 * myAmp
 					end
 					self:DealHit(t, 1.0 * factor, 2.0 * factor)
@@ -2895,20 +2906,42 @@ script HeroSummon extends Component
 							if not linked then
 								linked = pa2:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 2)
 							end
+							-- (요청 2026-08-15) 상태이상도 함께 소모 - 남겨두면 지속시간 내내 중복 발동한다.
+							pa2:ConsumeChargeBlowStatus(t, 2)
+						end
+						-- (양방향 연계) 얼음 → 감전 대상: 감전 쌍의 반대 방향. 소모하는 필드는 전기 필드(3).
+						if factor >= 2.0 then
+							pa2:PlayChargeBlowShockHitEffect(t)
+							pa2:SpawnChargeBlowShockZoneFor(t, myCp * myAmp)
+							if not linkedShock then
+								linkedShock = pa2:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 3)
+							end
+							pa2:ConsumeChargeBlowStatus(t, 3)
 						end
 						-- (요청) 빙결 지속시간 통일: 3초 → 4초.
 					if _UtilLogic:RandomDouble() < 0.5 then pa2:ApplyChargeBlowFreeze(t, 4.0) end
 					elseif myMode == 2 then
+						-- (양방향 연계) 불 → 빙결 대상: 화상 저주 쌍의 반대 방향. 소모하는 필드는 얼음 필드(1).
+						if pa2:IsTargetFrozen(t) then
+							pa2:SpawnChargeBlowCurseZoneFor(t, myCp * myAmp)
+							if not linked then
+								linked = pa2:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 1)
+							end
+							pa2:ConsumeChargeBlowStatus(t, 1)
+						end
 						if _UtilLogic:RandomDouble() < 0.5 then pa2:ApplyChargeBlowBurn(t) end
 					elseif myMode == 3 then
 						-- 속성 중복 타격: 빙결된 적을 전기로 때리면 2배 + 전용 히트 이펙트 + 10초 장판(원본과 동일).
 						if factor >= 2.0 then
 							pa2:PlayChargeBlowShockHitEffect(t)
 							pa2:SpawnChargeBlowShockZoneFor(t, myCp * myAmp)
-							if not linked then
-								linked = pa2:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 1)
+							if not linkedShock then
+								linkedShock = pa2:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 1)
 							end
+							pa2:ConsumeChargeBlowStatus(t, 1)
 						end
+						-- (양방향 연계) 전기는 감전 상태를 남긴다 - 다음 얼음 스텝이 이 상태를 연계로 쓴다.
+						if _UtilLogic:RandomDouble() < 0.5 then pa2:ApplyChargeBlowShock(t, 6.0) end
 					else
 						pa2:ApplyChargeBlowStun(t)
 					end
@@ -2917,15 +2950,24 @@ script HeroSummon extends Component
 			-- (주인과 동일) 허공 연계: 판정에 아무도 안 맞았어도 용사가 상반 속성 필드 위에 서 있으면
 			-- 중첩 결과물을 남긴다 - 몹이 죽거나 흩어져도 사슬이 끊기지 않는다.
 			if #targets == 0 then
-				if myMode == 1 and pa2:IsPosInElemField(myPos, 2) then
+				-- (양방향 연계, 주인과 동일) 쌍만 맞으면 어느 속성이 먼저든 성립한다. 얼음은 두 쌍에
+				-- 모두 속하므로 두 판정을 각각 독립으로 본다.
+				local curseField = 0
+				if myMode == 1 and pa2:IsPosInElemField(myPos, 2) then curseField = 2
+				elseif myMode == 2 and pa2:IsPosInElemField(myPos, 1) then curseField = 1 end
+				if curseField > 0 then
 					pa2:SpawnChargeBlowCurseZoneFor(self.Entity, myCp * myAmp)
-					pa2:ConsumeElemFieldAt(myPos, 2)
-					log("[HeroSummon] 허공 연계: 불 필드 + 얼음 → 화상 저주")
-				elseif myMode == 3 and pa2:IsPosInElemField(myPos, 1) then
+					pa2:ConsumeElemFieldAt(myPos, curseField)
+					log("[HeroSummon] 허공 연계: 화상 저주 (필드 " .. tostring(curseField) .. " + 속성 " .. tostring(myMode) .. ")")
+				end
+				local shockField = 0
+				if myMode == 3 and pa2:IsPosInElemField(myPos, 1) then shockField = 1
+				elseif myMode == 1 and pa2:IsPosInElemField(myPos, 3) then shockField = 3 end
+				if shockField > 0 then
 					pa2:PlayChargeBlowShockHitEffect(self.Entity)
 					pa2:SpawnChargeBlowShockZoneFor(self.Entity, myCp * myAmp)
-					pa2:ConsumeElemFieldAt(myPos, 1)
-					log("[HeroSummon] 허공 연계: 얼음 필드 + 전기 → 감전 장판")
+					pa2:ConsumeElemFieldAt(myPos, shockField)
+					log("[HeroSummon] 허공 연계: 감전 장판 (필드 " .. tostring(shockField) .. " + 속성 " .. tostring(myMode) .. ")")
 				end
 			end
 			-- (요청) 속성필드: 시전한 속성(1~3)의 필드를 남긴다. 다음 사슬 스텝이 이 필드를 소모하므로

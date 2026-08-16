@@ -20,6 +20,7 @@ script MapleHUDManager extends Logic
     -- MP는 표시 전용 (실제 MP 시스템 없음)
     property integer displayMaxMp = 50
     property integer updateTimer = 0
+    property integer barTimer = 0        -- HP/MP 바 전용(UpdateHUD가 죽어도 살아남는 독립 타이머)
 
     method void OnBeginPlay()
         -- 클라이언트에서만 HUD 갱신 타이머와 버튼 이벤트를 연결한다
@@ -46,8 +47,38 @@ script MapleHUDManager extends Logic
         end)
 
         self.updateTimer = _TimerService:SetTimerRepeat(self.UpdateHUD, 0.25)
+        -- (버그 수정 2026-08-15, 신고 "HP UI가 안 움직이는데 MP는 정상") HP/MP 바만 갱신하는 **독립 타이머**.
+        -- UpdateHUD 하나가 HP·MP·레벨·이름·HUD 표시여부를 전부 처리하는데, 그 안의 어느 한 줄이라도
+        -- 한 번 예외를 내면 반복 타이머가 통째로 죽어 **그 세션 내내 HP 표시가 멈춘다.** MP만 멀쩡해
+        -- 보이는 이유는 MpManager가 소모/회복 때마다 UpdateMpBar를 직접 밀어주기 때문이다(HP엔 그런
+        -- 푸시 경로가 없다). 바 갱신은 실패 위험이 없는 최소 경로만 담아 따로 돌린다.
+        self.barTimer = _TimerService:SetTimerRepeat(self.RefreshBars, 0.25)
         self:UpdateHUD()
-        log("[MapleHUD] OnBeginPlay - 버튼 연결 및 타이머 시작")
+        log("[MapleHUD] OnBeginPlay - 버튼 연결 및 타이머 시작(HUD 0.25s + 바 전용 0.25s)")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshBars()
+        -- HP/MP 바 전용 최소 갱신. UpdateHUD와 **독립**으로 돌아 한쪽이 죽어도 수치 표시는 살아남는다.
+        -- HUD가 숨겨진 상태(로그인/캐릭터선택)에서는 건드릴 것이 없으므로 건너뛴다.
+        if not isvalid(self.hudRoot) or not self.hudRoot.Enable then return end
+        local playerEntity = self:FindLocalPlayerEntity()
+        if not isvalid(playerEntity) then return end
+        local pc = playerEntity.PlayerComponent
+        if not isvalid(pc) then return end
+        local hp = math.floor(pc.Hp or 0)
+        local maxHp = math.floor(pc.MaxHp or 0)
+        if isvalid(self.hpFill) then
+            if maxHp > 0 then
+                self.hpFill.FillAmount = math.max(0, math.min(1, hp / maxHp))
+            else
+                self.hpFill.FillAmount = 1
+            end
+        end
+        if isvalid(self.hpText) then
+            self.hpText.Text = tostring(hp) .. " / " .. tostring(maxHp)
+        end
+        self:UpdateMpBar()
     end
 
     method void OnEndPlay()
@@ -55,6 +86,10 @@ script MapleHUDManager extends Logic
         if self.updateTimer ~= 0 then
             _TimerService:ClearTimer(self.updateTimer)
             self.updateTimer = 0
+        end
+        if self.barTimer ~= 0 then
+            _TimerService:ClearTimer(self.barTimer)
+            self.barTimer = 0
         end
         if self._T.buttonHandlers ~= nil then
             for _, rec in ipairs(self._T.buttonHandlers) do
@@ -78,17 +113,13 @@ script MapleHUDManager extends Logic
 
     @ExecSpace("ClientOnly")
     method Entity FindLocalPlayerEntity()
-        -- 맵 트리에서 PlayerComponent가 붙은 첫 엔티티를 찾는다 (UIMyInfoManager와 동일 패턴)
-        local mapsEnt = _EntityService:GetEntityByPath("/maps")
-        if not isvalid(mapsEnt) then return nil end
-        for _, map in ipairs(mapsEnt.Children:ToTable()) do
-            if not isvalid(map) then continue end
-            for _, child in ipairs(map.Children:ToTable()) do
-                if isvalid(child) and isvalid(child.PlayerComponent) then
-                    return child
-                end
-            end
-        end
+        -- **이 클라이언트의 플레이어**를 돌려준다.
+        -- (버그 수정 2026-08-15, 신고 "다른 아이디가 맞으면 내 HP바가 줄어든다") 종전엔 맵 트리에서
+        -- PlayerComponent가 붙은 **첫 엔티티**를 집었다. 접속자가 한 명일 땐 우연히 맞았지만, 둘 이상이면
+        -- 맵에 먼저 들어온 **남의 캐릭터**를 잡아 그 사람의 HP를 내 HUD에 그린다(내가 맞아도 안 줄고,
+        -- 남이 맞으면 내 바가 줄어드는 증상의 정체). LocalPlayer는 클라마다 자기 자신을 가리킨다.
+        local lp = _UserService.LocalPlayer
+        if isvalid(lp) and isvalid(lp.PlayerComponent) then return lp end
         return nil
     end
 

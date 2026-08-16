@@ -4,6 +4,10 @@ script PlayerAttack extends AttackComponent
 	-- 콤보 어택 버프로 쌓인 콤보 구슬 수(0~5). 서버가 갱신하고 모든 클라이언트에 동기화돼
 	-- ComboOrb(구슬 엔티티)가 균등 간격 공전 계산에 읽어 쓴다. 구슬 1개당 데미지 +20%.
 	@Sync property integer ComboOrbCount = 0
+	-- (요청 2026-08-15) 지금 걸려 있는 콤보 어택이 **다크드래곤이 걸어준 것**인가.
+	-- 참이면 구슬 1개당 최종 데미지가 절반(2% → 1%)이다 - 실제 곱셈은 클라의
+	-- CharInfoManager.GetComboFinalDamagePct가 하므로 @Sync로 클라까지 내려보낸다.
+	@Sync property boolean ComboFromDragon = false
 
 	-- 쉐도우 파트너 버프 활성 여부. 서버(AttackShadowPartner/만료 타이머)가 켜고 끄며 모든 클라이언트에
 	-- 동기화된다 - 클라이언트에서 실행되는 이펙트 재생 메서드들이 이 값을 보고 그림자 몫의
@@ -701,8 +705,17 @@ script PlayerAttack extends AttackComponent
 		-- 백스탭(2차)은 콤보 어택 보너스와 같은 층에서 "기본 공식 결과에 곱하는" 보너스로 얹는다 -
 		-- 이 위치에 두면 크리티컬/쉐도우 파트너 계산과 수동 표시 캐시가 모두 증가분을 반영한 값을 쓴다.
 		-- (발도술) 이 히트의 attackInfo를 캐시해둔다 - OnAttack(defender)에는 attackInfo가 안 넘어와서,
-		-- "어느 스킬의 히트인지"를 여기서 잡아 처치 판정 대상 스킬(파스/슬블/돌진/브랜디쉬)만 거른다.
-		self._T.battoLastAttackInfo = attackInfo
+		-- "어느 스킬의 히트인지"를 여기서 잡아 중첩 대상 스킬(파스/슬블/돌진/브랜디쉬)만 거른다.
+		-- (버그 수정 2026-08-16, 신고 "발도술이 공격을 해도 중첩이 안 될 때가 많다")
+		-- 종전엔 **모든** attackInfo가 이 캐시를 덮어썼다. 그래서 CalcDamage → OnAttack 사이에 다른
+		-- 데미지 계산이 한 번이라도 끼어들면(장판 도트 2초 주기 / 소환수·다크드래곤 공격 / 화상 틱 등
+		-- 전부 별도 타이머로 병렬 진행된다) 태그가 그 쪽 것으로 바뀌어 중첩 조건을 통과하지 못했다 -
+		-- 소환수·장판을 함께 굴릴수록 자주 새는 구조였다. → **대상 태그일 때만** 갱신하고 시각을 함께
+		-- 찍어, 끼어든 계산이 캐시를 훔치지 못하게 하고 오래된 태그로 오지급되지도 않게 한다.
+		if self:IsBattoEligibleTag(attackInfo) then
+			self._T.battoLastAttackInfo = attackInfo
+			self._T.battoTagAt = _UtilLogic.ServerElapsedSeconds
+		end
 		local dmg = self:ApplyComboAttackBonus(self:ApplyBackstabBonus(self:CalcDamageBase(attacker, defender, attackInfo), attacker, defender, attackInfo))
 		-- 암행2도 흉내내는 스킬(더블스탭 2줄 / 새비지블로우 6줄)과 같은 수동 다중 표시를 쓰므로 포함한다.
 		local isManualSkin = (attackInfo == "skill.doublestab" or attackInfo == "skill.magicclaw" or attackInfo == "skill.spearburst" or attackInfo == "skill.savageblow" or attackInfo == "skill.brandish.finish" or attackInfo == "skill.strafe.lock" or attackInfo == "skill.herosummon.stab" or attackInfo == "skill.amhaeng2" or attackInfo == "skill.shadowclone")
@@ -801,33 +814,37 @@ script PlayerAttack extends AttackComponent
 			self._T.shadowEchoBonusIsCritical = bonusIsCritical
 			dmg = dmg + bonus
 		end
-		-- (요청) 브랜디쉬 1타(skill.brandish)는 대상을 죽이지 않는다 - HP를 1만 남기고 2타(swingTF
-		-- 마지막의 2줄)에서 죽게 한다. Monster.HandleHitEvent가 Hp - TotalDamage로 깎으므로, 여기서
-		-- 반환값을 "지금 HP - 1"로 잘라두면 HitEvent 파이프라인은 그대로 태운 채(데미지 스킨/히트
-		-- 이펙트/피격음 전부 정상) HP만 1로 남는다. Hp에 직접 대입하는 방식은 HitEvent를 우회해
-		-- 그 연출들이 통째로 조용히 생략되므로 쓰지 않는다.
-		-- 잘라내기는 반드시 이 위치(쉐도우 파트너 보너스까지 합산된 최종값)에서 해야 한다 - 위쪽에서
-		-- 자르면 그 뒤에 보너스가 더해져 다시 치명타가 된다.
-		-- 2타(skill.brandish.finish)는 이 분기를 타지 않으므로 그대로 죽일 수 있다.
-		if attackInfo == "skill.brandish" and isvalid(defender) then
-			---@type Monster
-			local monsterComp = defender:GetComponent("script.Monster")
-			if isvalid(monsterComp) and not monsterComp.IsDead and dmg >= monsterComp.Hp then
-				local capped = monsterComp.Hp - 1
-				if capped < 0 then capped = 0 end
-				-- 쉐도우 파트너가 켜져 있으면 이 히트를 원본/보너스 2줄로 나눠 표시하는데
-				-- (ShowShadowEchoDamageSkin), 잘라낸 총량에 맞춰 두 줄도 같은 비율로 다시 나눠
-				-- 표시 합이 실제 적용량과 어긋나지 않게 한다.
-				if self._T.shadowEchoOriginal ~= nil and dmg > 0 then
-					local newBonus = math.floor(capped * (self._T.shadowEchoBonus or 0) / dmg)
-					self._T.shadowEchoBonus = newBonus
-					self._T.shadowEchoOriginal = capped - newBonus
-				end
-				log("[Brandish] 1타 마무리 방지: HP 1 남김 target=" .. tostring(defender.Name) .. " hp=" .. tostring(monsterComp.Hp) .. " dmg=" .. tostring(dmg) .. " -> " .. tostring(capped))
-				dmg = capped
-			end
-		end
+		-- (신고 수정 2026-08-15) **브랜디쉬 1타 HP-1 캡 폐지.**
+		-- 종전 사양: "1타(skill.brandish)는 대상을 죽이지 않는다 - HP를 1만 남기고 2타(swingTF 마지막
+		--   2줄)에서 죽게 한다"(구 요청). 구현은 반환값을 "지금 HP - 1"로 잘라내는 것이었다.
+		-- 신고: "1타에 200~300, 2타에 줄당 3~4만이 뜬다 - 1타 데미지가 비정상적이다."
+		-- 원인: 그 캡이 곧 표시 데미지였다. 1타·2타는 원래 **같은 줄당 배율**(RollBrandishLineMultiplier)을
+		--   쓰는데, 1타만 "남은 HP - 1"로 잘리니 화면에는 몬스터 HP만큼의 숫자가 떴다. 실측(레벨 150,
+		--   전투력 11,025, 브랜디쉬 마스터 30 → 줄당 32,634~39,249 = 신고의 "3~4만")에 대해 필드 몬스터
+		--   HP는 291(레벨 15)이라, 1타는 **항상** 캡에 걸려 200~300으로 보였다.
+		--   ⚠ 2026-08-14의 전투력·몬스터 HP 1/100 축소로 두 값의 자릿수 차이가 눈에 띄게 벌어지면서
+		--     "가끔 잘리는 값"이 "항상 지배적인 값"이 됐다 - 캡 자체는 그 전부터 있었다.
+		-- 이제 1타도 계산된 데미지를 그대로 적용한다 → 1타·2타가 줄당 완전히 같은 %로 뜬다.
+		-- ⚠ 부작용(의도된 사양 변경): 1타에 대상이 죽을 수 있다. 그 경우 2타 2줄은
+		--   DealBrandishFinishHit의 **표시 전용 폴백**(actuallyHit == false)이 그대로 숫자를 띄우므로
+		--   연출이 비지는 않는다.
 		return dmg
+	end
+
+	method number RollBrandishLineMultiplier()
+		-- 브랜디쉬 **줄당** 전투력 배율을 한 번 굴린다. 1타(swingT3 1줄)와 2타(swingTF 2줄)가 같은 값을 쓴다.
+		-- (요청 2026-08-12) 180%~240% + 분배 1포인트당 최소·최대 각 +4%p (마스터 30 = 296%~356%).
+		-- ⚠ (버그 수정 2026-08-15) **이 공식은 두 곳에서 필요하다** - 실제 데미지(CalcDamageBase)와,
+		--   대상이 앞선 줄에 이미 죽어 판정이 실패했을 때의 **표시 전용 폴백**(DealBrandishFinishHit).
+		--   종전엔 폴백에 구 고정 공식(400%~700%)이 복제된 채 남아 있어, 같은 시전 안에서도 줄마다
+		--   숫자가 확 달라 보였다(신고: "뜨는 데미지가 다르다"). 두 호출부가 반드시 이 함수만 쓰게 해
+		--   다시 어긋나지 않게 한다.
+		-- math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 2줄은 같은 틱에 잇따라 굴리므로
+		-- 이 파일에 문서화된 math.random() 반복 소비 편향(더블스탭에서 실측)에 그대로 걸린다.
+		local bdLv = math.max(1, math.min(self._T.brandishSkillLv or 1, 30))
+		local bdMin = 1.8 + 0.04 * (bdLv - 1)
+		local bdMax = 2.4 + 0.04 * (bdLv - 1)
+		return bdMin + _UtilLogic:RandomDouble() * math.max(0, bdMax - bdMin)
 	end
 
 	method integer CalcDamageBase(Entity attacker, Entity defender, string attackInfo)
@@ -840,11 +857,17 @@ script PlayerAttack extends AttackComponent
 		            -- math.random() 대신 _UtilLogic:RandomDouble()을 쓴다 - 마무리 2줄은 같은 틱에 잇따라
 		            -- 굴리므로 이 파일에 문서화된 math.random() 반복 소비 편향(더블스탭에서 실측)에 그대로 걸린다.
 		            local combatPower = self._T.pendingBrandishCombatPower or 0
-		            local bdLv = math.max(1, math.min(self._T.brandishSkillLv or 1, 30))
-		            local bdMin = 1.8 + 0.04 * (bdLv - 1)
-		            local bdMax = 2.4 + 0.04 * (bdLv - 1)
-		            local mult = bdMin + _UtilLogic:RandomDouble() * math.max(0, bdMax - bdMin)
-		            return math.floor(combatPower * mult)
+		            -- 배율은 RollBrandishLineMultiplier 한 곳에서만 굴린다(표시 전용 폴백과 공유 -
+		            -- 예전에 이 식을 복제해 뒀다가 한쪽만 개편돼 줄마다 숫자가 달라진 전례가 있다).
+		            return math.floor(combatPower * self:RollBrandishLineMultiplier())
+		        elseif attackInfo == "skill.brandish.final" then
+		            -- (요청 2026-08-16) 브랜디쉬의 파이널어택 추가타 1줄. 파워스트라이크/슬래쉬블래스트
+		            -- 파이널과 **같은 규칙** - 원본 줄당 배율에 15%~30%(투자 레벨 비례) 추가 배율을 얹는다.
+		            -- 줄당 배율은 본체와 같은 RollBrandishLineMultiplier 한 곳에서만 굴린다.
+		            local combatPower = self._T.pendingBrandishCombatPower or 0
+		            local faM = 0.6 + 0.4 * math.min(1, math.max(1, self._T.faSkillLv or 0) / 20)
+		            local bonus = 1 + (0.15 + _UtilLogic:RandomDouble() * (0.30 - 0.15)) * faM
+		            return math.floor(combatPower * self:RollBrandishLineMultiplier() * bonus)
 		        elseif attackInfo == "skill.darkdragon" then
 		            -- (요청 2026-08-12 3차) 다크드래곤 소환수 공격: 전투력의 **90%~100%**에서 분배 1포인트당
 		            -- 최소·최대 각 +3%p(마스터 20 = 147%~157%). 종전 고정 200%~300%.
@@ -951,12 +974,14 @@ script PlayerAttack extends AttackComponent
 		            -- (속성 증폭) 중첩 연계 데미지 배율(1 + 0.1×투자pt) 적용.
 		            return math.floor((self._T.pendingChargeBlowBurnPower or 0) * 0.5 * self:GetElementalAmpFactor())
 		        elseif attackInfo == "dot.chargeblow.shock" then
-		            -- (개편) 속성 연계 장판 공통 사양: 20초 동안 2초마다 전투력의 200%~400%. 속성 증폭 배율 적용.
-		            local linkMult = 2.0 + _UtilLogic:RandomDouble() * 2.0
+		            -- 속성 연계 장판 공통 사양: 20초 동안 2초마다 전투력의 **40%~80%**. 속성 증폭 배율 적용.
+		            -- (요청 2026-08-15) 200%~400% → **1/5**로 축소. 화상 저주 장판(curse)과 같은 값을 유지한다.
+		            local linkMult = 0.4 + _UtilLogic:RandomDouble() * 0.4
 		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * linkMult * self:GetElementalAmpFactor())
 		        elseif attackInfo == "dot.chargeblow.curse" then
-		            -- (개편) 속성 연계 장판 공통 사양: 20초 동안 2초마다 전투력의 200%~400%. 속성 증폭 배율 적용.
-		            local linkMult = 2.0 + _UtilLogic:RandomDouble() * 2.0
+		            -- 속성 연계 장판 공통 사양: 20초 동안 2초마다 전투력의 **40%~80%**. 속성 증폭 배율 적용.
+		            -- (요청 2026-08-15) 200%~400% → **1/5**로 축소. 감전 장판(shock)과 같은 값을 유지한다.
+		            local linkMult = 0.4 + _UtilLogic:RandomDouble() * 0.4
 		            return math.floor((self._T.pendingChargeBlowShockPower or 0) * linkMult * self:GetElementalAmpFactor())
 		        elseif attackInfo == "dot.firezone" then
 		            -- 불의 영역 화염 지대: 2초마다, 배율은 시전 시 클라가 넘긴 값(GetFireZone*Percent / 100 =
@@ -987,7 +1012,10 @@ script PlayerAttack extends AttackComponent
 		            local psMin = self._T.powerStrikeRateMin or 1.0
 		            local psMax = self._T.powerStrikeRateMax or 1.2
 		            local mult = psMin + _UtilLogic:RandomDouble() * math.max(0, psMax - psMin)
-		            return math.floor(combatPower * mult * self:GetChargeBlowDamageFactor(defender))
+		            -- (2026-08-15) 차지 블로우의 숨은 속성 배율(성 ×5 / 기타 ×3)은 폐지됐다 - 표시 %가
+		            -- 곧 실데미지다. 연계 성립 여부만 기록해 감전 장판으로 넘긴다.
+		            self:NoteChargeBlowLinkHit(defender)
+		            return math.floor(combatPower * mult)
 		        elseif attackInfo == "skill.slashblast" then
 		            -- (요청 2026-08-09) 기본 50%~60%, 분배 1포인트당 최소 +2%p / 최대 +3%p
 		            -- (1레벨 52%~63% / 마스터 20 90%~120%). 파워스트라이크와 같은 전달 방식.
@@ -1007,7 +1035,9 @@ script PlayerAttack extends AttackComponent
 		            local mult = pfMin + _UtilLogic:RandomDouble() * math.max(0, pfMax - pfMin)
 		            local faM = 0.6 + 0.4 * math.min(1, math.max(1, self._T.faSkillLv or 0) / 20)
 		            local bonus = 1 + (0.15 + _UtilLogic:RandomDouble() * (0.30 - 0.15)) * faM
-		            return math.floor(combatPower * mult * bonus * self:GetChargeBlowDamageFactor(defender))
+		            -- (2026-08-15) 본체와 같은 이유로 속성 배율 폐지 - 연계 기록만 남긴다.
+		            self:NoteChargeBlowLinkHit(defender)
+		            return math.floor(combatPower * mult * bonus)
 		        elseif attackInfo == "skill.slashblast.final" then
 		            -- 파이널어택: 슬래쉬블래스트와 동일한 공식에 추가 데미지를 곱한다(레벨 비례 - 위와 동일).
 		            local combatPower = self._T.pendingFinalSlashCombatPower or 0
@@ -4473,9 +4503,27 @@ script PlayerAttack extends AttackComponent
 		return _UtilLogic.ElapsedSeconds < until_
 	end
 
+	method boolean IsTargetShocked(Entity target)
+		-- (양방향 연계) 전기 속성으로 감전 중인 대상인지. 얼음으로 때렸을 때의 "감전 장판" 판정에 쓰인다 -
+		-- 빙결이 전기 쪽 연계 조건인 것과 정확히 대칭이다.
+		-- (속성필드) 전기 필드 위의 대상은 감전 상태로 간주한다.
+		if not isvalid(target) then return false end
+		if self:IsPosInElemField(target.TransformComponent.WorldPosition, 3) then return true end
+		local shocked = self._T.chargeBlowShocked
+		if shocked == nil then return false end
+		local until_ = shocked[target.Path]
+		if until_ == nil then return false end
+		return _UtilLogic.ElapsedSeconds < until_
+	end
+
 	-- ── 속성필드(팔라딘 3차 버프) ─────────────────────────────────────
 	-- 버프 지속 중 차지 블로우를 쓰면 시전 지역에 그 속성의 필드가 생기고, 필드 위의 대상은
-	-- 그 속성 상태(화상/빙결)를 보유한 것으로 간주돼 중첩 연계가 발동한다. 허공 공격도 연계된다.
+	-- 그 속성 상태(화상/빙결/감전)를 보유한 것으로 간주돼 중첩 연계가 발동한다. 허공 공격도 연계된다.
+	-- (요청 2026-08-15) 연계는 **양방향**이다 - 쌍만 맞으면 어느 속성이 먼저든 성립한다:
+	--   불 ↔ 얼음 = 화상 저주 장판  /  얼음 ↔ 전기 = 감전 장판
+	-- (2026-08-15) 연계의 보상은 **장판뿐**이다 - 타격 데미지에 곱하던 배율은 폐지됐다(NoteChargeBlowLinkHit).
+	-- 소모되는 필드는 항상 "때린 속성의 반대쪽"이라, 방금 자기가 깐 필드를 스스로 먹는 일은 없다.
+	-- (불 ↔ 전기는 결과물이 정의되지 않은 조합이라 연계가 아니다.)
 
 	-- (mode: 1=얼음 2=불 3=전기) 위치가 해당 속성 필드 안인지 (서버 전용 - _T.elemFields 조회)
 	method boolean IsPosInElemField(Vector3 pos, integer mode)
@@ -4676,7 +4724,8 @@ script PlayerAttack extends AttackComponent
 	method integer GetChainReadyFieldMode(Vector3 pos)
 		-- (자동사냥, 클라에서 호출) pos 주변에 "한 번만 더 다른 속성으로 치면 장판이 깔리는" 살아있는
 		-- 속성 필드가 있으면 그 필드의 mode를 돌려준다 - 2(불 필드: 얼음 차지 블로우 → 화상 저주) 우선,
-		-- 다음 1(얼음 필드: 전기 차지 블로우 → 감전). 없으면 0. 다른 스크립트가 _T를 직접 읽지 않도록
+		-- 다음 1(얼음 필드: 전기 차지 블로우 → 감전), 마지막 3(전기 필드: 얼음 차지 블로우 → 감전).
+		-- 없으면 0. 다른 스크립트가 _T를 직접 읽지 않도록
 		-- 메서드로 노출한다(IsBrandishMotionGuardOn과 같은 이유). 원장은 PlayElementalFieldZoneFx /
 		-- RemoveElementalFieldZoneFx가 유지하는 클라 사본이고, 판정 폭은 서버(ConsumeElemFieldAt)와 동일.
 		local fields = self._T.clientElemFields
@@ -4688,7 +4737,8 @@ script PlayerAttack extends AttackComponent
 				fields[id] = nil
 			elseif math.abs(pos.x - f.x) <= 1.6 and math.abs(pos.y - f.y) <= 1.2 then
 				if f.mode == 2 then return 2 end
-				if f.mode == 1 then found = 1 end
+				if f.mode == 1 then found = 1
+				elseif f.mode == 3 and found == 0 then found = 3 end
 			end
 		end
 		return found
@@ -4701,37 +4751,57 @@ script PlayerAttack extends AttackComponent
 		local mode = self._T.chargeBlowMode or 0
 		if mode <= 0 then return end
 		local myPos = self.Entity.TransformComponent.WorldPosition
-		if mode == 1 and self:IsPosInElemField(myPos, 2) then
-			-- 얼음 차지 블로우 + 불 필드 → 화상 저주 장판(시전자 위치). 사용한 필드는 소모된다.
+		-- (양방향 연계) 쌍은 순서와 무관하다 - 불↔얼음 = 화상 저주 / 얼음↔전기 = 감전.
+		-- 어느 속성으로 마무리하든 **반대 속성** 필드 위면 발동하고, 그 반대 속성 필드가 1장 소모된다.
+		-- 얼음(1)은 두 쌍에 모두 속하므로 두 판정이 각각 독립적으로 성립할 수 있다(elseif 아님).
+		local curseField = 0
+		if mode == 1 and self:IsPosInElemField(myPos, 2) then curseField = 2
+		elseif mode == 2 and self:IsPosInElemField(myPos, 1) then curseField = 1 end
+		if curseField > 0 then
 			self:SpawnChargeBlowCurseZoneFor(self.Entity, self._T.pendingCombatPower or 0)
-			self:ConsumeElemFieldAt(myPos, 2)
-			log("[ElemField] 허공 연계: 불 필드 + 얼음 → 화상 저주")
-		elseif mode == 3 and self:IsPosInElemField(myPos, 1) then
-			-- 전기 차지 블로우 + 얼음 필드 → 감전 장판(시전자 위치). 사용한 필드는 소모된다.
+			self:ConsumeElemFieldAt(myPos, curseField)
+			log("[ElemField] 허공 연계: 화상 저주 (필드 " .. tostring(curseField) .. " + 속성 " .. tostring(mode) .. ")")
+		end
+		local shockField = 0
+		if mode == 3 and self:IsPosInElemField(myPos, 1) then shockField = 1
+		elseif mode == 1 and self:IsPosInElemField(myPos, 3) then shockField = 3 end
+		if shockField > 0 then
 			self:PlayChargeBlowShockHitEffect(self.Entity)
 			self:SpawnChargeBlowShockZone(self.Entity)
-			self:ConsumeElemFieldAt(myPos, 1)
-			log("[ElemField] 허공 연계: 얼음 필드 + 전기 → 감전 장판")
+			self:ConsumeElemFieldAt(myPos, shockField)
+			log("[ElemField] 허공 연계: 감전 장판 (필드 " .. tostring(shockField) .. " + 속성 " .. tostring(mode) .. ")")
 		end
 	end
 
-	method number GetChargeBlowDamageFactor(Entity defender)
-		-- 차지 블로우 본체/파이널 데미지에 곱해지는 속성 보정.
-		-- (밸런스 2026-08-09, 워크시트 §5) 팔라딘 단일딜이 전 직업 최하위(언버프 2.6/s - 보마의 1/14)라
-		-- 중위권(~10~12/s) 목표로 차지 계열 전반 상향. 기존 값: 성 1.3 / 전기+빙결 2.0×증폭 / 기타 1.0.
-		--   차지 공통(불/얼음/전기 비빙결): ×3.0  → 기대 1.5×3.0/0.75s = 6.0/s
-		--   성(4)                        : ×5.0  → 10.0/s (주력 유지 모드)
-		--   전기(3)+빙결                 : ×3.0×증폭(M10 ×2.0) = ×6.0 → 12.0/s (셋업 콤보 보상)
+	method void NoteChargeBlowLinkHit(Entity defender)
+		-- 차지 블로우 1타가 **얼음↔전기 연계**를 성립시켰는지 판정해 이번 판정 목록에 담는다.
+		-- ResolveChargeBlowHits가 그 목록을 보고 전용 히트 이펙트 + 감전 장판을 남기고 필드를 소모한다.
+		--
+		-- ⚠ (밸런스 2026-08-15, 신고 "실제 데미지가 표시의 7배") 이 자리에 있던
+		--   `GetChargeBlowDamageFactor`(성 ×5.0 / 기타 ×3.0 / 연계 ×3.0×증폭)를 **폐지**했다.
+		--   그 배율은 툴팁 어디에도 없는 숨은 곱셈이라, 마스터 기준 표시 256~316%가 실제로는
+		--   1280~1580%(파워스트라이크의 6.6~7.1배)로 나갔다. 08-09에 팔라딘 최하위 DPS를 올리려고
+		--   넣었던 값인데, 08-12에 차지 블로우 배율 곡선이 파워스트라이크에서 독립하며 1.42배
+		--   상향된 것과 겹쳐 목표(10~12/s)를 크게 넘어섰다. **표시가 곧 실제**가 되도록 배율을 없앤다.
+		--   → 속성별 데미지 차이는 이제 디바인 강화 스킬의 분배 보너스(+2%/pt, 디바인 차지만 +3%/pt)
+		--      뿐이고, 속성의 값어치는 상태이상과 연계 장판이 낸다.
+		--   연계 장판 자체의 데미지는 별개다(20초·2초마다 40~80%×속성 증폭 - 08-15 요청으로 1/5 축소).
 		local mode = self._T.chargeBlowMode or 0
-		if mode <= 0 then return 1.0 end
-		if mode == 4 then return 5.0 end
+		if mode <= 0 then return end
+		-- (양방향 연계) 얼음↔전기 쌍은 어느 쪽이 먼저든 성립한다. 소모할 필드만 서로 반대다
+		-- (전기 공격 → 얼음 필드 1 / 얼음 공격 → 전기 필드 3).
 		if mode == 3 and self:IsTargetFrozen(defender) then
-			if self._T.chargeBlowShockHits == nil then self._T.chargeBlowShockHits = {} end
-			table.insert(self._T.chargeBlowShockHits, defender)
-			-- (속성 증폭) 빙결 보정도 중첩 연계 데미지 - 증폭 배율 적용
-			return 3.0 * self:GetElementalAmpFactor()
+			self:RegisterChargeBlowShockHit(defender, 1)
+		elseif mode == 1 and self:IsTargetShocked(defender) then
+			self:RegisterChargeBlowShockHit(defender, 3)
 		end
-		return 3.0
+	end
+
+	method void RegisterChargeBlowShockHit(Entity target, integer consumeFieldMode)
+		-- 감전 연계가 성립한 대상을 이번 판정 목록에 담는다. ResolveChargeBlowHits가 전용 히트 이펙트와
+		-- 감전 장판을 남기고 consumeFieldMode 속성의 필드를 1장 소모한다.
+		if self._T.chargeBlowShockHits == nil then self._T.chargeBlowShockHits = {} end
+		table.insert(self._T.chargeBlowShockHits, { entity = target, consume = consumeFieldMode })
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4747,12 +4817,16 @@ script PlayerAttack extends AttackComponent
 		self:TryElementalFieldAirLink(#targets)
 		local shockHits = self._T.chargeBlowShockHits
 		if shockHits ~= nil then
-			for _, t in ipairs(shockHits) do
+			for _, h in ipairs(shockHits) do
+				local t = h.entity
 				if isvalid(t) then
 					self:PlayChargeBlowShockHitEffect(t)
 					self:SpawnChargeBlowShockZone(t)
-					-- (속성필드) 빙결 연계가 얼음 필드 유래였다면 그 필드는 1회 소모로 사라진다.
-					self:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, 1)
+					-- 연계에 쓰인 근거를 1회 소모한다 - 전기 공격이면 얼음 필드/빙결(1),
+					-- 얼음 공격이면 전기 필드/감전(3). 필드와 상태이상을 함께 비워야 상태가
+					-- 남아 있는 동안 때릴 때마다 장판이 중복 생성되지 않는다.
+					self:ConsumeElemFieldAt(t.TransformComponent.WorldPosition, h.consume or 1)
+					self:ConsumeChargeBlowStatus(t, h.consume or 1)
 				end
 			end
 			self._T.chargeBlowShockHits = {}
@@ -4770,12 +4844,27 @@ script PlayerAttack extends AttackComponent
 			-- (속성필드) 연계가 필드 유래였다면 그 불 필드는 1회 소모로 사라진다.
 			if self:IsTargetBurning(target) then
 				self:SpawnChargeBlowCurseZone(target)
+				-- 연계에 쓰인 근거는 **필드든 상태이상이든 함께 소모**한다(중복 발동 방지).
 				self:ConsumeElemFieldAt(target.TransformComponent.WorldPosition, 2)
+				self:ConsumeChargeBlowStatus(target, 2)
 			end
+			-- (양방향 연계) "얼음 + 감전 대상 → 감전 장판"은 데미지 보정과 한 몸이라
+			-- NoteChargeBlowLinkHit가 목록에 담고 ResolveChargeBlowHits가 장판을 남긴다.
 			-- (요청) 빙결 지속시간 통일: 3초 → 4초.
 			if _UtilLogic:RandomDouble() < 0.5 then self:ApplyChargeBlowFreeze(target, 4.0) end
 		elseif mode == 2 then
+			-- (양방향 연계) 빙결된 적을 불로 때려도 "화상 저주" 장판이 나온다(얼음 → 불 방향).
+			-- 소모하는 필드는 반대쪽인 얼음 필드(1)다.
+			if self:IsTargetFrozen(target) then
+				self:SpawnChargeBlowCurseZone(target)
+				self:ConsumeElemFieldAt(target.TransformComponent.WorldPosition, 1)
+				self:ConsumeChargeBlowStatus(target, 1)
+			end
 			if _UtilLogic:RandomDouble() < 0.5 then self:ApplyChargeBlowBurn(target) end
+		elseif mode == 3 then
+			-- (양방향 연계) 전기는 감전 상태를 남긴다 - 다음 얼음 차지 블로우가 이 상태를 연계로 쓴다
+			-- (불의 화상 / 얼음의 빙결과 같은 역할, 같은 50% 확률).
+			if _UtilLogic:RandomDouble() < 0.5 then self:ApplyChargeBlowShock(target, 6.0) end
 		elseif mode == 4 then
 			self:ApplyChargeBlowStun(target)
 		end
@@ -4841,6 +4930,40 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(spr) then return end
 		local prevAlpha = spr.Color.a
 		spr.Color = Color(0.45, 0.65, 1.0, prevAlpha)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConsumeChargeBlowStatus(Entity target, integer statusMode)
+		-- (요청 2026-08-15) 연계가 발동하면 **근거가 된 상태이상도 함께 소모**한다.
+		-- statusMode는 속성 인덱스와 같은 번호다 - 1=빙결 2=화상 3=감전.
+		-- 종전엔 속성 필드만 1회 소모되고 상태이상은 그대로 남아, 상태가 지속되는 동안(화상 12초 /
+		-- 빙결 4초 / 감전 6초) **때릴 때마다 같은 장판이 새로 깔렸다.** 필드 유래든 상태 유래든
+		-- "한 번 쓰면 사라진다"로 통일해 중복 발동을 막는다.
+		-- ⚠ 빙결의 파란 틴트와 이동속도 감속은 각자의 만료 타이머(ApplyChargeBlowFreeze의 attemptRestore /
+		--   MonsterStatusLedger)가 **원래 시각에** 정리한다 - 여기서 장부만 비워도 연계 재발동은 막히고,
+		--   공유 장부(다른 플레이어의 빙결)를 건드리지 않아 안전하다. 화상은 도트 틱이 이 장부를 직접
+		--   읽으므로 비우는 즉시 남은 도트도 함께 끝난다(= 연계에 소모된 것).
+		if not isvalid(target) then return end
+		local key = target.Path
+		if statusMode == 1 then
+			if self._T.chargeBlowFrozen ~= nil then self._T.chargeBlowFrozen[key] = nil end
+		elseif statusMode == 2 then
+			if self._T.chargeBlowBurning ~= nil then self._T.chargeBlowBurning[key] = nil end
+		elseif statusMode == 3 then
+			if self._T.chargeBlowShocked ~= nil then self._T.chargeBlowShocked[key] = nil end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyChargeBlowShock(Entity target, number duration)
+		-- (양방향 연계) 감전. 데미지/행동에는 영향이 없는 **표식 상태**로, 다음 얼음 차지 블로우가
+		-- 이 대상을 때리면 얼음↔전기 연계(감전 장판)가 성립한다 - 빙결이 전기 쪽 연계
+		-- 조건인 것과 정확히 대칭이다. 겹쳐 걸리면 만료 시각만 갱신된다(복구할 상태가 없어
+		-- 빙결처럼 만료 타이머로 원복할 것이 없다).
+		if not isvalid(target) then return end
+		if self._T.chargeBlowShocked == nil then self._T.chargeBlowShocked = {} end
+		self._T.chargeBlowShocked[target.Path] = _UtilLogic.ElapsedSeconds + duration
+		log("[ChargeBlow] 감전 부여 " .. string.format("%.1f", duration) .. "초 (" .. target.Name .. ")")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -8835,6 +8958,9 @@ script PlayerAttack extends AttackComponent
 		-- 자기 시전은 자기 투자 상한을 그대로 쓴다 - 드래곤 버프가 올려놓은 임시 상한이 남아 있으면 내린다
 		-- (토큰이 바뀌어 드래곤 쪽 만료 콜백이 그냥 반환되므로 여기서 직접 되돌려야 값이 새지 않는다).
 		self._T.comboOrbCapOverride = 0
+		-- (요청 2026-08-15) 구슬 효과 절반 페널티도 같은 이유로 여기서 내린다 - **본인이 직접 시전한
+		-- 콤보 어택은 구슬당 2% 그대로**이고, 드래곤 버프 도중 시전하면 그 즉시 정상 수치가 된다.
+		self.ComboFromDragon = false
 
 		local userId = self.Entity.PlayerComponent.UserId
 		self:NotifyComboAttackStart(duration, userId)
@@ -8934,7 +9060,12 @@ script PlayerAttack extends AttackComponent
 	method number GetShadowEchoRate()
 		-- 미투자/미동기(다크드래곤이 걸어준 경우 등)면 1레벨 값(50%)으로 본다.
 		local lv = math.max(1, math.min(math.floor(self._T.shadowPartnerLevel or 0), 30))
-		return 0.50 + 0.01 * (lv - 1)
+		local rate = 0.50 + 0.01 * (lv - 1)
+		-- (요청 2026-08-15) **다크드래곤이 걸어준** 쉐도우 파트너는 분신 데미지가 절반이다(50% → 25%).
+		-- 본인이 직접 시전한 쉐도우 파트너는 그대로 - 플래그는 드래곤 버프 활성 구간에만 켜진다
+		-- (ActivateShadowPartnerSilent에서 세우고 만료/본인 시전 시 내린다).
+		if self._T.shadowPartnerFromDragon then rate = rate * 0.5 end
+		return rate
 	end
 
 	-- (2026-08-05 개편) 지속시간을 클라이언트가 투자 레벨로 계산해 넘겨준다(30초 + 분배당 10초).
@@ -8977,6 +9108,9 @@ script PlayerAttack extends AttackComponent
 		local dur = math.max(1, duration or 30)
 		self._T.shadowPartnerActive = true
 		self.ShadowPartnerOn = true
+		-- (요청 2026-08-15) 본인이 직접 시전한 쉐도우 파트너는 **절반 페널티가 없다** - 드래곤 버프가
+		-- 켜 둔 플래그를 여기서 내린다(드래곤 버프 도중 본인이 시전하면 그 즉시 정상 배율로 올라간다).
+		self._T.shadowPartnerFromDragon = false
 
 		local userId = self.Entity.PlayerComponent.UserId
 		self:NotifyShadowPartnerStart(dur, userId)
@@ -9351,11 +9485,13 @@ script PlayerAttack extends AttackComponent
 		-- 적중 즉시 중첩한다. 중복 방지 창(대상별 2.5초)은 그대로 살려, 다중 타격(브랜디쉬 1타+마무리,
 		-- 슬래시블러스트 6명 동시타)이 한 번의 공격으로 중첩을 몰아 쌓는 것을 막는다.
 		if self._T.battoActive and isvalid(defender) then
+			-- (버그 수정 2026-08-16) 태그는 CalcDamage가 **대상 스킬일 때만** 찍어두고 시각을 남긴다.
+			-- 여기서는 그 태그가 방금(0.2초 이내) 찍힌 것일 때만 인정한다 - 오래된 태그가 남아
+			-- 엉뚱한 히트에 중첩이 붙는 것을 막는다.
 			local btTag = self._T.battoLastAttackInfo
-			if btTag == "skill.powerstrike" or btTag == "skill.powerstrike.final"
-				or btTag == "skill.slashblast" or btTag == "skill.slashblast.final"
-				or btTag == "skill.rush"
-				or btTag == "skill.brandish" or btTag == "skill.brandish.finish" then
+			local btAt = self._T.battoTagAt or -99
+			if btTag ~= nil and self:IsBattoEligibleTag(btTag)
+				and (_UtilLogic.ServerElapsedSeconds - btAt) <= 0.2 then
 				self:CheckBattoHit(defender)
 			end
 		end
@@ -9552,14 +9688,17 @@ script PlayerAttack extends AttackComponent
 
 	-- (요청 2026-08-12) 초보자 패시브 "아이템 감각"의 드롭률 보너스(%). 몬스터 사망 시 Monster.Dead가
 	-- 킬러의 이 값을 읽어 모든 확률 아이템의 드랍 확률에 ×(1 + pct/100)로 곱한다.
+	-- (개명 2026-08-15) SetDropRateBonus/GetDropRateBonus → *Pct: 아이템 감각이 **0.5%/pt**가 되면서
+	-- 값이 정수가 아니게 됐다(integer로 두면 홀수 포인트의 소수부가 잘려 절반이 조용히 증발한다).
+	-- 서버 메서드 시그니처 변경은 개명이 안전하다는 관례(LEA-1102 회피)를 따른다.
 	@ExecSpace("ServerOnly")
-	method void SetDropRateBonus(integer dropPct)
+	method void SetDropRateBonusPct(number dropPct)
 		self._T.dropRateBonusPct = math.max(0, dropPct or 0)
 	end
 
 	-- Monster.Dead가 읽는 조회용(서버). 미동기화면 0.
 	@ExecSpace("ServerOnly")
-	method integer GetDropRateBonus()
+	method number GetDropRateBonusPct()
 		return self._T.dropRateBonusPct or 0
 	end
 
@@ -10382,6 +10521,19 @@ script PlayerAttack extends AttackComponent
 		_SkillManager:OnMonsterKilledForShuriken()
 	end
 
+	method boolean IsBattoEligibleTag(string attackInfo)
+		-- 발도술 중첩을 지급하는 스킬 태그인지. 캐시를 쓰는 쪽(CalcDamage)과 판정하는 쪽(OnAttack)이
+		-- **같은 목록**을 보도록 한 곳에 모았다 - 종전엔 OnAttack에만 목록이 있어, 새 태그가 생겨도
+		-- 여기 등록되지 않으면 조용히 중첩이 빠졌다(2026-08-16 `skill.brandish.final` 누락이 그 예).
+		-- ⚠ 브랜디쉬/파워스트라이크/슬래시블러스트 계열에 새 태그(.final 등)를 만들면 여기에 추가할 것.
+		if attackInfo == nil then return false end
+		return attackInfo == "skill.powerstrike" or attackInfo == "skill.powerstrike.final"
+			or attackInfo == "skill.slashblast" or attackInfo == "skill.slashblast.final"
+			or attackInfo == "skill.rush"
+			or attackInfo == "skill.brandish" or attackInfo == "skill.brandish.finish"
+			or attackInfo == "skill.brandish.final"
+	end
+
 	@ExecSpace("ServerOnly")
 	method void CheckBattoHit(Entity target)
 		-- (요청 2026-08-12) 구 CheckBattoKill(처치 확인)을 **적중 확인**으로 교체 - 사망 여부를 보지 않고
@@ -10403,35 +10555,92 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AddBattoStack()
-		-- 처치 1회 = 중첩 +1(상한은 분배 구간별 1/2/3). 첫 발동만 3초 창을 열고,
-		-- (요청) 이후 중첩은 남은 시간을 건드리지 않는다(기존 "+1초, 최대 3초" 규칙 제거).
+		-- 적중 1회 = 중첩 +1(상한은 분배 구간별 1/2/3).
+		-- (요청 2026-08-16) **스택마다 자기 만료 시각을 따로 가진다.** 종전엔 첫 스택이 연 3초 창이
+		-- 끝날 때 쌓인 중첩이 **한꺼번에** 사라져서, 뒤늦게 쌓은 스택이 1초도 못 가고 날아갔다(신고).
+		-- 이제 `_T.battoStackExpires`(만료 시각 배열)로 관리하고 0.1초 틱이 만료된 것만 하나씩 뺀다.
+		-- 풀스택에서 또 적중하면 **가장 적게 남은 스택의 시간만 갱신**한다(요청) - 새 스택을 못 넣는
+		-- 대신 곧 사라질 스택을 되살려, 계속 때리는 동안 풀스택이 유지된다.
 		local now = _UtilLogic.ServerElapsedSeconds
 		local maxN = self._T.battoMaxStacks or 1
-		local cur = self._T.battoStacks or 0
-		if cur <= 0 then
-			self._T.battoStacks = 1
-			self._T.battoProcUntil = now + 3.0
-			self._T.battoProcToken = (self._T.battoProcToken or 0) + 1
-			local myToken = self._T.battoProcToken
-			_TimerService:SetTimerOnce(function()
-				if self._T.battoProcToken ~= myToken then return end
-				self:ClearBattoProc()
-				log("[Batto] 중첩 버프 만료")
-			end, 3.0)
+		if self._T.battoStackExpires == nil then self._T.battoStackExpires = {} end
+		local list = self._T.battoStackExpires
+		if #list < maxN then
+			table.insert(list, now + 3.0)
 		else
-			self._T.battoStacks = math.min(cur + 1, maxN)
+			local minIdx = 1
+			for i = 2, #list do
+				if list[i] < list[minIdx] then minIdx = i end
+			end
+			list[minIdx] = now + 3.0
 		end
-		local remain = math.max(0, (self._T.battoProcUntil or now) - now)
-		local userId = self.Entity.PlayerComponent.UserId
-		self:NotifyBattoProc(self._T.battoStacks, remain, userId)
-		log("[Batto] 처치 프록! 중첩 " .. tostring(self._T.battoStacks) .. "/" .. tostring(maxN)
-			.. " 남은시간 " .. string.format("%.1f", remain) .. "초 (공격력 +" .. tostring(10 * self._T.battoStacks) .. " 크확 +" .. tostring(3 * self._T.battoStacks) .. "%)")
+		self._T.battoStacks = #list
+		self:StartBattoStackTick()
+		self:NotifyBattoStackState()
+		log("[Batto] 적중 프록! 중첩 " .. tostring(#list) .. "/" .. tostring(maxN)
+			.. " (스택별 개별 3초 만료, 공속 +" .. tostring(3 * #list) .. "% 크확 +" .. tostring(3 * #list) .. "%)")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void StartBattoStackTick()
+		-- 스택 만료 감시(0.1초). 스택이 하나라도 있는 동안만 돈다 - ClearBattoProc이 정리한다.
+		if (self._T.battoStackTickId or 0) ~= 0 then return end
+		self._T.battoStackTickId = _TimerService:SetTimerRepeat(function()
+			self:BattoStackTick()
+		end, 0.1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BattoStackTick()
+		-- 만료된 스택만 개별로 뺀다. 개수가 바뀐 틱에만 클라에 알린다(불필요한 RPC 방지).
+		local list = self._T.battoStackExpires
+		if list == nil or #list <= 0 then
+			self:ClearBattoProc()
+			return
+		end
+		local now = _UtilLogic.ServerElapsedSeconds
+		local before = #list
+		for i = #list, 1, -1 do
+			if list[i] <= now then table.remove(list, i) end
+		end
+		if #list == before then return end
+		self._T.battoStacks = #list
+		if #list <= 0 then
+			self:ClearBattoProc()
+			log("[Batto] 중첩 전부 만료")
+			return
+		end
+		self:NotifyBattoStackState()
+		log("[Batto] 중첩 만료 - 남은 중첩 " .. tostring(#list))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void NotifyBattoStackState()
+		-- 현재 중첩 수 + **가장 늦은 만료까지의 시간**을 클라에 보낸다(버프바는 "완전히 사라질 때"를
+		-- 표시해야 하므로 최댓값을 쓴다. 스택 수는 개수 그대로).
+		local list = self._T.battoStackExpires
+		if list == nil or #list <= 0 then return end
+		if not isvalid(self.Entity.PlayerComponent) then return end
+		local now = _UtilLogic.ServerElapsedSeconds
+		local latest = 0
+		for _, t in ipairs(list) do
+			if t > latest then latest = t end
+		end
+		local remain = math.max(0, latest - now)
+		self._T.battoProcUntil = latest
+		self:NotifyBattoProc(#list, remain, self.Entity.PlayerComponent.UserId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void ClearBattoProc()
-		-- 중첩 프록 종료 공통 정리: 중첩 0으로 되돌리고 클라 공격력/크확·퀵슬롯 중첩 표시를 원복시킨다.
+		-- 중첩 프록 종료 공통 정리: 중첩 0으로 되돌리고 클라 공속/크확·퀵슬롯 중첩 표시를 원복시킨다.
+		-- (2026-08-16) 스택별 만료 감시 타이머와 만료 시각 배열도 여기서 함께 정리한다.
 		self._T.battoProcToken = (self._T.battoProcToken or 0) + 1
+		if (self._T.battoStackTickId or 0) ~= 0 then
+			_TimerService:ClearTimer(self._T.battoStackTickId)
+			self._T.battoStackTickId = 0
+		end
+		self._T.battoStackExpires = {}
 		if (self._T.battoStacks or 0) <= 0 then return end
 		self._T.battoStacks = 0
 		self._T.battoProcUntil = 0
@@ -10567,17 +10776,22 @@ script PlayerAttack extends AttackComponent
 		-- (요청 2026-08-05) 드래곤이 걸어주는 콤보 어택은 콤보어택 미투자 캐릭터에게도 걸리므로,
 		-- 투자 기반 상한(미투자 = 1개)과 무관하게 **5개까지** 모을 수 있게 상한을 올린다.
 		-- 버프가 끝나는 시점에 원래 상한으로 되돌린다(GetComboOrbCap 참고).
+		-- (요청 2026-08-15) 절반 대상은 **상한이 아니라 구슬 효과**다 - 상한은 5로 두고,
+		-- 구슬당 최종 데미지를 2% → 1%로 내린다(ComboFromDragon 플래그, 클라 GetComboFinalDamagePct).
 		self._T.comboOrbCapOverride = 5
+		self.ComboFromDragon = true
 		local userId = self.Entity.PlayerComponent.UserId
 		self:NotifyComboAttackStart(duration, userId)
 		_TimerService:SetTimerOnce(function()
 			if self._T.comboAttackToken ~= myToken then return end
 			self._T.comboAttackActive = false
 			self._T.comboOrbCapOverride = 0
+			self.ComboFromDragon = false
 			self:ClearComboOrbs()
 			log("[ComboAttack] 드래곤 버프 종료(" .. tostring(duration) .. "초)")
 		end, duration)
-		log("[ComboAttack] 드래곤 버프 시작 duration=" .. tostring(duration) .. " 구슬 상한=" .. tostring(self:GetComboOrbCap()))
+		log("[ComboAttack] 드래곤 버프 시작 duration=" .. tostring(duration)
+			.. " 구슬 상한=" .. tostring(self:GetComboOrbCap()) .. " 구슬당 최종데미지=1%(절반)")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -10592,18 +10806,22 @@ script PlayerAttack extends AttackComponent
 		local myToken = self._T.shadowPartnerToken
 		self._T.shadowPartnerActive = true
 		self.ShadowPartnerOn = true
+		-- (요청 2026-08-15) 드래곤이 걸어준 버프는 분신 데미지가 절반(GetShadowEchoRate가 읽는다).
+		self._T.shadowPartnerFromDragon = true
 		local userId = self.Entity.PlayerComponent.UserId
 		self:NotifyShadowPartnerStart(duration, userId)
 		_TimerService:SetTimerOnce(function()
 			if self._T.shadowPartnerToken ~= myToken then return end
 			self._T.shadowPartnerActive = false
 			self.ShadowPartnerOn = false
+			self._T.shadowPartnerFromDragon = false
 			if isvalid(self._T.shadowPartnerEntity) then
 				self._T.shadowPartnerEntity.Enable = false
 			end
 			log("[ShadowPartner] 드래곤 버프 종료(" .. tostring(duration) .. "초)")
 		end, duration)
-		log("[ShadowPartner] 드래곤 버프 시작 duration=" .. tostring(duration))
+		log("[ShadowPartner] 드래곤 버프 시작 duration=" .. tostring(duration)
+			.. " 분신 데미지=" .. tostring(math.floor(self:GetShadowEchoRate() * 100 + 0.5)) .. "%")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -20301,8 +20519,50 @@ script PlayerAttack extends AttackComponent
 					self:DealBrandishFinishHit(t, 2)
 				end
 			end
+			-- (요청 2026-08-16) 2줄이 다 나간 **뒤에** 파이널어택 1줄을 얹는다(모션 없음).
+			self:TryTriggerBrandishFinalAttack(targets)
 		end, gap)
 		self._T.brandishTargets = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryTriggerBrandishFinalAttack(table targets)
+		-- (요청 2026-08-16) 브랜디쉬에도 파이널어택이 붙는다. 단 파워스트라이크/슬래쉬블래스트 파이널과
+		-- 달리 **전용 스윙 모션이 없다** - 연격 2줄이 끝난 직후 같은 대상에게 1줄이 더 들어가고
+		-- 데미지 숫자와 파이널어택 히트 이펙트만 뜬다. 모션을 넣으면 브랜디쉬 마무리 자세(swingTF)와
+		-- 겹치고 시전 잠금/복구(RestoreBrandishControl) 타이밍이 전부 어긋나기 때문이다.
+		-- 그래서 모션이 없는 만큼 컨트롤 잠금(LockSkillUse)도 걸지 않는다 - 브랜디쉬 본체의 잠금이
+		-- 이미 이 시점까지 이어져 있고, 추가로 잠그면 연사 간격만 늘어난다.
+		-- 발동 확률·미습득 차단은 전사 파이널어택 본체(TryTriggerFinalAttack)와 **같은 규칙**을 쓴다.
+		if not isvalid(self.Entity) then return end
+		if targets == nil then return end
+		if (self._T.faSkillLv or 0) <= 0 then return end
+		local faLv = math.min(20, self._T.faSkillLv)
+		local faChance = (5 + 45 * (faLv - 1) / 19) / 100
+		if _UtilLogic:RandomDouble() >= faChance then return end
+		-- 별도 인지범위 판정(HasFinalAttackTarget)은 쓰지 않는다 - 브랜디쉬는 이미 "때린 대상 목록"이
+		-- 확정돼 있어 그 목록이 곧 타겟 유무다(헛스윙 발동 방지라는 원래 취지가 그대로 지켜진다).
+		local alive = 0
+		for _, t in ipairs(targets) do
+			if isvalid(t) then alive = alive + 1 end
+		end
+		if alive == 0 then return end
+		-- 2줄의 마지막 숫자와 겹쳐 보이지 않게 짧은 텀을 두고 들어간다.
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) then return end
+			local hitCount = 0
+			for _, t in ipairs(targets) do
+				if isvalid(t) then
+					self._T.brandishCurrentTarget = t
+					local pos = t.TransformComponent.WorldPosition
+					local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
+					self:AttackShadowSafe(shape, "skill.brandish.final", t)
+					self:PlayFinalAttackHitEffect(t)
+					hitCount = hitCount + 1
+				end
+			end
+			log("[Brandish] 파이널어택 추가타(모션 없음) targets=" .. tostring(hitCount))
+		end, 0.25)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -20344,13 +20604,15 @@ script PlayerAttack extends AttackComponent
 		local bonusCrit = self._T.shadowEchoBonusIsCritical or false
 
 		if not actuallyHit then
-			-- CalcDamageBase의 skill.brandish.finish 분기와 동일한 공식(400%~700%)으로 표시 전용 데미지를
-			-- 새로 굴린다(실제 Hp에는 영향 없음). 크리티컬/쉐도우 파트너 보너스도 stale 값 대신 새로 굴린다.
+			-- CalcDamageBase와 **같은 함수**(RollBrandishLineMultiplier)로 표시 전용 데미지를 새로
+			-- 굴린다(실제 Hp에는 영향 없음). 크리티컬/쉐도우 파트너 보너스도 stale 값 대신 새로 굴린다.
+			-- ⚠ (버그 수정 2026-08-15) 여기 구 고정 공식 `4.0 + rand*3.0`(400~700%)이 복제돼 있었다 -
+			--   2026-08-12에 실제 데미지만 레벨 비례(180~240% + 4%p/pt)로 개편되고 이 표시 경로는
+			--   그대로 남아, 앞선 줄에 대상이 죽으면 그 줄만 2배 가까운 숫자가 떴다(신고).
 			local critRate = self:GetServerCritRatePercent() / 100
 			local critMult = (self._T.currentCritDamagePercent or 125) / 100
 			local combatPower = self._T.pendingBrandishCombatPower or 0
-			local mult = 4.0 + _UtilLogic:RandomDouble() * 3.0
-			damage = self:ApplyComboAttackBonus(math.floor(combatPower * mult))
+			damage = self:ApplyComboAttackBonus(math.floor(combatPower * self:RollBrandishLineMultiplier()))
 			-- 백스탭도 실제 히트와 같은 시전 판정으로 얹는다 - 이 표시 전용 경로에 안 얹으면 앞선 타격에
 			-- 대상이 죽은 뒤의 줄만 보너스가 빠져 "6줄 중 일부만 백스탭이 걸린 것처럼" 보인다.
 			damage = self:ApplyBackstabBonus(damage, self.Entity, target, "skill.brandish.finish")
@@ -20635,6 +20897,16 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("ServerOnly")
 	method void SummonDarkDragonLv(number combatPower, number duration, number rateMin, number rateMax)
 		-- 플레이어가 시전하는 서먼 다크드래곤. 수명·데미지 배율 모두 투자 레벨 비례(호출부가 계산).
+		-- (버그 수정 2026-08-15, 신고 "연속으로 누르면 2마리가 소환된다") **정리 → 스폰을 이 진입점
+		-- 한 곳에서 붙여 처리한다.** 구 구조는 클라(SkillManager)가 "활성 중이면" RequestCancelBuff를
+		-- 먼저 따로 보내는 방식이었는데 두 갈래로 새어나갔다:
+		--   ① 정리 RPC와 소환 RPC가 **각각 다른 호출**이라 순서가 어긋날 수 있다(첫 소환이 아직 서버에
+		--      도착하기 전에 두 번째 입력의 정리가 지나가면 지울 것이 없어 그대로 두 마리가 된다).
+		--   ② 정리로 죽은 주 드래곤의 OnEndPlay가 NotifyDarkDragonGone을 쏘는데, 이게 **방금 세운
+		--      클라 활성 창(darkDragonActiveUntil)을 뒤늦게 0으로 지운다.** 그러면 다음 입력이
+		--      "활성 아님"으로 보고 정리를 건너뛴 채 한 마리를 더 부른다 - 신고된 증상의 직접 원인.
+		-- 서버에서 원자적으로 처리하면 클라 상태나 RPC 순서와 무관하게 **항상 1마리**다.
+		self:ClearDarkDragonsForResummon()
 		self._T.darkDragonRateMin = rateMin
 		self._T.darkDragonRateMax = rateMax
 		self:SummonDarkDragonLife(combatPower, duration)
@@ -20683,6 +20955,26 @@ script PlayerAttack extends AttackComponent
 	method number GetDarkDragonCombatPower()
 		-- 드래곤(블랙드래곤 연쇄 소환/공격)이 참조하는 소환 시점 전투력.
 		return self._T.pendingDarkDragonCombatPower or 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearDarkDragonsForResummon()
+		-- 재소환 직전 정리. 기존 드래곤(버프로 나온 블랙드래곤 포함)을 전부 지우되 **소멸 통보는 막는다** -
+		-- IsMainSummon을 내려 OnEndPlay의 NotifyDarkDragonGone 경로를 끊는다. 통보를 그대로 두면
+		-- 새로 세운 클라 활성 창을 그 통보가 지워, 다음 시전이 정리를 건너뛰고 두 마리가 된다.
+		-- (우클릭 취소 경로 DismissDarkDragons는 반대로 통보가 **있어야** 하므로 별도 메서드로 둔다.)
+		local comps = self.Entity:GetChildComponentsByTypeName("script.DarkDragon", true)
+		local removed = 0
+		for _, c in ipairs(comps) do
+			if isvalid(c) and isvalid(c.Entity) then
+				c.IsMainSummon = false
+				c.Entity:Destroy()
+				removed = removed + 1
+			end
+		end
+		if removed > 0 then
+			log("[DarkDragon] 재소환 - 기존 " .. tostring(removed) .. "마리 정리(소멸 통보 생략)")
+		end
 	end
 
 	@ExecSpace("ServerOnly")

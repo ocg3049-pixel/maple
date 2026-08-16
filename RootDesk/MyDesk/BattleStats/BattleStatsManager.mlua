@@ -28,6 +28,17 @@ script BattleStatsManager extends Logic
 		return "/ui/DefaultGroup/BattleStatsWindow"
 	end
 
+	@ExecSpace("ClientOnly")
+	method string DetailWinPath()
+		-- (요청 2026-08-14) 상세("+")는 **별도 대형 창**이다. 종전엔 본 창을 세로로 늘려 8행을
+		-- 380px 폭 안에 우겨넣었는데, 점유율 칸이 40px라 "100.0%"가 2줄로 깨지고 데미지 자릿수가
+		-- 커지면 가로가 안 맞았다(신고).
+		-- ⚠ DefaultGroup.ui는 이미 2500개가 넘는 엔티티라 여기에 100여 개를 더 붙이면 뒤쪽 엔티티가
+		--   **에러 없이 통째로 누락**된다(파일 단위 예산). 그래서 전용 .ui 그룹 파일로 분리했고,
+		--   GroupOrder 8(양수 - 음수는 아예 렌더링되지 않는다)로 모든 창 위에 그린다.
+		return "/ui/BattleStatsDetailWindow/Window"
+	end
+
 	-- ── 라이프사이클 ──────────────────────────────────────────────────
 
 	method void OnBeginPlay()
@@ -62,8 +73,9 @@ script BattleStatsManager extends Logic
 
 		self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
 
-		local dp = _EntityService:GetEntityByPath(self:WinPath() .. "/DetailPanel")
-		if isvalid(dp) then dp.Enable = false end
+		-- (요청 2026-08-14) 상세 대형 창도 같은 규칙으로 숨겨 둔다(.ui는 enable=true 저장).
+		local dw = _EntityService:GetEntityByPath(self:DetailWinPath())
+		if isvalid(dw) then dw.Enable = false end
 
 		self:ConnectTouch("/TitleBar", self.OnTitleDown)
 		self:ConnectTouch("/TitleBar/BtnClose", self.OnCloseDown)
@@ -71,6 +83,9 @@ script BattleStatsManager extends Logic
 		self:ConnectTouch("/BtnToggle", self.OnToggleDown)
 		self:ConnectTouch("/ConfirmDialog/BtnYes", self.OnConfirmYesDown)
 		self:ConnectTouch("/ConfirmDialog/BtnNo", self.OnConfirmNoDown)
+		-- 상세 창(별도 그룹)은 절대 경로로 붙인다 - ConnectTouch는 본 창 상대 경로 전용이다.
+		self:ConnectTouchAt(self:DetailWinPath() .. "/TitleBar", self.OnDetailTitleDown)
+		self:ConnectTouchAt(self:DetailWinPath() .. "/TitleBar/BtnClose", self.OnDetailCloseDown)
 
 		self.uiTimer = _TimerService:SetTimerRepeat(self.UpdateTick, 0.25)
 		log("[BattleStats] ready (키설정 기능 battlestats, 기본 F8)")
@@ -98,9 +113,16 @@ script BattleStatsManager extends Logic
 	@ExecSpace("ClientOnly")
 	method void ConnectTouch(string subPath, any fn)
 		-- 창 내부 상대 경로 엔티티에 UITouchDownEvent 핸들러를 연결하고 장부에 기록한다
-		local ent = _EntityService:GetEntityByPath(self:WinPath() .. subPath)
+		self:ConnectTouchAt(self:WinPath() .. subPath, fn)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConnectTouchAt(string fullPath, any fn)
+		-- 절대 경로판 - 상세 창이 별도 .ui 그룹(/ui/BattleStatsDetailWindow)이라 본 창 상대 경로로는
+		-- 닿지 않는다. 해제는 ConnectTouch와 같은 장부(touchHandlers)에서 함께 처리된다.
+		local ent = _EntityService:GetEntityByPath(fullPath)
 		if not isvalid(ent) then
-			log_warning("[BattleStats] 터치 대상 없음: " .. subPath)
+			log_warning("[BattleStats] 터치 대상 없음: " .. fullPath)
 			return
 		end
 		local h = ent:ConnectEvent(UITouchDownEvent, fn)
@@ -154,6 +176,8 @@ script BattleStatsManager extends Logic
 	method void CloseWindow()
 		-- 창 닫기 (측정 상태는 유지 - 다시 열면 이어서 표시된다)
 		self:HideConfirm()
+		-- 상세 창은 본 창의 부속이므로 함께 닫는다 - 안 닫으면 본 창 없이 상세만 떠 있게 된다.
+		self:CloseDetail()
 		local w = _EntityService:GetEntityByPath(self:WinPath())
 		if isvalid(w) then w.Enable = false end
 		log("[BattleStats] 창 닫힘")
@@ -189,6 +213,12 @@ script BattleStatsManager extends Logic
 		-- 전투분석 창이 "제일 앞"일 때만 전담한다 - 아니면 false를 돌려 앞 창부터 닫히게 한다.
 		-- 다이얼로그가 열려 있으면 취소로 닫고, 창만 열려 있으면 종료 확인을 띄운다.
 		if not self:IsWindowOpen() then return false end
+		-- (요청 2026-08-14) 상세 대형 창은 전용 그룹이라 **항상 다른 창들 위**에 그려진다 -
+		-- 보이는 대로 ESC도 이쪽이 먼저 먹어야 한다(형제 인덱스 판정 대상이 아니므로 따로 처리).
+		if self:IsDetailOpen() then
+			self:CloseDetail()
+			return true
+		end
 		if not self:IsFrontmostWindow() then return false end
 		if self:IsConfirmOpen() then
 			self:HideConfirm()
@@ -377,28 +407,48 @@ script BattleStatsManager extends Logic
 		return rows
 	end
 
+	-- (요청 2026-08-14) 상세 표시 행 수. 대형 창이 되면서 8 → 16행.
+	@ExecSpace("ClientOnly")
+	method integer DetailRowCount()
+		-- .ui의 Row1~Row16과 반드시 같은 수여야 한다(더 크면 없는 엔티티를 찾아 조용히 넘어간다).
+		return 16
+	end
+
 	@ExecSpace("ClientOnly")
 	method boolean IsDetailOpen()
-		-- 상세 패널 표시 여부
-		local p = _EntityService:GetEntityByPath(self:WinPath() .. "/DetailPanel")
+		-- 상세 대형 창 표시 여부
+		local p = _EntityService:GetEntityByPath(self:DetailWinPath())
 		return isvalid(p) and p.Enable
 	end
 
 	@ExecSpace("ClientOnly")
 	method void ToggleDetail()
-		-- 자세히 보기 접기/펼치기 - 창 높이를 늘리고 상세 패널을 켠다
-		local w = _EntityService:GetEntityByPath(self:WinPath())
-		local p = _EntityService:GetEntityByPath(self:WinPath() .. "/DetailPanel")
-		if not isvalid(w) or not isvalid(p) then return end
+		-- "+" 버튼: 상세 대형 창 열기/닫기. (구 사양의 "본 창을 세로로 늘려 8행 표시"는 폐지 -
+		-- 좁은 폭 때문에 점유율이 2줄로 깨지고 데미지 자릿수를 못 받아냈다.)
+		local p = _EntityService:GetEntityByPath(self:DetailWinPath())
+		if not isvalid(p) then
+			log_warning("[BattleStats] 상세 창 엔티티 없음 - refresh 필요? " .. self:DetailWinPath())
+			return
+		end
 		local opening = not p.Enable
 		p.Enable = opening
-		w.UITransformComponent.RectSize = Vector2(380, opening and 560 or 300)
-		if opening then self:RefreshDetail() end
+		if opening then
+			-- 화면 밖으로 밀려나 있으면 중앙으로 복구(본 창 OpenWindow와 같은 규칙).
+			local tr = p.UITransformComponent
+			if math.abs(tr.anchoredPosition.x) > 900 or math.abs(tr.anchoredPosition.y) > 480 then
+				tr.anchoredPosition = Vector2(0, 0)
+			end
+			self:RefreshDetail()
+		end
+		log("[BattleStats] 상세 창 " .. (opening and "열림" or "닫힘"))
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RefreshDetail()
-		-- 상세 패널 8행 갱신: 스킬명 | 사용(시전) | 데미지 | 점유율(총합 대비 %), 데미지 내림차순.
+		-- 상세 창 갱신: 스킬명 | 사용(시전 횟수) | 타수 | 데미지 | 점유율(총합 대비 %), 데미지 내림차순.
+		-- (요청 2026-08-14) 종전엔 사용/타수를 한 칸에 섞어 보여줬는데(시전 0이면 타수로 대체),
+		-- 대형 창이 되면서 **두 칸으로 분리**했다 - 소환수/장판처럼 시전 1회에 타격이 수백인 항목을
+		-- 한눈에 구분할 수 있다.
 		-- 측정 중 = 실시간, 종료 후 = 프리즈 스냅샷.
 		if not self:IsDetailOpen() then return end
 		local rows
@@ -411,13 +461,14 @@ script BattleStatsManager extends Logic
 		end
 		local totalDmg = 0
 		for _, r in ipairs(rows) do totalDmg = totalDmg + r.dmg end
-		for i = 1, 8 do
-			local base = self:WinPath() .. "/DetailPanel/Row" .. tostring(i)
+		for i = 1, self:DetailRowCount() do
+			local base = self:DetailWinPath() .. "/Board/Row" .. tostring(i)
 			local r = rows[i]
-			local nameTxt, castTxt, dmgTxt, pctTxt = "", "", "", ""
+			local nameTxt, castTxt, hitTxt, dmgTxt, pctTxt = "", "", "", "", ""
 			if r ~= nil then
 				nameTxt = r.name
-				castTxt = (r.casts > 0) and (self:FormatComma(r.casts) .. "회") or (self:FormatComma(r.hits) .. "타")
+				castTxt = (r.casts > 0) and (self:FormatComma(r.casts) .. "회") or "-"
+				hitTxt = (r.hits > 0) and (self:FormatComma(r.hits) .. "타") or "-"
 				dmgTxt = self:FormatComma(r.dmg)
 				if totalDmg > 0 then
 					pctTxt = string.format("%.1f%%", r.dmg / totalDmg * 100)
@@ -425,6 +476,7 @@ script BattleStatsManager extends Logic
 			end
 			self:SetDetailCell(base .. "/Name", nameTxt)
 			self:SetDetailCell(base .. "/Casts", castTxt)
+			self:SetDetailCell(base .. "/Hits", hitTxt)
 			self:SetDetailCell(base .. "/Dmg", dmgTxt)
 			self:SetDetailCell(base .. "/Pct", pctTxt)
 		end
@@ -441,10 +493,32 @@ script BattleStatsManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnDetailDown(UITouchDownEvent e)
-		-- + (자세히 보기) 버튼
+		-- + (자세히 보기) 버튼 - 상세 대형 창을 연다/닫는다
 		if self:IsConfirmOpen() then return end
 		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:WinPath()) then return end
 		self:ToggleDetail()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnDetailTitleDown(UITouchDownEvent e)
+		-- 상세 창 타이틀바: 창 공용 드래그. 겹침 게이트는 자기 경로로 물어본다
+		-- (상세 창은 전용 그룹이라 UIClickArbiter가 항상 최상단으로 쳐 준다).
+		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:DetailWinPath()) then return end
+		_UIEquipInventoryManager:StartWindowDrag(self:DetailWinPath())
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnDetailCloseDown(UITouchDownEvent e)
+		-- 상세 창 X: 확인 없이 바로 닫는다(본 창과 달리 측정 상태와 무관한 보조 창이다)
+		if not _UIEquipInventoryManager:AcceptWindowClick(e, self:DetailWinPath()) then return end
+		self:CloseDetail()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseDetail()
+		-- 상세 대형 창 닫기
+		local p = _EntityService:GetEntityByPath(self:DetailWinPath())
+		if isvalid(p) then p.Enable = false end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -574,6 +648,7 @@ script BattleStatsManager extends Logic
 				["skill.slashblast"] = "슬래시블러스트", ["skill.slashblast.final"] = "파이널어택",
 				["skill.rush"] = "돌진", ["skill.chainshot"] = "체인샷·섬광", ["skill.parry"] = "패링 반격",
 				["skill.brandish"] = "브랜디쉬", ["skill.brandish.finish"] = "브랜디쉬(마무리)",
+				["skill.brandish.final"] = "파이널어택",
 				["skill.panic"] = "패닉", ["skill.coma"] = "코마",
 				["skill.spearburst"] = "스피어 버스터", ["skill.dragonroar"] = "드래곤 로어",
 				["skill.darkdragon"] = "서먼 다크드래곤", ["skill.ridingdragon"] = "드래곤 라이딩",
