@@ -73,6 +73,7 @@ script Monster extends Component
         if name ~= "IsDead" then return end
         if value == true then
             self:ClearStatusEffects()
+			self:ClearIceDemonMarkEffect()
         end
     end
 
@@ -293,10 +294,10 @@ script Monster extends Component
 
     @ExecSpace("ServerOnly")
     method void EnsureWanderAI()
-        -- 추적형 몬스터에게 배회 능력을 붙인다(이미 있으면 아무것도 하지 않는다).
-        if not isvalid(self.Entity.AIChaseComponent) then return end
-        if isvalid(self.Entity.AIWanderComponent) then return end
-        self.Entity:AddComponent("AIWanderComponent")
+		-- AIChase와 AIWander를 한 엔티티에 런타임으로 중복 추가하면 두 네이티브 AI가 물리 이동을
+		-- 번갈아 갱신하고, 대량 몬스터 맵에서 LWA-3048과 이동 끊김을 만든다. 모델에 원래 들어 있는
+		-- AI만 사용한다. AIChase 전용 몬스터는 피격 전에는 대기하고 피격 시에만 추적한다.
+		return
     end
 
     @ExecSpace("ServerOnly")
@@ -355,8 +356,60 @@ script Monster extends Component
         self._T.lastKiller = owner
     end
 
-    @ExecSpace("ServerOnly")
-    method void Dead()
+	@ExecSpace("ServerOnly")
+	method void ApplyIceDemonMark(Entity owner, integer skillLv)
+		-- 표식은 마지막 적중부터 5초 동안만 유효하다. 토큰으로 재적중 전 타이머가 새 표식을 지우지 않게 한다.
+		if self.IsDead or not isvalid(owner) then return end
+		self._T.iceDemonMarkOwner = owner
+		self._T.iceDemonMarkLevel = math.max(0, math.min(skillLv, 30))
+		self._T.iceDemonMarkExpiresAt = _UtilLogic.ServerElapsedSeconds + 5.0
+		self._T.iceDemonMarkToken = (self._T.iceDemonMarkToken or 0) + 1
+		local token = self._T.iceDemonMarkToken
+		self:ShowIceDemonMark()
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) or self.IsDead then return end
+			if self._T.iceDemonMarkToken ~= token then return end
+			self._T.iceDemonMarkOwner = nil
+			self._T.iceDemonMarkLevel = nil
+			self._T.iceDemonMarkExpiresAt = nil
+		end, 5.0)
+		log("[Monster] 아이스 데몬 표식 lv=" .. tostring(self._T.iceDemonMarkLevel))
+	end
+
+	method boolean HasIceDemonMarkFrom(Entity owner)
+		-- 살아 있는 현재 개체에 같은 주인이 남긴 유효한 아이스 데몬 표식이 있는지 반환한다.
+		return not self.IsDead and isvalid(owner) and self._T.iceDemonMarkOwner == owner
+			and (self._T.iceDemonMarkLevel or 0) > 0
+			and (_UtilLogic.ServerElapsedSeconds or 0) < (self._T.iceDemonMarkExpiresAt or 0)
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowIceDemonMark()
+		-- 반복 이펙트 serial을 반드시 제거해 사망·리젠 뒤 잔상이 남지 않게 한다.
+		if not self:IsClient() then return end
+		if self._T.iceDemonMarkEffect ~= nil then _EffectService:RemoveEffect(self._T.iceDemonMarkEffect) end
+		local serial = _EffectService:PlayEffectAttached("0e670196706243d9a482148499c7816f", self.Entity, Vector3(0, 0.6, 0), 0, Vector3(0.3, 0.3, 0.3), true)
+		self._T.iceDemonMarkEffect = serial
+		_TimerService:SetTimerOnce(function()
+			if self._T.iceDemonMarkEffect == serial then
+				_EffectService:RemoveEffect(serial)
+				self._T.iceDemonMarkEffect = nil
+			end
+		end, 5.0)
+	end
+
+	@ExecSpace("Multicast")
+	method void ClearIceDemonMarkEffect()
+		-- 사망/리젠 시 5초 타이머를 기다리지 않고 반복 표식 엔티티를 즉시 제거한다.
+		if not self:IsClient() then return end
+		if self._T.iceDemonMarkEffect ~= nil then
+			_EffectService:RemoveEffect(self._T.iceDemonMarkEffect)
+			self._T.iceDemonMarkEffect = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Dead()
         if self.IsDead then return end
         self.IsDead = true
         -- (표창 재고) 처치 통보 - 모든 처치가 지나는 유일한 길목이라 여기 한 곳이면 충분하다.
@@ -379,8 +432,20 @@ script Monster extends Component
         end
         log("Monster: Dead()")
 
-        local deathPos = self.Entity.TransformComponent.WorldPosition
-        local dropMap = self.Entity.CurrentMap
+		local deathPos = self.Entity.TransformComponent.WorldPosition
+		local markOwner = self._T.iceDemonMarkOwner
+		local markLevel = self._T.iceDemonMarkLevel or 0
+		self._T.iceDemonMarkOwner = nil
+		self._T.iceDemonMarkLevel = nil
+		self._T.iceDemonMarkExpiresAt = nil
+		self._T.iceDemonMarkToken = (self._T.iceDemonMarkToken or 0) + 1
+		self:ClearIceDemonMarkEffect()
+		if isvalid(markOwner) and markLevel > 0 then
+			---@type PlayerAttack
+			local markAttack = markOwner:GetComponent("script.PlayerAttack")
+			if isvalid(markAttack) then markAttack:TrySummonIceDemonMinion(deathPos, markLevel) end
+		end
+		local dropMap = self.Entity.CurrentMap
         if isvalid(dropMap) then
             -- (요청 2026-08-12) 초보자 패시브 "아이템 감각" - 마지막 공격자의 보너스(%)를 **메소 획득량과
             -- 모든 확률 아이템 드랍**에 함께 곱한다(분배당 +1%, 마스터 100 = 2배). 킬러를 못 찾으면 1.0.
@@ -477,6 +542,12 @@ script Monster extends Component
 
     @ExecSpace("ServerOnly")
     method void Respawn()
+		-- 재사용되는 동일 몬스터 엔티티에 이전 생명의 아이스 데몬 표식이 남지 않게 먼저 정리한다.
+		self._T.iceDemonMarkOwner = nil
+		self._T.iceDemonMarkLevel = nil
+		self._T.iceDemonMarkExpiresAt = nil
+		self._T.iceDemonMarkToken = (self._T.iceDemonMarkToken or 0) + 1
+		self:ClearIceDemonMarkEffect()
         self.IsDead = false
         self.Hp = self.MaxHp
         self._T.pendingDeath = nil

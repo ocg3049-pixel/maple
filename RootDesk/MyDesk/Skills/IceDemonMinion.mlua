@@ -1,0 +1,302 @@
+@Component
+script IceDemonMinion extends Component
+
+	@Sync property Entity OwnerEntity = nil
+	@Sync property integer MaxHp = 1
+	@Sync property integer Hp = 1
+	@Sync property string MoveRUID = ""
+	@Sync property string AttackRUID = ""
+	@Sync property string HitRUID = ""
+	@Sync property string DieRUID = ""
+	@Sync property string SpecialKind = ""
+	@Sync property integer AttackSequence = 0
+	@Sync property integer DamageFrameIndex = 8
+	property number Lifetime = 20.0
+	property number AttackInterval = 2.0
+	property number FollowDistance = 1.2
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- MapleTile(0)의 발판·중력 판정을 받도록 Rigidbody + 네이티브 배회 AI를 사용한다.
+		self._T.spawnAt = _UtilLogic.ServerElapsedSeconds
+		local p = self.Entity.TransformComponent.WorldPosition
+		self._T.patrolCenterX = p.x
+		self._T.patrolY = p.y
+		-- Body와 배회 AI는 icedemonminion.model에 정적으로 포함되어 있어 첫 프레임부터 발판을 따른다.
+		self._T.attackTimer = _TimerService:SetTimerRepeat(self.TryAttack, self.AttackInterval)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self) and isvalid(self.Entity) and self.Entity:GetComponent("script.IceDemonMinion") == self then self:RequestDeath() end
+		end, self.Lifetime)
+		log("[IceDemonMinion] 소환 시작 hp=" .. tostring(self.Hp) .. "/" .. tostring(self.MaxHp))
+	end
+
+	@ExecSpace("Client")
+	method void BeginReveal(string moveRuid)
+		-- 소환 이펙트와 동시에 투명 상태에서 1초 동안 서서히 모습을 드러낸다.
+		local sr = self.Entity.SpriteRendererComponent
+		if isvalid(sr) then
+			sr.Color = Color(1, 1, 1, 0)
+			sr.SortingLayer = "MapLayer0"
+			sr.OrderInLayer = 6
+			if moveRuid ~= "" then sr.SpriteRUID = moveRuid end
+		end
+		local startedAt = _UtilLogic.ElapsedSeconds
+		self._T.fadeTimer = _TimerService:SetTimerRepeat(function()
+			if not isvalid(self.Entity) or not isvalid(sr) then
+				if self._T.fadeTimer ~= nil then _TimerService:ClearTimer(self._T.fadeTimer) self._T.fadeTimer = nil end
+				return
+			end
+			local a = math.max(0, math.min(1, _UtilLogic.ElapsedSeconds - startedAt))
+			sr.Color = Color(1, 1, 1, a)
+			if a >= 1 then
+				_TimerService:ClearTimer(self._T.fadeTimer)
+				self._T.fadeTimer = nil
+			end
+		end, 1 / 30)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- 동기화된 이동/공격 클립 변경을 각 클라이언트 렌더러에 반영한다.
+		if self._T.frameHandler == nil then
+			self._T.frameHandler = self.Entity:ConnectEvent(SpriteAnimPlayerChangeFrameEvent, self.OnAttackFrameChanged)
+		end
+		if name == "MoveRUID" then
+			local sr = self.Entity.SpriteRendererComponent
+			if isvalid(sr) and value ~= nil and value ~= "" then sr.SpriteRUID = tostring(value) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnAttackFrameChanged(SpriteAnimPlayerChangeFrameEvent event)
+		-- 실제 공격 이미지가 목표 프레임에 도달한 순간 한 번만 서버에 판정을 요청한다.
+		if not isvalid(self.OwnerEntity) or _UserService.LocalPlayer ~= self.OwnerEntity then return end
+		if self.MoveRUID == "" or self.MoveRUID ~= self.AttackRUID then return end
+		if event.FrameIndex < self.DamageFrameIndex then return end
+		if (self._T.requestedAttackSequence or -1) == self.AttackSequence then return end
+		self._T.requestedAttackSequence = self.AttackSequence
+		log("[IceDemonMinion] visual damage frame=" .. tostring(event.FrameIndex + 1) .. " sequence=" .. tostring(self.AttackSequence))
+		self:RequestAttackFrameHit(self.AttackSequence)
+	end
+
+	@ExecSpace("Server")
+	method void RequestAttackFrameHit(integer attackSequence)
+		-- 클라이언트가 본 실제 공격 프레임과 서버의 현재 공격 회차를 검증한 뒤 피해를 적용한다.
+		if attackSequence ~= self.AttackSequence then return end
+		if self._T.appliedAttackSequence == attackSequence then return end
+		local attackTarget = self._T.attackTarget
+		if not isvalid(self.Entity) or not isvalid(attackTarget) or not isvalid(self.OwnerEntity) then return end
+		local ownerAttack = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(ownerAttack) then return end
+		self._T.appliedAttackSequence = attackSequence
+		if self.SpecialKind == "a62292659ac24cbba754bfa031515632" then
+			self:Fire2600902Ball(attackTarget)
+		else
+			ownerAttack:DealIceDemonSummonHit(attackTarget)
+			self:PlayOwnHitEffect(ownerAttack, attackTarget)
+		end
+		log("[IceDemonMinion] damage applied visualFrame=" .. tostring(self.DamageFrameIndex + 1) .. " sequence=" .. tostring(attackSequence))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- 실제 이동은 RigidbodyComponent + AIWanderComponent가 처리한다. Transform을 매 프레임
+		-- 직접 Translate하던 방식은 발판을 무시하고 서버 위치 동기화가 끊겨 보이는 원인이었다.
+		if not isvalid(self.OwnerEntity) and _UtilLogic.ServerElapsedSeconds - (self._T.spawnAt or 0) < 0.5 then
+			-- AddComponent 직후 OwnerEntity 동기화가 들어오기 전 첫 프레임은 파괴하지 않는다.
+			return
+		end
+		if not isvalid(self.OwnerEntity) then
+			self:RequestDeath()
+			return
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryAttack()
+		-- 가장 가까운 살아 있는 몬스터 하나를 찾아 드래곤 라이딩 1/3 데미지로 공격한다.
+		if self._T.dying or self._T.deathPending or not isvalid(self.OwnerEntity) or not isvalid(self.Entity.CurrentMap) then return end
+		if (_UtilLogic.ServerElapsedSeconds or 0) < (self._T.attackPauseUntil or 0) then return end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local best = nil
+		local bestDist = 1.3
+		for _, comp in ipairs(self.Entity.CurrentMap:GetChildComponentsByTypeName("script.Monster", true)) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local p = mc.Entity.TransformComponent.WorldPosition
+				local d = math.sqrt((p.x - myPos.x) * (p.x - myPos.x) + (p.y - myPos.y) * (p.y - myPos.y))
+				if d < bestDist then best, bestDist = mc.Entity, d end
+			end
+		end
+		if not isvalid(best) then return end
+		local attackDuration = self:GetAttackDuration()
+		self._T.attackPauseUntil = _UtilLogic.ServerElapsedSeconds + attackDuration
+		local wander = self.Entity.AIWanderComponent
+		if isvalid(wander) then
+			wander.Enable = false
+			_TimerService:SetTimerOnce(function()
+				if isvalid(self.Entity) and isvalid(wander) and not self._T.dying and not self._T.deathPending then wander.Enable = true end
+			end, attackDuration)
+		end
+		local movement = self.Entity.MovementComponent
+		if isvalid(movement) then movement:Stop() end
+		local body = self.Entity.RigidbodyComponent
+		if isvalid(body) then
+			body:SetForce(Vector2(0, 0))
+			-- SetForce(0)만으로 남는 직전 AI 이동 관성을 PositionReset으로 함께 제거한다.
+			body:PositionReset()
+		end
+		---@type PlayerAttack
+		local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return end
+		self._T.attackTarget = best
+		self.DamageFrameIndex = self.AttackRUID == "5814e0d06e42448b978b5c5574fdfa08" and 17 or 8
+		self.AttackSequence += 1
+		if self.AttackRUID ~= "" then
+			self.MoveRUID = self.AttackRUID
+			_TimerService:SetTimerOnce(function()
+				if not isvalid(self.Entity) then return end
+				if self._T.deathPending then self:BeginDeath()
+				elseif not self._T.dying then self.MoveRUID = self._T.idleRuid or self.MoveRUID end
+			end, attackDuration)
+		end
+	end
+
+	method number GetAttackDuration()
+		-- 각 attack animationclip의 실제 프레임 수 × 원본 프레임 시간(60ms).
+		-- 가장 긴 30프레임 소환수도 마지막 프레임까지 재생한 뒤 이동 클립으로 돌아간다.
+		local frames = {
+			["dfcf285ec5734d66a5ea7766505e5040"] = 20,
+			["5a2282507e6b40ed88dfe51b85fca32c"] = 20,
+			["1a9c37ef154d4f92bfe0ef7766723745"] = 20,
+			["d0660ef4ef3f4658abdb98a2f233881e"] = 14,
+			["5814e0d06e42448b978b5c5574fdfa08"] = 30,
+			["895d634bcad24368b8bb346e32e73072"] = 15,
+			["b8fe685987c5427fbef10b33fe5e83ef"] = 14,
+		}
+		-- WZ 원본 프레임은 프레임별 delay가 균일하지 않아 60ms×개수만으로는 마지막 구간이 잘렸다.
+		-- 보수적으로 120ms×개수 + 0.5초를 확보하고, attackPauseUntil 게이트로 중복 공격을 막는다.
+		return (frames[self.AttackRUID] or 20) * 0.12 + 0.5
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayOwnHitEffect(any ownerAttack, Entity target)
+		if self.SpecialKind == "sprite" then ownerAttack:PlayIceDemonSummonHitSprite(target, self.HitRUID)
+		else ownerAttack:PlayIceDemonSummonHitClip(target, self.HitRUID) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Fire2600902Ball(Entity target)
+		if not isvalid(target) or not isvalid(self.OwnerEntity) then return end
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local from = self.Entity.TransformComponent.WorldPosition
+		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", "IceDemonMinionBall", Vector3(from.x, from.y + 0.45, 0), map)
+		if not isvalid(fx) then return end
+		log("[IceDemonMinion] 2600902 visual-frame ball fired")
+		fx:AddComponent("script.IceDemonProjectile")
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(fx) then return end
+			local ball = fx:GetComponent("script.IceDemonProjectile")
+			if isvalid(ball) then ball:InitializeMinionBall(self.OwnerEntity, target, "a62292659ac24cbba754bfa031515632", self.HitRUID) end
+		end, 0.05)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHpBar()
+		-- 용사 소환과 같은 머리 위 HP바 모델과 색상을 사용한다.
+		local bar = _SpawnService:SpawnByModelId("snipinggaugetext", "IceDemonHpBar", Vector3(0, 1.05, 0), self.Entity)
+		if not isvalid(bar) then return end
+		local bg = bar:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			bg.SpriteRendererComponent.Color = Color(0.25, 0.25, 0.25, 0.8)
+			bg.SpriteRendererComponent.PlayRate = 0
+		end
+		local fill = bar:GetChildByName("Fill", false)
+		if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+			fill.SpriteRendererComponent.Color = Color(1, 0.3, 0.3, 1)
+			fill.SpriteRendererComponent.PlayRate = 0
+		end
+		self._T.hpBar = bar
+		self:UpdateHpBar()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateHpBar()
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		local fill = bar:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = self.MaxHp > 0 and math.max(0, math.min(1, self.Hp / self.MaxHp)) or 0
+		fill.TransformComponent.Scale = Vector3(0.5 * ratio, 0.5, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureVisuals(string moveRuid, string attackRuid, string hitRuid, string specialKind)
+		-- 랜덤 소환수의 이동/공격 애니메이션 RUID를 저장하고 동기화한다.
+		self._T.idleRuid = moveRuid
+		self.MoveRUID = moveRuid
+		self.AttackRUID = attackRuid
+		self.HitRUID = hitRuid
+		self.SpecialKind = specialKind
+		-- 모델 스폰과 HP/Owner 설정이 끝난 뒤 자식 HP바를 만든다.
+		if not isvalid(self._T.hpBar) then self:SpawnHpBar() end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureDeathVisual(string dieRuid)
+		self.DieRUID = dieRuid
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RequestDeath()
+		if self._T.dying or self._T.deathPending then return end
+		if (_UtilLogic.ServerElapsedSeconds or 0) < (self._T.attackPauseUntil or 0) then
+			self._T.deathPending = true
+			return
+		end
+		self:BeginDeath()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginDeath()
+		if self._T.dying then return end
+		self._T.dying = true
+		self._T.deathPending = false
+		if isvalid(self.Entity.AIWanderComponent) then self.Entity.AIWanderComponent.Enable = false end
+		if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+		if self.DieRUID ~= "" then self.MoveRUID = self.DieRUID end
+		-- 원본 die 클립의 마지막 프레임이 충분히 재생된 뒤 제거한다.
+		_TimerService:SetTimerOnce(function() if isvalid(self.Entity) then self.Entity:Destroy() end end, 3.0)
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Self")
+	handler HandleHitEvent(HitEvent event)
+		-- 한 번 피해를 받은 뒤 2초 동안 후속 연타를 무시한다.
+		local now = _UtilLogic.ServerElapsedSeconds
+		if self._T.dying or (self._T.hitImmuneUntil or 0) > now then return end
+		self._T.hitImmuneUntil = now + 2.0
+		local damage = math.max(0, math.floor(event.TotalDamage))
+		self.Hp = math.max(0, self.Hp - damage)
+		self:UpdateHpBar()
+		self:ShowReceivedDamage(damage)
+		log("[IceDemonMinion] 피격 damage=" .. tostring(damage) .. " hp=" .. tostring(self.Hp) .. " (2초 무적)")
+		if self.Hp <= 0 and isvalid(self.Entity) then self:RequestDeath() end
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowReceivedDamage(integer damage)
+		if not self:IsClient() or damage <= 0 then return end
+		_DamageSkinService:Play(self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0, { damage }, DamageSkinTweenType.Default, false, Vector2(0, 0.45), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- 반복 공격 타이머를 정리한다.
+		if self._T.attackTimer ~= nil then _TimerService:ClearTimer(self._T.attackTimer) end
+	end
+
+end

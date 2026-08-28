@@ -28,8 +28,8 @@ script ShadowClone extends Component
 
 	-- 주인이 소환 시점에 넣어주는 값들(전부 SkillManager가 투자 레벨로 계산해 RPC로 올린 것).
 	property number Lifetime = 30
-	-- 분신 데미지 = 본체 데미지의 이 % (50~90).
-	property number DamagePercent = 50
+	-- 분신 데미지 = 본체 데미지의 이 % (25~45).
+	property number DamagePercent = 25
 	-- 분신이 쓸 수 있는 공격 스킬의 최고 차수(1~4).
 	property integer SkillTier = 1
 	-- 주인의 전투력(서버가 직접 읽을 수 없는 클라 상태라 시전 시점에 받아둔다).
@@ -37,6 +37,8 @@ script ShadowClone extends Component
 	-- 주인의 다크사이트 재사용 대기시간(초). 0이면 주인이 안 배운 것 - 분신도 쓰지 않는다.
 	-- 분신은 이 값을 기준으로 **쿨타임 ~ 쿨타임×4** 사이 랜덤 주기로 잠복한다(주인 자동사냥과 같은 규칙).
 	property number DarkSightCooldown = 0
+	-- 소유자의 표시 레벨. 70 이상이면 공격 전에 쉐도우 파트너부터 사용한다.
+	property integer OwnerLevel = 1
 
 	-- 아바타 모션 채널(용사 소환과 동일 규격).
 	--   LocoState: stand / walk / jump - 이동 상태가 바뀔 때만 대입한다.
@@ -84,6 +86,7 @@ script ShadowClone extends Component
 		self._T.dsHiddenUntil = 0
 		self._T.dsAmbushUntil = 0
 		self._T.nextAssaulterAt = 0
+		self._T.shadowPartnerUntil = 0
 		local ntc = self.Entity.NameTagComponent
 		if isvalid(ntc) then
 			-- 주인과 같은 이름 - "분신"임을 알 수 있게 접두사만 붙인다.
@@ -95,6 +98,10 @@ script ShadowClone extends Component
 		end
 		-- 수명 만료 시 소멸(주인이 위치 교환으로 자리를 바꿔도 이 시각은 그대로다).
 		self._T.lifetimeEndAt = now + self.Lifetime
+		-- 70레벨 이상 분신은 첫 공격보다 쉐도우 파트너 시전이 반드시 먼저다.
+		if self.OwnerLevel >= 70 then
+			self:CastShadowPartner(now)
+		end
 		_TimerService:SetTimerOnce(function()
 			if isvalid(self.Entity) then
 				log("[ShadowClone] 소환 종료(수명 " .. tostring(math.floor(self.Lifetime)) .. "초)")
@@ -103,7 +110,23 @@ script ShadowClone extends Component
 		end, self.Lifetime)
 		log("[ShadowClone] 소환 - 수명 " .. tostring(math.floor(self.Lifetime))
 			.. "초 / 데미지 " .. tostring(math.floor(self.DamagePercent))
-			.. "% / 스킬 " .. tostring(self.SkillTier) .. "차 / 전투력 " .. tostring(math.floor(self.CombatPower)))
+			.. "% / 스킬 " .. tostring(self.SkillTier) .. "차 / 전투력 " .. tostring(math.floor(self.CombatPower))
+			.. " / 소유자 레벨 " .. tostring(self.OwnerLevel))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CastShadowPartner(number now)
+		-- 쉐도우 파트너(60초): 공격 타수를 복제한다. 시전 모션 동안 공격보다 버프가 우선되도록 잠근다.
+		self._T.shadowPartnerUntil = now + 60.0
+		self._T.attackLockUntil = math.max(self._T.attackLockUntil or 0, now + 1.0)
+		self._T.nextAttackAt = math.max(self._T.nextAttackAt or 0, now + 1.0)
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if isvalid(pa) then
+			pa:PlayHasteCastEffect(self.Entity)
+			pa:PlayBuffSound("a83d56a314fd449cad236fd7d9b2fa63")
+		end
+		log("[ShadowClone] 70레벨 이상 - 공격 전 쉐도우 파트너 우선 사용(60초)")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -131,6 +154,11 @@ script ShadowClone extends Component
 		self._T.ownerGoneAt = nil
 
 		local now = _UtilLogic.ServerElapsedSeconds
+		-- 70레벨 이상은 쉐도우 파트너가 끝나는 즉시 공격보다 재시전을 우선한다.
+		if self.OwnerLevel >= 70 and (self._T.shadowPartnerUntil or 0) <= now then
+			self:CastShadowPartner(now)
+			return
+		end
 		local mv = self.Entity.MovementComponent
 		local rb = self.Entity.RigidbodyComponent
 		if not isvalid(mv) or not isvalid(rb) then return end
@@ -211,6 +239,17 @@ script ShadowClone extends Component
 		if self._T.target == nil and (self._T.nextTargetAt or 0) <= now then
 			self._T.nextTargetAt = now + 0.3
 			self._T.target = self:PickTarget(myPos)
+			-- 현재 층에서 닿는 적이 없으면 다른 소환수와 같은 방식으로 위층 적과 로프를 찾는다.
+			if self._T.target == nil then
+				local above = self:PickUpperTarget(myPos)
+				if isvalid(above) then self:StartRopeClimb(above) end
+			end
+		end
+
+		-- 로프 등반은 추적·공격보다 우선한다. 걷기 정렬 → 점프 부착 → 수직 등반 순서로 진행한다.
+		if self._T.ropeClimb ~= nil then
+			self:RopeClimbTick(now, mv, rb, myPos)
+			return
 		end
 
 		local target = self._T.target
@@ -454,6 +493,167 @@ script ShadowClone extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method Entity PickUpperTarget(Vector3 myPos)
+		-- 점프로 닿지 않는 위층 적 중 로프로 접근 가능한 후보를 찾는다.
+		---@type PlayerAttack
+		local pa = self:GetOwnerAttack()
+		if not isvalid(pa) then return nil end
+		local cands = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 9.0, 8)
+		local best = nil
+		local bestDist = 999.0
+		for _, t in ipairs(cands or {}) do
+			if isvalid(t) then
+				local tp = t.TransformComponent.WorldPosition
+				local dy = tp.y - myPos.y
+				local dx = tp.x - myPos.x
+				if dy > 2.2 and dy <= 5.0 then
+					local dist = dx * dx + dy * dy
+					if dist < bestDist then
+						best = t
+						bestDist = dist
+					end
+				end
+			end
+		end
+		return best
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FindRopeUp(Vector3 myPos, number targetY)
+		-- 맵의 ClimbableComponent 조각을 x별 논리 로프로 합치고 현재 층에서 위층까지 이어지는 최근접 로프를 찾는다.
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return nil end
+		if self._T.ropeCache == nil or self._T.ropeCacheMap ~= map then
+			local comps = map:GetChildComponentsByTypeName("ClimbableComponent", true)
+			local byX = {}
+			for _, c in ipairs(comps or {}) do
+				if isvalid(c) and isvalid(c.Entity) then
+					local wp = c.Entity.TransformComponent.WorldPosition
+					local cx = wp.x + c.BoxOffset.x
+					local half = c.BoxSize.y * 0.5
+					local key = string.format("%.1f", cx)
+					if byX[key] == nil then byX[key] = { x = cx, segs = {} } end
+					table.insert(byX[key].segs, { bot = wp.y + c.BoxOffset.y - half, top = wp.y + c.BoxOffset.y + half })
+				end
+			end
+			local ropes = {}
+			for _, group in pairs(byX) do
+				table.sort(group.segs, function(a, b) return a.bot < b.bot end)
+				local cur = nil
+				for _, seg in ipairs(group.segs) do
+					if cur == nil then
+						cur = { x = group.x, bot = seg.bot, top = seg.top }
+					elseif seg.bot <= cur.top + 0.4 then
+						if seg.top > cur.top then cur.top = seg.top end
+					else
+						table.insert(ropes, cur)
+						cur = { x = group.x, bot = seg.bot, top = seg.top }
+					end
+				end
+				if cur ~= nil then table.insert(ropes, cur) end
+			end
+			self._T.ropeCache = ropes
+			self._T.ropeCacheMap = map
+			log("[ShadowClone] 로프 인덱스 구성: " .. tostring(#ropes) .. "줄")
+		end
+		local best = nil
+		local bestD = 10.0
+		for _, rope in ipairs(self._T.ropeCache) do
+			if rope.bot <= myPos.y + 0.8 and rope.top >= targetY - 0.8 and rope.top > myPos.y + 0.5 then
+				local d = math.abs(rope.x - myPos.x)
+				if d < bestD then
+					best = rope
+					bestD = d
+				end
+			end
+		end
+		return best
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean StartRopeClimb(Entity above)
+		if not isvalid(above) then return false end
+		if self._T.ropeClimb ~= nil then return true end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local targetY = above.TransformComponent.WorldPosition.y
+		local rope = self:FindRopeUp(myPos, targetY)
+		if rope == nil then return false end
+		local topY = math.min(targetY, rope.top)
+		local walkDist = math.abs(rope.x - myPos.x)
+		self._T.ropeClimb = { x = rope.x, topY = topY,
+			deadline = _UtilLogic.ServerElapsedSeconds + 4.0 + walkDist / 2.0, phase = "walk" }
+		self._T.target = above
+		log("[ShadowClone] 로프 등반 시작 x=" .. string.format("%.1f", rope.x)
+			.. " → y=" .. string.format("%.1f", topY))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EndRopeClimbState(MovementComponent mv, RigidbodyComponent rb, string reason)
+		local rc = self._T.ropeClimb
+		self._T.ropeClimb = nil
+		if isvalid(rb) and rb.KinematicMove then
+			rb.KinematicMove = false
+			rb:PositionReset()
+		end
+		if isvalid(mv) then
+			if rc ~= nil and rc.restoreSpeed ~= nil then mv.InputSpeed = rc.restoreSpeed end
+			mv:Stop()
+		end
+		self._T.moving = false
+		log("[ShadowClone] 로프 등반 종료 - " .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RopeClimbTick(number now, MovementComponent mv, RigidbodyComponent rb, Vector3 myPos)
+		local rc = self._T.ropeClimb
+		if rc == nil then return end
+		if now > rc.deadline then
+			self:EndRopeClimbState(mv, rb, "타임아웃")
+			return
+		end
+		if rc.phase == "walk" then
+			local dx = rc.x - myPos.x
+			if math.abs(dx) > 0.08 then
+				local dir = (dx > 0) and 1 or -1
+				if rc.restoreSpeed == nil then rc.restoreSpeed = mv.InputSpeed end
+				if math.abs(dx) < 0.3 then mv.InputSpeed = rc.restoreSpeed * 0.5 else mv.InputSpeed = rc.restoreSpeed end
+				mv:MoveToDirection(Vector2(dir, 0), 0)
+				self._T.moving = true
+				self._T.faceDir = dir
+			elseif rb:IsOnGround() then
+				if rc.aligned ~= true then
+					rc.aligned = true
+					mv:Stop()
+					self._T.moving = false
+				else
+					mv:Jump()
+					rc.phase = "attach"
+					rc.attachAt = now + 0.22
+				end
+			end
+		elseif rc.phase == "attach" and now >= (rc.attachAt or 0) then
+			if rc.restoreSpeed == nil then rc.restoreSpeed = mv.InputSpeed end
+			mv.InputSpeed = (self._T.baseInputSpeed or rc.restoreSpeed) * 0.9
+			rb.KinematicMove = true
+			mv:Stop()
+			rb:PositionReset()
+			rc.deadline = now + math.max(2.0, (rc.topY - myPos.y) / 1.0 + 2.0)
+			rc.phase = "climb"
+		elseif rc.phase == "climb" then
+			if myPos.y >= rc.topY - 0.05 then
+				rb:SetWorldPosition(Vector2(rc.x, rc.topY + 0.1))
+				self:EndRopeClimbState(mv, rb, "위층 도달")
+			else
+				mv:MoveToDirection(Vector2(0, 1), 0)
+				self._T.moving = true
+			end
+		end
+		self:ApplyFacing()
+		self:UpdateLoco(rb)
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ApplyFacing()
 		-- 아바타 NPC는 MoveToDirection으로 화면 방향이 안 뒤집힌다(LookAt 경로는 PlayerController 전용) -
 		-- 몬스터 관례대로 Scale.x 부호 반전으로 미러링한다(기본 아트가 왼쪽을 보므로 오른쪽일 때 -1).
@@ -471,7 +671,9 @@ script ShadowClone extends Component
 	method void UpdateLoco(RigidbodyComponent rb)
 		-- 이동 모션 상태를 @Sync로 클라이언트에 알린다(변할 때만 대입).
 		local want = "stand"
-		if not rb:IsOnGround() then
+		if self._T.ropeClimb ~= nil and self._T.ropeClimb.phase == "climb" then
+			want = "rope"
+		elseif not rb:IsOnGround() then
 			want = "jump"
 		elseif self._T.moving then
 			want = "walk"
@@ -604,13 +806,13 @@ script ShadowClone extends Component
 			motion = "swingO3"
 			splash = 6
 		end
-		-- 분신 데미지 비율 적용(본체의 50~90%).
-		local rate = math.max(0, self.DamagePercent or 50) / 100.0
-		-- (다크사이트) 잠복 후 첫 기습 한 방은 데미지 2배(주인의 다크사이트 딜과 같은 규칙).
+		-- 분신 데미지 비율 적용(본체의 25~45%).
+		local rate = math.max(0, self.DamagePercent or 25) / 100.0
+		-- (다크사이트) 잠복 후 첫 기습 한 방은 데미지 4배(주인의 다크사이트 딜과 같은 규칙).
 		if self._T.dsAmbushBonus == true then
 			self._T.dsAmbushBonus = false
-			rate = rate * 2.0
-			log("[ShadowClone] 다크사이트 기습 타격(데미지 2배) variant=" .. variant)
+			rate = rate * 4.0
+			log("[ShadowClone] 다크사이트 기습 타격(데미지 4배) variant=" .. variant)
 		end
 		mn = mn * rate
 		mx = mx * rate
@@ -746,12 +948,11 @@ script ShadowClone extends Component
 	method void DealHitLine(Entity target, number multMin, number multMax, string variant, integer hitIndex)
 		-- 주인 PlayerAttack의 skill.shadowclone 파이프라인으로 1타
 		-- (데미지 스킨/크리티컬 표시가 본체 공격과 똑같이 처리된다).
-		-- (2026-08-06) 백스탭은 **분신 자신의 위치**로 판정하고, 쉐도우 파트너는 분신 강화 II(3차)를
-		-- 배웠을 때만 함께 쓴다 - 둘 다 주인 쪽에서 판단할 수 없어 여기서 넘겨준다.
+		-- 백스탭은 분신 자신의 위치로 판정하고, 쉐도우 파트너 활성 여부도 여기서 넘긴다.
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) or not isvalid(target) then return end
-		local echoAllowed = (math.max(1, self.SkillTier or 1) >= 3)
+		local echoAllowed = (self._T.shadowPartnerUntil or 0) > _UtilLogic.ServerElapsedSeconds
 		pa:DealShadowCloneHitLine(self.Entity, target, self.CombatPower, multMin, multMax, echoAllowed, variant, hitIndex)
 	end
 
@@ -778,7 +979,10 @@ script ShadowClone extends Component
 
 	@ExecSpace("ClientOnly")
 	method void ClientTick(number delta)
-		-- 스킬 모션 재생 중이 아니면 LocoState(stand/walk/jump)에 맞는 이동 클립을 body에 보낸다.
+		-- 스킬 모션 재생 중이 아니면 LocoState(stand/walk/jump/rope)에 맞는 이동 클립을 body에 보낸다.
+		-- 서버 RopeClimbTick은 등반 단계에서 LocoState를 "rope"로 동기화하므로, 용사 소환과 똑같이
+		-- 클라이언트 body에 rope 반복 모션을 명시적으로 보내야 한다. 이 분기가 없으면 else의 stand1로
+		-- 떨어져 실제로는 올라가면서 서 있는 모습이 된다.
 		local ar = self.Entity.AvatarRendererComponent
 		if not isvalid(ar) then return end
 		local body = ar:GetBodyEntity()
@@ -795,6 +999,11 @@ script ShadowClone extends Component
 		elseif want == "jump" then
 			ev.CoreActionName = "jump"
 			ev.PartsActionName = "jump"
+			ev.PlayType = SpriteAnimClipPlayType.Loop
+		elseif want == "rope" then
+			-- 용사 소환의 로프 등반과 동일: 본체 CLIMB 상태의 rope 매달림 모션을 반복 재생한다.
+			ev.CoreActionName = "rope"
+			ev.PartsActionName = "rope"
 			ev.PlayType = SpriteAnimClipPlayType.Loop
 		else
 			ev.CoreActionName = "stand1"

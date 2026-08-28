@@ -14,6 +14,13 @@ script LuckySevenProjectile extends Component
 	property number DamageRateMin = 1.0
 	property number DamageRateMax = 1.5
 
+	-- 럭키세븐 계열 다중 표창의 위→아래 조준 오프셋. 스트레이프 분산각의 절반 폭을 사용한다.
+	property number AimYOffset = 0
+
+	-- 다중 표창의 피해 숫자를 한곳에 묶을 공통 대상. 비행체 자체를 앵커로 쓰면 각도별 도착 높이마다
+	-- 숫자가 따로 떨어져 보여 쉐도우 파트너의 4·6·8줄이 한 묶음으로 보이지 않는다.
+	@Sync property Entity DamageAnchor = ""
+
 	-- ── 마크 오브 어쌔신 (2026-08-05 신설, 이후 연출 여러 차례 개편) ─────────────
 	-- (요청 2026-08-07 4차 = 현재 사양) 마크 표창은 **플레이어 등 뒤 위쪽 화면 밖**에서 스폰돼
 	--   **직선으로** 날아와 표적에 꽂힌다. 곡선 비행(CurveFly)도, 크기로 주던 원근감도 쓰지 않는다.
@@ -86,6 +93,13 @@ script LuckySevenProjectile extends Component
 	-- 클라이언트의 부착 이펙트(OnSyncProperty)를 투명도 70%로 재생해야 하므로 @Sync로 내린다.
 	@Sync
 	property boolean VisualOnly = false
+
+	-- 쉐도우 파트너의 시각 표창이 도착할 때 표시할 후반부 피해 줄. 실제 HP 피해는 원본 표창이 이미
+	-- 합산 적용하므로 여기서는 숫자만 표시한다.
+	property integer VisualDamage = 0
+	property boolean VisualDamageCritical = false
+	-- true면 원본 표창은 합산 피해를 그대로 적용하되 그림자 몫 숫자는 즉시 표시하지 않는다.
+	property boolean DeferBonusDisplay = false
 
 	-- (요청) "단일 타게팅 스킬은 스킬 사용 시점에 대상과 데미지를 바로 정한다."
 	-- PlayerAttack.AttackStarThrow가 시전 시점에 표창 N발 몫을 미리 굴려 발마다 넣어준다.
@@ -295,7 +309,7 @@ script LuckySevenProjectile extends Component
 		end
 		if isvalid(self._T.target) then
 			local tp = self._T.target.TransformComponent.Position
-			return Vector3(tp.x, tp.y + _ShurikenLibrary:GetThrowHeight(), tp.z)
+			return Vector3(tp.x, tp.y + _ShurikenLibrary:GetThrowHeight() + self.AimYOffset, tp.z)
 		end
 		return fallbackPos
 	end
@@ -709,6 +723,10 @@ script LuckySevenProjectile extends Component
 			if not self.SilentOnMiss then
 				local vpos = self.Entity.TransformComponent.Position
 				self:ShowShadowHitEffect(vpos.x, vpos.y, vpos.z, self.HitEffectRUID, self._T.targetDied ~= true)
+				if self.VisualDamage > 0 then
+					self:ShowDamageSkin(self.VisualDamage, 0, self.HitIndex, self.VisualDamageCritical, false,
+						(self.DamageSkinRUID ~= "") and self.DamageSkinRUID or "3271c3e79bf04ecba9a107d55495970d", self.TotalShots)
+				end
 			end
 			_EntityService:Destroy(self.Entity)
 			return
@@ -799,7 +817,8 @@ script LuckySevenProjectile extends Component
 			end
 		end
 
-		self:ShowDamageSkin(damage, bonus, self.HitIndex, damageIsCritical, bonusIsCritical, (self.DamageSkinRUID ~= "") and self.DamageSkinRUID or "3271c3e79bf04ecba9a107d55495970d", self.TotalShots)
+		local displayBonus = self.DeferBonusDisplay and 0 or bonus
+		self:ShowDamageSkin(damage, displayBonus, self.HitIndex, damageIsCritical, bonusIsCritical, (self.DamageSkinRUID ~= "") and self.DamageSkinRUID or "3271c3e79bf04ecba9a107d55495970d", self.TotalShots)
 		-- 대상이 죽은 뒤 도달한 표창은 **타격 이펙트를 재생하지 않는다**. 그 자리에 몬스터가 부활하면
 		-- 이펙트가 되살아난 몬스터 위에서 터져 "hit 이펙트를 달고 부활"하는 것처럼 보인다(신고).
 		-- 데미지 숫자는 럭키세븐 사양대로 계속 띄운다.
@@ -817,39 +836,37 @@ script LuckySevenProjectile extends Component
 		-- 바꾸는 연출이 표창(다중 타격)에는 적용되지 않았다 - 발사 시점의 스킨을 인자로 받아 그대로 쓴다.
 		-- 대상 엔티티가 이미 사라졌을 수도 있으므로(먼저 죽은 경우) 항상 유효한 표창 자신(self.Entity)에 앵커링한다.
 		local shots = (totalShots ~= nil and totalShots > 0) and totalShots or 2
-		local offsetY = -0.2
-		local bonusGap = 0.15
-		if shots <= 2 then
-			-- 럭키세븐(2발)과 아대 기본공격(1발)은 기존 배치를 그대로 유지한다(숫자 위치가 바뀌지 않도록).
-			if bonus > 0 then
-				-- 표창 2발이 각각 원본+보너스 2줄씩 총 4줄일 때는 "1->2줄" 간격(0.3)과 같은 단위로
-				-- -0.45/-0.15/0.15/0.45로 배치한다(버프가 없을 때의 2줄 배치 -0.2/0.15는 유지).
-				offsetY = (hitIndex == 2) and 0.15 or -0.45
-				bonusGap = 0.3
-			else
-				if hitIndex == 2 then offsetY = 0.15 end
+		-- 피해 숫자 자체가 위로 떠오르는 연출을 가지므로 시작 높이와 줄 간격을 낮고 촘촘하게 둔다.
+		local gap = 0.2
+		local topY = 0.15
+		-- 공통 몬스터 앵커가 있으면 충돌체의 실제 윗부분 바로 위에서 첫 줄을 시작한다.
+		if isvalid(self.DamageAnchor) then
+			local hit = self.DamageAnchor.HitComponent
+			if isvalid(hit) then
+				local halfH = 0.3
+				if hit.ColliderType == ColliderType.Box then
+					halfH = hit.BoxSize.y / 2
+				elseif hit.ColliderType == ColliderType.Circle then
+					halfH = hit.CircleRadius
+				end
+				-- 충돌체 최상단보다 0.1 아래에서 시작해 실제 렌더가 지나치게 높아지는 것을 막는다.
+				topY = hit.ColliderOffset.y + halfH - 0.1
 			end
-		else
-			-- (트리플/쿼드러플 스로우) 3발·4발은 줄 수가 3/6, 4/8줄로 늘어난다 -
-			-- 전체 줄을 0.3 간격으로 화면 중앙 기준 대칭 배치한다.
-			--   버프 없음: k = hitIndex,        총 lines = shots
-			--   쉐도우 중: k = hitIndex*2 - 1,  총 lines = shots * 2 (원본 바로 위에 보너스)
-			local gap = 0.3
-			local lines = (bonus > 0) and (shots * 2) or shots
-			local k = (bonus > 0) and (hitIndex * 2 - 1) or hitIndex
-			offsetY = (k - (lines + 1) / 2) * gap
-			bonusGap = gap
 		end
+		-- 1번 줄은 몬스터 바로 위, 이후 줄은 번호가 커질수록 그 위로 쌓인다.
+		local offsetY = topY + (math.max(1, hitIndex) - 1) * gap
+		local bonusGap = shots * gap
 		-- (버그 수정) "각자 크리티컬 여부를 독립적으로 판단해야 한다" - 하드코딩된 false 대신 CalcDamage가
 		-- 독립적으로 굴린 결과를 그대로 전달한다.
+		local damageAnchor = isvalid(self.DamageAnchor) and self.DamageAnchor or self.Entity
 		_DamageSkinService:Play(
-			self.Entity, skinRuid, 0,
+			damageAnchor, skinRuid, 0,
 			{ damage }, DamageSkinTweenType.Default, damageIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
 		if bonus > 0 then
 			_DamageSkinService:Play(
-				self.Entity, skinRuid, 0,
+				damageAnchor, skinRuid, 0,
 				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)

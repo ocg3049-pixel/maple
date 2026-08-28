@@ -1,0 +1,116 @@
+@Component
+script IceDemonProjectile extends Component
+
+	@Sync property Entity OwnerEntity = nil
+	@Sync property number DirectionX = 1
+	@Sync property integer SkillLevel = 1
+	@Sync property Entity MinionTarget = nil
+	@Sync property boolean IsMinionBall = false
+	@Sync property string VisualRUID = ""
+	@Sync property string MinionHitRUID = ""
+	-- 기존 속도 7의 1/3. 파이어에로우 사거리(6 × 1.5 = 9 world units)는 그대로 맞춘다.
+	property number Speed = 2.3333333333
+	property number MaxLifetime = 3.8571428571
+	property number HitRadius = 0.55
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- 서버에서 관통 투사체의 수명과 개별 대상 적중 장부를 초기화한다.
+		self._T.life = 0
+		self._T.hitNames = {}
+		self._T.readyAt = _UtilLogic.ServerElapsedSeconds + 0.1
+		log("[IceDemonProjectile] 생성 dir=" .. tostring(self.DirectionX) .. " lv=" .. tostring(self.SkillLevel))
+	end
+
+	@ExecSpace("Client")
+	method void InitializeVisual(number directionX)
+		-- 아이스 데몬 ball 애니메이션을 투사체 렌더러에 적용한다.
+		local sr = self.Entity.SpriteRendererComponent
+		if not isvalid(sr) then return end
+		sr.SpriteRUID = "d0bbbf99a1b3428293deacf96fb0b0de"
+		sr.SortingLayer = "MapLayer0"
+		sr.OrderInLayer = 8
+		sr.FlipX = directionX > 0
+	end
+
+	@ExecSpace("Server")
+	method void InitializeMinionBall(Entity owner, Entity target, string ballRuid, string hitRuid)
+		self.OwnerEntity = owner
+		self.MinionTarget = target
+		self.VisualRUID = ballRuid
+		self.MinionHitRUID = hitRuid
+		self.IsMinionBall = true
+		self:ApplyMinionBallVisual(ballRuid)
+	end
+
+	@ExecSpace("Multicast")
+	method void ApplyMinionBallVisual(string ballRuid)
+		if not self:IsClient() then return end
+		local sr = self.Entity.SpriteRendererComponent
+		if isvalid(sr) then sr.SpriteRUID = ballRuid sr.SortingLayer = "MapLayer0" sr.OrderInLayer = 8 end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- 매 프레임 전진하며 경로에 닿은 살아 있는 몬스터를 각각 한 번씩 관통 타격한다.
+		if (_UtilLogic.ServerElapsedSeconds or 0) < (self._T.readyAt or 0) then return end
+		if self.IsMinionBall then
+			self:UpdateMinionBall(delta)
+			return
+		end
+		self._T.life = (self._T.life or 0) + delta
+		if self._T.life >= self.MaxLifetime then
+			self.Entity:Destroy()
+			return
+		end
+		local dir = self.DirectionX >= 0 and 1 or -1
+		self.Entity.TransformComponent:Translate(dir * self.Speed * delta, 0)
+		local map = self.Entity.CurrentMap
+		if not isvalid(map) then return end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		for _, comp in ipairs(map:GetChildComponentsByTypeName("script.Monster", true)) do
+			---@type Monster
+			local mc = comp
+			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
+				local key = mc.Entity.Name
+				if self._T.hitNames[key] ~= true then
+					local pos = mc.Entity.TransformComponent.WorldPosition
+					local dx = pos.x - myPos.x
+					local dy = pos.y - myPos.y
+					if math.abs(dx) <= self.HitRadius and math.abs(dy) <= 0.8 then
+						self._T.hitNames[key] = true
+						if isvalid(self.OwnerEntity) then
+							---@type PlayerAttack
+							local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+							if isvalid(pa) then pa:DealIceDemonProjectileHit(mc.Entity, self.SkillLevel) end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateMinionBall(number delta)
+		if not isvalid(self.MinionTarget) or not isvalid(self.OwnerEntity) then self.Entity:Destroy() return end
+		self._T.life = (self._T.life or 0) + delta
+		if self._T.life > 2.0 then self.Entity:Destroy() return end
+		local p = self.Entity.TransformComponent.WorldPosition
+		local tp = self.MinionTarget.TransformComponent.WorldPosition
+		local dx, dy = tp.x - p.x, (tp.y + 0.5) - p.y
+		local dist = math.sqrt(dx * dx + dy * dy)
+		if dist <= 0.25 then
+			local pa = self.OwnerEntity:GetComponent("script.PlayerAttack")
+			if isvalid(pa) then
+				pa:DealIceDemonSummonHit(self.MinionTarget)
+				pa:PlayIceDemonSummonHitClip(self.MinionTarget, self.MinionHitRUID)
+				log("[IceDemonMinionBall] target hit")
+			end
+			self.Entity:Destroy()
+			return
+		end
+		local step = math.min(dist, 6.0 * delta)
+		self.Entity.TransformComponent:Translate(dx / dist * step, dy / dist * step)
+	end
+
+end

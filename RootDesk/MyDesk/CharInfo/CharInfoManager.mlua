@@ -659,6 +659,44 @@ script CharInfoManager extends Logic
 		end
 	end
 
+	@ExecSpace("ClientOnly")
+	method void UseMagicBooster(number duration, integer bonusCpPct)
+		-- 기존 2차 부스터와 독립적으로 중첩되며 재시전 시 자기 효과만 갱신한다.
+		if not self._T.magicBoosterActive then self.atkSpeedStage += 1 end
+		self._T.magicBoosterActive = true
+		self._T.magicBoosterCombatPowerPct = math.max(0, bonusCpPct)
+		self._T.magicBoosterUntil = _UtilLogic.ElapsedSeconds + duration
+		self._T.magicBoosterToken = (self._T.magicBoosterToken or 0) + 1
+		local token = self._T.magicBoosterToken
+		_SkillManager:SyncDarkSightStats()
+		self:UpdateStats()
+		_TimerService:SetTimerOnce(function()
+			if self._T.magicBoosterToken ~= token or not self._T.magicBoosterActive then return end
+			self._T.magicBoosterActive = false
+			self._T.magicBoosterCombatPowerPct = 0
+			self._T.magicBoosterUntil = 0
+			self.atkSpeedStage -= 1
+			_SkillManager:SyncDarkSightStats()
+			self:UpdateStats()
+			log("[CharInfo] 매직 부스터 종료")
+		end, duration)
+		_MagicBoosterBuffUI:ShowBuff(duration)
+		log("[CharInfo] 매직 부스터 발동 - 공속 +1단계 전투력 +" .. tostring(bonusCpPct) .. "% 지속=" .. tostring(duration))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelMagicBooster()
+		if not self._T.magicBoosterActive then return end
+		self._T.magicBoosterToken = (self._T.magicBoosterToken or 0) + 1
+		self._T.magicBoosterActive = false
+		self._T.magicBoosterCombatPowerPct = 0
+		self._T.magicBoosterUntil = 0
+		self.atkSpeedStage -= 1
+		_SkillManager:SyncDarkSightStats()
+		self:UpdateStats()
+		log("[CharInfo] 매직 부스터 취소 - 공격속도/전투력 원복")
+	end
+
 	-- 발도술(히어로 3차) 기본 사용 효과: 버프 지속시간 동안 공속 +1단계. 부스터와 동일한 토큰 패턴이되
 	-- 별도 필드(battoProc*)라 부스터/비약과 겹쳐 적용된다. 재시전 시 이전 적용을 되돌리고 새로 건다.
 	-- (효과 개편) 예전엔 처치 중첩 프록이 이 메서드로 공속을 올렸지만, 지금은 시전 시점(SkillManager
@@ -974,6 +1012,15 @@ script CharInfoManager extends Logic
 			-- 드래곤이 걸어준 공마 +30 분노(ApplyDragonStatBuff)가 동시에 켜져 있을 수 있으므로
 			-- 아래 공용 공마 경로도 그대로 이어서 탄다.
 		end
+		if key == "dragonblood" then
+			self._T.dragonBloodUntil = 0
+			self._T.dragonBloodCombatPowerPct = 0
+			self._T.dragonBloodToken = (self._T.dragonBloodToken or 0) + 1
+			log("[CharInfo] 드래곤 블러드 취소 - 전투력 배율 원복")
+			_SkillManager:SyncDarkSightStats()
+			local cwD = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+			if isvalid(cwD) and cwD.Enable then self:UpdateStats() end
+		end
 		local activeKey = "buff_" .. key .. "_active"
 		local bonusKey = "buff_" .. key .. "_bonus"
 		local tokenKey = "buff_" .. key .. "_token"
@@ -984,6 +1031,30 @@ script CharInfoManager extends Logic
 		log("[CharInfo] 버프 취소(우클릭, " .. key .. ") 공마 원복 (합계 buffAttackBonus=" .. tostring(self.buffAttackBonus) .. ")")
 		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 		if isvalid(cw) and cw.Enable then self:UpdateStats() end
+	end
+
+	-- 드래곤 블러드: 분배 1포인트당 전투력 +1%. 재사용 시 중첩하지 않고 수치와 지속시간을 갱신한다.
+	@ExecSpace("ClientOnly")
+	method void ApplyDragonBloodCombatPowerBuff(integer bonusCpPct, number duration)
+		-- 표시 전투력과 서버 동기화 전투력이 같은 CalcCombatPower 경로에서 이 값을 읽는다.
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.dragonBloodCombatPowerPct = math.max(0, bonusCpPct)
+		self._T.dragonBloodUntil = now + duration
+		self._T.dragonBloodToken = (self._T.dragonBloodToken or 0) + 1
+		local myToken = self._T.dragonBloodToken
+		log("[CharInfo] 드래곤 블러드 발동 - 전투력 +" .. tostring(bonusCpPct) .. "% (" .. tostring(duration) .. "초)")
+		_SkillManager:SyncDarkSightStats()
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then self:UpdateStats() end
+		_TimerService:SetTimerOnce(function()
+			if self._T.dragonBloodToken ~= myToken then return end
+			self._T.dragonBloodUntil = 0
+			self._T.dragonBloodCombatPowerPct = 0
+			log("[CharInfo] 드래곤 블러드 종료 - 전투력 원복")
+			_SkillManager:SyncDarkSightStats()
+			local cw2 = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+			if isvalid(cw2) and cw2.Enable then self:UpdateStats() end
+		end, duration)
 	end
 
 	-- 분노(2차 버프): (개편 2026-08-12 2차) **전투력 +1%/분배** 버프 - "추가 전투력%"에 합산되어
@@ -1338,7 +1409,14 @@ script CharInfoManager extends Logic
 			-- 오버라이드는 레벨을 못 박는 것이므로 아이템 공속 배수도 태우지 않는다(0으로 리셋 -
 			-- 직전 계산의 값이 남아 레벨이 한 번 더 부풀지 않게).
 			self._T.lastItemAtkSpdPct = 0
-			return self._T.testLevelOverride * 7
+			local testTotal = self._T.testLevelOverride * 7
+			-- /lv 테스트 중에도 실제 전투가 쓰는 전투력에는 블레스·메디테이션 등 실효 보너스를 반영한다.
+			-- 표시 레벨 환산(CalcEquipCombatPower)은 cpExcludeRealBuff=true로 들어오므로 기존 고정 레벨을 유지한다.
+			if self._T.cpExcludeRealBuff ~= true then
+				testTotal += self.realBuffAttackBonus + self.skillAttackBonus + self.commonAttackBonus
+				testTotal += self.realBuffStatBonus / 4
+			end
+			return math.floor(testTotal)
 		end
 		-- (요청 2026-08-16) 전투력도 **직업이 쓰는 쪽만** 센다. 종전엔 잠재 「공격력」·「마력」을 한 통에
 		-- 합산해, 전사가 마력 잠재를 굴려도 전투력(=데미지)이 올랐다(스탯창 표시는 08-16에 먼저 분리).
@@ -1433,7 +1511,6 @@ script CharInfoManager extends Logic
 			--   블록으로 옮겨 표시/스킬 구분 없이 항상 반영된다. 여기 남겨두면 표시 경로에서 두 번 더해진다.
 			-- (2026-08-16) 물약·버프 공마는 "공격력과 마력 둘 다 오른다"는 사양이라 **양쪽 통**에 넣는다.
 			bothATK += self.potionAttackBonus + self.buffAttackBonus
-				+ self.commonAttackBonus
 			-- (요청 2026-08-16) **버프 공속은 전투력에서 뺐다.** 종전엔 표시 공속 초과분(부스터 단계·
 			-- 발도술 중첩 +3%/스택·무기 보너스)을 여기서 전투력에 곱했는데, 부스터/발도술은 "공격 속도만
 			-- 올리는" 버프인데도 전투력이 올라 **데미지까지 함께 오르는** 이중 이득이 됐다(신고).
@@ -1453,12 +1530,14 @@ script CharInfoManager extends Logic
 		--   나오는 표창 크확(shurikenCritBonus)·공속(shurikenAtkSpeedStage)은 위 표시 블록에 그대로 둔다.
 		-- ⚠ 단 **레벨 환산 경로(CalcEquipCombatPower)만은 제외**한다 - "레벨은 순수 장비 성능"이라
 		--   여기 넣으면 버프로 표시 레벨이 출렁이고 최대 MP·매직 미사일 구체 수·SP 예산이 함께 흔들린다.
-		--   (표창+·트레이닝도 스킬 투자분이라 레벨로 되먹임되면 순환한다 - 반드시 이 블록 안에 둔다.)
+		--   (표창+·트레이닝·무기 숙련도 스킬 투자분이라 레벨로 되먹임되면 순환한다 - 반드시 이 블록 안에 둔다.)
 		-- ⚠ 4스탯은 아래 statTerm에서 ÷4 되므로 네 스탯 각 +N은 statFlat에 4N을 더해야 한다
 		--   (장비 "올스탯 +N"이 statFlat += N*4인 것과 같은 규칙).
 		if self._T.cpExcludeRealBuff ~= true then
-			-- (2026-08-16) 실효 버프·스킬(블레스/메디테이션/표창+/트레이닝) 공마도 양쪽 통에 넣는다.
-			bothATK += self.realBuffAttackBonus + self.skillAttackBonus
+			-- (버그 수정 2026-08-26) 실효 버프·스킬(블레스/메디테이션/표창+/트레이닝/무기 숙련)
+			-- 공마도 양쪽 통에 넣는다. 무기 숙련(commonAttackBonus)이 표시 전용 cpIncludeBuffs 블록에만
+			-- 있으면 공격력 표시는 올라가도 스킬·기본공격이 쓰는 전투력에는 반영되지 않는다.
+			bothATK += self.realBuffAttackBonus + self.skillAttackBonus + self.commonAttackBonus
 			-- (요청 2026-08-16) 4스탯 전부에 붙는 버프(블레스 등)도 **주스탯 몫 하나만** 전투력에 실린다
 			-- (종전 ×4 → ×1). 무관한 스탯은 어떤 경로로 들어와도 전투력·레벨을 올리지 않는다.
 			statFlat += self.realBuffStatBonus
@@ -1612,11 +1691,15 @@ script CharInfoManager extends Logic
 		return pct
 	end
 
-	-- (요청 2026-08-12) 버프 유래 추가 전투력% - 현재는 분노(분배당 +1%)만. 레벨에는 반영되지 않는다.
+	-- 버프 유래 추가 전투력% - 분노와 드래곤 블러드를 합산한다. 레벨에는 반영되지 않는다.
 	@ExecSpace("ClientOnly")
 	method number GetBuffBonusCombatPowerPct()
-		if (self._T.rageUntil or 0) <= _UtilLogic.ElapsedSeconds then return 0 end
-		return self._T.rageFinalPct or 0
+		local now = _UtilLogic.ElapsedSeconds
+		local pct = 0
+		if (self._T.rageUntil or 0) > now then pct += self._T.rageFinalPct or 0 end
+		if (self._T.dragonBloodUntil or 0) > now then pct += self._T.dragonBloodCombatPowerPct or 0 end
+		if (self._T.magicBoosterUntil or 0) > now then pct += self._T.magicBoosterCombatPowerPct or 0 end
+		return pct
 	end
 
 	-- (요청 2026-08-12 2차) 콤보 어택 구슬이 주는 최종 데미지% = **구슬 1개당 2% 고정**.

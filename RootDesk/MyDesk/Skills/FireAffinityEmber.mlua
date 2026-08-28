@@ -1,0 +1,255 @@
+@Component
+script FireAffinityEmber extends AttackComponent
+
+	@Sync property Entity OwnerEntity = nil
+	@Sync property integer MaxHp = 1
+	@Sync property integer Hp = 1
+	@Sync property number CombatPower = 0
+	@Sync property string VisualRUID = ""
+	@Sync property integer AttackSequence = 0
+	property number Lifetime = 20.0
+	property number AttackInterval = 2.0
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		self._T.spawnAt = _UtilLogic.ServerElapsedSeconds
+		self._T.attackTimer = _TimerService:SetTimerRepeat(self.TryAttack, self.AttackInterval)
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) then self:RequestDeath() end
+		end, self.Lifetime)
+		log("[FireAffinityEmber] 생성")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Configure()
+		self._T.moveRuid = "815b4815081344b79c02af0676228df4"
+		self._T.standRuid = "5d4eb1ab13ad4c279d072e8735d99278"
+		self._T.hitRuid = "65786765fcfb439bb0591b8023e97098"
+		self._T.idleRuid = self._T.standRuid
+		self.VisualRUID = self._T.standRuid
+		self._T.lastVisualX = self.Entity.TransformComponent.WorldPosition.x
+		if isvalid(self.Entity.SpriteRendererComponent) then
+			self.Entity.SpriteRendererComponent.SpriteRUID = self.VisualRUID
+			self.Entity.SpriteRendererComponent.SortingLayer = "MapLayer0"
+			self.Entity.SpriteRendererComponent.OrderInLayer = 6
+		end
+		local wander = self.Entity.AIWanderComponent
+		if isvalid(wander) then wander.Enable = true end
+		self:SpawnHpBar()
+		log("[FireAffinityEmber] 설정 hp=" .. tostring(self.Hp) .. "/" .. tostring(self.MaxHp))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- mob/9010194.img의 stand/move를 실제 좌우 이동 여부에 맞춰 전환한다.
+		if self._T.dying or self._T.attacking or (_UtilLogic.ServerElapsedSeconds or 0) < (self._T.hitUntil or 0) then return end
+		local x = self.Entity.TransformComponent.WorldPosition.x
+		local lastX = self._T.lastVisualX or x
+		self._T.lastVisualX = x
+		local desired = math.abs(x - lastX) > 0.002 and (self._T.moveRuid or "") or (self._T.standRuid or "")
+		if desired ~= "" and self.VisualRUID ~= desired then self.VisualRUID = desired end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		if self._T.frameHandler == nil then
+			self._T.frameHandler = self.Entity:ConnectEvent(SpriteAnimPlayerChangeFrameEvent, self.OnVisualFrame)
+		end
+		if name == "VisualRUID" and isvalid(self.Entity.SpriteRendererComponent) and value ~= "" then
+			self.Entity.SpriteRendererComponent.SpriteRUID = tostring(value)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnVisualFrame(SpriteAnimPlayerChangeFrameEvent event)
+		if not isvalid(self.OwnerEntity) or _UserService.LocalPlayer ~= self.OwnerEntity then return end
+		if self.VisualRUID == "a06a165ffb3849cdafe7f4951a0f8395" then
+			local pulseFrames = { 2, 5, 8, 11, 14 }
+			for i, frame in ipairs(pulseFrames) do
+				if event.FrameIndex >= frame and (self._T.sentPulse or 0) < i then
+					self._T.sentPulse = i
+					self:RequestAttackPulse(self.AttackSequence, i)
+				end
+			end
+			if event.FrameIndex >= 17 and self._T.sentComplete ~= self.AttackSequence then
+				self._T.sentComplete = self.AttackSequence
+				self:RequestAttackComplete(self.AttackSequence)
+			end
+		elseif self.VisualRUID == "5e97f3042a654e65a8e56783b4b28b95" and event.FrameIndex >= 17 then
+			self:RequestDieComplete()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryAttack()
+		if self._T.dying or self._T.attacking or not isvalid(self.Entity.CurrentMap) then return end
+		local myPos = self.Entity.TransformComponent.WorldPosition
+		local found = false
+		for _, monster in ipairs(self.Entity.CurrentMap:GetChildComponentsByTypeName("script.Monster", true)) do
+			if isvalid(monster) and isvalid(monster.Entity) and not monster.IsDead then
+				local p = monster.Entity.TransformComponent.WorldPosition
+				if math.abs(p.x - myPos.x) <= 1.8 and math.abs(p.y - myPos.y) <= 1.2 then found = true break end
+			end
+		end
+		if not found then return end
+		self._T.attacking = true
+		self.AttackSequence += 1
+		self.VisualRUID = "a06a165ffb3849cdafe7f4951a0f8395"
+		local wander = self.Entity.AIWanderComponent
+		if isvalid(wander) then wander.Enable = false end
+		if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+		if isvalid(self.Entity.RigidbodyComponent) then self.Entity.RigidbodyComponent:SetForce(Vector2(0, 0)) self.Entity.RigidbodyComponent:PositionReset() end
+		local sequence = self.AttackSequence
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) and self._T.attacking and self.AttackSequence == sequence then self:FinishAttack(sequence) end
+		end, 3.2)
+	end
+
+	@ExecSpace("Server")
+	method void RequestAttackPulse(integer sequence, integer pulse)
+		if self._T.dying or not self._T.attacking or sequence ~= self.AttackSequence then return end
+		self._T.appliedPulses = self._T.appliedPulses or {}
+		if self._T.appliedPulses[pulse] then return end
+		self._T.appliedPulses[pulse] = true
+		local p = self.Entity.TransformComponent.WorldPosition
+		self:AttackFast(BoxShape(Vector2(p.x, p.y), Vector2(3.6, 2.4), 0), "skill.fireaffinity.ember", CollisionGroups.HitBox)
+	end
+
+	@ExecSpace("Server")
+	method void RequestAttackComplete(integer sequence)
+		self:FinishAttack(sequence)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishAttack(integer sequence)
+		if sequence ~= self.AttackSequence or not self._T.attacking then return end
+		self._T.attacking = false
+		self._T.appliedPulses = {}
+		if self._T.deathPending then self:BeginDeath() return end
+		self.VisualRUID = self._T.standRuid or self._T.idleRuid
+		local wander = self.Entity.AIWanderComponent
+		if isvalid(wander) then wander.Enable = true end
+	end
+
+	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		if isvalid(defender.PlayerComponent) then return false end
+		local monster = defender:GetComponent("script.Monster")
+		if not isvalid(monster) or monster.IsDead then return false end
+		return __base:IsAttackTarget(defender, attackInfo)
+	end
+
+	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+		return math.max(1, math.floor(self.CombatPower * (0.5 + _UtilLogic:RandomDouble() * 0.2)))
+	end
+
+	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		return false
+	end
+
+	method void OnAttack(Entity defender)
+		if self:IsServer() then self:PlayHitSound() end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayHitSound()
+		if self:IsClient() then _SoundService:PlaySound("74de6d2785d24039bea6abe33039f881", 1.0) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RequestDeath()
+		if self._T.dying or self._T.deathPending then return end
+		if self._T.attacking then self._T.deathPending = true return end
+		self:BeginDeath()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginDeath()
+		if self._T.dying then return end
+		self._T.dying = true
+		self._T.deathPending = false
+		if isvalid(self.Entity.AIWanderComponent) then self.Entity.AIWanderComponent.Enable = false end
+		if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+		self.VisualRUID = "5e97f3042a654e65a8e56783b4b28b95"
+		self:PlayDieSound()
+		_TimerService:SetTimerOnce(function() if isvalid(self.Entity) then self.Entity:Destroy() end end, 4.0)
+	end
+
+	@ExecSpace("Server")
+	method void RequestDieComplete()
+		if self._T.dying and isvalid(self.Entity) then self.Entity:Destroy() end
+	end
+
+	@ExecSpace("Multicast")
+	method void PlayDieSound()
+		if self:IsClient() then _SoundService:PlaySound("aa91305b94334328b04f6c4d11c2a035", 1.0) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHpBar()
+		local bar = _SpawnService:SpawnByModelId("snipinggaugetext", "FireAffinityHpBar", Vector3(0, 1.2, 0), self.Entity)
+		if not isvalid(bar) then return end
+		-- 불씨 본체는 1/2 크기지만 체력 정보까지 지나치게 작아지지 않도록 게이지만 보정한다.
+		bar.TransformComponent.Scale = Vector3(1.5, 1.5, 1)
+		local bg = bar:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			bg.SpriteRendererComponent.Color = Color(0.03, 0.03, 0.03, 0.95)
+			bg.SpriteRendererComponent.PlayRate = 0
+		end
+		local fill = bar:GetChildByName("Fill", false)
+		if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+			fill.SpriteRendererComponent.Color = Color(1, 0.18, 0.03, 1)
+			fill.SpriteRendererComponent.PlayRate = 0
+		end
+		self._T.hpBar = bar
+		self:UpdateHpBar()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateHpBar()
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		local fill = bar:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = self.MaxHp > 0 and math.max(0, math.min(1, self.Hp / self.MaxHp)) or 0
+		fill.TransformComponent.Scale = Vector3(0.5 * ratio, 0.5, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Self")
+	handler HandleHitEvent(HitEvent event)
+		-- 플레이어 본체·투사체·플레이어 소환수 공격은 모두 주인을 플레이어로 역추적할 수 있다.
+		-- 작은 불씨는 아군이므로 이 피해는 HP/무적시간/피격 모션을 전혀 건드리지 않는다.
+		if isvalid(_BattleStatsManager:ResolveOwner(event.AttackerEntity)) then return end
+		local now = _UtilLogic.ServerElapsedSeconds
+		if self._T.dying or (self._T.hitImmuneUntil or 0) > now then return end
+		self._T.hitImmuneUntil = now + 2.0
+		local damage = math.max(0, math.floor(event.TotalDamage))
+		self.Hp = math.max(0, self.Hp - damage)
+		self:UpdateHpBar()
+		self:ShowReceivedDamage(damage)
+		if self.Hp <= 0 then
+			self:RequestDeath()
+		elseif not self._T.attacking then
+			self._T.hitUntil = (_UtilLogic.ServerElapsedSeconds or 0) + 0.45
+			self.VisualRUID = self._T.hitRuid or self.VisualRUID
+			_TimerService:SetTimerOnce(function()
+				if isvalid(self.Entity) and not self._T.dying and not self._T.attacking then
+					self.VisualRUID = self._T.standRuid or self.VisualRUID
+				end
+			end, 0.45)
+		end
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowReceivedDamage(integer damage)
+		if not self:IsClient() or damage <= 0 then return end
+		_DamageSkinService:Play(self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0, { damage }, DamageSkinTweenType.Default, false, Vector2(0, 0.55), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		if self._T.attackTimer ~= nil then _TimerService:ClearTimer(self._T.attackTimer) end
+	end
+
+end
