@@ -50,66 +50,10 @@ script RegionTierLogic extends Logic
 		end
 	end
 
-	-- 몬스터 레벨 → MaxHp. (밸런스 워크시트 §3, 2026-08-09)
-	-- HP(L) = (7L)² × m(L) × 1.5타 - 7L은 적정 레벨 유저의 전투력총합, 제곱이 스킬이 쓰는 전투력,
-	-- m(L)은 그 레벨대 주력 스킬의 "한 방 기대배율"(1차 1.5 → 2차 2.5~5 → 3차 5~10 → 4차 10~16 보간).
-	-- Balance/MonsterHpTable.csv가 진실의 원천 - 없거나 손상이면 같은 공식의 하드코딩 폴백.
 	@ExecSpace("ServerOnly")
 	method integer GetMonsterHpForLevel(integer level)
-		-- 레벨 구간 밖은 경계로 클램프. 테이블은 최초 1회만 읽어 배열로 캐시한다.
-		local lv = math.max(1, math.min(200, math.floor(level or 1)))
-		if self._T.monsterHpRows == nil then
-			local rows = nil
-			local ok, ds = pcall(function() return _DataService:GetTable("MonsterHpTable") end)
-			if ok and ds ~= nil then
-				local n = ds:GetRowCount()
-				if n >= 100 then
-					rows = {}
-					for i = 1, n do
-						local l = math.floor(tonumber(ds:GetCell(i, "level")) or 0)
-						local hp = math.floor(tonumber(ds:GetCell(i, "hp")) or 0)
-						if l >= 1 and hp >= 1 then rows[l] = hp end
-					end
-					log("[RegionTier] MonsterHpTable CSV 로드 완료 (" .. tostring(n) .. "레벨)")
-				end
-			end
-			self._T.monsterHpRows = rows or false
-		end
-		if self._T.monsterHpRows ~= false and self._T.monsterHpRows[lv] ~= nil then
-			return self:ScaleMonsterHp(self._T.monsterHpRows[lv])
-		end
-		-- 폴백: CSV와 같은 공식 (m 앵커 선형 보간)
-		local anchors = { {1, 1.2}, {10, 1.5}, {29, 2.5}, {30, 2.5}, {69, 5.0}, {70, 5.0}, {119, 10.0}, {120, 10.0}, {200, 16.0} }
-		local m = anchors[#anchors][2]
-		for i = 1, #anchors - 1 do
-			local l0 = anchors[i][1]
-			local m0 = anchors[i][2]
-			local l1 = anchors[i + 1][1]
-			local m1 = anchors[i + 1][2]
-			if lv >= l0 and lv <= l1 then
-				if l1 == l0 then m = m0 else m = m0 + (lv - l0) / (l1 - l0) * (m1 - m0) end
-				break
-			end
-		end
-		return self:ScaleMonsterHp(math.floor((7 * lv) * (7 * lv) * m * 1.5 + 0.5))
-	end
-
-	-- (요청 2026-08-14 10차) **몬스터 HP 1/100 축소.** 전투력이 최종 단계에서 1/100로 내려갔으므로
-	-- (CharInfoManager.ScaleFinalCombatPower - 데미지 = 전투력 × 배율) 같은 곡선에서 나온 몬스터 HP도
-	-- 같은 비율로 내려야 **처치 타수가 그대로 유지**된다. 한쪽만 바꾸면 처치 시간이 100배가 되고,
-	-- 자동사냥의 차지/피어싱 판정(HP ↔ 전투력×배율 비교)도 전부 어긋난다.
-	-- ⚠ CSV(MonsterHpTable.csv)는 **축소 전 원본 곡선**을 그대로 둔다 - 밸런스 워크시트 §3의 공식
-	--   HP(L) = (7L)² × m(L) × 1.5와 표가 1:1로 맞아야 검산이 되기 때문이다. 축소는 이 한 곳에서만.
-	-- ⚠ 명시 HP를 가진 몬스터(허수아비 1억 등)는 Monster.OnBeginPlay의 기본값 분기를 타지 않으므로
-	--   여기를 지나지 않는다 - 그쪽은 의도적으로 원래 값 그대로다(불사 샌드백이라 타수 개념이 없다).
-	-- ⚠ 0 방지: 1~2레벨(원본 88~363)은 내리면 0이 되어 **때려도 안 죽는 몬스터**가 된다 - 최소 1 보장.
-	@ExecSpace("ServerOnly")
-	method integer ScaleMonsterHp(integer rawHp)
-		-- 곡선에서 뽑은 원본 HP에 1/100 축소(내림)를 적용한다.
-		if rawHp == nil or rawHp <= 0 then return 1 end
-		local scaled = math.floor(rawHp / 100)
-		if scaled < 1 then scaled = 1 end
-		return scaled
+		-- 기존 구간 보간 CSV 대신 동일 레벨 히어로의 합법적 SP·버프 기준 피해 ×1.9를 사용한다.
+		return _HeroMonsterBalance:GetMonsterHP(level)
 	end
 
 	-- 맵 이름 → 티어. 로비는 지역 시작 티어, 미등록 맵(마을/테스트존 등)은 T1(게이트 없음).
@@ -141,14 +85,36 @@ script RegionTierLogic extends Logic
 		return math.max(1, math.floor(info.meso * mult))
 	end
 
-	-- 서버가 아는 플레이어 레벨: 클라가 0.5초마다 보고하는 MaxHp(=50+레벨×10)의 역산.
-	-- (인벤·전투력이 클라 전용이라 서버는 이 채널로만 레벨을 안다 - UIMyInfoManager.ApplyLevelHp 참고)
+	-- 장비 기반 표시 레벨의 서버 사본. 최대 HP와 독립적으로 플레이어별 동기화한다.
 	@ExecSpace("ServerOnly")
 	method integer GetServerLevelOf(Entity player)
+		-- 최대 HP는 잠재능력·버프로도 변하므로 레벨 역산에 사용하지 않는다.
 		if not isvalid(player) then return 0 end
-		local pc = player.PlayerComponent
-		if not isvalid(pc) then return 0 end
-		return math.max(0, math.floor(((pc.MaxHp or 50) - 50) / 10))
+		local pa = player:GetComponent("script.PlayerAttack")
+		if not isvalid(pa) then return 0 end
+		return pa.CombatLevel
+	end
+
+	method number GetLevelMesoRate(integer monsterLevel, integer playerLevel)
+		-- 높고 낮음에 관계없이 레벨 차이당 2% 감소. 50레벨 이상 차이는 0%.
+		return math.max(0, 1 - math.abs(monsterLevel - playerLevel) * 0.02)
+	end
+
+	method number GetLevelDamageRate(integer monsterLevel, integer playerLevel)
+		-- 몬스터가 높은 경우에만 레벨당 2% 피해 감소. 음수 피해는 허용하지 않는다.
+		return math.max(0, 1 - math.max(0, monsterLevel - playerLevel) * 0.02)
+	end
+
+	method integer ApplyMonsterLevelDamage(integer damage, Entity player, Entity defender)
+		-- 원래 피해가 확정되는 지점에서 적용해 실제 HP 감소량과 데미지 표시·예약을 일치시킨다.
+		if not isvalid(defender) then return damage end
+		local monster = defender:GetComponent("script.Monster")
+		if not isvalid(monster) then return damage end
+		local level = self:GetServerLevelOf(player)
+		if level <= 0 then return damage end
+		local monsterLevel = monster.NameTagLevel > 0 and monster.NameTagLevel or monster.MonsterLevel
+		local rate = self:GetLevelDamageRate(monsterLevel, level)
+		return math.max(0, math.floor(damage * rate + 0.0000001))
 	end
 
 	-- 티어 개방 게이트: 통과면 true. 차단이면 false + 해당 클라이언트에 토스트 안내.

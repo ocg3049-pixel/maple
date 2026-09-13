@@ -43,6 +43,8 @@ script CharInfoManager extends Logic
 
 	-- (발도술) 공격 중첩 버프의 크리티컬 확률 보너스(+3%×중첩). CalcCritRate/UpdateStats 두 곳에서 가산된다.
 	property integer battoCritBonus = 0
+	-- 발도술 중첩당 최종 전투력 +3%. 레벨 환산에는 들어가지 않고 실제 표시·스킬 피해 전투력에만 적용된다.
+	property integer battoCombatPowerPct = 0
 	-- (발도술, 요청 2026-08-12) 공격 중첩 버프의 공격속도 보너스(+3%×중첩). 단계(10%)로는 3%를 표현할 수
 	-- 없어 GetAttackSpeedPercent의 퍼센트 항에 직접 더한다(잠재 "공격속도 +N%"와 같은 자리).
 	property integer battoStackAtkSpdPct = 0
@@ -55,11 +57,10 @@ script CharInfoManager extends Logic
 	-- 콤보 감시 타이머 id(OnBeginPlay에서 걸고 OnEndPlay에서 푼다 - LEA-3051 방지).
 	property integer comboWatchTimerId = 0
 
-	-- (표창+ 개편 2026-08-05) 지금 고른 표창 종류가 주는 상시 효과. 표창을 바꾸거나 표창+ 계열 스킬에
-	-- 포인트를 찍을 때 SkillManager.ApplyShurikenAttackBonus가 통째로 다시 대입한다(누적이 아니다).
-	--   · 공격력은 skillAttackBonus에 함께 합산된다(아래 프로퍼티)
-	--   · 크리티컬 확률은 CalcCritRate/UpdateStats에서 가산
-	--   · 공격속도 단계는 GetAttackSpeedStage에서 가산(부스터/발도술과 겹쳐 적용)
+	-- 지금 선택한 표창의 전투력 보너스(%). 1번 5% ... 9번 45%, 미해금 상태는 0%다.
+	-- SkillManager.ApplyShurikenAttackBonus가 선택/분배/복원 때마다 통째로 대입한다.
+	property integer shurikenCombatPowerPct = 0
+	-- 구 저장 구조 및 다른 계산 경로 호환용. 새 표창 효과에서는 항상 0으로 유지한다.
 	property integer shurikenCritBonus = 0
 	property integer shurikenAtkSpeedStage = 0
 
@@ -84,6 +85,10 @@ script CharInfoManager extends Logic
 	-- (요청 2026-08-12) **공격력·마력 둘 다** 올리는 상시 보너스(현재는 초보자 "무기 숙련"만).
 	-- skillAttackBonus(표창+·표창 효과·트레이닝 = 공격력 전용)와 구분해 두 줄에 각각 옳게 표시한다.
 	property integer commonAttackBonus = 0
+
+	-- 불과 친화력 상시 패시브 전투력 보너스(%). SkillManager가 분배/복원 직후 최신 레벨을 넣는다.
+	-- 전투력 계산 중 SkillManager 카탈로그를 역조회하지 않아 초기화 순서와 UI 갱신 누락의 영향을 받지 않는다.
+	property integer fireAffinityCombatPowerPct = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
@@ -793,12 +798,16 @@ script CharInfoManager extends Logic
 		end
 		local spdBonus = 3 * stacks
 		local critBonus = 3 * stacks
+		local combatPowerBonus = 3 * stacks
 		self.battoStackAtkSpdPct = self.battoStackAtkSpdPct + spdBonus
 		self.battoCritBonus = self.battoCritBonus + critBonus
+		self.battoCombatPowerPct = combatPowerBonus
 		self._T.battoStackSpd = spdBonus
 		self._T.battoStackCrit = critBonus
 		self._T.battoStackActive = true
-		log("[CharInfo] 발도술 중첩 프록 - 공격속도 +" .. tostring(spdBonus) .. "% 크확 +" .. tostring(critBonus) .. "% (" .. string.format("%.1f", remain) .. "초)")
+		log("[CharInfo] 발도술 중첩 프록 - 공격속도 +" .. tostring(spdBonus) .. "% 크확 +"
+			.. tostring(critBonus) .. "% 전투력 +" .. tostring(combatPowerBonus) .. "% ("
+			.. string.format("%.1f", remain) .. "초)")
 		local cwBS = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 		if isvalid(cwBS) and cwBS.Enable then
 			self:UpdateStats()
@@ -820,6 +829,7 @@ script CharInfoManager extends Logic
 		self._T.battoStackToken = (self._T.battoStackToken or 0) + 1
 		self.battoStackAtkSpdPct = self.battoStackAtkSpdPct - (self._T.battoStackSpd or 0)
 		self.battoCritBonus = self.battoCritBonus - (self._T.battoStackCrit or 0)
+		self.battoCombatPowerPct = 0
 		self._T.battoStackActive = false
 		log("[CharInfo] 발도술 중첩 프록 종료 - 공격속도/크확 원복 (battoStackAtkSpdPct=" .. tostring(self.battoStackAtkSpdPct) .. " battoCritBonus=" .. tostring(self.battoCritBonus) .. ")")
 		local cwBS = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
@@ -1012,6 +1022,17 @@ script CharInfoManager extends Logic
 			-- 드래곤이 걸어준 공마 +30 분노(ApplyDragonStatBuff)가 동시에 켜져 있을 수 있으므로
 			-- 아래 공용 공마 경로도 그대로 이어서 탄다.
 		end
+		if key == "meditation" then
+			if (self._T.meditationUntil or 0) > _UtilLogic.ElapsedSeconds then
+				self._T.meditationUntil = 0
+				self._T.meditationFinalPct = 0
+				self._T.meditationToken = (self._T.meditationToken or 0) + 1
+				log("[CharInfo] 메디테이션 취소(우클릭) - 전투력 배율 원복")
+				_SkillManager:SyncDarkSightStats()
+				local cwM = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+				if isvalid(cwM) and cwM.Enable then self:UpdateStats() end
+			end
+		end
 		if key == "dragonblood" then
 			self._T.dragonBloodUntil = 0
 			self._T.dragonBloodCombatPowerPct = 0
@@ -1086,31 +1107,44 @@ script CharInfoManager extends Logic
 		_RageBuffUI:ShowBuff(duration)
 	end
 
-	-- 메디테이션(2차 버프): 마력 보너스·지속시간을 호출부(SkillManager)가 투자 레벨로 계산해 넘긴다.
+	-- 메디테이션(2차 버프): 분노와 동일하게 분배 1포인트당 전투력 +1%를 적용한다.
 	@ExecSpace("ClientOnly")
-	method void UseMeditation(number duration, integer atkBonus)
-		-- (썬콜 개편 2026-08-08) 고정 +30/5분 → 마력 +2/분배(마스터 +40).
-		-- (요청 2026-08-14) 지속시간은 **블레스와 동일**(SkillManager.GetMeditationDuration이 블레스
-		-- 헬퍼를 위임받는다 - 호출부가 계산해 넘겨준다), 그리고 **오른 마력이 실제 전투력에 반영**되도록
-		-- 공용 버프 코어(ApplyAttackBuff = 표시 전용) 대신 **실효 버프 통**(ApplyRealBuff)을 쓴다.
-		-- ⚠ 다크드래곤이 걸어주는 메디테이션(ApplyDragonStatBuff "meditation", +30/30초)은 별개 사양이라
-		--   여전히 공용 통을 쓴다 - 우클릭 취소가 두 경로를 모두 부르는 이유(BuffBarManager 참고).
-		self:ApplyRealBuff("meditation", atkBonus, 0, duration)
+	method void UseMeditation(number duration, integer bonusCpPct)
+		local now = _UtilLogic.ElapsedSeconds
+		self._T.meditationFinalPct = bonusCpPct
+		self._T.meditationUntil = now + duration
+		self._T.meditationToken = (self._T.meditationToken or 0) + 1
+		local myToken = self._T.meditationToken
+		log("[CharInfo] 메디테이션 발동 - 전투력 +" .. tostring(bonusCpPct) .. "% (" .. tostring(duration) .. "초)")
+		_SkillManager:SyncDarkSightStats()
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then self:UpdateStats() end
+		_TimerService:SetTimerOnce(function()
+			if self._T.meditationToken ~= myToken then return end
+			self._T.meditationUntil = 0
+			self._T.meditationFinalPct = 0
+			log("[CharInfo] 메디테이션 종료 - 전투력 원복")
+			_SkillManager:SyncDarkSightStats()
+			local cw2 = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+			if isvalid(cw2) and cw2.Enable then self:UpdateStats() end
+		end, duration)
 		_MeditationBuffUI:ShowBuff(duration)
 	end
 
 	-- (다크드래곤) 드래곤이 걸어주는 분노/메디테이션 스탯 버프를 소유주 클라에 적용한다. 서버(DarkDragon)가
 	-- 소유주 UserId를 마지막 인자로 넘겨 이 클라 메서드를 호출한다(쿨타임 초기화 ResetAllCooldowns와 동일 패턴).
-	-- key="rage"/"meditation", 지속시간 30초. 공마 +30(기존 분노/메디테이션과 동일 보너스).
+	-- 현재 분노/메디테이션과 같은 실효 경로를 사용하되, 지속시간과 효과량은 드래곤 호출값을 유지한다.
 	@ExecSpace("Client")
 	method void ApplyDragonStatBuff(string key, integer atkBonus, number duration)
-		self:ApplyAttackBuff(key, atkBonus, duration)
 		if key == "rage" then
-			_RageBuffUI:ShowBuff(duration)
+			-- 현재 분노: 고정 공마가 아니라 전투력 % 증가.
+			self:UseRage(duration, atkBonus)
 		elseif key == "meditation" then
-			_MeditationBuffUI:ShowBuff(duration)
+			-- 현재 메디테이션도 분노와 같은 전투력 % 증가.
+			self:UseMeditation(duration, atkBonus)
 		end
-		log("[CharInfo] 드래곤 버프 적용(" .. key .. ") +" .. tostring(atkBonus) .. " " .. tostring(duration) .. "초")
+		log("[CharInfo] 드래곤 버프 적용(" .. key .. ") 전투력 +" .. tostring(atkBonus)
+			.. "% 지속=" .. tostring(duration) .. "초")
 	end
 
 	-- 블레스(2차 버프): 5분간 자신에게 공마 + 4스탯 보너스. 주변 소환 용사 몫은 서버
@@ -1691,15 +1725,34 @@ script CharInfoManager extends Logic
 		return pct
 	end
 
-	-- 버프 유래 추가 전투력% - 분노와 드래곤 블러드를 합산한다. 레벨에는 반영되지 않는다.
+	-- 버프 유래 추가 전투력% - 분노·메디테이션·드래곤 블러드를 합산한다. 레벨에는 반영되지 않는다.
 	@ExecSpace("ClientOnly")
 	method number GetBuffBonusCombatPowerPct()
 		local now = _UtilLogic.ElapsedSeconds
 		local pct = 0
 		if (self._T.rageUntil or 0) > now then pct += self._T.rageFinalPct or 0 end
+		if (self._T.meditationUntil or 0) > now then pct += self._T.meditationFinalPct or 0 end
 		if (self._T.dragonBloodUntil or 0) > now then pct += self._T.dragonBloodCombatPowerPct or 0 end
 		if (self._T.magicBoosterUntil or 0) > now then pct += self._T.magicBoosterCombatPowerPct or 0 end
+		pct += self.battoCombatPowerPct
+		-- 불과 친화력은 상시 패시브로 분배 1포인트당 전투력 +1%.
+		pct += math.max(0, math.min(self.fireAffinityCombatPowerPct, 20))
+		-- 선택 표창 번호당 전투력 +5%. 표창+가 하나도 열리지 않았으면 SkillManager가 0을 넣는다.
+		pct += math.max(0, math.min(self.shurikenCombatPowerPct, 45))
 		return pct
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyFireAffinityCombatPower(integer skillLv)
+		local oldCombatPower = self:CalcCombatPower()
+		self.fireAffinityCombatPowerPct = math.max(0, math.min(skillLv, 20))
+		local newCombatPower = self:CalcCombatPower()
+		-- 기본공격처럼 서버가 캐시한 전투력을 쓰는 경로도 즉시 최신값으로 맞춘다.
+		_SkillManager:SyncDarkSightStats()
+		-- 스탯창이 닫혀 있어도 내부 표시값과 HUD 갱신 경로가 최신 수치를 읽도록 즉시 재계산한다.
+		self:UpdateStats()
+		log("[FireAffinity] 전투력 패시브 적용 lv=" .. tostring(self.fireAffinityCombatPowerPct)
+			.. " combatPower=" .. tostring(oldCombatPower) .. "→" .. tostring(newCombatPower))
 	end
 
 	-- (요청 2026-08-12 2차) 콤보 어택 구슬이 주는 최종 데미지% = **구슬 1개당 2% 고정**.

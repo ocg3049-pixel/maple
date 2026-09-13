@@ -8,6 +8,10 @@ script Monster extends Component
     @Sync property integer Hp = 0
     @Sync property boolean RespawnOn = false
     @Sync property boolean IsDead = false
+    @Sync property number HealthBarUntil = 0
+    property number HealthBarOffsetY = 0
+    @Sync property integer NameTagLevel = 0
+    @Sync property string NameTagText = ""
     property boolean GroupRespawn = false
     property number RespawnDelay = 5.0
     property number DestroyDelay = 0.6
@@ -70,21 +74,164 @@ script Monster extends Component
     method void OnSyncProperty(string name, any value)
         -- IsDead가 true로 넘어오는 순간이 클라이언트가 아는 유일한 "죽었다" 신호다
         -- (Dead()는 ServerOnly라 클라 쪽 이펙트 장부를 직접 못 지운다).
+        if name == "Hp" or name == "MaxHp" then
+            self._T.healthBarDirty = true
+        end
         if name ~= "IsDead" then return end
         if value == true then
+            if isvalid(self._T.nameTag) then self._T.nameTag.Enable = false end
+            self:HideHealthBar()
             self:ClearStatusEffects()
 			self:ClearIceDemonMarkEffect()
         end
     end
 
     @ExecSpace("ServerOnly")
+    method void SetupMonsterNameTag()
+        -- 배치 번호를 제외한 몬스터 종류로 표시 문구를 찾고 플레이어와 같은 기본 이름표를 붙인다.
+        local labels = {
+            ["monster-2634"] = "Lv.2 파란 달팽이",
+            ["monster-1143"] = "Lv.4 빨간 달팽이",
+            ["monster-2416"] = "Lv.15 초록 버섯",
+            ["monster-1957"] = "Lv.8 시니컬한 주황버섯",
+            ["monster-2218"] = "Lv.8 주황버섯",
+            ["monster-545"] = "Lv.2 스포아",
+            ["monster-805"] = "Lv.20 파란버섯",
+            ["monster-1419"] = "Lv.20 우는 파란버섯",
+            ["monster-1224"] = "Lv.1 달팽이",
+            ["monster-1366"] = "Lv.22 뿔버섯",
+            ["monster-2053"] = "Lv.22 화난 뿔버섯",
+            ["monster-undead-healtest"] = "Lv.24 좀비버섯",
+            ["monster-1037"] = "Lv.27 이블아이",
+            ["monster-2119"] = "Lv.35 커즈아이",
+            ["monster-2143"] = "Lv.29 서전아이",
+            ["monster-621"] = "Lv.4 스텀프",
+            ["monster-506"] = "Lv.17 엑스텀프",
+            ["monster-1290"] = "Lv.10 다크 스텀프",
+            ["monster-1914"] = "Lv.22 다크 엑스텀프",
+            ["monster-4733"] = "Lv.19 고스텀프",
+            ["monster-1217"] = "Lv.19 히죽대는 고스텀프",
+            ["monster-664"] = "Lv.52 크로코",
+            ["monster-757"] = "Lv.32 리게이터",
+            ["monster-2586"] = "Lv.49 늪진흙괴물",
+            ["monster-2270"] = "Lv.55 스톤골렘",
+            ["monster-316"] = "Lv.62 아이스 믹스골렘",
+            ["monster-2150"] = "Lv.59 믹스골렘",
+            ["monster-3240"] = "Lv.58 다크 스톤골렘",
+            ["monster-2095"] = "Lv.65 파이어 믹스골렘",
+            ["monster-2302"] = "Lv.12 옥토퍼스",
+            ["monster-1550"] = "Lv.21 주니어 네키",
+            ["monster-3223"] = "Lv.15 버블링",
+            ["monster-1806"] = "Lv.6 슬라임",
+            ["monster-2056"] = "Lv.30 페어리",
+            ["monster-957"] = "Lv.33 아이스 페어리",
+            ["monster-1844"] = "Lv.25 와일드보어",
+            ["monster-3246"] = "Lv.28 겁먹은 와일드보어",
+            ["monster-499"] = "Lv.42 아이언호그",
+            ["monster-2511"] = "Lv.45 아이언보어",
+        }
+        local kind = string.gsub(self.Entity.Name, "_%d+$", "")
+        local label = labels[kind]
+        if label == nil then return end
+        local tag = self.Entity.NameTagComponent
+        if not isvalid(tag) then
+            self.Entity:AddComponent("MOD.Core.NameTagComponent")
+            tag = self.Entity.NameTagComponent
+        end
+        if not isvalid(tag) then return end
+        local separator = string.find(label, " ")
+        if separator == nil then return end
+        local level = string.sub(label, 1, separator - 1)
+        local monsterName = string.sub(label, separator + 1)
+        self.NameTagLevel = tonumber(string.sub(level, 4)) or 0
+        label = level .. ". " .. monsterName
+        tag.Name = label
+        tag.FontSize = 1
+        tag.FontColor = Color(1, 1, 1, 1)
+        tag.Bold = false
+        tag.FontOffset = Vector2(0, 0)
+        tag.OffsetY = 0
+        self.NameTagText = "<mark=#00000080> <size=85%>" .. level .. ".</size> " .. monsterName .. " </mark>"
+        tag.Enable = false
+        log("[MonsterNameTag] " .. self.Entity.Name .. " -> " .. label)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateMonsterNameTag()
+        -- 몬스터의 음수 스케일을 상속하지 않는 로컬 이름표를 만들고 발밑을 따라가게 한다.
+        local nameEntity = self._T.nameTag
+        if self.IsDead or self.Hp <= 0 or not self.Entity.VisibleInHierarchy or self.NameTagText == "" then
+            if isvalid(nameEntity) then nameEntity.Enable = false end
+            return
+        end
+        if not isvalid(nameEntity) then
+            if (self._T.nameTagRetryAt or 0) > _UtilLogic.ElapsedSeconds then return end
+            self._T.nameTagRetryAt = _UtilLogic.ElapsedSeconds + 1
+            if not isvalid(self.Entity.CurrentMap) then return end
+            nameEntity = _SpawnService:SpawnByModelId("monsternametag", "Name_" .. self.Entity.Id, Vector3(0, 0, 0), self.Entity.CurrentMap)
+            if not isvalid(nameEntity) then return end
+            self._T.nameTag = nameEntity
+            self._T.nameTagColorBand = nil
+            local text = nameEntity.TextRendererComponent
+            text.FontSize = 1.2
+            text.FontColor = Color(1, 1, 1, 1)
+            text.IsRichText = true
+            text.BestFit = false
+            text.Wrapping = false
+            text.SizeFit = true
+            text.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+            text.VerticalAlignment = TextVerticalAlignmentOption.Middle
+            text.RectOffset = Vector2(0, -0.12)
+            text.SortingLayer = "MapLayer0"
+            text.OrderInLayer = 11
+            text.Text = self.NameTagText
+            text.Enable = true
+            log("[MonsterNameTag] client created " .. self.Entity.Name)
+            self:UpdateMonsterNameTagColor(math.max(1, _UIMyInfoManager.DisplayLevel))
+        end
+        local pos = self.Entity.TransformComponent.WorldPosition
+        nameEntity.TransformComponent.WorldPosition = Vector3(pos.x, pos.y, pos.z - 0.01)
+        nameEntity.Enable = true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateMonsterNameTagColor(integer playerLevel)
+        -- 자신의 HUD 레벨과 표시용 몬스터 레벨을 비교한다. 클라이언트에서만 바꿔 다른 유저와 색이 섞이지 않는다.
+        if not isvalid(self._T.nameTag) then return end
+        local text = self._T.nameTag.TextRendererComponent
+        if not isvalid(text) or self.NameTagLevel <= 0 then return end
+        local difference = self.NameTagLevel - playerLevel
+        local band = 0
+        if difference > 10 then
+            band = 2
+        elseif difference > 5 then
+            band = 1
+        elseif difference < -5 then
+            band = -1
+        end
+        if self._T.nameTagColorBand == band then return end
+        self._T.nameTagColorBand = band
+        if band == 2 then
+            text.FontColor = Color(1, 0.2, 0.2, 1)
+        elseif band == 1 then
+            text.FontColor = Color(1, 0.55, 0.1, 1)
+        elseif band == -1 then
+            text.FontColor = Color(1, 0.9, 0.2, 1)
+        else
+            text.FontColor = Color(1, 1, 1, 1)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
     method void OnBeginPlay()
         -- (밸런스 2026-08-09) MaxHp를 명시하지 않은 몬스터(= 기본값 3000 그대로)는 MonsterLevel로
-        -- HP 곡선(RegionTierLogic.GetMonsterHpForLevel - (7L)²×배율×1.5타)을 적용한다.
+        -- 동일 레벨 히어로의 주력기·버프·SP 기준 피해 ×1.9를 적용한다.
         -- 3000을 센티널로 쓰므로, 특정 몬스터에 정확히 3000을 주고 싶으면 .map/.model에 2999나
         -- 3001처럼 다른 값을 명시할 것. 허수아비(1억)처럼 명시된 값은 그대로 존중된다.
+        self:SetupMonsterNameTag()
+        self.HealthBarUntil = 0
         if self.MaxHp == 3000 then
-            self.MaxHp = _RegionTierLogic:GetMonsterHpForLevel(self.MonsterLevel)
+            self.MaxHp = _RegionTierLogic:GetMonsterHpForLevel(self.NameTagLevel > 0 and self.NameTagLevel or self.MonsterLevel)
         end
         self.Hp = self.MaxHp
         -- (버그 수정) 배치된 최초 위치를 기억해 둔다 - 리젠은 죽은 자리가 아니라 항상 이 자리에서 이뤄진다.
@@ -128,6 +275,9 @@ script Monster extends Component
         --   다른 투사체로 때렸을 때 어그로가 안 걸린다. ResolveOwner는 OwnerComponentNames 목록으로
         --   모든 투사체/소환수를 커버한다(새 투사체는 그 목록에 등록하면 여기도 자동으로 따라온다).
         local aggroOwner = _BattleStatsManager:ResolveOwner(event.AttackerEntity)
+        if event.TotalDamage > 0 and isvalid(aggroOwner) then
+            self.HealthBarUntil = _UtilLogic.ServerElapsedSeconds + 5.0
+        end
         if isvalid(aggroOwner) then
             -- 어그로는 마지막 피격으로부터 AggroDurationSeconds(10초) 유지되고, 만료되면 배회로 돌아간다.
             local nowSrv = _UtilLogic.ServerElapsedSeconds
@@ -341,16 +491,7 @@ script Monster extends Component
     @ExecSpace("ServerOnly")
     method void RememberLastAttacker(Entity attacker)
         if not isvalid(attacker) then return end
-        local owner = attacker
-        if not isvalid(owner:GetComponent("script.PlayerAttack")) then
-            owner = nil
-            local ls = attacker:GetComponent("script.LuckySevenProjectileAttack")
-            if isvalid(ls) and isvalid(ls.OwnerEntity) then owner = ls.OwnerEntity end
-            if owner == nil then
-                local av = attacker:GetComponent("script.AvengerProjectileAttack")
-                if isvalid(av) and isvalid(av.OwnerEntity) then owner = av.OwnerEntity end
-            end
-        end
+        local owner = _BattleStatsManager:ResolveOwner(attacker)
         if owner == nil or not isvalid(owner) then return end
         if not isvalid(owner:GetComponent("script.PlayerAttack")) then return end
         self._T.lastKiller = owner
@@ -358,11 +499,11 @@ script Monster extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ApplyIceDemonMark(Entity owner, integer skillLv)
-		-- 표식은 마지막 적중부터 5초 동안만 유효하다. 토큰으로 재적중 전 타이머가 새 표식을 지우지 않게 한다.
+		-- 표식은 마지막 적중부터 10초 동안 유효하다. 토큰으로 재적중 전 타이머가 새 표식을 지우지 않게 한다.
 		if self.IsDead or not isvalid(owner) then return end
 		self._T.iceDemonMarkOwner = owner
 		self._T.iceDemonMarkLevel = math.max(0, math.min(skillLv, 30))
-		self._T.iceDemonMarkExpiresAt = _UtilLogic.ServerElapsedSeconds + 5.0
+		self._T.iceDemonMarkExpiresAt = _UtilLogic.ServerElapsedSeconds + 10.0
 		self._T.iceDemonMarkToken = (self._T.iceDemonMarkToken or 0) + 1
 		local token = self._T.iceDemonMarkToken
 		self:ShowIceDemonMark()
@@ -372,7 +513,7 @@ script Monster extends Component
 			self._T.iceDemonMarkOwner = nil
 			self._T.iceDemonMarkLevel = nil
 			self._T.iceDemonMarkExpiresAt = nil
-		end, 5.0)
+		end, 10.0)
 		log("[Monster] 아이스 데몬 표식 lv=" .. tostring(self._T.iceDemonMarkLevel))
 	end
 
@@ -381,6 +522,29 @@ script Monster extends Component
 		return not self.IsDead and isvalid(owner) and self._T.iceDemonMarkOwner == owner
 			and (self._T.iceDemonMarkLevel or 0) > 0
 			and (_UtilLogic.ServerElapsedSeconds or 0) < (self._T.iceDemonMarkExpiresAt or 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFireDemonMark(Entity owner, integer skillLv)
+		if self.IsDead or not isvalid(owner) then return end
+		self._T.fireDemonMarkOwner=owner self._T.fireDemonMarkLevel=math.max(0,math.min(skillLv,30))
+		self._T.fireDemonMarkExpiresAt=_UtilLogic.ServerElapsedSeconds+5.0
+		self._T.fireDemonMarkToken=(self._T.fireDemonMarkToken or 0)+1
+		local token=self._T.fireDemonMarkToken self:ShowFireDemonMark()
+		_TimerService:SetTimerOnce(function() if isvalid(self.Entity) and self._T.fireDemonMarkToken==token then self._T.fireDemonMarkOwner=nil self._T.fireDemonMarkLevel=nil self._T.fireDemonMarkExpiresAt=nil end end,5.0)
+	end
+
+	method boolean HasFireDemonMarkFrom(Entity owner)
+		return not self.IsDead and isvalid(owner) and self._T.fireDemonMarkOwner==owner and (self._T.fireDemonMarkLevel or 0)>0 and (_UtilLogic.ServerElapsedSeconds or 0)<(self._T.fireDemonMarkExpiresAt or 0)
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowFireDemonMark()
+		if not self:IsClient() then return end
+		if self._T.fireDemonMarkEffect~=nil then _EffectService:RemoveEffect(self._T.fireDemonMarkEffect) end
+		local serial=_EffectService:PlayEffectAttached("0e670196706243d9a482148499c7816f",self.Entity,Vector3(0,0.6,0),0,Vector3(0.3,0.3,0.3),true,{["Color"]=Color(1,0.15,0.05,1)})
+		self._T.fireDemonMarkEffect=serial
+		_TimerService:SetTimerOnce(function() if self._T.fireDemonMarkEffect==serial then _EffectService:RemoveEffect(serial) self._T.fireDemonMarkEffect=nil end end,5.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -395,12 +559,12 @@ script Monster extends Component
 				_EffectService:RemoveEffect(serial)
 				self._T.iceDemonMarkEffect = nil
 			end
-		end, 5.0)
+		end, 10.0)
 	end
 
 	@ExecSpace("Multicast")
 	method void ClearIceDemonMarkEffect()
-		-- 사망/리젠 시 5초 타이머를 기다리지 않고 반복 표식 엔티티를 즉시 제거한다.
+		-- 사망/리젠 시 10초 타이머를 기다리지 않고 반복 표식 엔티티를 즉시 제거한다.
 		if not self:IsClient() then return end
 		if self._T.iceDemonMarkEffect ~= nil then
 			_EffectService:RemoveEffect(self._T.iceDemonMarkEffect)
@@ -412,6 +576,7 @@ script Monster extends Component
 	method void Dead()
         if self.IsDead then return end
         self.IsDead = true
+        self.HealthBarUntil = 0
         -- (표창 재고) 처치 통보 - 모든 처치가 지나는 유일한 길목이라 여기 한 곳이면 충분하다.
         local killer = self._T.lastKiller
         if isvalid(killer) then
@@ -433,6 +598,9 @@ script Monster extends Component
         log("Monster: Dead()")
 
 		local deathPos = self.Entity.TransformComponent.WorldPosition
+		local fireMarkOwner = self._T.fireDemonMarkOwner
+		local fireMarkLevel = self._T.fireDemonMarkLevel or 0
+		self._T.fireDemonMarkOwner=nil self._T.fireDemonMarkLevel=nil self._T.fireDemonMarkExpiresAt=nil self._T.fireDemonMarkToken=(self._T.fireDemonMarkToken or 0)+1
 		local markOwner = self._T.iceDemonMarkOwner
 		local markLevel = self._T.iceDemonMarkLevel or 0
 		self._T.iceDemonMarkOwner = nil
@@ -445,13 +613,17 @@ script Monster extends Component
 			local markAttack = markOwner:GetComponent("script.PlayerAttack")
 			if isvalid(markAttack) then markAttack:TrySummonIceDemonMinion(deathPos, markLevel) end
 		end
+		if isvalid(fireMarkOwner) and fireMarkLevel>0 then
+			local pa=fireMarkOwner:GetComponent("script.PlayerAttack")
+			if isvalid(pa) then pa:TrySummonFireDemonMinion(deathPos,fireMarkLevel) end
+		end
 		local dropMap = self.Entity.CurrentMap
         if isvalid(dropMap) then
             -- (요청 2026-08-12) 초보자 패시브 "아이템 감각" - 마지막 공격자의 보너스(%)를 **메소 획득량과
             -- 모든 확률 아이템 드랍**에 함께 곱한다(분배당 +1%, 마스터 100 = 2배). 킬러를 못 찾으면 1.0.
             -- 메소·아이템 두 블록이 같은 값을 쓰므로 여기서 한 번만 구한다.
             local dropMult = 1.0
-            local killerEnt = self._T.lastKiller
+            local killerEnt = killer
             if isvalid(killerEnt) then
                 ---@type PlayerAttack
                 local killerPa = killerEnt:GetComponent("script.PlayerAttack")
@@ -460,8 +632,14 @@ script Monster extends Component
                 end
             end
 
-            -- 메소 드랍 (항상) - (Phase 3) 지역 티어 기반: 몬스터 스펙은 전 지역 동일,
-            -- 지역이 좋을수록 메소만 커진다 (티어 기본값 ±20%, GDD §4.4)
+            -- 메소 획득 확률만 레벨 차이당 2% 낮춘다. 성공 시 기존 티어·아이템 감각 지급량을 유지한다.
+            local mesoRate = 1.0
+            if isvalid(killer) then
+                local killerLevel = _RegionTierLogic:GetServerLevelOf(killer)
+                local monsterLevel = self.NameTagLevel > 0 and self.NameTagLevel or self.MonsterLevel
+                if killerLevel > 0 then mesoRate = _RegionTierLogic:GetLevelMesoRate(monsterLevel, killerLevel) end
+            end
+            if _UtilLogic:RandomDouble() < mesoRate then
             local mesoAmount = math.floor(_RegionTierLogic:RollMesoForMap(dropMap.Name) * dropMult)
             local mesoEnt = _SpawnService:SpawnByModelId("droppedmeso", self.Entity.Name .. "_meso", deathPos, dropMap)
             if isvalid(mesoEnt) then
@@ -481,18 +659,20 @@ script Monster extends Component
                 log("[Monster] 메소 드랍: " .. tostring(mesoAmount))
             end
 
+            end
+
             -- 확률 아이템 드랍 (매 사망마다 랜덤 롤)
             -- type 미지정 = "sprite"(아이콘 스프라이트), "avataritem" = 장비 아바타 아이템(장비 탭으로 들어가고
             -- 월드 드롭 아이콘은 thumbnail://로 렌더).
             local itemDrops = {
                 -- (재보정) 드롭 아이템 박스: 파괴가 5성부터로 잦아진 만큼 공급도 늘림 (0.05% → 1.5%)
-                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", rate = 0.015 },
-                { ruid = "b2300eda46f3445e9b1c6e774a2ee95a", rate = 0.005 },
-                { ruid = "b8f0af90c30b462f859f45bdc1878d8b", rate = 0.002 },
-                { ruid = "af5404f4c8fc4ec78ccc1a57446f69db", rate = 0.004 },
-                { ruid = "9c2a12b9a92f44d4b6dd95c7fb182ac9", rate = 0.0015 },
-                { ruid = "bb6c1532d7364170a11abd2d8835bc81", rate = 0.00001 },
-                { ruid = "b45e7dfab446401f82ab98ec2a881b9f", rate = 0.000001 },
+                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", name = "드롭 아이템", rate = 0.015 },
+                { ruid = "b2300eda46f3445e9b1c6e774a2ee95a", name = "레드큐브", rate = 0.005 },
+                { ruid = "b8f0af90c30b462f859f45bdc1878d8b", name = "블랙큐브", rate = 0.002 },
+                { ruid = "af5404f4c8fc4ec78ccc1a57446f69db", name = "에디셔널큐브", rate = 0.004 },
+                { ruid = "9c2a12b9a92f44d4b6dd95c7fb182ac9", name = "화이트 에디셔널큐브", rate = 0.0015 },
+                { ruid = "bb6c1532d7364170a11abd2d8835bc81", name = "장비강화 주문서", rate = 0.00001 },
+                { ruid = "b45e7dfab446401f82ab98ec2a881b9f", name = "10주년 주문서", rate = 0.000001 },
                 { ruid = "14267ae8e168458480697c148ddfdcab", name = "잠재능력 부여주문서", rate = 0.0005 },
                 -- (요청) 아바타 장비(상의/하의/망토/장갑/신발)는 몬스터가 드롭하지 않는다 -
                 -- 소비 탭의 "드롭 아이템" 박스로만 뽑을 수 있다(UIEquipInventoryManager 박스 지급 경로).
@@ -504,7 +684,8 @@ script Monster extends Component
                     if isvalid(dropEnt) then
                         local dic = dropEnt.DroppedItemComponent
                         if isvalid(dic) then
-                            if drop.name then dic.ItemName = drop.name end
+                            -- 공용 모델의 기본 이름(껍질)을 물려받지 않도록 명시한다.
+                            dic.ItemName = drop.name
                             dic.ItemRUID = drop.ruid
                             local itype = drop.type or "sprite"
                             dic.ItemType = itype
@@ -547,8 +728,10 @@ script Monster extends Component
 		self._T.iceDemonMarkLevel = nil
 		self._T.iceDemonMarkExpiresAt = nil
 		self._T.iceDemonMarkToken = (self._T.iceDemonMarkToken or 0) + 1
+		self._T.fireDemonMarkOwner=nil self._T.fireDemonMarkLevel=nil self._T.fireDemonMarkExpiresAt=nil self._T.fireDemonMarkToken=(self._T.fireDemonMarkToken or 0)+1
 		self:ClearIceDemonMarkEffect()
         self.IsDead = false
+        self.HealthBarUntil = 0
         self.Hp = self.MaxHp
         self._T.pendingDeath = nil
         self._T.deathDeferUntil = nil
@@ -580,6 +763,113 @@ script Monster extends Component
         -- 그 상태가 리스폰까지 따라 나온다. 살아날 때 렌더 상태를 항상 기본값으로 초기화한다.
         self:ResetTint()
         log("Monster: Respawn(), Hp=" .. tostring(self.Hp) .. " pos=" .. tostring(self._T.spawnX) .. "," .. tostring(self._T.spawnY))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HideHealthBar()
+        -- 몬스터 본체는 유지하고 이 클라이언트의 HP바만 숨긴다.
+        local bar = self._T.healthBar
+        if isvalid(bar) then bar.Enable = false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PaintHealthBar()
+        -- HP가 바뀔 때만 흰 테두리, 검정 여백, 왼쪽부터 차는 게이지를 다시 그린다.
+        local bar = self._T.healthBar
+        if not isvalid(bar) then return end
+        local pixel = bar.PixelRendererComponent
+        if not isvalid(pixel) then return end
+        local ratio = 0
+        if self.MaxHp > 0 then ratio = math.max(0, math.min(1, self.Hp / self.MaxHp)) end
+        local fill = math.floor(46 * ratio)
+        if ratio > 0 then fill = math.max(1, fill) end
+        local color = Color(0.3, 0.95, 0.1, 1)
+        if ratio <= 0.1 then
+            color = Color(1, 0.12, 0.08, 1)
+        elseif ratio < 0.5 then
+            color = Color(1, 0.55, 0.05, 1)
+        end
+        local black = Color(0, 0, 0, 1)
+        local white = Color(1, 1, 1, 1)
+        local pixels = {}
+        for y = 1, 9 do
+            for x = 1, 52 do
+                local c = black
+                if x >= 2 and x <= 51 and y >= 2 and y <= 8
+                    and (x == 2 or x == 51 or y == 2 or y == 8) then
+                    c = white
+                elseif y >= 4 and y <= 6 and x >= 4 and x < 4 + fill then
+                    c = color
+                end
+                pixels[#pixels + 1] = c
+            end
+        end
+        pixel:SetPixels(pixels)
+        self._T.healthBarDirty = false
+        self._T.healthBarHp = self.Hp
+        self._T.healthBarMaxHp = self.MaxHp
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- 서버가 승인한 마지막 플레이어 피격 시각을 기준으로 5초간 머리 위를 따라간다.
+        self:UpdateMonsterNameTag()
+        self._T.nameTagColorElapsed = (self._T.nameTagColorElapsed or 0) + delta
+        if self._T.nameTagColorElapsed >= 0.25 then
+            self._T.nameTagColorElapsed = 0
+            -- UIMyInfoManager가 현재 장비에서 환산해 갱신한 레벨을 재사용해 몬스터마다 장비를 재계산하지 않는다.
+            self:UpdateMonsterNameTagColor(math.max(1, _UIMyInfoManager.DisplayLevel))
+        end
+        if self.IsDead or self.Hp <= 0 or self.HealthBarUntil <= _UtilLogic.ServerElapsedSeconds
+            or not self.Entity.VisibleInHierarchy then
+            self:HideHealthBar()
+            return
+        end
+        local bar = self._T.healthBar
+        if not isvalid(bar) then
+            if (self._T.healthBarRetryAt or 0) > _UtilLogic.ElapsedSeconds then return end
+            self._T.healthBarRetryAt = _UtilLogic.ElapsedSeconds + 1
+            local currentMap = self.Entity.CurrentMap
+            if not isvalid(currentMap) then return end
+            bar = _SpawnService:SpawnByModelId("monsterhealthbar", "HP_" .. self.Entity.Id, Vector3(0, 0, 0), currentMap)
+            if not isvalid(bar) then return end
+            self._T.healthBar = bar
+            bar.PixelRendererComponent:ResetWithColor(52, 9, Color(0, 0, 0, 0))
+            self._T.healthBarDirty = true
+            log("[MonsterHPBar] created " .. self.Entity.Name)
+        end
+        local pos = self.Entity.TransformComponent.WorldPosition
+        local height = self.HealthBarOffsetY
+        if height <= 0 then
+            height = 1.2
+            local hit = self.Entity.HitComponent
+            if isvalid(hit) then
+                local halfHeight = hit.BoxSize.y * 0.5
+                if hit.ColliderType == ColliderType.Circle then halfHeight = hit.CircleRadius end
+                local offset = hit.ColliderOffset
+                if hit.IsLegacy then offset = hit.BoxOffset end
+                height = math.max(0.5, (offset.y + halfHeight) * math.abs(self.Entity.TransformComponent.Scale.y) + 0.25)
+            end
+        end
+        bar.TransformComponent.WorldPosition = Vector3(pos.x, pos.y + height, pos.z - 0.01)
+        local sprite = self.Entity.SpriteRendererComponent
+        if isvalid(sprite) then
+            bar.PixelRendererComponent.SortingLayer = sprite.SortingLayer
+            bar.PixelRendererComponent.OrderInLayer = math.max(10, sprite.OrderInLayer + 1)
+        end
+        if self._T.healthBarDirty or self._T.healthBarHp ~= self.Hp or self._T.healthBarMaxHp ~= self.MaxHp then
+            self:PaintHealthBar()
+        end
+        bar.Enable = true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- 맵 이탈이나 몬스터 제거 시 클라이언트 전용 HP바를 정리한다.
+        if isvalid(self._T.nameTag) then self._T.nameTag:Destroy() end
+        self._T.nameTag = nil
+        if isvalid(self._T.healthBar) then self._T.healthBar:Destroy() end
+        self._T.healthBar = nil
     end
 
     @ExecSpace("Multicast")

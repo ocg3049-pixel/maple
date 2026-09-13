@@ -98,8 +98,9 @@ script ShadowClone extends Component
 		end
 		-- 수명 만료 시 소멸(주인이 위치 교환으로 자리를 바꿔도 이 시각은 그대로다).
 		self._T.lifetimeEndAt = now + self.Lifetime
-		-- 70레벨 이상 분신은 첫 공격보다 쉐도우 파트너 시전이 반드시 먼저다.
-		if self.OwnerLevel >= 70 then
+		-- 쉐도우 파트너는 분신 강화 II로 3차 공격이 열린 경우에만 사용한다.
+		-- 레벨만 검사하면 강화 미투자 분신의 더블스탭에 보너스 한 줄이 섞여 3줄로 보인다.
+		if self.OwnerLevel >= 70 and self.SkillTier >= 3 then
 			self:CastShadowPartner(now)
 		end
 		_TimerService:SetTimerOnce(function()
@@ -154,8 +155,8 @@ script ShadowClone extends Component
 		self._T.ownerGoneAt = nil
 
 		local now = _UtilLogic.ServerElapsedSeconds
-		-- 70레벨 이상은 쉐도우 파트너가 끝나는 즉시 공격보다 재시전을 우선한다.
-		if self.OwnerLevel >= 70 and (self._T.shadowPartnerUntil or 0) <= now then
+		-- 3차 공격이 해금된 70레벨 이상 분신만 쉐도우 파트너를 재시전한다.
+		if self.OwnerLevel >= 70 and self.SkillTier >= 3 and (self._T.shadowPartnerUntil or 0) <= now then
 			self:CastShadowPartner(now)
 			return
 		end
@@ -271,7 +272,7 @@ script ShadowClone extends Component
 		local dy = tp.y - myPos.y
 		-- 바라보는 방향은 언제나 대상 쪽(뒤로 돌아 들어가는 동안에는 걷는 방향을 본다).
 		local dir = ((tp.x - myPos.x) >= 0) and 1 or -1
-		if math.abs(dx) > 1.1 or math.abs(dy) >= 1.2 then
+		if math.abs(dx) > 0.9 or math.abs(dy) >= 1.2 then
 			-- 접근: 좌우로 걷고, 위/아래 발판은 점프/아랫점프로 넘는다.
 			local moveDir = (dx >= 0) and 1 or -1
 			self._T.faceDir = moveDir
@@ -438,11 +439,11 @@ script ShadowClone extends Component
 
 	@ExecSpace("ServerOnly")
 	method void FollowOwnerTick(MovementComponent mv, RigidbodyComponent rb, Vector3 myPos, Vector3 ownerPos)
-		-- 표적이 없을 때 주인 곁을 지킨다. 이 거리 안이면 멈춰 서서 대기한다.
-		-- (요청 2026-08-06) 복귀 거리 3배 완화 - 2.2 → **6.6유닛**. 순간이동 복귀선(24유닛)과 한 세트로
-		-- 움직여야 "멀리 떨어져도 주인 쪽으로 안 온다"가 성립한다(여기만 좁게 두면 결국 걸어서 붙는다).
+		-- 비숍 도적소환의 RoamTick과 같은 규칙: 대상이 없으면 주인 2.5유닛 안에서 대기하고
+		-- 멀 때만 걸어오며, 대기 중에는 가끔 짧게 점프한다.
 		local dx = ownerPos.x - myPos.x
-		if math.abs(dx) > 6.6 then
+		local now = _UtilLogic.ServerElapsedSeconds
+		if math.abs(dx) > 2.5 then
 			local dir = (dx >= 0) and 1 or -1
 			self._T.faceDir = dir
 			mv:MoveToDirection(Vector2(dir, 0), 0)
@@ -450,6 +451,10 @@ script ShadowClone extends Component
 		else
 			mv:Stop()
 			self._T.moving = false
+			if rb:IsOnGround() and (self._T.nextHopAt or 0) <= now then
+				self._T.nextHopAt = now + 4.0 + _UtilLogic:RandomDouble() * 4.0
+				if _UtilLogic:RandomDouble() < 0.3 then mv:Jump() end
+			end
 		end
 		self:ApplyFacing()
 		self:UpdateLoco(rb)
@@ -457,7 +462,7 @@ script ShadowClone extends Component
 
 	@ExecSpace("ServerOnly")
 	method boolean IsTargetGone(Vector3 myPos)
-		-- 표적이 죽었거나(부활 대기 포함) 반경 7유닛 밖으로 벗어났는가.
+		-- 도적소환과 같은 유지 범위: 반경 10유닛, 위 +2.2 / 아래 -3.0.
 		local t = self._T.target
 		if not isvalid(t) then return true end
 		if t.Enable ~= true then return true end
@@ -467,7 +472,7 @@ script ShadowClone extends Component
 		local tp = t.TransformComponent.WorldPosition
 		local dx = tp.x - myPos.x
 		local dy = tp.y - myPos.y
-		if (dx * dx + dy * dy) > 49.0 then return true end
+		if (dx * dx + dy * dy) > 100.0 or dy > 2.2 or dy < -3.0 then return true end
 		return false
 	end
 
@@ -477,19 +482,28 @@ script ShadowClone extends Component
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) then return nil end
-		local cands = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 6.0, 8)
+		local cands = pa:FindMonstersInRadius(Vector2(myPos.x, myPos.y), 9.0, 8)
 		local reach = {}
 		for _, t in ipairs(cands) do
 			if isvalid(t) then
 				local dy = t.TransformComponent.WorldPosition.y - myPos.y
-				-- 닿을 수 있는 높이만(위 2.2 / 아래 3.0) - 용사 소환과 같은 기준.
-				if dy <= 2.2 and dy >= -3.0 then
-					table.insert(reach, t)
+				-- 비숍 도적소환의 섀도어와 같은 높이 제한(위 1.4 / 아래 3.0).
+				if dy <= 1.4 and dy >= -3.0 then
+					table.insert(reach, { ent = t, ady = math.abs(dy) })
 				end
 			end
 		end
 		if #reach == 0 then return nil end
-		return reach[_UtilLogic:RandomIntegerRange(1, math.min(3, #reach))]
+		table.sort(reach, function(a, b) return a.ady < b.ady end)
+		local pickN = math.min(3, #reach)
+		if reach[1].ady <= 0.5 then
+			local sameH = 0
+			for i = 1, pickN do
+				if reach[i].ady <= 0.5 then sameH = i end
+			end
+			pickN = math.max(1, sameH)
+		end
+		return reach[_UtilLogic:RandomIntegerRange(1, pickN)].ent
 	end
 
 	@ExecSpace("ServerOnly")
@@ -708,29 +722,31 @@ script ShadowClone extends Component
 		-- 배운 분신 강화 차수(SkillTier)까지다.
 		--   · 2차부터: 새비지블로우가 더블스탭의 상위 호환 - 더블스탭은 1%만 나온다.
 		--   · 3차부터: 어썰터가 끼어든다. 다만 연속으로 몰아쓰지 않게 최소 간격을 둔다(요청 - "자연스럽게").
-		--   · 4차부터: 암살이 주력(다수기). 새비지블로우는 10%이고 그마저도 **주변 적이 적을 때** 위주다.
-		--   · 연막 안(주인이 깔아준 것): 어썰터 5% / 암살 92% / 새비지블로우 3%.
-		--     단 연막 안에 적이 1~2명뿐이면 단일 대상이 더 센 새비지블로우를 쓴다.
+		--   · 4차부터: 부메랑 스탭의 선택 가중치를 새비지블로우보다 항상 높게 둔다.
+		--   · 연막 안: 어썰터 5% / 암살 82% / 부메랑 스탭 10% / 새비지블로우 3%.
 		local tier = math.max(1, math.min(self.SkillTier or 1, 4))
 		if tier <= 1 then return "doublestab" end
 
 		local assaulterReady = (tier >= 3) and ((self._T.nextAssaulterAt or 0) <= now)
+		local assassinateReady = (tier >= 4) and ((self._T.nextAssassinateAt or 0) <= now)
 
 		if tier >= 4 and smokeOn then
-			if nearby <= 2 then return "savageblow" end
+			if nearby <= 2 then return "boomerangstep" end
 			local r = _UtilLogic:RandomDouble() * 100.0
 			if r < 5.0 and assaulterReady then return "assaulter" end
-			if r < 97.0 then return "assassinate" end
+			if r < 87.0 and assassinateReady then return "assassinate" end
+			if r < 97.0 then return "boomerangstep" end
 			return "savageblow"
 		end
 
 		local pool = {}
 		table.insert(pool, { name = "doublestab", w = 0.01 })
 		if tier >= 4 then
-			-- 암살 주력 - 새비지블로우는 10%. 몰려 있을수록 암살이 더 이득이라 그 10%도 더 줄어든다.
+			-- 부메랑 스탭(30)은 새비지블로우(최대 10)보다 항상 자주 선택된다.
 			local savageW = (nearby <= 2) and 10.0 or 3.0
 			table.insert(pool, { name = "savageblow", w = savageW })
-			table.insert(pool, { name = "assassinate", w = 90.0 })
+			table.insert(pool, { name = "boomerangstep", w = 30.0 })
+			if assassinateReady then table.insert(pool, { name = "assassinate", w = 90.0 }) end
 		else
 			table.insert(pool, { name = "savageblow", w = 100.0 })
 		end
@@ -757,11 +773,11 @@ script ShadowClone extends Component
 	@ExecSpace("ServerOnly")
 	method void UseAttackSkill(Entity target, number dir, number now)
 		-- 분신의 공격 1회. 어떤 스킬을 쓸지는 PickAttackVariant가 주인과 같은 규칙으로 고른다.
-		--   더블스탭 흉내   : 2타 × 전투력 100%~200%
-		--   새비지블로우    : 6타 × 전투력 100%~200%
+		--   더블스탭 흉내   : 2타 × 소유자의 현재 더블스탭 한 타당 계수
+		--   새비지블로우    : 6타 × 소유자의 현재 새비지블로우 한 타당 계수
 		--   어썰터          : 1타 × 전투력 400%~600% (주변 최대 6명)
 		--   암살            : 1타 × 전투력 500%~700% (주변 최대 6명 - 다수기)
-		-- 타수/배율은 암행2 그림자(더블스탭 2줄 / 새비지블로우 6줄, 한 타당 100%~200%)의 관례를
+		-- 타수/배율은 암행2 그림자(더블스탭 2줄 / 새비지블로우 6줄)의 관례를
 		-- 그대로 따른다. 여기에 분신 데미지 비율(DamagePercent)을 곱한 값이 실제 피해다.
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
@@ -795,6 +811,9 @@ script ShadowClone extends Component
 			motion = (_UtilLogic:RandomIntegerRange(1, 2) == 1) and "stabO1" or "stabO2"
 		elseif variant == "savageblow" then
 			hits = 6
+		elseif variant == "boomerangstep" then
+			hits = 3
+			splash = 6
 		elseif variant == "assaulter" then
 			hits = 1
 			motion = "prone"
@@ -805,6 +824,8 @@ script ShadowClone extends Component
 			hits = 1
 			motion = "swingO3"
 			splash = 6
+			-- 분신 암살도 본체와 같은 쿨타임 규칙: 기본 10초, 주인의 연막 지속 중 2초.
+			self._T.nextAssassinateAt = now + (smokeOn and 2.0 or 10.0)
 		end
 		-- 분신 데미지 비율 적용(본체의 25~45%).
 		local rate = math.max(0, self.DamagePercent or 25) / 100.0
@@ -816,6 +837,13 @@ script ShadowClone extends Component
 		end
 		mn = mn * rate
 		mx = mx * rate
+
+		-- 어썰터는 본체처럼 출발 연출 0.8초 뒤 대상들을 관통해 뒤쪽 발판으로 이동한 다음
+		-- 착지 모션·도착 이펙트·타격을 실행한다.
+		if variant == "assaulter" then
+			self:UseAssaulterSkill(target, dir, now, mn, mx, pa)
+			return
+		end
 
 		-- 시전 잠금 = 모션 전체. 잠금 중에는 이동/방향 전환이 멈춘다(위 ServerTick 앞단 게이트).
 		-- (신고 2026-08-06) 분신이 **본체보다 훨씬 빠른 공속**으로 때리는 문제 - 공격 간격이 스킬과
@@ -830,12 +858,16 @@ script ShadowClone extends Component
 			self._T.nextAttackAt = now + frameInterval * 8 + 0.2 * atkMult
 			self._T.attackLockUntil = now + frameInterval * 8 + 0.1 * atkMult
 		elseif variant == "doublestab" then
-			self._T.nextAttackAt = now + 0.75 * atkMult * 0.9
-			self._T.attackLockUntil = now + 0.6 * atkMult * 0.9
+			-- 분신 더블스탭은 기존 속도의 2/3: 모든 시간 간격을 1.5배 늘린다.
+			self._T.nextAttackAt = now + 0.75 * atkMult * 0.9 * 1.5
+			self._T.attackLockUntil = now + 0.6 * atkMult * 0.9 * 1.5
 		elseif variant == "assassinate" then
 			-- 연쇄가 최대 10명 × 0.1초라 시전 잠금이 그 시간을 덮어야 한다(본체도 연쇄 내내 조작이 잠긴다).
 			self._T.nextAttackAt = now + 1.2 * atkMult
 			self._T.attackLockUntil = now + 1.1 * atkMult
+		elseif variant == "boomerangstep" then
+			self._T.nextAttackAt = now + 0.98
+			self._T.attackLockUntil = now + 0.9
 		else
 			self._T.nextAttackAt = now + 0.9 * atkMult
 			self._T.attackLockUntil = now + 0.65 * atkMult
@@ -864,7 +896,9 @@ script ShadowClone extends Component
 			end
 		elseif motion ~= "" then
 			-- 본체와 같은 재생 속도: 공격속도 배율이 빠를수록(mult<1) 모션도 빨라진다(playRate = 1/mult).
-			self:PlayMotion(motion, 1.0 / atkMult)
+			local motionMult = atkMult
+			if variant == "doublestab" then motionMult = motionMult * 1.5 end
+			self:PlayMotion(motion, 1.0 / motionMult)
 		end
 
 		-- ── 시전 연출 (본체와 동일한 클립/사운드) ─────────────────────────
@@ -873,12 +907,14 @@ script ShadowClone extends Component
 		end
 		-- 어썰터/암살은 사라졌다가 다시 나타나는 연출이라 마지막 타격 뒤 알파를 되돌린다.
 		if variant == "assaulter" or variant == "assassinate" then
+			local reappearDelay = 0.45
+			if variant == "assassinate" then reappearDelay = 1.7 end
 			_TimerService:SetTimerOnce(function()
 				if not isvalid(self.Entity) then return end
 				---@type PlayerAttack
 				local paBack = self:GetOwnerAttack()
 				if isvalid(paBack) then paBack:PlayShadowCloneReappear(self.Entity) end
-			end, 0.45)
+			end, reappearDelay)
 		end
 
 		-- 광역기(어썰터/암살)는 주변 적을 함께 때린다 - 단일 대상만 때리면 "다수기"가 아니다.
@@ -915,17 +951,24 @@ script ShadowClone extends Component
 		if variant == "savageblow" then
 			step = frameInterval
 		elseif variant == "doublestab" then
-			step = 0.15 * atkMult
+			step = 0.15 * atkMult * 1.5
 		end
 		-- (버그 수정 2026-08-06) 암살은 본체처럼 **대상마다 시간차를 두고 옮겨 붙는다**.
 		-- 예전에는 주변 대상 전원을 한 프레임에 몰아쳐서 "본체보다 훨씬 빠르게 번진다"는 신고가 났다
 		-- (본체 hop 간격 = 진입 0.05 + 타격 0.05 ≈ 0.1초, 공격속도 배율 적용).
 		local hopStep = 0.0
 		if variant == "assassinate" then hopStep = 0.1 * atkMult end
+		local assassinateSingle = variant == "assassinate" and #targets == 1
+		local firstLineMin = assassinateSingle and (mn * 0.5) or mn
+		local firstLineMax = assassinateSingle and (mx * 0.5) or mx
 		for i = 1, hits do
 			local idx = i
 			for ti = 1, #targets do
 				local tIdx = ti
+				local hitDelay = (idx - 1) * step + (tIdx - 1) * hopStep
+				if variant == "boomerangstep" then
+					hitDelay = ((idx == 1) and 0.42 or (0.72 + 0.06 * (idx - 2))) + (tIdx - 1) * 0.01
+				end
 				_TimerService:SetTimerOnce(function()
 					if not isvalid(self.Entity) then return end
 					if self._T == nil then return end
@@ -938,10 +981,77 @@ script ShadowClone extends Component
 					end
 					-- (버그 수정 2026-08-06) 타수 번호와 스킬 종류를 함께 넘긴다 - 주인 쪽에서 본체와 같은
 					-- 수동 다중 표시(더블스탭 2줄 / 새비지블로우 6줄)를 그리는 데 쓴다.
-					self:DealHitLine(t, mn, mx, variant, idx)
-				end, (idx - 1) * step + (tIdx - 1) * hopStep)
+					self:DealHitLine(t, firstLineMin, firstLineMax, variant, idx)
+				end, hitDelay)
 			end
 		end
+		-- 분신 암살도 단일 대상이면 첫 타격 포함 총 10타, 전 타격 50%, 간격 0.075초로 공격한다.
+		if assassinateSingle then
+			for extra = 1, 9 do
+				local extraIndex = extra
+				_TimerService:SetTimerOnce(function()
+					if not isvalid(self.Entity) then return end
+					local t = targets[1]
+					if not isvalid(t) then return end
+					---@type PlayerAttack
+					local paHit = self:GetOwnerAttack()
+					if isvalid(paHit) then paHit:PlayShadowCloneHitFx(self.Entity, t, "assassinate", dir, hitRuid) end
+					self:DealHitLine(t, mn * 0.5, mx * 0.5, "assassinate", extraIndex + 1)
+				end, 0.075 * extraIndex)
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UseAssaulterSkill(Entity target, number dir, number now, number mn, number mx, PlayerAttack pa)
+		if not isvalid(target) or not isvalid(pa) then return end
+		self._T.nextAttackAt = now + 1.3
+		self._T.attackLockUntil = now + 1.3
+		self._T.faceDir = dir
+		self:ApplyFacing()
+		local mv = self.Entity.MovementComponent
+		if isvalid(mv) then mv:Stop() end
+		pa:PlayShadowCloneCastFx(self.Entity, "assaulter", dir, 0.09)
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) or not isvalid(target) then
+				if isvalid(self.Entity) then pa:PlayShadowCloneReappear(self.Entity) end
+				return
+			end
+			local targetPos = target.TransformComponent.WorldPosition
+			local targets = pa:FindAssaulterSplashTargets(Vector2(targetPos.x, targetPos.y), 6)
+			if targets == nil or #targets == 0 then targets = { target } end
+			local farX = targetPos.x
+			local farY = targetPos.y
+			for _, t in ipairs(targets) do
+				if isvalid(t) then
+					local p = t.TransformComponent.WorldPosition
+					if (p.x - farX) * dir > 0 then
+						farX = p.x
+						farY = p.y
+					end
+				end
+			end
+			local landX = farX + dir * 1.0
+			local landY = farY
+			local map = self.Entity.CurrentMap
+			local rb = self.Entity.RigidbodyComponent
+			if isvalid(map) and isvalid(map.FootholdComponent) then
+				local fh = pa:FindNearbyFootholdAtX(map.FootholdComponent, landX, farY, 1.2)
+				if fh ~= nil then landY = fh:GetYByX(landX) + 0.05 end
+			end
+			if isvalid(mv) then mv:Stop() end
+			if isvalid(rb) then rb:SetWorldPosition(Vector2(landX, landY)) end
+			self._T.faceDir = dir
+			self:ApplyFacing()
+			pa:PlayShadowCloneAssaulterReappearEffects(self.Entity, dir)
+			for i, t in ipairs(targets) do
+				if isvalid(t) then
+					pa:PlayShadowCloneHitFx(self.Entity, t, "assaulter", dir, "")
+					self:DealHitLine(t, mn, mx, "assaulter", i)
+				end
+			end
+			log("[ShadowClone] 본체 동기화 어썰터 이동·착지·타격 완료 targets=" .. tostring(#targets))
+		end, 0.8)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -952,7 +1062,11 @@ script ShadowClone extends Component
 		---@type PlayerAttack
 		local pa = self:GetOwnerAttack()
 		if not isvalid(pa) or not isvalid(target) then return end
-		local echoAllowed = (self._T.shadowPartnerUntil or 0) > _UtilLogic.ServerElapsedSeconds
+		-- 방어적으로 차수도 다시 검사해 강화 II 미투자 상태에서는 추가 데미지 줄이 절대 생기지 않게 한다.
+		-- 더블스탭은 정확히 두 번의 본 타격만 표시·적용한다. 분신 내부 쉐도우 파트너의
+		-- 보너스 줄은 다른 공격 변형에만 허용한다.
+		local echoAllowed = variant ~= "doublestab" and self.SkillTier >= 3
+			and (self._T.shadowPartnerUntil or 0) > _UtilLogic.ServerElapsedSeconds
 		pa:DealShadowCloneHitLine(self.Entity, target, self.CombatPower, multMin, multMax, echoAllowed, variant, hitIndex)
 	end
 
