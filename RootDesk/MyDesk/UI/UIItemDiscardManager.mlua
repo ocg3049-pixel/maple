@@ -1,0 +1,219 @@
+@Logic
+script UIItemDiscardManager extends Logic
+	property Entity Modal = "5ce6f84e-2f38-4d43-9b2f-04a55d9e44a3"
+	property Entity QuantityInput = "9736079e-52c1-4f22-84a8-14bae527d761"
+	property Entity ItemName = "4176a52f-1eb8-4fb3-a8bc-4e9c41906c8b"
+	property Entity Prompt = "4f96676b-8191-452d-8aeb-bc2f2fcea855"
+	property Entity ItemIcon = "72f1c4e3-f670-4995-b304-40526d588571"
+	property Entity ConfirmButton = "9e2c4cd6-7a99-42b9-b099-c4f9c3fafbd3"
+	property Entity CancelButton = "da0fcb23-39aa-49e6-802e-d4b47ac16d44"
+	property boolean pending = false
+	property number clock = 0
+	property number releaseUntil = 0
+	property string sourceTab = ""
+	property integer sourceSlot = 0
+	property string sourceItem = ""
+	property integer maximum = 1
+	property any sourceMap = nil
+	property any keyEvent = nil
+	property table effects = {}
+	property number EffectDuration = 1.5
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self.pending = false
+		self.clock = 0
+		self.releaseUntil = 0
+		self.effects = {}
+		self.Modal.Enable = false
+		self.ConfirmButton:ConnectEvent(ButtonClickEvent, self.OnConfirm)
+		self.CancelButton:ConnectEvent(ButtonClickEvent, self.OnCancel)
+		self.QuantityInput:ConnectEvent(TextInputSubmitEvent, self.OnSubmit)
+		self.keyEvent = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+		-- 창들과 같은 캔버스의 첫 형제로 두어 모든 창 배경보다 먼저 그린다.
+		local effectRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup/DiscardEffects")
+		if isvalid(effectRoot) then _UILogic:SetSiblingIndex(effectRoot.UITransformComponent, 0) end
+		for i=1,8 do
+			local e = _EntityService:GetEntityByPath("/ui/DefaultGroup/DiscardEffects/Effect" .. i)
+			if isvalid(e) then e.Enable = false end
+			table.insert(self.effects, {entity=e, active=false, elapsed=0})
+		end
+		log("[Discard] ready: confirmation, quantity, Enter, fixed world origin")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean BlocksInput()
+		return self.pending or self.clock < self.releaseUntil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsWorldPoint(Vector2 point)
+		if self:BlocksInput() then return false end
+		if _UIClickArbiter:GetTopmostWindowAt(point) ~= "" then return false end
+		if _UICursorManager:TargetAt(point) ~= nil then return false end
+		return not _InputService:IsPointerOverUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Show(string tab, integer slot, string expectedItem)
+		if self.pending or slot < 1 or slot > 128 or expectedItem == "" then return end
+		local m = _UIEquipInventoryManager
+		if m:GetTabItem(tab,slot) ~= expectedItem then return end
+		if _EnhancementManager:HasEnhanceTarget() then
+			_UIToast:ShowMessage("강화 중에는 아이템을 버릴 수 없습니다.")
+			return
+		end
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or not isvalid(player.CurrentMap) then return end
+		self.sourceTab = tab
+		self.sourceSlot = slot
+		self.sourceItem = expectedItem
+		self.sourceMap = player.CurrentMap
+		self.maximum = 1
+		if m:ParseSlotIdx(expectedItem) == 0 and m:GetField(expectedItem,3) ~= "deco" then
+			self.maximum = math.max(1,math.floor(m:ParseCount(expectedItem)))
+		end
+		self.ItemName.TextGUIRendererComponent.Text = m:ParseName(expectedItem)
+		self.Prompt.TextGUIRendererComponent.Text = self.maximum > 1 and "몇 개를 버리시겠습니까? (1 ~ " .. tostring(self.maximum) .. "개)" or "이 아이템을 버리시겠습니까?"
+		local ruid = m:ParseInvenRUID(expectedItem)
+		self.ItemIcon.SpriteGUIRendererComponent.ImageRUID = DataRef(m:ParseSlotIdx(expectedItem) >= 1 and "thumbnail://" .. ruid or ruid)
+		self.QuantityInput.Enable = self.maximum > 1
+		m:HideTooltip()
+		self.pending = true
+		self.Modal.Enable = true
+		-- 비활성 입력창의 Text는 활성화 시 이전 편집값으로 복원되므로 켠 다음 초기화한다.
+		self.QuantityInput.TextGUIRendererInputComponent.Text = tostring(self.maximum)
+		if self.maximum > 1 then self.QuantityInput.TextGUIRendererInputComponent:ActivateInputField() end
+		_UICursorManager:BringToFront()
+		log("[Discard] prompt tab=" .. tab .. " slot=" .. tostring(slot) .. " max=" .. tostring(self.maximum))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Close()
+		self.pending = false
+		self.releaseUntil = self.clock + 0.1
+		if isvalid(self.Modal) then self.Modal.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Confirm()
+		if not self.pending then return end
+		local text = self.maximum > 1 and self.QuantityInput.TextGUIRendererInputComponent.Text or "1"
+		local qty = tonumber(text)
+		if not string.match(text,"^%d+$") or qty == nil or qty < 1 or qty > self.maximum then
+			self.Prompt.TextGUIRendererComponent.Text = "1 ~ " .. tostring(self.maximum) .. " 사이의 정수를 입력해주세요."
+			self.QuantityInput.TextGUIRendererInputComponent:ActivateInputField()
+			return
+		end
+		local m = _UIEquipInventoryManager
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= self.sourceMap or m:GetTabItem(self.sourceTab,self.sourceSlot) ~= self.sourceItem or _EnhancementManager:HasEnhanceTarget() then
+			self:Close()
+			_UIToast:ShowMessage("아이템 상태가 변경되어 버리기를 취소했습니다.")
+			log("[Discard] stale source cancelled")
+			return
+		end
+		-- 입력 경로가 중복되어도 아래 차감은 한 번만 실행한다.
+		self.pending = false
+		local item = self.sourceItem
+		local remain = self.maximum - qty
+		local value = ""
+		if remain > 0 then
+			local fields = {}
+			for part in string.gmatch(item .. "|", "(.-)|") do fields[#fields+1] = part end
+			while #fields < 7 do fields[#fields+1] = "0" end
+			fields[7] = tostring(remain)
+			value = table.concat(fields,"|")
+		end
+		m:SetTabItem(self.sourceTab,self.sourceSlot,value)
+		self:Close()
+		self:PlayDiscardEffect(item)
+		-- 소지품만 변경되므로 장착 외형을 다시 계산하지 않고 인벤토리와 저장만 갱신한다.
+		m:UpdateInvenUI()
+		_CharacterPersistence:MarkDirty("discard")
+		log("[Discard] confirmed count=" .. tostring(qty) .. " remaining=" .. tostring(remain))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirm(ButtonClickEvent e)
+		self:Confirm()
+	end
+	@ExecSpace("ClientOnly")
+	method void OnCancel(ButtonClickEvent e)
+		self:Close()
+	end
+	@ExecSpace("ClientOnly")
+	method void OnSubmit(TextInputSubmitEvent e)
+		if not self.pending then return end
+		self.QuantityInput.TextGUIRendererInputComponent.Text = e.Text
+		self:Confirm()
+	end
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent e)
+		if not self.pending then return end
+		if e.key == KeyboardKey.Escape then self:Close()
+		elseif e.key == KeyboardKey.Return or e.key == KeyboardKey.KeypadEnter then
+			-- 입력 중에는 TextInputSubmitEvent의 확정된 문자열을 사용한다.
+			if self.maximum == 1 or not self.QuantityInput.TextGUIRendererInputComponent.IsFocused then self:Confirm() end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayDiscardEffect(string item)
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return end
+		local slot = nil
+		for _,fx in ipairs(self.effects) do if not fx.active then slot=fx; break end end
+		if slot == nil then slot = self.effects[1] end
+		if slot == nil or not isvalid(slot.entity) then return end
+		local pos = player.TransformComponent.WorldPosition
+		slot.x = pos.x
+		slot.y = pos.y
+		slot.map = player.CurrentMap
+		slot.elapsed = 0
+		slot.active = true
+		local m = _UIEquipInventoryManager
+		local ruid = m:ParseInvenRUID(item)
+		slot.entity.Enable = false
+		slot.entity.SpriteGUIRendererComponent.ImageRUID = DataRef(m:ParseSlotIdx(item) >= 1 and "thumbnail://" .. ruid or ruid)
+		self:UpdateEffect(slot)
+		slot.entity.Enable = true
+		log("[DiscardFX] start x=" .. tostring(slot.x) .. " y=" .. tostring(slot.y))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateEffect(table fx)
+		local u = math.min(1,fx.elapsed/self.EffectDuration)
+		-- 몸 높이 0.45와 바닥 도착점을 유지하고 상승폭을 기존의 2/3(약 1.03)로 줄인다.
+		local world = Vector2(fx.x,fx.y+0.45+4.5284738202*u-4.9784738202*u*u)
+		local tr = fx.entity.UITransformComponent
+		tr.anchoredPosition = _UILogic:ScreenToUIPosition(_UILogic:WorldToScreenPosition(world))
+		-- 상하 이동 시간과 독립적으로 기존 회전 속도(초당 800도)를 유지한다.
+		tr.UIRotation = Vector3(0,0,800*fx.elapsed)
+		fx.entity.SpriteGUIRendererComponent:SetAlpha(math.max(0,1-u))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		self.clock += delta
+		local player = _UserService.LocalPlayer
+		if self.pending and (not isvalid(player) or player.CurrentMap ~= self.sourceMap) then self:Close() end
+		for _,fx in ipairs(self.effects) do
+			if fx.active then
+				fx.elapsed += delta
+				if fx.elapsed >= self.EffectDuration or not isvalid(player) or player.CurrentMap ~= fx.map then
+					fx.active = false
+					if isvalid(fx.entity) then fx.entity.Enable = false end
+					log("[DiscardFX] end x=" .. tostring(fx.x) .. " y=" .. tostring(fx.y))
+				else self:UpdateEffect(fx) end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		self:Close()
+		if self.keyEvent ~= nil then _InputService:DisconnectEvent(KeyDownEvent,self.keyEvent) end
+		for _,fx in ipairs(self.effects) do if isvalid(fx.entity) then fx.entity.Enable = false end end
+	end
+end

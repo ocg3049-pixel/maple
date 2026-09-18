@@ -895,6 +895,58 @@ script EnhancementManager extends Logic
 
 	-- ─── 강화 실행 ────────────────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
+	method string ReadCurrentTarget()
+		-- 활성 인벤 탭 대신 등록 당시 원본 위치에서 최신 장비 문자열을 읽는다.
+		if self.enhanceTargetEquipSlot > 0 then return _UIEquipInventoryManager:GetEquip(self.enhanceTargetEquipSlot) end
+		local tab = self.enhanceTargetSrcTab ~= "" and self.enhanceTargetSrcTab or "equip"
+		return _UIEquipInventoryManager:GetTabItem(tab, self.enhanceTargetInvenIdx)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshCurrentTarget()
+		-- 주문서 사용 후 대상의 외형/별/보호/파괴를 다시 읽어 강화창에 반영한다.
+		if self.enhanceTargetRUID == "" then return end
+		local s = self:ReadCurrentTarget()
+		if s == "" then self:ClearTarget() return end
+		self.enhanceTargetItemStr = s
+		self.enhanceTargetName = _UIEquipInventoryManager:ParseName(s)
+		self.enhanceTargetRUID = _UIEquipInventoryManager:ParseRUID(s)
+		self.enhanceLevel = _UIEquipInventoryManager:ParseStars(s)
+		self:ApplyEnhanceTargetUI()
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CheckCurrentTarget()
+		-- 대상 이동/교환 후 오래된 캐시로 다른 장비를 강화하지 않도록 다시 등록하게 한다.
+		if self.enhanceTargetItemStr == "" then return false end
+		if self:ReadCurrentTarget() ~= self.enhanceTargetItemStr then
+			self:ClearTarget()
+			self:AppendLog("장비 상태가 변경되었습니다. 대상을 다시 등록하세요.")
+			return false
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ConsumeTargetProtection()
+		-- 유효한 스타포스 시도가 확정된 뒤 보호를 먼저 제거한다. 실패 유지도 저장 대상이다.
+		local s = self:ReadCurrentTarget()
+		if not _UIEquipInventoryManager:HasStarforceProtection(s) then return false end
+		local updated = _UIEquipInventoryManager:WithStarforceProtection(s, false)
+		if self.enhanceTargetEquipSlot > 0 then
+			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, updated)
+		else
+			local tab = self.enhanceTargetSrcTab ~= "" and self.enhanceTargetSrcTab or "equip"
+			_UIEquipInventoryManager:SetTabItem(tab, self.enhanceTargetInvenIdx, updated)
+		end
+		self.enhanceTargetItemStr = updated
+		_UIEquipInventoryManager:HideTooltip()
+		_CharacterPersistence:MarkDirty("starforce_protect_consumed")
+		log("[Protect] 스타포스 1회 보호 소모: " .. self.enhanceTargetName)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
 	method void DoEnhance()
 		-- (감사) 매크로 연타 게이트: 최소 0.25초 간격. 오토클릭/키반복으로 초당 수십 회 강화가
 		-- 돌면 시간 비용이 0이 되어 밸런스가 무너지고, 저장 스냅샷 병합으로 회당 감사도 불가능해진다.
@@ -906,6 +958,7 @@ script EnhancementManager extends Logic
 			log("[Enhance] DoEnhance: 대상 없음")
 			return
 		end
+		if not self:CheckCurrentTarget() then return end
 		if self.enhanceLevel >= 100 then
 			self:AppendLog("최대 강화 단계입니다.")
 			return
@@ -918,6 +971,7 @@ script EnhancementManager extends Logic
 			return
 		end
 
+		local protected = self:ConsumeTargetProtection()
 		_UIEquipInventoryManager:AddMeso(-cost)
 		-- 사이드바 보유 메소 표시 갱신 (원작 개편)
 		self:UpdateMesoDisplay()
@@ -953,6 +1007,10 @@ script EnhancementManager extends Logic
 			self:UpdateStarforceUI(self.enhanceLevel)
 			self:AppendLog("실패! 1단계 하락 → +" .. tostring(self.enhanceLevel) .. "강")
 			log("[Enhance] 강화 실패 - 하락 → +" .. tostring(self.enhanceLevel) .. "강")
+		elseif protected then
+			-- 파괴 결과만 유지로 바꾼다. 성공/유지/하락에서도 보호는 이미 소모되었다.
+			self:AppendLog("프로텍트가 장비 파괴를 막았습니다. 별 수 유지. (보호 소모)")
+			log("[Protect] 스타포스 파괴 방지: " .. self.enhanceTargetName)
 		else
 			-- 파괴: 아이템 소멸 후 기본 장비 재구매 제안 (Phase 2 재구매 루프)
 			local destroyedSlot = self:GetTargetFieldNum(3)
@@ -963,6 +1021,10 @@ script EnhancementManager extends Logic
 				self:ShowRebuyDialog(destroyedSlot)
 			end
 		end
+		if protected and self.enhanceTargetRUID ~= "" then
+			self:UpdateStarforceUI(self.enhanceLevel)
+		end
+		_CharacterPersistence:MarkDirty("enhance_starforce")
 	end
 
 	-- (Phase 2) 파괴 직후 기본 장비 재구매 제안 다이얼로그. 방어구 10,000 / 무기 50,000 메소 -
@@ -1056,8 +1118,14 @@ script EnhancementManager extends Logic
 			efields[4] = tostring(newStars)
 			local newStr = table.concat(efields, "|")
 			_UIEquipInventoryManager:SetEquipStr(self.enhanceTargetEquipSlot, newStr)
-			self.enhanceTargetItemStr = newStr
+			-- 기본 상의 이관은 RefreshUI의 공간/하의 잠금 검사 후에만 확정한다.
 			_UIEquipInventoryManager:RefreshUI()
+			newStr = _UIEquipInventoryManager:GetEquip(self.enhanceTargetEquipSlot)
+			self.enhanceTargetItemStr = newStr
+			self.enhanceTargetName = _UIEquipInventoryManager:ParseName(newStr)
+			self.enhanceTargetRUID = _UIEquipInventoryManager:ParseRUID(newStr)
+			self:ApplyEnhanceTargetUI()
+			_DecoWindowManager:ApplyAppearance()
 			_CharacterPersistence:MarkDirty("enhance_equip")
 			return
 		end
@@ -1072,11 +1140,14 @@ script EnhancementManager extends Logic
 		if s == "" then return end
 		local fields = self:SplitItemFieldsPreserve(s)
 		fields[4] = tostring(newStars)
-		local newInvStr = table.concat(fields, "|")
+		local newInvStr = _UIEquipInventoryManager:ResolveAppearance(table.concat(fields, "|"), _UIMyInfoManager:GetSelectedCharacterJobIdx())
 		_UIEquipInventoryManager:SetTabItem(srcTab, idx, newInvStr)
 		-- (버그 수정) 인벤 경로도 대상 캐시를 갱신한다 - 갱신하지 않으면 이후 주문서/큐브가
 		-- 등록 시점의 별 수치로 아이템을 재조립해 강화 성과가 롤백되던 유실 버그.
 		self.enhanceTargetItemStr = newInvStr
+		self.enhanceTargetName = _UIEquipInventoryManager:ParseName(newInvStr)
+		self.enhanceTargetRUID = _UIEquipInventoryManager:ParseRUID(newInvStr)
+		self:ApplyEnhanceTargetUI()
 		_UIEquipInventoryManager:RefreshUI()
 		_CharacterPersistence:MarkDirty("enhance_inven")
 	end
@@ -1189,9 +1260,13 @@ script EnhancementManager extends Logic
 		if isvalid(main) then main.Enable = hasItem end
 		if not hasItem then return end
 
-		-- 소비 탭에서 사용 가능한 주문서(연두색주문서) 수집
+		-- 종류당 한 칸을 사용해 같은 주문서의 여러 스택이 다른 종류를 가리지 않게 한다.
 		local validRUIDs = {}
 		validRUIDs["314215aface349c48b81eee58065e1b7"] = true
+		validRUIDs["bb6c1532d7364170a11abd2d8835bc81"] = true
+		validRUIDs["a6c6ff42196548dd874b83332ad5b336"] = true
+		local seenRUIDs = {}
+		local previous = self._T.scrollSlots and self._T.scrollSlots[self.scrollSelectedSlot] or nil
 		local consumeData = _UIEquipInventoryManager._T.tabData["consume"] or {}
 		local slotFill = {}
 		local found = 0
@@ -1200,7 +1275,8 @@ script EnhancementManager extends Logic
 			if cs ~= "" then
 				local ruid  = _UIEquipInventoryManager:ParseInvenRUID(cs)
 				local count = _UIEquipInventoryManager:ParseCount(cs)
-				if validRUIDs[ruid] and count > 0 then
+				if validRUIDs[ruid] and count > 0 and not seenRUIDs[ruid] then
+					seenRUIDs[ruid] = true
 					found = found + 1
 					if found <= 8 then
 						slotFill[found] = {
@@ -1212,6 +1288,12 @@ script EnhancementManager extends Logic
 			end
 		end
 		self._T.scrollSlots = slotFill
+		self.scrollSelectedSlot = 0
+		if previous then
+			for i, entry in ipairs(slotFill) do
+				if entry.ruid == previous.ruid then self.scrollSelectedSlot = i break end
+			end
+		end
 
 		-- 선택 유지: 소진되면 해제, 미선택이면 첫 주문서 자동 선택
 		if self.scrollSelectedSlot > 0 and slotFill[self.scrollSelectedSlot] == nil then
@@ -1255,7 +1337,9 @@ script EnhancementManager extends Logic
 		local sel = slotFill[self.scrollSelectedSlot]
 		if isvalid(descEnt) then
 			if sel then
-				descEnt.TextComponent.Text = sel.itemName .. "  |  성공 확률 60%"
+				local rate = sel.ruid == "bb6c1532d7364170a11abd2d8835bc81" and "90%" or "60%"
+				if sel.ruid == "a6c6ff42196548dd874b83332ad5b336" then rate = "100%" end
+				descEnt.TextComponent.Text = sel.itemName .. "  |  성공 확률 " .. rate
 			else
 				descEnt.TextComponent.Text = ""
 			end
@@ -1265,6 +1349,12 @@ script EnhancementManager extends Logic
 			local scrolls = self:GetTargetFieldNum(5)
 			local upgrade = self:GetTargetFieldNum(6)
 			infoEnt.TextComponent.Text = "성공 시 주문서 강화 +1 (현재 +" .. tostring(scrolls) .. ")\n남은 업그레이드 가능 횟수 : " .. tostring(upgrade) .. "회"
+			if sel and sel.ruid == "bb6c1532d7364170a11abd2d8835bc81" then
+				infoEnt.TextComponent.Text = "성공: 스타포스 +1~5성 (각 20%, 최대 100성)\n실패: 장비 파괴 / 프로텍트 적용 시 1회 방지"
+			elseif sel and sel.ruid == "a6c6ff42196548dd874b83332ad5b336" then
+				local state = _UIEquipInventoryManager:HasStarforceProtection(self.enhanceTargetItemStr) and "이미 적용됨 (중복 불가)" or "미적용 (사용 가능)"
+				infoEnt.TextComponent.Text = "다음 스타포스 1회 파괴 방지 / 성공·실패 후 소모\n" .. state
+			end
 		end
 		log("[Enhance] RefreshScrollContent found=" .. tostring(found) .. " sel=" .. tostring(self.scrollSelectedSlot))
 	end
@@ -1283,7 +1373,8 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void UseScrollOnTarget()
-		-- 사용하기: 선택된 주문서를 강화 대상 장비에 적용 (60% 성공, 성공 시 주문서 강화 +1, 항상 업그레이드 횟수 -1)
+		-- 선택된 주문서의 효과별로 검증한 뒤 사용한다. 강화/보호는 업그레이드 횟수를 쓰지 않는다.
+		if not self:CheckCurrentTarget() then return end
 		if self.enhanceTargetItemStr == "" then
 			self:SetScrollLog("강화할 장비를 먼저 올려주세요.")
 			return
@@ -1293,6 +1384,21 @@ script EnhancementManager extends Logic
 			self:SetScrollLog("사용할 주문서를 선택하세요.")
 			return
 		end
+		local cdLive = _UIEquipInventoryManager:GetTabItem("consume", sel.consumeSlot)
+		if cdLive == "" or _UIEquipInventoryManager:ParseInvenRUID(cdLive) ~= sel.ruid or _UIEquipInventoryManager:ParseCount(cdLive) <= 0 then
+			self:SetScrollLog("주문서가 없거나 위치가 변경되었습니다.")
+			self:RefreshScrollContent()
+			return
+		end
+		if _UIEquipInventoryManager:IsSpecialEnhanceScroll(sel.ruid) then
+			local tab = self.enhanceTargetSrcTab ~= "" and self.enhanceTargetSrcTab or "equip"
+			local result = _UIEquipInventoryManager:UseSpecialEnhanceScroll("consume", sel.consumeSlot, self.enhanceTargetEquipSlot, tab, self.enhanceTargetInvenIdx, sel.ruid)
+			self:SetScrollLog(result.message)
+			self:AppendLog(result.message)
+			self:RefreshScrollContent()
+			return
+		end
+		if sel.ruid ~= "314215aface349c48b81eee58065e1b7" then return end
 
 		-- 파이프 필드 파싱 (잠재능력 등 추가 필드 보존)
 		local s = self.enhanceTargetItemStr
@@ -1358,6 +1464,7 @@ script EnhancementManager extends Logic
 		_UIEquipInventoryManager:RefreshUI()
 
 		-- 대상 이름 라벨 갱신 ("이름+N")
+		_CharacterPersistence:MarkDirty("enhance_scroll")
 		local nameLabel = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetNameLabel")
 		if isvalid(nameLabel) then
 			nameLabel.TextComponent.Text = _UIEquipInventoryManager:GetDisplayName(newStr)
@@ -1417,8 +1524,15 @@ script EnhancementManager extends Logic
 		local rateEnt = _EntityService:GetEntityByPath(sfPath .. "/RateText")
 		if isvalid(rateEnt) then
 			local band = self:GetStarforceBand(level)
+			if _UIEquipInventoryManager:HasStarforceProtection(self.enhanceTargetItemStr) then
+				band.keep = band.keep + band.destroy
+				band.destroy = 0
+			end
 			rateEnt.TextComponent.Text = "성공 " .. tostring(band.success) .. "% | 유지 " .. tostring(band.keep)
 				.. "% | 하락 " .. tostring(band.drop) .. "% | 파괴 " .. tostring(band.destroy) .. "%"
+			if _UIEquipInventoryManager:HasStarforceProtection(self.enhanceTargetItemStr) then
+				rateEnt.TextComponent.Text = rateEnt.TextComponent.Text .. "\n프로텍트 적용: 이번 강화 후 소모"
+			end
 		end
 
 		-- 사용 재화
@@ -1443,6 +1557,32 @@ script EnhancementManager extends Logic
 	-- (Phase 5) Balance/StarforceTable.csv가 진실의 원천 - 없거나 손상이면 아래 하드코딩 폴백.
 	@ExecSpace("ClientOnly")
 	method table GetStarforceBand(integer level)
+		-- 표시와 실제 판정이 동일한 테스트 확률을 사용한다. 원본 구간표/비용은 수정하지 않는다.
+		local band = self:GetBaseStarforceBand(level)
+		if self._T.testGuaranteedStarforce == true then
+			band.success = 100
+			band.keep = 0
+			band.drop = 0
+			band.destroy = 0
+		end
+		return band
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetTestGuaranteedStarforce(boolean enabled)
+		-- 개발 테스트용 세션 상태. 캐릭터 저장 데이터에는 포함하지 않는다.
+		self._T.testGuaranteedStarforce = enabled
+		self:UpdateStarforceUI(self.enhanceLevel)
+		if enabled then
+			_UIToast:ShowMessage("개발 테스트: 강화 성공 확률 100% 적용")
+		else
+			_UIToast:ShowMessage("개발 테스트: 강화 성공 확률을 원래대로 복원")
+		end
+		log("[EnhanceTest] 성공 확률 100%=" .. tostring(enabled))
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetBaseStarforceBand(integer level)
 		-- CSV 로드 (최초 1회 캐싱): minStar 오름차순 밴드 목록
 		if self._T.sfBands == nil then
 			local bands = nil

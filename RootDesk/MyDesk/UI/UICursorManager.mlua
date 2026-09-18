@@ -1,0 +1,359 @@
+@Logic
+script UICursorManager extends Logic
+
+	property number FrameDuration = 0.30
+	property number CursorScale = 1.2
+	property number ClickDuration = 0.25
+	property number ClickInterval = 0.27
+	property string CurrentKind = "normal"
+	property string CurrentRUID = ""
+	property Entity CursorImage = "efee9c80-0a9c-495a-93e5-8f62fc709b98"
+	property Entity ButtonFrameOne = "714958aa-c167-4041-a0bc-276687081838"
+	property Entity ButtonFrameTwo = "7d23d661-0b48-40d9-bd3b-3c40c47b5d7d"
+	property Entity ClickBlocker = "a9906a88-9af4-4250-8b1a-42927e0e7644"
+	property any downHandler = nil
+	property any releaseHandler = nil
+	property table targets = {}
+	property number clock = 0
+	property number animationTime = 0
+	property number clickUntil = 0
+	property number lockUntil = 0
+	property boolean decisionAllowed = true
+	property boolean pointerHeld = false
+	property boolean scrollHeld = false
+	property number refreshAfter = 0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- 세션마다 커서와 입력 상태를 초기화한다.
+		self.clock = 0
+		self.clickUntil = 0
+		self.lockUntil = 0
+		self.decisionAllowed = true
+		self.pointerHeld = false
+		self.scrollHeld = false
+		self.CurrentRUID = ""
+		self.targets = {}
+		self:HideButtonFrames()
+		_ResourceService:PreloadAsync({"3930c5d2e85b4bff8467aada64fda7f5","1188b31c01db4af18b269dcd02020d88","1ea1b81aa7a24f8c8d251ce809a7b723","79819392249746f88952f3b2321f2f17","0783db1be0e54f74ba7824b3a7685fad","bb5de730dc214e478bc2dedd8f590aca","bad931fce2ec4b67aa9bfb6a7c699df6","ed897e8a043b4432bb6fd69995a3be2f","d68abf38c6114597a8177a240a3c2fc4","31bec553111449b8be0095501f382525"}, function(results)
+			log("[UICursor] cursor frames preloaded")
+		end)
+		self:RefreshTargets()
+		self:BringToFront()
+		self.downHandler = _InputService:ConnectEvent(ScreenTouchEvent, self.OnPointerDown)
+		self.releaseHandler = _InputService:ConnectEvent(ScreenTouchReleaseEvent, self.OnPointerUp)
+		if isvalid(self.ClickBlocker) then self.ClickBlocker.Enable = false end
+		_InputService:SetCursorVisible(false)
+		self:DrawCursor("normal", _InputService:GetCursorPosition())
+		log("[UICursor] ready click=0.25 lock=0.27 frame=0.30 scale=1.2 targets=" .. tostring(#self.targets))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 테스트 종료/세션 종료 때 시스템 커서와 이벤트를 복구한다.
+		if self.downHandler ~= nil then _InputService:DisconnectEvent(ScreenTouchEvent, self.downHandler) end
+		if self.releaseHandler ~= nil then _InputService:DisconnectEvent(ScreenTouchReleaseEvent, self.releaseHandler) end
+		self.downHandler = nil
+		self.releaseHandler = nil
+		if isvalid(self.CursorImage) then self.CursorImage.Enable = false end
+		self:HideButtonFrames()
+		if isvalid(self.ClickBlocker) then self.ClickBlocker.Enable = false end
+		_InputService:ResetCursor()
+		_InputService:SetCursorVisible(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean Hit(Entity target, Vector2 point)
+		-- 부모 앵커/스케일을 포함한 로컬 좌표로 판정하며 숨겨진 창은 제외한다.
+		if not isvalid(target) or not target.EnabledInHierarchy or not target.VisibleInHierarchy then return false end
+		local tr = target.UITransformComponent
+		if not isvalid(tr) then return false end
+		local p = _UILogic:ScreenToLocalUIPosition(point, tr)
+		local s = tr.RectSize
+		local v = tr.Pivot
+		if p.x < -v.x*s.x or p.x > (1-v.x)*s.x or p.y < -v.y*s.y or p.y > (1-v.y)*s.y then return false end
+		local parent = target
+		while isvalid(parent) and parent.Path ~= "/ui" do
+			local canvas = parent.CanvasGroupComponent
+			if isvalid(canvas) and (not canvas.Interactable or canvas.GroupAlpha <= 0) then return false end
+			if isvalid(parent.MaskComponent) and parent ~= target then
+				local rect = parent.UITransformComponent
+				local localPoint = _UILogic:ScreenToLocalUIPosition(point, rect)
+				local sz, pv = rect.RectSize, rect.Pivot
+				if localPoint.x < -pv.x*sz.x or localPoint.x > (1-pv.x)*sz.x or localPoint.y < -pv.y*sz.y or localPoint.y > (1-pv.y)*sz.y then return false end
+			end
+			parent = parent.Parent
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AddTarget(string path, string kind, integer index)
+		-- UI 위치는 캐시하지 않아 창 이동/인벤 축소/스크롤 변경을 즉시 반영한다.
+		local target = _EntityService:GetEntityByPath(path)
+		if isvalid(target) then table.insert(self.targets, {entity=target, kind=kind, index=index}) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshTargets()
+		-- 런타임에 생성된 버튼도 주기적으로 포함한다. 항목/스크롤은 명시적인 영역으로 구분한다.
+		self.targets = {}
+		self._T.itemGhost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
+		self._T.skillGhost = _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost")
+		local root = _EntityService:GetEntityByPath("/ui")
+		if isvalid(root) then
+			for _, button in ipairs(root:GetChildComponentsByTypeName("MOD.Core.ButtonComponent", true)) do
+				local path = button.Entity.Path
+				if not string.find(path,"/InvenSlot") and not string.find(path,"/EquipWindow/Slot") and not string.find(path,"/SkillCard") then
+					table.insert(self.targets, {entity=button.Entity, kind="button", index=0})
+				end
+			end
+			for _, touch in ipairs(root:GetChildComponentsByTypeName("MOD.Core.UITouchReceiveComponent", true)) do
+				local name = touch.Entity.Name
+				if string.find(name, "Btn") or string.find(name, "Button") or string.find(name, "Close") or string.find(name, "Tab") or name == "ClickZone" then
+					table.insert(self.targets, {entity=touch.Entity, kind="button", index=0})
+				end
+			end
+		end
+		local base = "/ui/DefaultGroup/"
+		for i=1,128 do self:AddTarget(base .. "InvenWindow/InvenSlot" .. i, "inven", i) end
+		local slots = {"SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove"}
+		for i,name in ipairs(slots) do self:AddTarget(base .. "EquipWindow/" .. name, "equip", i) end
+		for i=1,10 do
+			self:AddTarget(base .. "SkillWindow/SkillCard" .. i, "skill", i)
+			self:AddTarget(base .. "SkillWindow/SkillCard" .. i .. "/PlusBG", "button", 0)
+			self:AddTarget(base .. "SkillWindow/SkillCard" .. i .. "/MinusBG", "button", 0)
+		end
+		for i=0,7 do self:AddTarget(base .. "SkillWindow/Tab_" .. i .. "_BG", "button", 0) end
+		for _,name in ipairs({"InvenScrollUp","InvenScrollDown","InvenScrollTrack","InvenScrollThumb"}) do
+			self:AddTarget(base .. "InvenWindow/" .. name, "scroll", 0)
+		end
+		for _,name in ipairs({"SkillScrollTrackTouch","SkillScrollThumbTouch"}) do
+			self:AddTarget(base .. "SkillWindow/" .. name, "scroll", 0)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsAbove(Entity a, Entity b)
+		-- 서로 다른 그룹은 GroupOrder, 같은 그룹은 공통 부모 아래 형제 순서를 비교한다.
+		if not isvalid(b) then return true end
+		local aa, bb = {}, {}
+		local node = a
+		while isvalid(node) and node.Path ~= "/ui" do table.insert(aa, 1, node); node = node.Parent end
+		node = b
+		while isvalid(node) and node.Path ~= "/ui" do table.insert(bb, 1, node); node = node.Parent end
+		if #aa == 0 or #bb == 0 then return false end
+		local ga, gb = aa[1].UIGroupComponent, bb[1].UIGroupComponent
+		if isvalid(ga) and isvalid(gb) and ga.GroupOrder ~= gb.GroupOrder then return ga.GroupOrder > gb.GroupOrder end
+		for i=1,math.min(#aa,#bb) do
+			if aa[i] ~= bb[i] then return _UILogic:GetSiblingIndex(aa[i].UITransformComponent) > _UILogic:GetSiblingIndex(bb[i].UITransformComponent) end
+		end
+		return #aa >= #bb
+	end
+
+	@ExecSpace("ClientOnly")
+	method table TargetAt(Vector2 point)
+		-- 빈 슬롯/잠긴 슬롯은 일반 커서이며 겹친 창 뒤의 클릭 대상은 제외한다.
+		local top = _UIClickArbiter:GetTopmostWindowAt(point)
+		local best = nil
+		for _,entry in ipairs(self.targets) do
+			local target = entry.entity
+			if self:Hit(target, point) then
+				local allowed = top == "" or string.sub(target.Path,1,#top) == top
+				if not allowed and string.sub(target.Path,1,17) ~= "/ui/DefaultGroup/" then
+					allowed = self:IsAbove(target, _EntityService:GetEntityByPath(top))
+				end
+				local btn = target.ButtonComponent
+				if isvalid(btn) and not btn.Enable then allowed = false end
+				if allowed and (best == nil or self:IsAbove(target, best.entity)) then best = entry end
+			end
+		end
+		return best
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsGhostHeld()
+		-- 누르고 끌기와 클릭 후 배정 모드 모두 실제 고스트 표시 수명에 맞춘다.
+		local item = self._T.itemGhost
+		local skill = self._T.skillGhost
+		return (isvalid(item) and item.EnabledInHierarchy and item.VisibleInHierarchy)
+			or (isvalid(skill) and skill.EnabledInHierarchy and skill.VisibleInHierarchy)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string KindAt(Vector2 point)
+		-- 실제 데이터 유무에 따라 빈 슬롯과 집을 수 있는 항목을 구분한다.
+		if self:IsGhostHeld() then return "holding" end
+		local best = self:TargetAt(point)
+		if best == nil then return "normal" end
+		if best.kind == "inven" then
+			local idx = _UIEquipInventoryManager:VisualToDataIdx(best.index)
+			if idx <= 128 and _UIEquipInventoryManager:GetInven(idx) ~= "" then return "item" end
+			return "normal"
+		elseif best.kind == "equip" then
+			if _UIEquipInventoryManager:GetEquip(best.index) ~= "" then return "item" end
+			return "normal"
+		elseif best.kind == "skill" then
+			return _SkillManager:CursorKindForCard(best.index)
+		end
+		return best.kind
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean AcceptPointerDown(Vector2 point)
+		-- 동일 누름이 전역/창 핸들러로 중복 전달되어도 한 번만 판단한다.
+		if self.pointerHeld then return self.decisionAllowed end
+		self.pointerHeld = true
+		self.decisionAllowed = self.clock >= self.lockUntil
+		if not self.decisionAllowed then
+			log("[UICursor] rapid click blocked")
+			return false
+		end
+		local kind = self:KindAt(point)
+		self.scrollHeld = kind == "scroll"
+		if kind == "normal" then
+			self.clickUntil = self.clock + self.ClickDuration
+			self.lockUntil = self.clock + self.ClickInterval
+			log("[UICursor] normal click accepted")
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsBlocked()
+		-- 릴리즈 핸들러도 차단된 두 번째 누름을 실행하지 않게 한다.
+		return not self.decisionAllowed
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPointerDown(ScreenTouchEvent e)
+		-- PC 좌클릭과 시뮬레이터의 화면 터치를 공통 게이트로 보낸다.
+		if e.TouchId == 1 then self:AcceptPointerDown(e.TouchPoint) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPointerUp(ScreenTouchReleaseEvent e)
+		-- 누름을 놓으면 스크롤 커서를 즉시 호버/일반 상태로 되돌린다.
+		if e.TouchId ~= 1 then return end
+		self.pointerHeld = false
+		self.scrollHeld = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BringToFront()
+		-- 모달이 나중에 활성화되어도 커서 그룹과 실제 렌더러를 최상단에 유지한다.
+		local group = _EntityService:GetEntityByPath("/ui/CursorGroup")
+		local root = _EntityService:GetEntityByPath("/ui")
+		if not isvalid(group) or not isvalid(root) then return end
+		local top = 0
+		for _,child in ipairs(root.Children:ToTable()) do
+			if isvalid(child.UITransformComponent) then
+				top = math.max(top,_UILogic:GetSiblingIndex(child.UITransformComponent))
+			end
+		end
+		_UILogic:SetSiblingIndex(group.UITransformComponent,top)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideButtonFrames()
+		-- 렌더러는 켜 둔 채 투명하게 준비하므로 첫 호버에서 리소스를 교체하지 않는다.
+		if isvalid(self.ButtonFrameOne) then self.ButtonFrameOne.SpriteGUIRendererComponent:SetAlpha(0) end
+		if isvalid(self.ButtonFrameTwo) then self.ButtonFrameTwo.SpriteGUIRendererComponent:SetAlpha(0) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DrawCursor(string kind, Vector2 point)
+		-- MSW 원본 피벗(x,y: 좌하단 기준)을 복원해 손가락과 손등이 함께 안쪽으로 움직이게 한다.
+		if not isvalid(self.CursorImage) then return end
+		if self.CurrentKind ~= kind then self.CurrentKind = kind; self.animationTime = 0 end
+		local frame = math.floor(self.animationTime / self.FrameDuration)
+		local second = frame % 2 == 1
+		local ruid = "3930c5d2e85b4bff8467aada64fda7f5"
+		local size = Vector2(24,28)
+		local offset = Vector2(0,3) -- normal pivot=(0,25), height=28
+		if kind == "item" then
+			-- 0.90초 주기: 펼친 손 0.40초 → 중간 동작 0.10초 → 움켜쥔 손 0.40초.
+			local phase = self.animationTime % 0.90
+			local itemFrame = 2
+			if phase < 0.40 then itemFrame = 0
+			elseif phase < 0.50 then itemFrame = 1 end
+			if itemFrame == 0 then
+				ruid = "1188b31c01db4af18b269dcd02020d88"
+				size = Vector2(28,32)
+				offset = Vector2(-6,10) -- 원본 pivot=(6,22)
+			elseif itemFrame == 1 then
+				ruid = "1ea1b81aa7a24f8c8d251ce809a7b723"
+				size = Vector2(28,24)
+				offset = Vector2(-6,4) -- 원본 pivot=(6,20)
+			else
+				ruid = "0783db1be0e54f74ba7824b3a7685fad"
+				size = Vector2(24,24)
+				offset = Vector2(-5,5) -- 원본 pivot=(5,19)
+			end
+		elseif kind == "holding" then
+			ruid = "0783db1be0e54f74ba7824b3a7685fad"
+			size = Vector2(24,24)
+			offset = Vector2(-5,5)
+		elseif kind == "button" then
+			ruid = second and "bad931fce2ec4b67aa9bfb6a7c699df6" or "bb5de730dc214e478bc2dedd8f590aca"
+			-- 제작 이미지의 도트 간격(첫 장 약23px, 둘째 약25px)을 통일한다.
+			-- 두 마우스 그림의 아래 중앙을 동일한 논리 좌표(24,-29)에 맞춰 투명 여백을 상쇄한다.
+			local dot = second and 25 or 23
+			local mouseCenterX = second and 873 or 849
+			local mouseBottomY = second and 965 or 978
+			size = Vector2(1254/dot,1254/dot)
+			offset = Vector2(24-mouseCenterX/dot,mouseBottomY/dot-29)
+			local buttonFrame = second and self.ButtonFrameTwo or self.ButtonFrameOne
+			if not isvalid(buttonFrame) then return end
+			local buttonTr = buttonFrame.UITransformComponent
+			local buttonPos = _UILogic:ScreenToUIPosition(point)
+			buttonTr.RectSize = Vector2(size.x*self.CursorScale,size.y*self.CursorScale)
+			buttonTr.anchoredPosition = Vector2(buttonPos.x+offset.x*self.CursorScale,buttonPos.y+offset.y*self.CursorScale)
+			self.CursorImage.Enable = false
+			self.ButtonFrameOne.SpriteGUIRendererComponent:SetAlpha(second and 0 or 1)
+			self.ButtonFrameTwo.SpriteGUIRendererComponent:SetAlpha(second and 1 or 0)
+			self.CurrentRUID = ruid
+			return
+		elseif kind == "scroll" then
+			ruid = second and "d68abf38c6114597a8177a240a3c2fc4" or "ed897e8a043b4432bb6fd69995a3be2f"
+			size = Vector2(40,36)
+			offset = Vector2(0,0)
+		elseif kind == "scroll-held" then
+			ruid = "31bec553111449b8be0095501f382525"; size = Vector2(36,36)
+			offset = Vector2(0,0)
+		elseif kind == "click" then
+			ruid = "79819392249746f88952f3b2321f2f17"; size = Vector2(28,24)
+			offset = Vector2(-4,2) -- 원본 click pivot=(4,22)
+		end
+		self:HideButtonFrames()
+		local tr = self.CursorImage.UITransformComponent
+		local cursor = _UILogic:ScreenToUIPosition(point)
+		tr.Pivot = Vector2(0,1)
+		tr.RectSize = Vector2(size.x*self.CursorScale, size.y*self.CursorScale)
+		tr.anchoredPosition = Vector2(cursor.x+offset.x*self.CursorScale, cursor.y+offset.y*self.CursorScale)
+		if self.CurrentRUID ~= ruid then
+			self.CurrentRUID = ruid
+			self.CursorImage.SpriteGUIRendererComponent.ImageRUID = DataRef(ruid)
+		end
+		self.CursorImage.Enable = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 커서 밖으로 이동한 프레임에 바로 상태를 바꾸고 일반 클릭 잠금만 유지한다.
+		self.clock += delta
+		self.animationTime += delta
+		self.refreshAfter -= delta
+		if self.refreshAfter <= 0 then self.refreshAfter = 1; self:RefreshTargets() end
+		local point = _InputService:GetCursorPosition()
+		local kind = self:KindAt(point)
+		if kind == "holding" then
+			-- 고스트를 집고 있는 동안은 위치/누름 상태와 무관하게 움켜쥔 손으로 고정한다.
+		elseif self.scrollHeld and self.pointerHeld then kind = "scroll-held"
+		elseif kind == "normal" and self.clock < self.clickUntil then kind = "click" end
+		self:DrawCursor(kind, point)
+		if isvalid(self.ClickBlocker) then self.ClickBlocker.Enable = self.clock < self.lockUntil end
+		_InputService:SetCursorVisible(false)
+	end
+
+end

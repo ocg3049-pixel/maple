@@ -104,6 +104,10 @@ script UIEquipInventoryManager extends Logic
 		if isvalid(cEnh) then cEnh:ConnectEvent(ButtonClickEvent, self.OnCloseEnhance) end
 		local cCI = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow/CloseCharInfo")
 		if isvalid(cCI) then cCI:ConnectEvent(ButtonClickEvent, self.OnCloseCharInfo) end
+		local sortButton = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenSortBtn")
+		if isvalid(sortButton) then
+			self._T.sortClickConnection = sortButton:ConnectEvent(ButtonClickEvent, self.OnSortInventory)
+		end
 		_InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
 
 		-- 장비 슬롯: UITouchReceiveComponent 추가 후 click + hover 연결
@@ -370,12 +374,10 @@ script UIEquipInventoryManager extends Logic
 		if isvalid(initGhost) then initGhost.Enable = false end
 		log("[EquipInven] drag-drop wired")
 
-		-- 박스 타입 선택 팝업 버튼 와이어링. 버튼 순서(TypeBtn_0~13) = 모자/망토/상의/장갑/하의/신발/무기/
-		-- 펜던트/반지/견장/귀고리/눈장식/얼굴장식/밸트. 아이템이 준비된 7종에 타입 1~7을 부여한다
-		-- (1모자 2망토 3상의 4장갑 5하의 6신발 7무기), 나머지는 0(준비 중).
+		-- 모자/상의/망토/장갑/신발/무기 6종. 기존 지급 타입 ID는 유지한다(하의 ID 5 제외).
 		local typePopupBase = "/ui/DefaultGroup/ItemTypeSelectPopup/Dialog/"
-		local typeSlotMap = {1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0, 0, 0}
-		for bi = 0, 13 do
+		local typeSlotMap = {1, 3, 2, 4, 6, 7}
+		for bi = 0, 5 do
 			local capturedTypeSlot = typeSlotMap[bi + 1]
 			local typeBtnEnt = _EntityService:GetEntityByPath(typePopupBase .. "TypeBtn_" .. tostring(bi))
 			if isvalid(typeBtnEnt) then
@@ -393,6 +395,10 @@ script UIEquipInventoryManager extends Logic
 		end
 		-- 박스 수량 팝업 버튼 와이어링
 		local qtyPopupBase = "/ui/DefaultGroup/BoxQuantityPopup/Dialog/"
+		local qtyInputEnt = _EntityService:GetEntityByPath(qtyPopupBase .. "QuantityInput")
+		if isvalid(qtyInputEnt) then
+			qtyInputEnt:ConnectEvent(TextInputSubmitEvent, self.OnBoxQuantitySubmit)
+		end
 		local confirmBtnEnt = _EntityService:GetEntityByPath(qtyPopupBase .. "ConfirmBtn")
 		if isvalid(confirmBtnEnt) then
 			confirmBtnEnt:ConnectEvent(ButtonClickEvent, function(e)
@@ -490,6 +496,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyDown(KeyDownEvent event)
+		if _UIItemDiscardManager:BlocksInput() then return end
 		-- 단축키 세팅의 퀵슬롯 리매핑 키 캡처 중에는 창 토글 키를 무시한다
 		if _KeySettingManager:IsCapturingKey() then return end
 		-- 창 열기 키는 키설정(])에서 옮길 수 있으므로 하드코딩하지 않고 기능 매핑으로 판정한다
@@ -861,10 +868,12 @@ script UIEquipInventoryManager extends Logic
 				local dragRUID2 = dragS ~= "" and self:ParseInvenRUID(dragS) or ""
 				local isPotCube = (dragRUID2 == "b2300eda46f3445e9b1c6e774a2ee95a" or dragRUID2 == "b8f0af90c30b462f859f45bdc1878d8b")
 				local isAddCube = (dragRUID2 == "af5404f4c8fc4ec78ccc1a57446f69db" or dragRUID2 == "9c2a12b9a92f44d4b6dd95c7fb182ac9")
-				if isPotCube or isAddCube then
+				local isEnhanceScroll = self:IsSpecialEnhanceScroll(dragRUID2)
+				if isPotCube or isAddCube or isEnhanceScroll then
 					if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
 						self:CancelInvenDrag()
 						local tabIdx = isPotCube and 4 or 5
+						if isEnhanceScroll then tabIdx = 2 end
 						_EnhancementManager:OpenWindowWithTab(tabIdx)
 						self.lastInvenSlot = 0
 					else
@@ -948,11 +957,20 @@ script UIEquipInventoryManager extends Logic
 				end
 				return
 			end
-			-- 주문서(slotIdx==0) → 단일 클릭으로 고스트 시작, 장비 탭으로 이동
+			-- 주문서: 단일 클릭은 슬롯 이동, 더블클릭은 장비에 사용할 대상 선택.
 			if dragSI == 0 then
-				self:StartDrag(slotIdx)
-				self:StartInvenDrag(slotIdx)
-				self:OnTabSwitch("equip")
+				if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+					self:CancelInvenDrag()
+					self:StartDrag(slotIdx)
+					self._T.hoverEquipSlot = 0
+					self._T.hoverInvenSlot = 0
+					self:OnTabSwitch("equip")
+					self.lastInvenSlot = 0
+				else
+					self.lastInvenSlot = slotIdx
+					self.lastInvenTime = t
+					self:StartInvenDrag(slotIdx)
+				end
 				return
 			end
 			if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
@@ -1306,6 +1324,9 @@ script UIEquipInventoryManager extends Logic
 	-- (후르츠 대거/나무 스태프/우드완드는 리소스 상 onehandedweapon 이라 TwoHandedWeapon 슬롯에 SetEquip 시 [LEA-3005] 에러 발생 - msw-search getResource로 확인됨)
 	@ExecSpace("ClientOnly")
 	method boolean IsOneHandedJobWeapon(string name)
+		self:EnsureAppearanceCatalog()
+		local row = self._T.appearanceByName[name]
+		if row ~= nil and row[2] == 6 then return row[6] == "weapon" end
 		if name == "후르츠 대거" then return true end
 		if name == "나무 스태프" then return true end
 		if name == "우드완드" then return true end
@@ -1324,12 +1345,18 @@ script UIEquipInventoryManager extends Logic
 	@ExecSpace("ClientOnly")
 	method boolean IsOneHandedSwordWeapon(string name)
 		-- 한손검 계열 무기가 늘어나면 여기에만 추가하면 된다(공격속도 보너스의 단일 출처).
+		self:EnsureAppearanceCatalog()
+		local row = self._T.appearanceByName[name]
+		if row ~= nil and row[2] == 6 and _UIMyInfoManager:GetSelectedCharacterJobIdx() == 2 then return true end
 		return name == "카알대검"
 	end
 
 	-- 드롭박스에서 지급되는 직업별 무기 이름인지 판정 (기본옵션 부여 대상 판별용)
 	@ExecSpace("ClientOnly")
 	method boolean IsJobDropWeapon(string name)
+		self:EnsureAppearanceCatalog()
+		local row = self._T.appearanceByName[name]
+		if row ~= nil and row[2] == 6 then return true end
 		local t = self:GetJobWeaponTable()
 		for i = 1, 10 do
 			if t[i].name == name then return true end
@@ -1536,8 +1563,28 @@ script UIEquipInventoryManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method string WithStackCount(string item, number count)
+		if count <= 0 then return "" end
+		local f = _EnhancementManager:SplitItemFieldsPreserve(item)
+		while #f < 7 do table.insert(f, "0") end
+		if f[2] == "47841bc4d3554cf0a68bd05f19de1f18" then f[1] = "드롭 아이템" end
+		f[7] = tostring(count)
+		return table.concat(f, "|")
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ConsumableStackKey(string item)
+		if item == "" or self:ParseSlotIdx(item) ~= 0 then return "" end
+		if self:GetItemMaxStack(self:ParseInvenRUID(item)) <= 1 then return "" end
+		-- 수량 이외 필드가 같아야 합친다. 아이콘을 공유하는 서로 다른 물약은 별개다.
+		return self:WithStackCount(item, 1)
+	end
+
+	@ExecSpace("ClientOnly")
 	method number GetItemMaxStack(string ruid)
-		if ruid == "47841bc4d3554cf0a68bd05f19de1f18" then return 999 end
+		-- 강화/보호 주문서는 소비 슬롯에 99개씩 보관한다.
+		if self:IsSpecialEnhanceScroll(ruid) then return 99 end
+		if ruid == "47841bc4d3554cf0a68bd05f19de1f18" then return 10 end
 		if ruid == "14267ae8e168458480697c148ddfdcab" then return 99 end
 		if ruid == "314215aface349c48b81eee58065e1b7" then return 99 end
 		if ruid == "0f134eebddee4b368062790b46afc26a" then return 99 end
@@ -1555,6 +1602,112 @@ script UIEquipInventoryManager extends Logic
 	@ExecSpace("ClientOnly")
 	method string BuildItemStr(string baseName, string ruid, number slotIdx, number stars, number scrolls, number upgrade)
 		return baseName .. "|" .. ruid .. "|" .. tostring(slotIdx) .. "|" .. tostring(stars) .. "|" .. tostring(scrolls) .. "|" .. tostring(upgrade)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsSpecialEnhanceScroll(string ruid)
+		-- 기존 장비강화 주문서와 1회 스타포스 보호 주문서의 공통 사용 경로.
+		return ruid == "bb6c1532d7364170a11abd2d8835bc81" or ruid == "a6c6ff42196548dd874b83332ad5b336"
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasStarforceProtection(string itemStr)
+		-- 1~16번 옵션 필드 뒤의 이름 있는 메타데이터로 저장해 외형 메타데이터와 공존한다.
+		local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
+		for i = 17, #fields do
+			if fields[i] == "starforce-protect:1" then return true end
+		end
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method string WithStarforceProtection(string itemStr, boolean enabled)
+		-- 다른 옵션과 빈 필드를 보존하고 보호 표식만 추가/제거한다. 오래된 장비는 보호 없음.
+		if itemStr == "" then return itemStr end
+		local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
+		for i = #fields, 17, -1 do
+			if fields[i] == "starforce-protect:1" then table.remove(fields, i) end
+		end
+		if enabled then
+			while #fields < 16 do table.insert(fields, "") end
+			table.insert(fields, "starforce-protect:1")
+		end
+		return table.concat(fields, "|")
+	end
+
+	@ExecSpace("ClientOnly")
+	method string SpecialScrollBlockedReason(string ruid, string itemStr)
+		-- 소모 전에 장비 종류, 최대 별 수, 중복 보호를 검사한다.
+		if not self:IsSpecialEnhanceScroll(ruid) then return "사용할 수 없는 주문서입니다." end
+		if itemStr == "" or not _EnhancementManager:IsEnhanceableSlot(self:ParseSlotIdx(itemStr)) then
+			return "스타포스 강화 가능한 장비에만 사용할 수 있습니다."
+		end
+		if self:ParseStars(itemStr) >= 100 then return "최대 스타포스 단계의 장비입니다." end
+		if ruid == "a6c6ff42196548dd874b83332ad5b336" and self:HasStarforceProtection(itemStr) then
+			return "이미 프로텍트 주문서가 적용된 장비입니다."
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ResolveEquipmentScroll(string itemStr, number roll, integer starGain)
+		-- 90% 성공이면 균등 추첨한 1~5성을 추가한다. 보호는 성공/실패 모두 이번 시도에 소모한다.
+		local protected = self:HasStarforceProtection(itemStr)
+		local updated = self:WithStarforceProtection(itemStr, false)
+		if roll < 0.9 then
+			local fields = _EnhancementManager:SplitItemFieldsPreserve(updated)
+			local oldStars = self:ParseStars(itemStr)
+			local stars = math.min(100, oldStars + math.max(1, math.min(5, starGain)))
+			fields[4] = tostring(stars)
+			return { item = table.concat(fields, "|"), message = "성공! 스타포스 +" .. tostring(stars - oldStars) .. "성 → " .. tostring(stars) .. "성", protected = protected }
+		end
+		if protected then return { item = updated, message = "실패! 프로텍트가 파괴를 막았습니다. (보호 소모)", protected = true } end
+		return { item = "", message = "실패! 장비가 파괴되었습니다.", protected = false }
+	end
+
+	@ExecSpace("ClientOnly")
+	method table UseSpecialEnhanceScroll(string scrollTab, number scrollSlot, number equipSlot, string itemTab, number itemSlot, string expectedRUID)
+		-- 강화창과 드래그 사용이 같은 검증·소모·저장 경로를 사용한다.
+		local scrollStr = self:GetTabItem(scrollTab, scrollSlot)
+		if scrollStr == "" or self:ParseInvenRUID(scrollStr) ~= expectedRUID or self:ParseCount(scrollStr) <= 0 then
+			return { used = false, message = "주문서가 없거나 위치가 변경되었습니다." }
+		end
+		local itemStr = equipSlot > 0 and self:GetEquip(equipSlot) or self:GetTabItem(itemTab, itemSlot)
+		local blocked = self:SpecialScrollBlockedReason(expectedRUID, itemStr)
+		if blocked ~= "" then return { used = false, message = blocked } end
+		local result = nil
+		if expectedRUID == "a6c6ff42196548dd874b83332ad5b336" then
+			result = { item = self:WithStarforceProtection(itemStr, true), message = "프로텍트 주문서 적용! 다음 스타포스 강화 1회 보호." }
+		else
+			result = self:ResolveEquipmentScroll(itemStr, _UtilLogic:RandomDouble(), _UtilLogic:RandomIntegerRange(1, 5))
+			if result.protected and result.item ~= "" and self:ParseStars(result.item) > self:ParseStars(itemStr) then
+				result.message = result.message .. " (프로텍트 소모)"
+			end
+		end
+		local count = self:ParseCount(scrollStr) - 1
+		local remaining = ""
+		if count > 0 then
+			local fields = _EnhancementManager:SplitItemFieldsPreserve(scrollStr)
+			while #fields < 7 do table.insert(fields, "0") end
+			fields[7] = tostring(count)
+			remaining = table.concat(fields, "|")
+		end
+		self:SetTabItem(scrollTab, scrollSlot, remaining)
+		local updated = self:ResolveAppearance(result.item, _UIMyInfoManager:GetSelectedCharacterJobIdx())
+		if equipSlot > 0 then self:SetEquipStr(equipSlot, updated)
+		else self:SetTabItem(itemTab, itemSlot, updated) end
+		self:HideTooltip()
+		self:RefreshUI()
+		if equipSlot > 0 then _DecoWindowManager:ApplyAppearance() end
+		_CharacterPersistence:MarkDirty("enhance_special_scroll")
+		local manager = _EnhancementManager
+		if (equipSlot > 0 and manager.enhanceTargetEquipSlot == equipSlot)
+			or (equipSlot == 0 and manager.enhanceTargetEquipSlot == 0 and manager.enhanceTargetSrcTab == itemTab and manager.enhanceTargetInvenIdx == itemSlot) then
+			manager:RefreshCurrentTarget()
+		end
+		result.used = true
+		log("[EnhanceScroll] ruid=" .. expectedRUID .. " equip=" .. tostring(equipSlot) .. " slot=" .. tostring(itemSlot) .. " " .. result.message)
+		return result
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1621,6 +1774,7 @@ script UIEquipInventoryManager extends Logic
 		self._T.tabData["consume"][22] = "1억 메소 주머니|f0aa7764ff5344848d59accafa2dbf6e|0|0|0|0|10"
 		-- 허수아비 생성 999개 → 소비 탭 슬롯 23: 더블클릭 시 발밑에 허수아비 소환 (전투분석 DPS 측정용)
 		self._T.tabData["consume"][23] = "허수아비 생성|c9c6022d09854016b0c7f8422441ba2a|0|0|0|0|999"
+		self:SeedDropTestConsumables()
 		-- 치장 아이템 → 치장 탭
 		self:SeedDecoItems()
 		self:RefreshUI()
@@ -1686,13 +1840,12 @@ script UIEquipInventoryManager extends Logic
 		log("[EquipInven] 기존 캐릭터에 공격력 물약 999개 지급 (소비 슬롯 " .. tostring(emptySlot) .. ")")
 	end
 
-	-- (요청) 소비 탭의 "드롭 아이템 / 공격 속도의 비약 / 연두색주문서"를 999개로 채워준다.
+	-- (요청) 소비 탭의 "공격 속도의 비약 / 연두색주문서"를 999개로 채워준다.
 	-- 테스트용 지급이므로 RestoreSave에서 매 접속마다 호출되어 999개로 다시 채운다(소모해도 재접속 시 복구).
 	-- 지급을 끝내고 싶으면 CharacterPersistence.RestoreSave의 이 호출 한 줄만 지우면 된다.
 	@ExecSpace("ClientOnly")
 	method void SeedTestConsumables()
 		local wanted = {
-			{ name = "드롭 아이템",       ruid = "47841bc4d3554cf0a68bd05f19de1f18" },
 			{ name = "공격 속도의 비약",  ruid = "9d6404b526184e85aeddfd6728e39fdb" },
 			{ name = "연두색주문서",      ruid = "314215aface349c48b81eee58065e1b7" },
 			-- 허수아비 생성(전투분석 DPS 측정용) - 기존 캐릭터도 접속 시 999개 채워준다
@@ -1711,8 +1864,54 @@ script UIEquipInventoryManager extends Logic
 				end
 			end
 			if slotIdx > 0 then
-				self._T.tabData["consume"][slotIdx] = w.name .. "|" .. w.ruid .. "|0|0|0|0|999"
-				log("[EquipInven] 테스트 지급: " .. w.name .. " 999개 (소비 슬롯 " .. tostring(slotIdx) .. ")")
+				local count = math.min(999, self:GetItemMaxStack(w.ruid))
+				local old = self:GetTabItem("consume", slotIdx)
+				count = math.max(count, old ~= "" and self:ParseCount(old) or 0)
+				self._T.tabData["consume"][slotIdx] = w.name .. "|" .. w.ruid .. "|0|0|0|0|" .. tostring(count)
+				log("[EquipInven] 테스트 지급: " .. w.name .. " " .. tostring(count) .. "개 (소비 슬롯 " .. tostring(slotIdx) .. ")")
+			end
+		end
+		self:SeedDropTestConsumables()
+	end
+
+
+	-- 테스트용: 몬스터 드롭 8종과 장비강화 주문서를 최소 10개 보장한다.
+	@ExecSpace("ClientOnly")
+	method void SeedDropTestConsumables()
+		local wanted = {
+			{ "장비강화 주문서", "bb6c1532d7364170a11abd2d8835bc81" },
+			{ "드롭 아이템", "47841bc4d3554cf0a68bd05f19de1f18" },
+			{ "레드큐브", "b2300eda46f3445e9b1c6e774a2ee95a" },
+			{ "블랙큐브", "b8f0af90c30b462f859f45bdc1878d8b" },
+			{ "에디셔널큐브", "af5404f4c8fc4ec78ccc1a57446f69db" },
+			{ "화이트 에디셔널큐브", "9c2a12b9a92f44d4b6dd95c7fb182ac9" },
+			{ "에디셔널 잠재능력 부여주문서", "0f134eebddee4b368062790b46afc26a" },
+			{ "프로텍트 주문서", "a6c6ff42196548dd874b83332ad5b336" },
+			{ "잠재능력 부여주문서", "14267ae8e168458480697c148ddfdcab" },
+		}
+		for _, item in ipairs(wanted) do
+			local count = 0
+			local emptySlot = 0
+			local stackSlot = 0
+			for i = 1, 128 do
+				local s = self:GetTabItem("consume", i)
+				if s == "" then
+					if emptySlot == 0 then emptySlot = i end
+				elseif self:ParseInvenRUID(s) == item[2] then
+					count = count + self:ParseCount(s)
+					stackSlot = i
+				end
+			end
+			if count < 10 then
+				local slot = stackSlot > 0 and stackSlot or emptySlot
+				if slot > 0 then
+					local old = self:GetTabItem("consume", slot)
+					local amount = (old ~= "" and self:ParseCount(old) or 0) + 10 - count
+					self:SetTabItem("consume", slot, item[1] .. "|" .. item[2] .. "|0|0|0|0|" .. tostring(amount))
+					log("[DropTestGrant] " .. item[1] .. " +" .. tostring(10 - count) .. "개")
+				else
+					log_warning("[DropTestGrant] 소비창 공간 부족: " .. item[1])
+				end
 			end
 		end
 	end
@@ -1723,14 +1922,14 @@ script UIEquipInventoryManager extends Logic
 	-- ⚠ 순수 테스트용이다. 출시 전에 이 메서드와 RestoreSave의 호출부를 함께 지울 것.
 	@ExecSpace("ClientOnly")
 	method void SeedTestStarforceEquip()
-		-- 이미 갖고 있으면(이름으로 판정) 다시 넣지 않는다 - 접속할 때마다 인벤이 불어나지 않게.
+		-- 외형 전환으로 이름이 바뀌어도 저장된 테스트 표식으로 중복 지급을 막는다.
 		local ITEM_NAME = "테스트 모자(99성)"
 		for i = 1, 128 do
 			local s = self:GetTabItem("equip", i)
-			if s ~= "" and self:ParseName(s) == ITEM_NAME then return end
+			if s ~= "" and (self:ParseName(s) == ITEM_NAME or string.find(s, "|appearance-test:hat", 1, true) ~= nil) then return end
 		end
 		-- 장착 중인 모자가 이미 이 아이템이면 역시 건너뛴다.
-		if self:ParseName(self:GetEquip(7)) == ITEM_NAME then return end
+		if self:ParseName(self:GetEquip(7)) == ITEM_NAME or string.find(self:GetEquip(7), "|appearance-test:hat", 1, true) ~= nil then return end
 		local slotIdx = 0
 		for i = 1, 128 do
 			if self:GetTabItem("equip", i) == "" then slotIdx = i break end
@@ -1753,9 +1952,9 @@ script UIEquipInventoryManager extends Logic
 		local WEAPON_NAME = w.name .. "(99성)"
 		for i = 1, 128 do
 			local s2 = self:GetTabItem("equip", i)
-			if s2 ~= "" and self:ParseName(s2) == WEAPON_NAME then return end
+			if s2 ~= "" and (self:ParseName(s2) == WEAPON_NAME or string.find(s2, "|appearance-test:weapon", 1, true) ~= nil) then return end
 		end
-		if self:ParseName(self:GetEquip(6)) == WEAPON_NAME then return end
+		if self:ParseName(self:GetEquip(6)) == WEAPON_NAME or string.find(self:GetEquip(6), "|appearance-test:weapon", 1, true) ~= nil then return end
 		local wSlot = 0
 		for i = 1, 128 do
 			if self:GetTabItem("equip", i) == "" then wSlot = i break end
@@ -1813,27 +2012,39 @@ script UIEquipInventoryManager extends Logic
 			_UIToast:ShowMessage("강화 중인 아이템은 장착할 수 없습니다.")
 			return
 		end
-		local s = self:GetInven(invenIdx)
+		if self._T.activeTab ~= "equip" then return end
+		local s = self:ResolveAppearance(self:GetInven(invenIdx), _UIMyInfoManager:GetSelectedCharacterJobIdx())
 		if s == "" then return end
-		local name    = self:ParseName(s)
-		local ruid    = self:ParseInvenRUID(s)
 		local slotIdx = self:ParseSlotIdx(s)
 		if slotIdx < 1 or slotIdx > 9 then return end
-
-		-- 6필드 포맷 그대로 swap
-		local cur = self:GetEquip(slotIdx)
-		if cur ~= "" and self:ParseRUID(cur) ~= "" then
-			self:SetInvenStr(invenIdx, cur)
-		else
-			self:SetInvenStr(invenIdx, "")
+		local displaced = { slotIdx }
+		if slotIdx == 3 and self:IsLongcoatItem(s) and self:GetEquip(4) ~= "" then table.insert(displaced, 4) end
+		if slotIdx == 4 and self:IsLongcoatItem(self:GetEquip(3)) then table.insert(displaced, 3) end
+		local returns = {}
+		for _, slot in ipairs(displaced) do
+			if _EnhancementManager:HasEnhanceTarget() and _EnhancementManager.enhanceTargetEquipSlot == slot then
+				_UIToast:ShowMessage("강화 중인 아이템은 해제할 수 없습니다.")
+				return
+			end
+			local old = self:GetEquip(slot)
+			if old ~= "" then table.insert(returns, old) end
 		end
-
+		-- 들어오는 아이템의 칸도 빈칸으로 센다. 모든 반환 위치가 확보된 후에만 변경한다.
+		local destinations = { invenIdx }
+		for i = 1, 128 do
+			if i ~= invenIdx and self:GetTabItem("equip", i) == "" then table.insert(destinations, i) end
+		end
+		if #returns > #destinations then
+			_UIToast:ShowMessage("해제할 장비를 보관할 인벤토리 공간이 부족합니다.")
+			return
+		end
+		self:SetTabItem("equip", invenIdx, "")
+		for i, old in ipairs(returns) do self:SetTabItem("equip", destinations[i], old) end
+		for _, slot in ipairs(displaced) do self:SetEquipStr(slot, "") end
 		self:SetEquipStr(slotIdx, s)
-
-		-- 외형 반영은 치장(외형 우선) + 장비를 합쳐 계산하는 DecoWindowManager가 전담한다
-		-- (한손/두손 무기 슬롯 정리도 ApplyAppearance가 처리)
-		_DecoWindowManager:ApplyAppearance()
+		log("[EquipAppearance] 장착 slot=" .. tostring(slotIdx) .. " 반환=" .. tostring(#returns))
 		self:RefreshUI()
+		_DecoWindowManager:ApplyAppearance()
 	end
 
 	-- 아바타 아이템 RUID -> 장비 슬롯 인덱스 (GDD §4.6: 1얼굴 2머리 3상의 4하의 5신발 6무기 7모자 8망토 9장갑).
@@ -1841,6 +2052,9 @@ script UIEquipInventoryManager extends Logic
 	-- 아직 개방되지 않은 잠금 부위(반지/귀고리 등 10~25 미개방 칸)에만 해당한다.
 	@ExecSpace("ClientOnly")
 	method integer GetAvatarSlotIdx(string ruid)
+		self:EnsureAppearanceCatalog()
+		local row = self._T.appearanceByRuid[ruid]
+		if row ~= nil then return row[2] end
 		if ruid == "ae8d3590a96e48c3b7cd75d46ebd3f15" then return 3 end  -- 흰색 반팔티(상의)
 		if ruid == "61f10ef0a6204e0ab6593bdf36fed3e5" then return 4 end  -- 파란 청바지(하의)
 		if ruid == "202544d7095c42c5bfb3046619ab58cc" then return 5 end  -- 가죽 샌들(신발)
@@ -1852,6 +2066,7 @@ script UIEquipInventoryManager extends Logic
 	-- 드랍 아이템 습득 시 호출 (서버→클라이언트 RPC 경유)
 	@ExecSpace("ClientOnly")
 	method void AddItemToInventory(string name, string ruid, string itemType)
+		if ruid == "47841bc4d3554cf0a68bd05f19de1f18" then name = "드롭 아이템" end
 		-- avataritem → 장비 탭, 나머지 → 소비 탭
 		local targetTab = (itemType == "avataritem") and "equip" or "consume"
 		local slotMark = (itemType == "avataritem") and "7" or "0"
@@ -1863,7 +2078,7 @@ script UIEquipInventoryManager extends Logic
 				-- 같은 RUID이며 아직 여유 있는 슬롯에 먼저 쌓기
 				for i = 1, 128 do
 					local s = td[i] or ""
-					if s ~= "" and self:ParseInvenRUID(s) == ruid then
+					if s ~= "" and self:ConsumableStackKey(s) == self:ConsumableStackKey(name .. "|" .. ruid .. "|0|0|0|0|1") then
 						local cnt = self:ParseCount(s)
 						if cnt < maxStack then
 							local fields = {}
@@ -1916,6 +2131,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RefreshUI()
+		self:RefreshEquipmentAppearance()
 		-- 공용 드롭 모델 이름이 저장된 박스는 수량/옵션을 보존하고 이름만 복구한다.
 		local consume = self._T.tabData and self._T.tabData["consume"]
 		if consume then
@@ -2074,6 +2290,9 @@ script UIEquipInventoryManager extends Logic
 	-- 툴팁 표시 (원작 스타일: 장비=착용중 비교+전투력증가량 / 치장=간단+비교 / 소비 주문서=효과·확률 / 기타=설명만)
 	@ExecSpace("ClientOnly")
 	method void ShowTooltipFromStr(string s, boolean isEquip, string slotPath, string winPath)
+		-- 표시 대상과 높이를 기억하여 커서 이동/호버 종료를 매 프레임 반영한다.
+		self._T.tooltipSlotPath = slotPath
+		self._T.tooltipWindowPath = winPath
 		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
 		if not isvalid(tp) then return end
 
@@ -2110,6 +2329,8 @@ script UIEquipInventoryManager extends Logic
 			cmpH = self:PaintTooltipSide("Cmp", cmpStr, kind, true)
 		end
 		if isvalid(cmpEnt) then cmpEnt.Enable = (cmpStr ~= "") end
+		self._T.tooltipMainHeight = mainH
+		self._T.tooltipCompareHeight = cmpH
 
 		-- 위치: 슬롯 오른쪽 (오른쪽 공간 부족 시 왼쪽), 화면 상/하 클램프
 		local W = 340
@@ -2144,6 +2365,63 @@ script UIEquipInventoryManager extends Logic
 
 		self:BringWindowToFront("/ui/DefaultGroup/TooltipPanel")
 		tp.Enable = true
+		self:FollowItemTooltip()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FollowItemTooltip()
+		-- 호버 대상이 닫히거나 가려지면 즉시 닫고, 그렇지 않으면 커서 옆을 따라간다.
+		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
+		if not isvalid(tp) or not tp.Enable then return end
+		local point = _InputService:GetCursorPosition()
+		local target = _EntityService:GetEntityByPath(self._T.tooltipSlotPath or "")
+		local winPath = self._T.tooltipWindowPath or ""
+		if not _UICursorManager:Hit(target, point) or not _UIClickArbiter:IsTopmostAt(winPath, point) then
+			self:HideTooltip()
+			return
+		end
+		local pos = _UILogic:ScreenToUIPosition(point)
+		local mainH = self._T.tooltipMainHeight or 400
+		local cmpH = self._T.tooltipCompareHeight or 0
+		local cmp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel/Cmp")
+		local hasCompare = isvalid(cmp) and cmp.Enable
+		local width = hasCompare and 688 or 340
+		local left = pos.x + 18
+		if left + width > 950 then left = pos.x - 18 - width end
+		left = math.max(-950, math.min(950-width, left))
+		local height = math.max(mainH, cmpH)
+		local top = math.max(-530+height, math.min(530, pos.y-18))
+		tp.UITransformComponent.anchoredPosition = Vector2(left+170, top-mainH/2)
+		if hasCompare then cmp.UITransformComponent.anchoredPosition = Vector2(348, mainH/2-cmpH/2) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdatePointerItemTooltip(Vector2 point)
+		-- 자식 이미지 간 Enter/Exit 순서와 무관하게 현재 슬롯/데이터를 최종 판정한다.
+		local target = _UICursorManager:TargetAt(point)
+		if target == nil or (target.kind ~= "inven" and target.kind ~= "equip") then
+			self._T.pointerItemSignature = ""
+			if self.tooltipSource == "inven" or self.tooltipSource == "equip" then self:HideTooltip() end
+			return
+		end
+		local item = ""
+		local winPath = "/ui/DefaultGroup/EquipWindow"
+		if target.kind == "equip" then
+			item = self:GetEquip(target.index)
+		else
+			winPath = "/ui/DefaultGroup/InvenWindow"
+			local idx = self:VisualToDataIdx(target.index)
+			if idx <= 128 then item = self:GetInven(idx) end
+		end
+		if item == "" then self._T.pointerItemSignature = ""; self:HideTooltip(); return end
+		local sig = target.entity.Path .. ":" .. item
+		local tip = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
+		if sig ~= self._T.pointerItemSignature or not isvalid(tip) or not tip.Enable then
+			self._T.pointerItemSignature = sig
+			self.tooltipSource = target.kind
+			self:ShowTooltipFromStr(item, self:ParseSlotIdx(item) >= 1, target.entity.Path, winPath)
+		end
+		self:FollowItemTooltip()
 	end
 
 	-- 툴팁 한쪽 패널(Main/Cmp)을 채우고 패널 높이를 반환한다
@@ -2243,6 +2521,9 @@ script UIEquipInventoryManager extends Logic
 			metaText = "착용 직업 : 공용"
 			if baseName == "연두색 머리띠" then metaText = metaText .. "\n요구 레벨 : 5" end
 			infoText = self:BuildTooltipStatsText(baseName, stars, upgrade) .. self:BuildPotentialText(s)
+			if self:HasStarforceProtection(s) then
+				infoText = infoText .. "\n<color=#7EDCFF>프로텍트 주문서 적용</color>"
+			end
 		elseif kind == "deco" then
 			metaText = "착용 직업 : 공용"
 			infoText = "치장용 아이템입니다.\n장착 시 외형이 장비보다 우선 적용됩니다."
@@ -2278,6 +2559,7 @@ script UIEquipInventoryManager extends Logic
 				pill1 = "방어구"
 			end
 			pill2 = self:GetEquipTypeFullBySlot(si2)
+			if self:IsLongcoatItem(s) then pill2 = "한벌옷" end
 		elseif kind == "deco" then
 			pill1 = "치장"
 			pill2 = self:GetDecoCatLabel(self:GetField(s, 4))
@@ -2539,6 +2821,10 @@ script UIEquipInventoryManager extends Logic
 			return "[연두색 머리띠용]\n성공률: 60%\n강화 1회 소모"
 		elseif name == "잠재능력 부여주문서" then
 			return "장비에 잠재능력을 부여합니다.\n성공률: 70%\n실패 시 아이템 파괴\n이미 부여된 아이템에 사용 불가"
+		elseif name == "장비강화 주문서" or name == "장비 강화 주문서" then
+			return "성공률: 90%\n스타포스 1~5성 추가 (각 20%)\n최대 100성 / 실패 시 장비 파괴\n프로텍트 적용 시 파괴 방지\n강화창 > 주문서에서 사용"
+		elseif name == "프로텍트 주문서" then
+			return "성공률: 100%\n다음 스타포스 강화 1회 파괴 방지\n성공·실패 모두 보호 효과 소모\n장비강화 주문서에도 적용\n중복 적용 불가 / 소모 후 재사용 가능"
 		elseif name == "에디셔널 잠재능력 부여주문서" then
 			return "장비에 에디셔널 잠재능력을 부여합니다.\n성공률: 70%\n실패 시 아이템 파괴\n1번 성공하면 재사용 불가"
 		elseif name == "공격 속도의 비약" then
@@ -2714,6 +3000,9 @@ script UIEquipInventoryManager extends Logic
 		if s == "" then return end
 		self._T.isDraggingInvenItem = true
 		self._T.dragInvenSourceSlot = invenSlot
+		self._T.dragInvenSourceTab = self._T.activeTab
+		self._T.dragInvenSourceItem = s
+		self._T.dragInvenStartPoint = _InputService:GetCursorPosition()
 		self._T.pendingCancelInvenDrag = false
 		self._T.justStartedDrag = true
 		local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
@@ -2746,6 +3035,10 @@ script UIEquipInventoryManager extends Logic
 	method void ApplyInvenDrop(number targetSlot)
 		if not self._T.isDraggingInvenItem then return end
 		local srcSlot = self._T.dragInvenSourceSlot
+		if self._T.dragInvenSourceTab ~= self._T.activeTab or self:GetInven(srcSlot) ~= self._T.dragInvenSourceItem then
+			self:CancelInvenDrag()
+			return
+		end
 		if srcSlot == targetSlot then
 			self:CancelInvenDrag()
 			if self.isDragging then self:CancelDrag() end
@@ -2764,8 +3057,17 @@ script UIEquipInventoryManager extends Logic
 		-- 인벤 슬롯 간 swap
 		local srcStr = self:GetInven(srcSlot)
 		local dstStr = self:GetInven(targetSlot)
-		self:SetInvenStr(srcSlot, dstStr)
-		self:SetInvenStr(targetSlot, srcStr)
+		local key = self:ConsumableStackKey(srcStr)
+		if self._T.activeTab == "consume" and key ~= "" and key == self:ConsumableStackKey(dstStr) then
+			local cap = self:GetItemMaxStack(self:ParseInvenRUID(dstStr))
+			local moved = math.min(self:ParseCount(srcStr), math.max(0, cap - self:ParseCount(dstStr)))
+			self:SetInvenStr(srcSlot, self:WithStackCount(srcStr, self:ParseCount(srcStr) - moved))
+			self:SetInvenStr(targetSlot, self:WithStackCount(dstStr, self:ParseCount(dstStr) + moved))
+			log("[InvenStack] merged=" .. tostring(moved))
+		else
+			self:SetInvenStr(srcSlot, dstStr)
+			self:SetInvenStr(targetSlot, srcStr)
+		end
 		self:RefreshUI()
 		log("[InvenDrag] 이동: 슬롯" .. tostring(srcSlot) .. " ↔ 슬롯" .. tostring(targetSlot))
 		self:CancelInvenDrag()
@@ -2782,6 +3084,13 @@ script UIEquipInventoryManager extends Logic
 		if itemStr == "" then self:CancelDrag() return end
 
 		local scrollRUID = self:ParseInvenRUID(scrollStr)
+		if self:IsSpecialEnhanceScroll(scrollRUID) then
+			local result = self:UseSpecialEnhanceScroll(self._T.dragScrollTab, scrollSlot, equipSlot, "equip", 0, scrollRUID)
+			_UIToast:ShowMessage(result.message)
+			self:CancelDrag()
+			if self:GetEquip(equipSlot) ~= "" then self:ShowEquipTooltip(equipSlot) end
+			return
+		end
 
 		-- 잠재능력 부여주문서: 미부여 아이템에만 사용, 70% 성공, 실패 시 아이템 파괴
 		if scrollRUID == "14267ae8e168458480697c148ddfdcab" then
@@ -2793,8 +3102,7 @@ script UIEquipInventoryManager extends Logic
 			self:ConsumeScrollInDragTab(scrollSlot)
 			local success = _UtilLogic:RandomDouble() < 0.7
 			if success then
-				local fields = {}
-				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
 				while #fields < 12 do fields[#fields+1] = "0" end
 				fields[7] = "1"
 				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
@@ -2829,8 +3137,7 @@ script UIEquipInventoryManager extends Logic
 			self:ConsumeScrollInDragTab(scrollSlot)
 			local success = _UtilLogic:RandomDouble() < 0.7
 			if success then
-				local fields = {}
-				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
 				while #fields < 16 do fields[#fields+1] = "0" end
 				fields[8] = "1"
 				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
@@ -2871,7 +3178,11 @@ script UIEquipInventoryManager extends Logic
 		else
 			log("[Scroll] 실패.  남은 업그레이드: " .. tostring(newUpgrade))
 		end
-		local newStr = self:BuildItemStr(baseName, ruid, slotIdx, stars, scrolls, newUpgrade)
+		-- 잠재/에디셔널/프로텍트/외형 메타데이터를 보존한다.
+		local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
+		fields[5] = tostring(scrolls)
+		fields[6] = tostring(newUpgrade)
+		local newStr = table.concat(fields, "|")
 		self:SetEquipStr(equipSlot, newStr)
 		self:RefreshUI()
 		self:CancelDrag()
@@ -2880,6 +3191,8 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		-- 표시 중인 아이템/장비 설명창의 위치와 호버 유효성을 갱신한다.
+		self:FollowItemTooltip()
 		local cursor = _InputService:GetCursorPosition()
 		local cursorUI = Vector2(cursor.x, cursor.y)
 		local ghostUI = Vector2(cursor.x - 960, cursor.y - 540)
@@ -2918,6 +3231,7 @@ script UIEquipInventoryManager extends Logic
 			end
 		end
 		-- 주문서 드래그: 고스트 위치 갱신
+		self:UpdatePointerItemTooltip(cursor)
 		if self.isDragging then
 			local ghost = _EntityService:GetEntityByPath("/ui/DefaultGroup/DragGhost")
 			if isvalid(ghost) then
@@ -3103,12 +3417,24 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnScreenRelease(ScreenTouchReleaseEvent e)
+		if e.TouchId ~= 1 or _UIItemDiscardManager:BlocksInput() then return end
+		-- 차단된 재클릭은 아이템 드롭/취소로 처리하지 않는다.
+		if _UICursorManager:IsBlocked() then return end
 		self._T.dragHandledThisClick = false
 		if self._T.justStartedDrag then
 			self._T.justStartedDrag = false
-			return
+			local start = self._T.dragInvenStartPoint
+			if start == nil or not self._T.isDraggingInvenItem then return end
+			local dx,dy = e.TouchPoint.x-start.x,e.TouchPoint.y-start.y
+			if dx*dx+dy*dy < 64 or not _UIItemDiscardManager:IsWorldPoint(e.TouchPoint) then return end
 		end
 		if self.isDragging then
+			-- 주문서 사용 대기 중 바닥 클릭은 취소만 한다. 아이템 버리기로 넘기지 않는다.
+			if _UIItemDiscardManager:IsWorldPoint(e.TouchPoint) then
+				self:CancelDrag()
+				log("[ScrollInput] 바닥 클릭으로 사용 취소")
+				return
+			end
 			-- hover 중인 슬롯에 드랍 처리
 			local eq = self._T.hoverEquipSlot
 			local iv = self._T.hoverInvenSlot
@@ -3128,11 +3454,17 @@ script UIEquipInventoryManager extends Logic
 			-- isDraggingInvenItem=true이고 장비슬롯이 아닌 경우: 아래 블록에서 처리
 		end
 		if self._T.isDraggingInvenItem then
-			-- 클릭-클릭 픽업 중 빈 곳(슬롯 밖) 클릭 → 픽업 취소
-			-- (슬롯 위 드롭은 해당 슬롯의 TouchDown 핸들러가 이미 처리해 이 시점엔 플래그가 꺼져 있다)
+			-- 실제 바닥에서만 버리기 확인. UI의 빈 배경은 픽업 취소만 한다.
+			local worldDrop = _UIItemDiscardManager:IsWorldPoint(e.TouchPoint)
+			local tab = self._T.dragInvenSourceTab
+			local slot = self._T.dragInvenSourceSlot
+			local item = self._T.dragInvenSourceItem
 			self:CancelInvenDrag()
 			if self.isDragging then self:CancelDrag() end
-			log("[InvenDrag] 빈 곳 클릭 — 픽업 취소")
+			if self._T.isDraggingPotion then self:CancelPotionDrag() end
+			if self._T.isDraggingEquipToEnhance then self:CancelEquipDrag() end
+			if worldDrop then _UIItemDiscardManager:Show(tab,slot,item) end
+			return
 		end
 		if self._T.isDraggingPotion then
 			local cursor = _InputService:GetCursorPosition()
@@ -3283,7 +3615,9 @@ script UIEquipInventoryManager extends Logic
 	-- UITouchDownEvent가 CharInfoWindow에서 발생하지 않아 대체 구현
 	@ExecSpace("ClientOnly")
 	method void OnCharInfoTitleTouch(ScreenTouchEvent e)
+		-- 전역 일반 클릭 잠금을 제목 표시줄에도 적용한다.
 		if e.TouchId ~= 1 then return end
+		if not _UICursorManager:AcceptPointerDown(e.TouchPoint) then return end
 		local ciw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 		if not isvalid(ciw) or not ciw.Enable then return end
 		if self._T.isDraggingWindow then return end
@@ -3335,6 +3669,14 @@ script UIEquipInventoryManager extends Logic
 		if scrollStr == "" then self:CancelDrag() return end
 		local itemStr = self:GetInven(invenSlot)
 		if itemStr == "" then self:CancelDrag() return end
+		local specialRUID = self:ParseInvenRUID(scrollStr)
+		if self:IsSpecialEnhanceScroll(specialRUID) then
+			local result = self:UseSpecialEnhanceScroll(self._T.dragScrollTab, scrollSlot, 0, self._T.activeTab, invenSlot, specialRUID)
+			_UIToast:ShowMessage(result.message)
+			self:CancelDrag()
+			if self:GetInven(invenSlot) ~= "" then self:ShowInvenTooltip(invenSlot) end
+			return
+		end
 		local slotIdx = self:ParseSlotIdx(itemStr)
 		if slotIdx < 1 or slotIdx > 7 then
 			log("[Scroll] 장비 아이템이 아님 (slotIdx=" .. tostring(slotIdx) .. ") — 주문서 사용 불가")
@@ -3354,8 +3696,7 @@ script UIEquipInventoryManager extends Logic
 			self:ConsumeScrollInDragTab(scrollSlot)
 			local success = _UtilLogic:RandomDouble() < 0.7
 			if success then
-				local fields = {}
-				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
 				while #fields < 12 do fields[#fields+1] = "0" end
 				fields[7] = "1"
 				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
@@ -3392,8 +3733,7 @@ script UIEquipInventoryManager extends Logic
 			self:ConsumeScrollInDragTab(scrollSlot)
 			local success = _UtilLogic:RandomDouble() < 0.7
 			if success then
-				local fields = {}
-				for part in string.gmatch(itemStr, "[^|]+") do fields[#fields+1] = part end
+				local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
 				while #fields < 16 do fields[#fields+1] = "0" end
 				fields[8] = "1"
 				local et = self:GetEquipTypeBySlot(self:ParseSlotIdx(itemStr))
@@ -3435,7 +3775,11 @@ script UIEquipInventoryManager extends Logic
 		else
 			log("[Scroll] 실패.  남은 업그레이드: " .. tostring(newUpgrade))
 		end
-		local newStr = self:BuildItemStr(baseName, ruid, slotIdx, stars, scrolls, newUpgrade)
+		-- 잠재/에디셔널/프로텍트/외형 메타데이터를 보존한다.
+		local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
+		fields[5] = tostring(scrolls)
+		fields[6] = tostring(newUpgrade)
+		local newStr = table.concat(fields, "|")
 		self:SetInvenStr(invenSlot, newStr)
 		self:RefreshUI()
 		-- 강화창이 이 아이템을 대상으로 열려있다면 강화 단계(★) 표시를 즉시 재동기화
@@ -3510,6 +3854,119 @@ script UIEquipInventoryManager extends Logic
 		log(self._T.minimized and "[Inven] 축소 (4×8, 스크롤)" or "[Inven] 확장 (16×8)")
 	end
 
+	-- 숫자 토큰은 자릿수/값으로 비교한다 (2 < 10, 큰 정수도 정밀도 손실 없음).
+	@ExecSpace("ClientOnly")
+	method integer CompareItemNames(string left, string right)
+		local a, b = string.lower(left), string.lower(right)
+		while a ~= "" and b ~= "" do
+			local na, nb = string.match(a, "^%d+"), string.match(b, "^%d+")
+			if na ~= nil and nb ~= nil then
+				local va, vb = string.gsub(na, "^0+", ""), string.gsub(nb, "^0+", "")
+				if #va ~= #vb then return #va < #vb and -1 or 1 end
+				if va ~= vb then return va < vb and -1 or 1 end
+				a, b = string.sub(a, #na + 1), string.sub(b, #nb + 1)
+			else
+				local ca, cb = string.sub(a, 1, 1), string.sub(b, 1, 1)
+				if ca ~= cb then return ca < cb and -1 or 1 end
+				a, b = string.sub(a, 2), string.sub(b, 2)
+			end
+		end
+		if a == b then return 0 end
+		return a == "" and -1 or 1
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSortInventory(ButtonClickEvent event)
+		self:SortInventory()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SortInventory()
+		if _UIItemDiscardManager:BlocksInput() then return end
+		if _EnhancementManager:HasEnhanceTarget() then
+			_UIToast:ShowMessage("강화창의 아이템을 먼저 해제해주세요.")
+			return
+		end
+		if self._T.boxQuantityPending then return end
+		local box = _EntityService:GetEntityByPath("/ui/DefaultGroup/ItemTypeSelectPopup")
+		if isvalid(box) and box.Enable then return end
+		local tab = self._T.activeTab
+		if self._T.tabData == nil or self._T.tabData[tab] == nil then return end
+		self:CancelInvenDrag()
+		if self.isDragging then self:CancelDrag() end
+		if self._T.isDraggingPotion then self:CancelPotionDrag() end
+		if self._T.isDraggingEquipToEnhance then self:CancelEquipDrag() end
+		self:HideTooltip()
+		self._T.hoverInvenSlot = 0
+		self._T.pendingShowSlotType = ""
+		self._T.pointerItemSignature = ""
+		self.lastInvenSlot = 0
+		self.lastInvenTime = 0
+		self._T.scrollRow = 0
+		local entries = {}
+		for slot = 1, 128 do
+			local value = self:GetTabItem(tab, slot)
+			if value ~= "" then
+				table.insert(entries, {value = value, name = self:ParseName(value), order = slot})
+			end
+		end
+		if tab == "consume" then
+			local groups = {}
+			local groupList = {}
+			local packed = {}
+			for _, entry in ipairs(entries) do
+				local key = self:ConsumableStackKey(entry.value)
+				if key == "" then
+					table.insert(packed, entry)
+				else
+					local group = groups[key]
+					if group == nil then
+						group = {value = key, count = 0, order = entry.order}
+						groups[key] = group
+						table.insert(groupList, group)
+					end
+					group.count = group.count + self:ParseCount(entry.value)
+				end
+			end
+			-- 각 종류에 최소 한 슬롯을 예약한다. 구버전 초과 스택이 있어도 정렬은 끝낸다.
+			local spare = 128 - #packed - #groupList
+			local overflow = false
+			for _, group in ipairs(groupList) do
+				local key = group.value
+				local cap = self:GetItemMaxStack(self:ParseInvenRUID(key))
+				local extra = math.min(spare, math.max(0, math.ceil(group.count / cap) - 1))
+				spare = spare - extra
+				for part = 0, extra do
+					local count = part == extra and group.count or math.min(cap, group.count)
+					if count > cap then overflow = true end
+					table.insert(packed, {value = self:WithStackCount(key, count), name = self:ParseName(key), order = group.order, part = part})
+					group.count = group.count - count
+				end
+			end
+			if overflow then
+				_UIToast:ShowMessage("정렬 완료. 공간이 부족한 기존 초과 스택은 수량을 보존했습니다. 빈 슬롯 확보 후 다시 정렬해주세요.")
+			end
+			entries = packed
+		end
+		table.sort(entries, function(a, b)
+			local comparison = self:CompareItemNames(a.name, b.name)
+			if comparison == 0 then
+				if a.order == b.order then return (a.part or 0) < (b.part or 0) end
+				return a.order < b.order
+			end
+			return comparison < 0
+		end)
+		-- 데이터 슬롯은 4열×8행 묶음 순서: 1~4 아래에 5~8, 32 다음은 오른쪽 묶음.
+		-- 확대/축소와 관계없이 같은 슬롯 순서로 원문 데이터를 통째로 이동한다.
+		for slot = 1, 128 do
+			local entry = entries[slot]
+			self:SetTabItem(tab, slot, entry and entry.value or "")
+		end
+		self:UpdateInvenUI()
+		_CharacterPersistence:MarkDirty("item-sort")
+		log("[InvenSort] tab=" .. tab .. " count=" .. tostring(#entries))
+	end
+
 	@ExecSpace("ClientOnly")
 	method void ApplyInvenLayout()
 		-- InvenWindow 전체 배치 (메이플 원작 스타일). 확장 1200×760 / 축소 455×760.
@@ -3539,6 +3996,8 @@ script UIEquipInventoryManager extends Logic
 		local rowY = {210, 140, 70, 0, -70, -140, -210, -280}
 		local winW = self._T.minimized and 455 or 1200
 		if isvalid(winEnt) then winEnt.UITransformComponent.RectSize = Vector2(winW, 760) end
+		sp(b .. "InvenSortBtn", self._T.minimized and -190 or -500, 264)
+		sr(b .. "InvenSortBtn", self._T.minimized and 74 or 110, 28)
 		sr(b .. "BG", winW, 760)
 		sp(b .. "BG", 0, 0)
 		-- 타이틀 바: 창 최상단 고정 (56px)
@@ -3674,7 +4133,8 @@ script UIEquipInventoryManager extends Logic
 			if isvalid(sEnt) then
 				local stc = sEnt:GetComponent("MOD.Core.TextComponent")
 				if isvalid(stc) then
-					stc.Text = (s ~= "") and self:GetStarText(self:ParseStars(s)) or ""
+					stc.Text = ""
+					sEnt.Enable = false
 				end
 			end
 		end
@@ -3847,10 +4307,8 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnBoxTypeSelect(number typeSlotIdx)
-		if typeSlotIdx == 0 then
-			log("[Box] 해당 종류는 아직 준비 중입니다.")
-			return
-		end
+		-- 선택 UI 밖에서 호출되더라도 허용한 6종만 변환한다.
+		if not self:IsBoxConversionType(typeSlotIdx) then return end
 		self._T.boxSelectedType = typeSlotIdx
 		self:HideBoxTypeSelectPopup()
 		self:ShowBoxQuantityPopup(typeSlotIdx)
@@ -3858,6 +4316,9 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void ShowBoxQuantityPopup(number typeSlotIdx)
+		-- 수량 입력창은 열 때마다 한 번의 확인만 허용한다.
+		if not self:IsBoxConversionType(typeSlotIdx) then return end
+		self._T.boxQuantityPending = true
 		local sourceSlot = self._T.boxSourceSlot
 		local s = self:GetInven(sourceSlot)
 		local boxCount = self:ParseCount(s)
@@ -3901,21 +4362,58 @@ script UIEquipInventoryManager extends Logic
 			popup.Enable = true
 		end
 		log("[Box] 수량 팝업 표시 maxQty=" .. tostring(maxQty))
+		if isvalid(inputEnt) then inputEnt.TextInputComponent:ActivateInputField() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsBoxConversionType(number typeSlotIdx)
+		-- 1모자 3상의 2망토 4장갑 6신발 7무기.
+		return typeSlotIdx == 1 or typeSlotIdx == 3 or typeSlotIdx == 2
+			or typeSlotIdx == 4 or typeSlotIdx == 6 or typeSlotIdx == 7
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBoxQuantitySubmit(TextInputSubmitEvent event)
+		-- Enter 제출을 확인 버튼과 같은 경로로 처리한다.
+		if self._T.boxQuantityPending ~= true then return end
+		local input = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/QuantityInput")
+		if isvalid(input) then input.TextInputComponent.Text = event.Text end
+		self:OnBoxQuantityConfirm()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void HideBoxQuantityPopup()
+		-- 닫힌 팝업의 지연 제출/연속 Enter는 무시한다.
+		self._T.boxQuantityPending = false
 		local popup = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup")
 		if isvalid(popup) then popup.Enable = false end
 		self:RemoveWin("/ui/DefaultGroup/BoxQuantityPopup")
 	end
 
 	@ExecSpace("ClientOnly")
+	method integer GetBoxStarforce(number roll)
+		-- 0성 70%, 1~29성은 남은 30%를 매 단계 절반씩 배정.
+		-- 30성에는 마지막 잔여 확률을 전부 배정해 총합 100%를 유지한다.
+		if roll < 0.7 then return 0 end
+		for stars = 1, 29 do
+			if roll < 1 - 0.3 / (2 ^ stars) then return stars end
+		end
+		return 30
+	end
+
+	@ExecSpace("ClientOnly")
 	method void OnBoxQuantityConfirm()
+		-- 버튼과 Enter가 연달아 도착해도 한 번만 지급한다.
+		if self._T.boxQuantityPending ~= true then return end
+		self._T.boxQuantityPending = false
+		if not self:IsBoxConversionType(self._T.boxSelectedType or 0) then
+			self:HideBoxQuantityPopup()
+			return
+		end
 		local inputEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/BoxQuantityPopup/Dialog/QuantityInput")
 		if not isvalid(inputEnt) then return end
 		local inputText = inputEnt.TextInputComponent.Text
-		local qty = tonumber(inputText) or 0
+		local qty = math.floor(tonumber(inputText) or 0)
 		local maxQty = self._T.boxMaxQty or 0
 		if qty <= 0 then
 			log("[Box] 수량 0 이하, 취소")
@@ -3929,8 +4427,7 @@ script UIEquipInventoryManager extends Logic
 			return
 		end
 		local sourceSlot = self._T.boxSourceSlot
-		-- 선택한 종류(1모자 2망토 3상의 4장갑 5하의 6신발 7무기)에 맞는 아이템을 장비 탭에 qty개 지급한다.
-		-- 아바타 방어구는 실제 부위 슬롯으로(상의=3/하의=4/신발=5), 슬롯 없는 망토·장갑은 0(보유만).
+		-- 선택한 6종에 맞는 아이템을 실제 장착 부위로 장비 탭에 지급한다.
 		local bt = self._T.boxSelectedType
 		local grantItem = nil
 		if bt == 1 then
@@ -3941,8 +4438,6 @@ script UIEquipInventoryManager extends Logic
 			grantItem = "흰색 반팔티|ae8d3590a96e48c3b7cd75d46ebd3f15|3|0|0|0"
 		elseif bt == 4 then
 			grantItem = "노가다 목장갑|2e58683f2f094f099a0813c36e278dd5|9|0|0|0"
-		elseif bt == 5 then
-			grantItem = "파란 청바지|61f10ef0a6204e0ab6593bdf36fed3e5|4|0|0|0"
 		elseif bt == 6 then
 			grantItem = "가죽 샌들|202544d7095c42c5bfb3046619ab58cc|5|0|0|0"
 		elseif bt == 7 then
@@ -3963,7 +4458,12 @@ script UIEquipInventoryManager extends Logic
 		for i = 1, 128 do
 			if added >= qty then break end
 			if self:GetInven(i) == "" then
-				self:SetInvenStr(i, grantItem)
+				-- 일괄 개봉도 장비 한 개마다 독립적으로 스타포스를 추첨한다.
+				local stars = self:GetBoxStarforce(_UtilLogic:RandomDouble())
+				local fields = _EnhancementManager:SplitItemFieldsPreserve(grantItem)
+				fields[4] = tostring(stars)
+				self:SetInvenStr(i, table.concat(fields, "|"))
+				log("[BoxStarforce] slot=" .. tostring(i) .. " stars=" .. tostring(stars))
 				added = added + 1
 			end
 		end
@@ -4040,6 +4540,909 @@ script UIEquipInventoryManager extends Logic
 			end
 		end
 		log("[ESC] 창 닫힘: " .. path)
+	end
+
+
+	-- MSW 등록 이름/RUID. 1~3=전사, 4=비숍, 5=썬콜, 6=불독, 7=신궁, 8=보우마스터, 9=나이트로드, 10=섀도어.
+	-- 마지막 단계 이후에는 마지막 외형을 유지한다. 원본: 장비 외형/궁수/마법사/도적.txt 목록.
+	@ExecSpace("ClientOnly")
+	method void EnsureAppearanceCatalog()
+		if self._T.appearanceRows ~= nil then return end
+		self._T.appearanceRows = {
+			{1, 6, 0, "검", "9edfb2ac8d4948ae9d6d789c99e0b966", "weapon"},
+			{1, 6, 2, "목검", "43ad7bfeb9184252b24e6d60f76c17e5", "twohandweapon"},
+			{1, 6, 4, "환목검", "bc5de7124e584423b6bbc33cbf3a65c1", "twohandweapon"},
+			{1, 6, 6, "양손검", "88e6d4f9c00b407fa2be9d6aaafab276", "twohandweapon"},
+			{1, 6, 8, "왕푸", "c744cd3e85cf4390ae0c9b27a07406bd", "twohandweapon"},
+			{1, 6, 10, "하이랜더", "0cdc0913dc1a447a9d946b13accbb37c", "twohandweapon"},
+			{1, 6, 12, "쟈드", "3a0ded694eab4360a98073799002f1e9", "twohandweapon"},
+			{1, 6, 14, "호검", "189da705e84844f8abe5e88bdaf772b1", "twohandweapon"},
+			{1, 6, 16, "베인스워드", "83a47134f6b6411d95b35d4d6b3b32e6", "twohandweapon"},
+			{1, 6, 18, "메이플 소울 로헨", "2b0aab337a1944d6bfab723759265100", "twohandweapon"},
+			{1, 6, 20, "그륜힐", "40f7a7d1e55c417f8c2ecbddcea536d2", "twohandweapon"},
+			{1, 6, 22, "청운검", "29459cbfc27c4c6a84d626b5ffa71ad4", "twohandweapon"},
+			{1, 6, 24, "참마도", "33f6ddf5a9c942b19de5d8fb18c041a0", "twohandweapon"},
+			{1, 6, 26, "라 투핸더", "0dc84c13841e4f7cb36d469e58b7234a", "twohandweapon"},
+			{1, 6, 28, "참화도", "13df07e1868a4d0db34ab0ba183e7867", "twohandweapon"},
+			{1, 6, 30, "드래곤 클레이모어", "7f3580c9701c4623bbafc1e2bf8722f4", "twohandweapon"},
+			{1, 6, 32, "아스카론", "72cfdea7fc60453e8c6111295d55d7eb", "twohandweapon"},
+			{1, 6, 34, "타임리스 니플하임", "dbb074dfc25042739b79a05f99b822fa", "twohandweapon"},
+			{1, 6, 36, "라이온하트 배틀시미터", "06eefd35fc66442483f599ec5b030aa2", "twohandweapon"},
+			{1, 6, 38, "파프니르 페니텐시아", "7d3be3b4bd364798abab477ae0b9b23f", "twohandweapon"},
+			{1, 6, 40, "앱솔랩스 브로드세이버", "b5a56a2da60b4b73afb3331742ec599d", "twohandweapon"},
+			{1, 6, 42, "아케인셰이드 투핸드소드", "9d140bdf9b74472cb70210f07ed6f5dd", "twohandweapon"},
+			{1, 6, 44, "봉인된 제네시스 투핸드소드", "8fba9123a8fe4f7a9f1ebbbb62f7e18f", "twohandweapon"},
+			{2, 6, 0, "검", "9edfb2ac8d4948ae9d6d789c99e0b966", "weapon"},
+			{2, 6, 2, "카알 대검", "444f1da6365d4599a27bbfd207585856", "weapon"},
+			{2, 6, 4, "사브르", "c77586647a3a4e61885f9776744ca9b5", "weapon"},
+			{2, 6, 6, "바이킹 소드", "447d6b79023545e892581dbcc09a003e", "weapon"},
+			{2, 6, 8, "쿠크리", "399cb3b1bdb84a57bcafd1d4ad08c5bd", "weapon"},
+			{2, 6, 10, "글라디우스", "8bead71dcd9d43168a32b0a10d258c35", "weapon"},
+			{2, 6, 12, "붉은 채찍", "a9a329f2760e469bbbc4e87dcba14e20", "weapon"},
+			{2, 6, 14, "메이플 소드", "4668b7ab224449fc94805e2e6cb0f6f5", "weapon"},
+			{2, 6, 16, "커틀러스", "75b5f7276c104998877642a5c56af7b9", "weapon"},
+			{2, 6, 18, "노란색 우산", "8668230e7f024e21997ad7f0518db3e3", "weapon"},
+			{2, 6, 20, "화염의 카타나", "b7884d08a2e546b9b6994248a7069b76", "weapon"},
+			{2, 6, 22, "광선채찍", "062c098c992242d4aec54dbee8b12757", "weapon"},
+			{2, 6, 24, "메이플 켈트 소드", "2e019761dae5423fb2dd95cd44039c07", "weapon"},
+			{2, 6, 26, "검정 우산", "e1e76f7fc6344d6d8feb2a5233bf5dc0", "weapon"},
+			{2, 6, 28, "레드 카타나", "ebe98875ee894a55ba6d4d4bc7392804", "weapon"},
+			{2, 6, 30, "스파타", "0bcac0c2d9354177b674cc0ddbd3160b", "weapon"},
+			{2, 6, 32, "드래곤 카라벨라", "a5accc828b6542a399709d6d1da3370c", "weapon"},
+			{2, 6, 34, "타임리스 엑서큐서너스", "24b1a73084e14591a1a681c4b43efec6", "weapon"},
+			{2, 6, 36, "라이온하트 커틀러스", "d5e4cf5aabce4c87aa4870b5c0c44a82", "weapon"},
+			{2, 6, 38, "파프니르 미스틸테인", "535d6ec2b2e04a8d866050b3cf50a5f0", "weapon"},
+			{2, 6, 40, "앱솔랩스 세이버", "23f591e794a8487298d8e5ee9a3a7727", "weapon"},
+			{2, 6, 42, "아케인셰이드 세이버", "44a07a6cb6df4f3d894f74a7ae570bf9", "weapon"},
+			{2, 6, 44, "봉인된 제네시스 세이버", "7855133d97bb4b9496efb1b68b42ce79", "weapon"},
+			{3, 6, 0, "창", "dcaddf14378045cdbc6f512fa1a29d39", "twohandweapon"},
+			{3, 6, 2, "포크 창", "c1301dfa090648319c8cf6e5a374ca56", "twohandweapon"},
+			{3, 6, 4, "물고기 작살", "8ba4ad38509b4d12911af317bba36fc9", "twohandweapon"},
+			{3, 6, 6, "죽창", "ead37244e3c14a4ca48b2b053c6ee405", "twohandweapon"},
+			{3, 6, 8, "삼지창", "5c067263f57e4c2caed7c3b0c782da57", "twohandweapon"},
+			{3, 6, 10, "나카마키", "72ebf19a38fd48148c8edb6d7e903fb5", "twohandweapon"},
+			{3, 6, 12, "제코", "270d3a67004d4ff784801ee6f1ec77b9", "twohandweapon"},
+			{3, 6, 14, "장팔사모", "7990ebdf5b7840aea70cae249750be34", "twohandweapon"},
+			{3, 6, 16, "메이플 스피어", "a911d7794deb4d04a32188b55eda32ab", "twohandweapon"},
+			{3, 6, 18, "낚싯대", "f5a279e6b90449268ab74c7a59e0db42", "twohandweapon"},
+			{3, 6, 20, "메이플 베리트 스피어", "61066ad81ce34351b78e52ae319cd21c", "twohandweapon"},
+			{3, 6, 22, "십자창", "b8816cebb8884f0b8abcd941d36d026b", "twohandweapon"},
+			{3, 6, 24, "스페판", "0a37c1661a8447dc88256730fa49843e", "twohandweapon"},
+			{3, 6, 26, "호진공창", "ce25ffa938ae4eb882c1c0f613c32e0c", "twohandweapon"},
+			{3, 6, 28, "페어프로즌", "d9e4890899bf4a1896bed995ec3b11c6", "twohandweapon"},
+			{3, 6, 30, "피나카", "c839782bc3ab45a2946f26d240c101e4", "twohandweapon"},
+			{3, 6, 32, "드래곤 팔티잔", "3e91590c97604521b64d4ee29434e891", "twohandweapon"},
+			{3, 6, 34, "타임리스 알슈피스", "164067c82a8347d681cf49a8be3db5df", "twohandweapon"},
+			{3, 6, 36, "라이온하트 푸스키나", "0b6ac31cf54f43fb8121a67e2a9c4d4d", "twohandweapon"},
+			{3, 6, 38, "파프니르 브류나크", "c752f89e7e3f4b689743d2514c6be098", "twohandweapon"},
+			{3, 6, 40, "앱솔랩스 피어싱스피어", "0018e268ee3540459f31d623be363a82", "twohandweapon"},
+			{3, 6, 42, "아케인셰이드 스피어", "c316fbaaafb04cc1bab7cb9cf635b2cc", "twohandweapon"},
+			{3, 6, 44, "봉인된 제네시스 스피어", "a0c741eb5b1c479bb7a9564fb517b324", "twohandweapon"},
+			{1, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{2, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{3, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{1, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{2, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{3, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{1, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{2, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{3, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{1, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{2, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{3, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{1, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{2, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{3, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{1, 8, 25, "빨간색 모험가의 망토", "724a9e818ddd41ba9825b6fcce789521", "cape"},
+			{3, 8, 25, "검은색 모험가의 망토", "04458a90640c424bbbe3921952dda263", "cape"},
+			{2, 8, 25, "갈색 모험가의 망토", "2ee3c4719c7a42918a543a7eea4c21a1", "cape"},
+			{1, 8, 30, "빨간색 세라프의 망토", "4bec629a08ea405ab4c70dec185a66b4", "cape"},
+			{3, 8, 30, "검은색 세라프의 망토", "08879b8c46ea43fa8206b22dff8fce97", "cape"},
+			{2, 8, 30, "흰색 세라프의 망토", "94fb777efd0e4ea483aa16152e1715ce", "cape"},
+			{1, 8, 35, "시리우스 망토", "b727c091ceb74028b6bad2668d49d6d0", "cape"},
+			{2, 8, 35, "시리우스 망토", "b727c091ceb74028b6bad2668d49d6d0", "cape"},
+			{3, 8, 35, "시리우스 망토", "b727c091ceb74028b6bad2668d49d6d0", "cape"},
+			{1, 5, 0, "가죽 샌들", "202544d7095c42c5bfb3046619ab58cc", "shoes"},
+			{2, 5, 0, "가죽 샌들", "202544d7095c42c5bfb3046619ab58cc", "shoes"},
+			{3, 5, 0, "가죽 샌들", "202544d7095c42c5bfb3046619ab58cc", "shoes"},
+			{1, 5, 5, "브론즈 그리브", "1dd86bece9b44f30bc9ae72381401f38", "shoes"},
+			{2, 5, 5, "브론즈 그리브", "1dd86bece9b44f30bc9ae72381401f38", "shoes"},
+			{3, 5, 5, "브론즈 그리브", "1dd86bece9b44f30bc9ae72381401f38", "shoes"},
+			{1, 5, 10, "다크 워 부츠", "2a67053e769041df8329001ecba64224", "shoes"},
+			{2, 5, 10, "다크 워 부츠", "2a67053e769041df8329001ecba64224", "shoes"},
+			{3, 5, 10, "다크 워 부츠", "2a67053e769041df8329001ecba64224", "shoes"},
+			{1, 5, 15, "블러드 카멜부츠", "74fbfcb794d64602b53ab05d413fed6b", "shoes"},
+			{3, 5, 15, "오리할콘 카멜부츠", "a656cd0c50ff4d60ae791b4926b0c881", "shoes"},
+			{2, 5, 15, "사파이어 카멜부츠", "b1f5ac2f84364ce281b25fdfee5eb5ec", "shoes"},
+			{1, 5, 20, "블루 드래곤 부츠", "67d58171ad3d4f9a856d3db3281715f7", "shoes"},
+			{2, 5, 20, "블루 드래곤 부츠", "67d58171ad3d4f9a856d3db3281715f7", "shoes"},
+			{3, 5, 20, "블루 드래곤 부츠", "67d58171ad3d4f9a856d3db3281715f7", "shoes"},
+			{1, 5, 25, "타임리스 그라베", "f6029c9d6d95450d9282de9b5b13dcd7", "shoes"},
+			{2, 5, 25, "타임리스 그라베", "f6029c9d6d95450d9282de9b5b13dcd7", "shoes"},
+			{3, 5, 25, "타임리스 그라베", "f6029c9d6d95450d9282de9b5b13dcd7", "shoes"},
+			{1, 5, 30, "아가레스 블러디부츠", "8d71c8232f374ee18a60e136c3b89aa8", "shoes"},
+			{2, 5, 30, "아가레스 블러디부츠", "8d71c8232f374ee18a60e136c3b89aa8", "shoes"},
+			{3, 5, 30, "아가레스 블러디부츠", "8d71c8232f374ee18a60e136c3b89aa8", "shoes"},
+			{1, 5, 35, "라이온하트 배틀부츠", "3fd8a4625af342da9e89453b1c06cfb3", "shoes"},
+			{2, 5, 35, "라이온하트 배틀부츠", "3fd8a4625af342da9e89453b1c06cfb3", "shoes"},
+			{3, 5, 35, "라이온하트 배틀부츠", "3fd8a4625af342da9e89453b1c06cfb3", "shoes"},
+			{1, 3, 0, "빨간색 검도복", "834a166ce75747e9af502faa641f9ef6", "longcoat"},
+			{3, 3, 0, "흰색 검도복", "c19246603ccf4c19a1aa6cfcc72d1222", "longcoat"},
+			{2, 3, 0, "파란색 검도복", "b948261f5f6f445887eff1c1243115cc", "longcoat"},
+			{1, 3, 5, "흑룡포", "6e679a8002d941079c247b832278c8e7", "longcoat"},
+			{2, 3, 5, "흑룡포", "6e679a8002d941079c247b832278c8e7", "longcoat"},
+			{3, 3, 5, "흑룡포", "6e679a8002d941079c247b832278c8e7", "longcoat"},
+			{1, 3, 10, "파란색 가운", "3981fe513b8a43e1a1f0b58807aa7792", "longcoat"},
+			{2, 3, 10, "파란색 가운", "3981fe513b8a43e1a1f0b58807aa7792", "longcoat"},
+			{3, 3, 10, "파란색 가운", "3981fe513b8a43e1a1f0b58807aa7792", "longcoat"},
+			{1, 3, 15, "레드 배틀로드", "29fefb108a0647ec92239fc876af421b", "longcoat"},
+			{3, 3, 15, "다크 배틀로드", "8901e13d816c4afeb707dc2cce4a5e1c", "longcoat"},
+			{2, 3, 15, "블루 배틀로드", "60df4fffa42148b3a8930a43851a5d8a", "longcoat"},
+			{1, 3, 20, "블루 드래곤 아머", "a061b02e24214352bbb73b4d483e8d5d", "longcoat"},
+			{2, 3, 20, "블루 드래곤 아머", "a061b02e24214352bbb73b4d483e8d5d", "longcoat"},
+			{3, 3, 20, "블루 드래곤 아머", "a061b02e24214352bbb73b4d483e8d5d", "longcoat"},
+			{1, 3, 25, "막스 반 레온 배틀슈트", "6f8d6da40d11468d9fb0d296d9811d0c", "longcoat"},
+			{2, 3, 25, "막스 반 레온 배틀슈트", "6f8d6da40d11468d9fb0d296d9811d0c", "longcoat"},
+			{3, 3, 25, "막스 반 레온 배틀슈트", "6f8d6da40d11468d9fb0d296d9811d0c", "longcoat"},
+			{1, 3, 30, "타임리스 타라곤", "6cadc72275ae429eb3e1ac5493428a35", "longcoat"},
+			{2, 3, 30, "타임리스 타라곤", "6cadc72275ae429eb3e1ac5493428a35", "longcoat"},
+			{3, 3, 30, "타임리스 타라곤", "6cadc72275ae429eb3e1ac5493428a35", "longcoat"},
+			{1, 3, 35, "라이온하트 배틀메일", "1e7379dd52c048bab553fb8ed281cb6c", "longcoat"},
+			{2, 3, 35, "라이온하트 배틀메일", "1e7379dd52c048bab553fb8ed281cb6c", "longcoat"},
+			{3, 3, 35, "라이온하트 배틀메일", "1e7379dd52c048bab553fb8ed281cb6c", "longcoat"},
+			{1, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{2, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{3, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{1, 9, 5, "설빙의 장갑", "f4c17a43adb449f2a75ca99dc39fbfd5", "glove"},
+			{2, 9, 5, "설빙의 장갑", "f4c17a43adb449f2a75ca99dc39fbfd5", "glove"},
+			{3, 9, 5, "설빙의 장갑", "f4c17a43adb449f2a75ca99dc39fbfd5", "glove"},
+			{1, 9, 10, "다크 너클", "44ac1b320dc6403fb5a2eba84f11e539", "glove"},
+			{2, 9, 10, "다크 너클", "44ac1b320dc6403fb5a2eba84f11e539", "glove"},
+			{3, 9, 10, "다크 너클", "44ac1b320dc6403fb5a2eba84f11e539", "glove"},
+			{1, 9, 15, "블러드 엠페러", "cff005cb4fd04c7b87693be84992e88e", "glove"},
+			{3, 9, 15, "다크 엠페러", "5ddf1dc72f81467e8f86f8c119768cc3", "glove"},
+			{2, 9, 15, "사파이어 엠페러", "b45a53117fef421c8d56a506df51063c", "glove"},
+			{1, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{2, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{3, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{1, 9, 25, "아가레스 블러디 건틀렛", "6dcdd0547237457fbe70b88fc0f0ae08", "glove"},
+			{2, 9, 25, "아가레스 블러디 건틀렛", "6dcdd0547237457fbe70b88fc0f0ae08", "glove"},
+			{3, 9, 25, "아가레스 블러디 건틀렛", "6dcdd0547237457fbe70b88fc0f0ae08", "glove"},
+			{1, 9, 30, "그린 코르뱅", "be7a46aae6774493be95ca5df6f010ab", "glove"},
+			{3, 9, 30, "다크 코르뱅", "59cf08d4e27c41cea548d6c6df8194a7", "glove"},
+			{2, 9, 30, "블루 코르뱅", "201a381a72df43908ea57f692e009968", "glove"},
+			{1, 9, 35, "라이온하트 배틀브레이서", "aee8072cfcc94224941b37e7d32c7ff1", "glove"},
+			{2, 9, 35, "라이온하트 배틀브레이서", "aee8072cfcc94224941b37e7d32c7ff1", "glove"},
+			{3, 9, 35, "라이온하트 배틀브레이서", "aee8072cfcc94224941b37e7d32c7ff1", "glove"},
+			{1, 7, 0, "빨간색 머리띠", "8c38474b97ed460ca3bccc52c3ec3634", "cap"},
+			{3, 7, 0, "검은색 머리띠", "3b935d6199c941ee80f24fb555dfbfd1", "cap"},
+			{2, 7, 0, "노란색 머리띠", "f39e170f39094bcbae39bae334568a06", "cap"},
+			{1, 7, 2, "브론즈 코이프", "a3d4e926400640deafcd453d1cf50899", "cap"},
+			{2, 7, 2, "브론즈 코이프", "a3d4e926400640deafcd453d1cf50899", "cap"},
+			{3, 7, 2, "브론즈 코이프", "a3d4e926400640deafcd453d1cf50899", "cap"},
+			{1, 7, 4, "브론즈 캡", "a4f30c91591a4de287faacc5cb9f2b75", "cap"},
+			{2, 7, 4, "브론즈 캡", "a4f30c91591a4de287faacc5cb9f2b75", "cap"},
+			{3, 7, 4, "브론즈 캡", "a4f30c91591a4de287faacc5cb9f2b75", "cap"},
+			{1, 7, 6, "브론즈 풀 헬름", "51e9d8c51e054282ac7740c1dcfc9830", "cap"},
+			{2, 7, 6, "브론즈 풀 헬름", "51e9d8c51e054282ac7740c1dcfc9830", "cap"},
+			{3, 7, 6, "브론즈 풀 헬름", "51e9d8c51e054282ac7740c1dcfc9830", "cap"},
+			{1, 7, 8, "브론즈 바이킹 헬름", "b365cb5fab2641a183a3ffcd37a4e626", "cap"},
+			{2, 7, 8, "브론즈 바이킹 헬름", "b365cb5fab2641a183a3ffcd37a4e626", "cap"},
+			{3, 7, 8, "브론즈 바이킹 헬름", "b365cb5fab2641a183a3ffcd37a4e626", "cap"},
+			{1, 7, 10, "아이언 버거넷 헬름", "c2e69217b08846e3ba4fc5a334699c25", "cap"},
+			{2, 7, 10, "아이언 버거넷 헬름", "c2e69217b08846e3ba4fc5a334699c25", "cap"},
+			{3, 7, 10, "아이언 버거넷 헬름", "c2e69217b08846e3ba4fc5a334699c25", "cap"},
+			{1, 7, 12, "파란색 삿갓", "255f54dfe98949cc9afec514c6cd40a6", "cap"},
+			{2, 7, 12, "파란색 삿갓", "255f54dfe98949cc9afec514c6cd40a6", "cap"},
+			{3, 7, 12, "파란색 삿갓", "255f54dfe98949cc9afec514c6cd40a6", "cap"},
+			{1, 7, 14, "주스팅", "60f5b75749894b2cb91f4e9ada01bb7b", "cap"},
+			{2, 7, 14, "주스팅", "60f5b75749894b2cb91f4e9ada01bb7b", "cap"},
+			{3, 7, 14, "주스팅", "60f5b75749894b2cb91f4e9ada01bb7b", "cap"},
+			{1, 7, 16, "레드 그레이트 헬멧", "95d76452de9c421ebfbb3d87b8039f2a", "cap"},
+			{3, 7, 16, "브라운 그레이트 헬멧", "c4cf8e607afc44bca67e805c2710fbd9", "cap"},
+			{2, 7, 16, "블루 그레이트 헬멧", "2a41dbffad5543b0b4da1c86583b8968", "cap"},
+			{1, 7, 18, "레드 듀크", "15d2df64a99c475ab593592936cd0d19", "cap"},
+			{3, 7, 18, "옐로우 듀크", "7799dfe1cd1e486c930278f3abd6c4d8", "cap"},
+			{2, 7, 18, "블루 듀크", "969586911ab244369cef89d66460e606", "cap"},
+			{1, 7, 20, "골드 노르만 헬름", "6a759362884149bbbba905832cb8859c", "cap"},
+			{2, 7, 20, "골드 노르만 헬름", "6a759362884149bbbba905832cb8859c", "cap"},
+			{3, 7, 20, "골드 노르만 헬름", "6a759362884149bbbba905832cb8859c", "cap"},
+			{1, 7, 22, "본 헬름", "25d29fc9b06f401f8070e9ec955cb1e2", "cap"},
+			{2, 7, 22, "본 헬름", "25d29fc9b06f401f8070e9ec955cb1e2", "cap"},
+			{3, 7, 22, "본 헬름", "25d29fc9b06f401f8070e9ec955cb1e2", "cap"},
+			{1, 7, 24, "브론즈 크루세이더 헬름", "1147bf323fb74b949312a89dc350f506", "cap"},
+			{2, 7, 24, "브론즈 크루세이더 헬름", "1147bf323fb74b949312a89dc350f506", "cap"},
+			{3, 7, 24, "브론즈 크루세이더 헬름", "1147bf323fb74b949312a89dc350f506", "cap"},
+			{1, 7, 26, "낡은 브론즈 노르만 헬름", "5c80c3fc22374005a31c8526e4641a61", "cap"},
+			{2, 7, 26, "낡은 브론즈 노르만 헬름", "5c80c3fc22374005a31c8526e4641a61", "cap"},
+			{3, 7, 26, "낡은 브론즈 노르만 헬름", "5c80c3fc22374005a31c8526e4641a61", "cap"},
+			{1, 7, 28, "레드 오리엔트 헬멧", "435f83d6692f4508bfafe8c86c090ea1", "cap"},
+			{2, 7, 28, "레드 오리엔트 헬멧", "435f83d6692f4508bfafe8c86c090ea1", "cap"},
+			{3, 7, 28, "레드 오리엔트 헬멧", "435f83d6692f4508bfafe8c86c090ea1", "cap"},
+			{1, 7, 30, "실버 플레닛", "cef69afbfbef4b47bfa69b349e05ec92", "cap"},
+			{2, 7, 30, "실버 플레닛", "cef69afbfbef4b47bfa69b349e05ec92", "cap"},
+			{3, 7, 30, "실버 플레닛", "cef69afbfbef4b47bfa69b349e05ec92", "cap"},
+			{1, 7, 32, "레드 드래곤 바부타", "2ea6022b03084c47aa81a077f78d593e", "cap"},
+			{3, 7, 32, "다크 드래곤 바부타", "73d227f7a0e1429b8709577da0a4d291", "cap"},
+			{2, 7, 32, "블루 드래곤 바부타", "f93c3a1d754e4b6f8f919d44ba713986", "cap"},
+			{1, 7, 34, "그린 니르첸 투구", "25b6f4b6857543c6916f433d7f5a978a", "cap"},
+			{3, 7, 34, "다크 니르첸 투구", "bb7f209f3e1641af9c9706c05f12a880", "cap"},
+			{2, 7, 34, "블루 니르첸 투구", "f268bff93764478da6e6c7699e6416ae", "cap"},
+			{1, 7, 36, "블루 드래곤 투구", "e91a68c0c40f48f0aa5717b3870d2c9d", "cap"},
+			{2, 7, 36, "블루 드래곤 투구", "e91a68c0c40f48f0aa5717b3870d2c9d", "cap"},
+			{3, 7, 36, "블루 드래곤 투구", "e91a68c0c40f48f0aa5717b3870d2c9d", "cap"},
+			{1, 7, 38, "막스 반 레온 헬멧", "bfb70a37a45b48c7ba1af2355d65d989", "cap"},
+			{2, 7, 38, "막스 반 레온 헬멧", "bfb70a37a45b48c7ba1af2355d65d989", "cap"},
+			{3, 7, 38, "막스 반 레온 헬멧", "bfb70a37a45b48c7ba1af2355d65d989", "cap"},
+			{1, 7, 40, "타임리스 휀넬", "1e9a8e362fa54f67a280ad35d1e78557", "cap"},
+			{2, 7, 40, "타임리스 휀넬", "1e9a8e362fa54f67a280ad35d1e78557", "cap"},
+			{3, 7, 40, "타임리스 휀넬", "1e9a8e362fa54f67a280ad35d1e78557", "cap"},
+			{1, 7, 42, "아가레스 블러디 기어", "a4208d62bff94a5c91413c65ae6e0c77", "cap"},
+			{2, 7, 42, "아가레스 블러디 기어", "a4208d62bff94a5c91413c65ae6e0c77", "cap"},
+			{3, 7, 42, "아가레스 블러디 기어", "a4208d62bff94a5c91413c65ae6e0c77", "cap"},
+			{1, 7, 44, "라이온하트 배틀헬름", "7f2eac32e9214544822c6e8bf1f7177c", "cap"},
+			{2, 7, 44, "라이온하트 배틀헬름", "7f2eac32e9214544822c6e8bf1f7177c", "cap"},
+			{3, 7, 44, "라이온하트 배틀헬름", "7f2eac32e9214544822c6e8bf1f7177c", "cap"},
+			-- 궁수 2직업: 장비 외형 궁수.txt. 미일치 12개 이름은 승인된 MSW 등록 후보로 대체.
+			{8, 6, 0, "워 보우", "3ffe515570ad435caa397ca0f2e2f83b", "twohandweapon"},
+			{8, 6, 2, "합금 활", "33f389c9f73e45dc9c55a251b3cc2646", "twohandweapon"},
+			{8, 6, 4, "사냥꾼의 활", "67ce4147813d49f5975917ee86777950", "twohandweapon"},
+			{8, 6, 6, "라이덴", "481f35a5516742119214754e508a7ac5", "twohandweapon"},
+			{8, 6, 8, "배틀 보우", "b38cb173f5554259aeafaeb9f7afd948", "twohandweapon"},
+			{8, 6, 10, "발터2000", "306fcb1c0589418d81e1766502acb56e", "twohandweapon"},
+			{8, 6, 12, "메이플 보우", "edde225a13754c149f7191fd8a2dac35", "twohandweapon"},
+			{8, 6, 14, "레드 바이퍼", "d1df8ca59a99400c97a98668c183b283", "twohandweapon"},
+			{8, 6, 16, "메이플 헌터스", "34937fcedab6474b94ed08cd224ebff0", "twohandweapon"},
+			{8, 6, 18, "봉황위궁", "9103f26880c84f6d992a23fd107ce2f5", "twohandweapon"},
+			{8, 6, 20, "메이플 간디바 보우", "4ed546c010ec449983b4edd63a129ac5", "twohandweapon"},
+			{8, 6, 22, "골든 힌켈", "a837019832254702b1c56319c6b1abe9", "twohandweapon"},
+			{8, 6, 24, "다크 아룬드", "4221533996834439979ed3381d134a25", "twohandweapon"},
+			{8, 6, 26, "메투스", "1a66da6b342e4440a5d15bea3a971a2e", "twohandweapon"},
+			{8, 6, 28, "화이트 니스록", "eb6d9dda10ea4b068c447ee6bfd1829f", "twohandweapon"},
+			{8, 6, 30, "드래곤 샤인보우", "ed83963681d448f08ecad5d78292d08e", "twohandweapon"},
+			{8, 6, 32, "바리사다", "cce6bbbb3abb4d77abd389f57c298189", "twohandweapon"},
+			{8, 6, 34, "타임리스 엔가우", "9e8fe977ff9540d180f3f08dc420d087", "twohandweapon"},
+			{8, 6, 36, "팔콘윙 컴포지트 보우", "68a32d50881844a2af05a0fc9961763a", "twohandweapon"},
+			{8, 6, 38, "파프니르 윈드체이서", "2f9973b7ae8a498ca2ca06be53ebc8d5", "twohandweapon"},
+			{8, 6, 40, "앱솔랩스 슈팅보우", "70c9507a004e423785216e18cad84a3f", "twohandweapon"},
+			{8, 6, 42, "아케인셰이드 보우", "2376e3b2ed9d4ce3ab04a7b014b868dc", "twohandweapon"},
+			{8, 6, 44, "봉인된 제네시스 보우", "5b06fe8bd2954256bf1d631be5f41879", "twohandweapon"},
+			{7, 6, 0, "석궁", "8601845b98014cec9b336041be103015", "twohandweapon"},
+			{7, 6, 2, "산양 석궁", "44e827e170a14c5786a4848d473af35a", "twohandweapon"},
+			{7, 6, 4, "전투 석궁", "e050f266abca42609d2280de7d577a9b", "twohandweapon"},
+			{7, 6, 6, "발란쉐", "4ab0633c7203404d8f3b2f8ff81cadb6", "twohandweapon"},
+			{7, 6, 8, "이글크로", "d1451194e7324ff29c855ea967240f91", "twohandweapon"},
+			{7, 6, 10, "메이플 크로우", "7176fdd3f47f4dada59f87a870b84a07", "twohandweapon"},
+			{7, 6, 12, "헤클러", "aee570c196c040fa9fa1ecb87dd415cb", "twohandweapon"},
+			{7, 6, 14, "메이플 크로스보우", "ad3ef3c5834f4aa2803d6719bb7ea6e7", "twohandweapon"},
+			{7, 6, 16, "실버 크로우", "788b8b278963426089a1d42365a71c4b", "twohandweapon"},
+			{7, 6, 18, "로우어", "d4fe89b2cafc42fbb0f61bf142533a5b", "twohandweapon"},
+			{7, 6, 20, "골든 크로우", "785e404e29af4521ac5786e7ba819d56", "twohandweapon"},
+			{7, 6, 22, "메이플 니샤다", "21aa9774425f43008d7bcbcfbf925ccd", "twohandweapon"},
+			{7, 6, 24, "그로스야거", "fd4b47b313794e7b8ab953499f203a06", "twohandweapon"},
+			{7, 6, 26, "다크 샬리트", "b311052eca374fd5acf8d9768563c778", "twohandweapon"},
+			{7, 6, 28, "카사 크로우", "27a88238bef643349e000c7a323eb400", "twohandweapon"},
+			{7, 6, 30, "화이트 네쉐르", "20466263d9b845509f1f2cc9dd898357", "twohandweapon"},
+			{7, 6, 32, "드래곤 샤인크로스", "e0d7ef5dc8ac49739773362f09090f35", "twohandweapon"},
+			{7, 6, 34, "타임리스 블랙뷰티", "24bd03c3d62c4006aaf79811589165b9", "twohandweapon"},
+			{7, 6, 36, "팔콘윙 헤비크로스보우", "94108135333848fba90f3076da486d0f", "twohandweapon"},
+			{7, 6, 38, "파프니르 윈드윙슈터", "2d57a5dc537a418d8aff7ddaa93ce552", "twohandweapon"},
+			{7, 6, 40, "앱솔랩스 크로스보우", "3c3f3d6582484d309524a6af3c53985d", "twohandweapon"},
+			{7, 6, 42, "아케인셰이드 크로스보우", "3834b8f4da2c4750918d04b9d089e431", "twohandweapon"},
+			{7, 6, 44, "봉인된 제네시스 크로스보우", "96f2982a93d64e29822d1b00f8f8a05e", "twohandweapon"},
+			{7, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{8, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{7, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{8, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{7, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{8, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{7, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{8, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{7, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{8, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{7, 8, 25, "빨간색 모험가의 망토", "724a9e818ddd41ba9825b6fcce789521", "cape"},
+			{8, 8, 25, "갈색 모험가의 망토", "2ee3c4719c7a42918a543a7eea4c21a1", "cape"},
+			{7, 8, 30, "빨간색 세라프의 망토", "4bec629a08ea405ab4c70dec185a66b4", "cape"},
+			{8, 8, 30, "흰색 세라프의 망토", "94fb777efd0e4ea483aa16152e1715ce", "cape"},
+			{7, 8, 35, "시리우스 망토", "b727c091ceb74028b6bad2668d49d6d0", "cape"},
+			{8, 8, 35, "시리우스 망토", "b727c091ceb74028b6bad2668d49d6d0", "cape"},
+			{7, 5, 0, "파란색 고무 장화", "1caf1454526742ffb9691a0b09800af7", "shoes"},
+			{8, 5, 0, "파란색 고무 장화", "1caf1454526742ffb9691a0b09800af7", "shoes"},
+			{7, 5, 5, "브라운 우드탑", "1a7f73e7e8b6443e992afe62d173961b", "shoes"},
+			{8, 5, 5, "브라운 우드탑", "1a7f73e7e8b6443e992afe62d173961b", "shoes"},
+			{7, 5, 10, "빨간색 가죽 구두", "09e1b97cc131471480d8bcf8adbc1b77", "shoes"},
+			{8, 5, 10, "주황색 가죽 구두", "9b17170c9a8e4e20bf6e9469238b23cb", "shoes"},
+			{7, 5, 15, "다크 윙부츠", "add78b845288460c99f02123f0579185", "shoes"},
+			{8, 5, 15, "그린 윙부츠", "59d1c7da60054c5986373a60922dece6", "shoes"},
+			{7, 5, 20, "레드 아르나슈즈", "c38b931ec2b94ca98ad7c8098216407a", "shoes"},
+			{8, 5, 20, "그린 아르나슈즈", "c6019ce8b8ab4f75877b5f87b32e336a", "shoes"},
+			{7, 5, 25, "타임리스 론타노", "eae4a562c0bf40b994bbc4261b34003b", "shoes"},
+			{8, 5, 25, "타임리스 론타노", "eae4a562c0bf40b994bbc4261b34003b", "shoes"},
+			{7, 5, 30, "아가레스 블러디부츠", "8d71c8232f374ee18a60e136c3b89aa8", "shoes"},
+			{8, 5, 30, "아가레스 블러디부츠", "8d71c8232f374ee18a60e136c3b89aa8", "shoes"},
+			{7, 5, 35, "팔콘윙 센티널부츠", "fb3c10dc52e045cc868f563ac7051e53", "shoes"},
+			{8, 5, 35, "팔콘윙 센티널부츠", "fb3c10dc52e045cc868f563ac7051e53", "shoes"},
+			{7, 3, 0, "레드 오버롤 미니", "1cc3baa17c8a494993ad291d61d2d316", "longcoat"},
+			{8, 3, 0, "그린 오버롤 팬츠", "cfd4440bd412416cb0e6ca2448e4bee0", "longcoat"},
+			{7, 3, 5, "모험가의 루이마리", "b96107b74b5543539c75865b15c69d6c", "longcoat"},
+			{8, 3, 5, "모험가의 레골라스 슈트", "b59f85e458ee48bbb64b6bfa22682f52", "longcoat"},
+			{7, 3, 10, "구름 로브", "99ad076afd8b4817803518cc7b28df40", "longcoat"},
+			{8, 3, 10, "구름 로브", "99ad076afd8b4817803518cc7b28df40", "longcoat"},
+			{7, 3, 15, "적선백궁", "f1a54fbd50d24b479201f5d9571b175a", "longcoat"},
+			{8, 3, 15, "청선백궁", "e4dbe6288ade4e1bbca776137db39db1", "longcoat"},
+			{7, 3, 20, "다크 프리아", "fb6e3eba1e3e444eb11781e8002ed0bf", "longcoat"},
+			{8, 3, 20, "그린 프리아", "6d2a334b5e1e4265b7eec7dd40094988", "longcoat"},
+			{7, 3, 25, "레드 맨틀", "1c24c33bf19445309920d4619fd9c3ed", "longcoat"},
+			{8, 3, 25, "레드 맨틀", "1c24c33bf19445309920d4619fd9c3ed", "longcoat"},
+			{7, 3, 30, "타임리스 에버뉴", "11587251a5624be4b1b86bc40e4364a0", "longcoat"},
+			{8, 3, 30, "타임리스 에버뉴", "11587251a5624be4b1b86bc40e4364a0", "longcoat"},
+			{7, 3, 35, "팔콘윙 센티널슈트", "5bb578fc62c149068511816bb64b4270", "longcoat"},
+			{8, 3, 35, "팔콘윙 센티널슈트", "5bb578fc62c149068511816bb64b4270", "longcoat"},
+			{7, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{8, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{7, 9, 5, "설빙의 장갑", "f4c17a43adb449f2a75ca99dc39fbfd5", "glove"},
+			{8, 9, 5, "설빙의 장갑", "f4c17a43adb449f2a75ca99dc39fbfd5", "glove"},
+			{7, 9, 10, "다크 사바타", "5a0375159b634d89bb1981b4c86e2a2b", "glove"},
+			{8, 9, 10, "다크 사바타", "5a0375159b634d89bb1981b4c86e2a2b", "glove"},
+			{7, 9, 15, "다크 아이즈", "06645c3a6c6d472c95cf19420fb71295", "glove"},
+			{8, 9, 15, "블루 아이즈", "e8273403b126438d8f02f04a697b2857", "glove"},
+			{7, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{8, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{7, 9, 25, "레드 아르시나", "857a75d236fa40218559d763d376084e", "glove"},
+			{8, 9, 25, "그린 아르시나", "89c364cc86194fe2bbbcd721c9bfd2f9", "glove"},
+			{7, 9, 30, "타임리스 프레스토", "1e45d70f228d4ba28b8f3d90352943aa", "glove"},
+			{8, 9, 30, "타임리스 프레스토", "1e45d70f228d4ba28b8f3d90352943aa", "glove"},
+			{7, 9, 35, "팔콘윙 센티널글러브", "6979437698a24d358b62a872c12ae7b7", "glove"},
+			{8, 9, 35, "팔콘윙 센티널글러브", "6979437698a24d358b62a872c12ae7b7", "glove"},
+			{7, 7, 0, "검은색 머리띠", "3b935d6199c941ee80f24fb555dfbfd1", "cap"},
+			{8, 7, 0, "연두색 머리띠", "274b50c184c047d8abf1b520c958ce98", "cap"},
+			{7, 7, 2, "초록색 고급 가죽 모자", "c0c01ebb890f41dfb73bd80888212dcc", "cap"},
+			{8, 7, 2, "초록색 고급 가죽 모자", "c0c01ebb890f41dfb73bd80888212dcc", "cap"},
+			{7, 7, 4, "레드 페더햇", "39886d8f65a04435ac6b86a643fa290d", "cap"},
+			{8, 7, 4, "브라운 페더햇", "cd5f9397f52c4822b5feccf6f4d0c4e6", "cap"},
+			{7, 7, 6, "블루 헌트", "43368c1733054536b6f1f761f9175cf2", "cap"},
+			{8, 7, 6, "그린 헌트", "fc48ae17f3c2494380cafc0c6efcee4a", "cap"},
+			{7, 7, 8, "빨간색 별 두건", "bfb7bf36f4254701bef36df9c5e287c8", "cap"},
+			{8, 7, 8, "빨간색 별 두건", "bfb7bf36f4254701bef36df9c5e287c8", "cap"},
+			{7, 7, 10, "갈색 삿갓", "226a2cbcb6dc42be9ea5851a269570ba", "cap"},
+			{8, 7, 10, "갈색 삿갓", "226a2cbcb6dc42be9ea5851a269570ba", "cap"},
+			{7, 7, 12, "레드 헌트", "9ed60459e38444939f0bf39e2de38108", "cap"},
+			{8, 7, 12, "브라운 헌트", "1a609c2bc2c04c57b3f0037d0629b2b8", "cap"},
+			{7, 7, 14, "레드 폴레패더햇", "ba443640137441a58aabab61d4e37f6d", "cap"},
+			{8, 7, 14, "그린 폴레패더햇", "1cf81d3439ba40fdab6bd6f62d4b765c", "cap"},
+			{7, 7, 16, "적마로", "56f17cbe7d7a41e38554d4e6e7dc9ff4", "cap"},
+			{8, 7, 16, "녹마로", "0ae6edeffc6b4b8696c16a3f073c1c14", "cap"},
+			{7, 7, 18, "적궁우", "79aff4cc36a5400e871c75f95bd9f8af", "cap"},
+			{8, 7, 18, "토궁우", "c561ab301e614d3988dd88004209e345", "cap"},
+			{7, 7, 20, "백궁우", "681d2bfbca8141d1a8eae87717ba420a", "cap"},
+			{8, 7, 20, "백궁우", "681d2bfbca8141d1a8eae87717ba420a", "cap"},
+			{7, 7, 22, "다크 웨어캡", "7737e3580dc743efb8d546c85d381152", "cap"},
+			{8, 7, 22, "그린 웨어캡", "8f5f8d5435cf4f97887fe39d606630f6", "cap"},
+			{7, 7, 24, "레드 골드윙캡", "8b59b630481d46ea8e78014c360b5049", "cap"},
+			{8, 7, 24, "그린 골드윙캡", "4602afd937db420a85c831c13cf208ae", "cap"},
+			{7, 7, 26, "레드 아데스햇", "48c44ce512724270802df64235c49dc4", "cap"},
+			{8, 7, 26, "그린 아데스햇", "f3818e4e50714f05a685e767f73aab60", "cap"},
+			{7, 7, 28, "레드 아르나햇", "75b4dd33fd784698957709ef8c41d880", "cap"},
+			{8, 7, 28, "그린 아르나햇", "c50cdd36cc394de7a57b71eb3e341586", "cap"},
+			{7, 7, 30, "레드 헌터", "4f0d07c4571244f9b9a8c3f6c392265f", "cap"},
+			{8, 7, 30, "레드 헌터", "4f0d07c4571244f9b9a8c3f6c392265f", "cap"},
+			{7, 7, 32, "타임리스 라피드", "b69deecec4bd434a91adc9483a31173e", "cap"},
+			{8, 7, 32, "타임리스 라피드", "b69deecec4bd434a91adc9483a31173e", "cap"},
+			{7, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{8, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{7, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{8, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{7, 7, 38, "시간여행자의 써클렛", "d7d955750ed547e08a78797a9c9caff1", "cap"},
+			{8, 7, 38, "시간여행자의 써클렛", "d7d955750ed547e08a78797a9c9caff1", "cap"},
+			{7, 7, 40, "스칼리온 모자", "0e55dad1f2d947a2b913f318840c1547", "cap"},
+			{8, 7, 40, "스칼리온 모자", "0e55dad1f2d947a2b913f318840c1547", "cap"},
+			{7, 7, 42, "막스 반 레온 헬멧", "bfb70a37a45b48c7ba1af2355d65d989", "cap"},
+			{8, 7, 42, "막스 반 레온 헬멧", "bfb70a37a45b48c7ba1af2355d65d989", "cap"},
+			{7, 7, 44, "팔콘윙 센티널캡", "5113da1f83c545679f9ea1dc0ede6832", "cap"},
+			{8, 7, 44, "팔콘윙 센티널캡", "5113da1f83c545679f9ea1dc0ede6832", "cap"},
+			-- 마법사 3직업: 수정된 2강/26강 배정과 승인된 대체 외형을 반영한다.
+			-- 42강 모자는 사용자 지정 대체 외형인 메모리얼 엔젤을 사용한다.
+			{4, 3, 0, "그린 오버롤 팬츠", "cfd4440bd412416cb0e6ca2448e4bee0", "longcoat"},
+			{4, 3, 5, "베이지 플레로브", "d913fb3c2f5442baa86eb9284c225a3a", "longcoat"},
+			{4, 3, 10, "구름 로브", "99ad076afd8b4817803518cc7b28df40", "longcoat"},
+			{4, 3, 15, "화이트 아나카문", "2595cbd0ecf5439fb620201b21b477e3", "longcoat"},
+			{4, 3, 20, "다크 바즈라", "28b36ba9dcb64d44942af79a04480ebc", "longcoat"},
+			{4, 3, 25, "블랙 로타네브", "6b187262abb6465c9a09886f95e7d47b", "longcoat"},
+			{4, 3, 30, "타임리스 미스트 블루", "e86656c2b9704c8bbb128e0551f33557", "longcoat"},
+			{4, 3, 35, "드래곤테일 메이지로브", "8ffcffd0f8994b19bd2e69048be3b0de", "longcoat"},
+			{4, 5, 0, "파란색 고무 장화", "1caf1454526742ffb9691a0b09800af7", "shoes"},
+			{4, 5, 5, "노란색 코우치", "e3913ef81c254eee9a1bdea841f96de9", "shoes"},
+			{4, 5, 10, "주황색 가죽 구두", "9b17170c9a8e4e20bf6e9469238b23cb", "shoes"},
+			{4, 5, 15, "골드 문슈즈", "1f6baceefabe47cb8f29593d7df6fdb5", "shoes"},
+			{4, 5, 20, "퍼플 크리시아슈즈", "4ef292d72cff4b1ea39dfec05e5fcddc", "shoes"},
+			{4, 5, 25, "그린 바르슈즈", "aa953fdb0eeb4f07b0ac9e51c3bb6cb7", "shoes"},
+			{4, 5, 30, "타임리스 카바티나", "0409718bb9ad438fb23ec4e3bdefa4ae", "shoes"},
+			{4, 5, 35, "드래곤테일 메이지슈즈", "fc3466277c2740c0a83b803103732a31", "shoes"},
+			{4, 6, 0, "우드 완드", "061712eadf7d4357a6c306dfd5368860", "weapon"},
+			{4, 6, 2, "하드우드 완드", "8b30dd5dc3e24064ad96799b4587ae5a", "weapon"},
+			{4, 6, 4, "메탈 완드", "1553a46c9510412fa3c5dda1cd756d7d", "weapon"},
+			{4, 6, 6, "아이스 완드", "62f38a74f94a42adad10acdf838318c0", "weapon"},
+			{4, 6, 8, "위저드 완드", "c2545bb24d7544038e7b3f306a678fe9", "weapon"},
+			{4, 6, 10, "크리스탈 완드", "102c15b28a944d2f905872dd10f795ec", "weapon"},
+			{4, 6, 12, "크로미", "f40b305407874e928e59ca9d6c9090fd", "weapon"},
+			{4, 6, 14, "이블테일러", "a5dc4044efcd429cb053cf30b11f4d4b", "weapon"},
+			{4, 6, 16, "하트 완드", "f22b06b1abd84be08503932b2d3c839b", "weapon"},
+			{4, 6, 18, "엔젤윙즈", "cd0f106fca6445a9a5dd452389290f9d", "weapon"},
+			{4, 6, 20, "메이플 샤이니 완드", "c6f0d8016be643579f4203790129a433", "weapon"},
+			{4, 6, 22, "피닉스 완드", "9c0fb504c222456bbdc870b5aee484ed", "weapon"},
+			{4, 6, 24, "마기코라스", "3208460c417d486bb481226b4bec2d8b", "weapon"},
+			{4, 6, 26, "다이몬의 완드", "39fb76eb3831486395bba411dea379eb", "weapon"},
+			{4, 6, 28, "드래곤 완드", "d8bc9682c6a849ab941993a36c0e7e5c", "weapon"},
+			{4, 6, 30, "타임리스 엔릴 티어", "9886e1456d9c4c32b477589666abc2e4", "weapon"},
+			{4, 6, 32, "알마 반 레온 완드", "773a1b7b1ea740bc9ff0fd1f8fe24a38", "weapon"},
+			{4, 6, 34, "엘리고스 블러디 완드", "07ffcb1edac14605bafa410056f3be19", "weapon"},
+			{4, 6, 36, "드래곤테일 아크완드", "92741ec2de834092ae74f9206a0b09b3", "weapon"},
+			{4, 6, 38, "파프니르 마나테이커", "878e43b226cc4beba2038824b16bbca9", "weapon"},
+			{4, 6, 40, "앱솔랩스 스펠링완드", "0e562dfaa93a485d994e781b471bcfaa", "weapon"},
+			{4, 6, 42, "아케인셰이드 완드", "45f13f992eaa4f689f41aeaa8ed5722f", "weapon"},
+			{4, 6, 44, "봉인된 제네시스 완드", "d7dadfb790464023824f91f6cac79cdb", "weapon"},
+			{4, 7, 0, "흰색 머리띠", "383a49c8aabe47a19d71c094c915b110", "cap"},
+			{4, 7, 2, "할로윈 호박 모자", "3f6fc20a594f4dfc9dd60f74f5a715a9", "cap"},
+			{4, 7, 4, "갈색 낡은 고깔 모자", "e72340e953214ea384748e4251cdbfab", "cap"},
+			{4, 7, 6, "다크문 고깔모자", "74892b3cc8a1499d80f7b3c29cd79206", "cap"},
+			{4, 7, 8, "초록색 사제의 모자", "7d8bef2d2c334b20986d5265118c21d3", "cap"},
+			{4, 7, 10, "리본돼지 머리띠", "03b432fbe52d468b9929ee87d18b2563", "cap"},
+			{4, 7, 12, "블랙 핀터", "d826412d7b164eecb062a549ffb093b3", "cap"},
+			{4, 7, 14, "그린 매티", "b358e2b167a744e4b692729369b24b17", "cap"},
+			{4, 7, 16, "자쿰의 투구", "81c8cb83df334a599bc6ef68b63a894b", "cap"},
+			{4, 7, 18, "레이븐 페르소나", "bb9b9b7f532e44c398683dac7f97adab", "cap"},
+			{4, 7, 20, "다크 골든서클릿", "b8b41a2e10244543a824958dac3313b5", "cap"},
+			{4, 7, 22, "그린 세라피스", "e31431e6ee5e476e9a7e70fde1cfda60", "cap"},
+			{4, 7, 24, "화이트 세라피스", "542b5cef0d0d443c85d7b8df5e44f743", "cap"},
+			{4, 7, 26, "도깨비 감투", "331e9f69747e4c33b04f9fe83395b7fa", "cap"},
+			{4, 7, 28, "다크 바르햇", "ed923d54fe6e474baec93434cf8a4ce7", "cap"},
+			{4, 7, 30, "타르가 모자", "68e3e833646540809c5096fb0ab127b2", "cap"},
+			{4, 7, 32, "타임리스 코럴", "1548a4f5e515456a84b466d866f9d1db", "cap"},
+			{4, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{4, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{4, 7, 38, "시간여행자의 써클렛", "d7d955750ed547e08a78797a9c9caff1", "cap"},
+			{4, 7, 40, "메이플 래티넘 베레모", "3ca2069ab7bb45868042bfc96d427deb", "cap"},
+			{4, 7, 42, "메모리얼 엔젤", "1cb70749254448b59d001f53e0b149e3", "cap"},
+			{4, 7, 44, "드래곤테일 메이지샐릿", "d330321d95b346bd850d0e939b40a079", "cap"},
+			{4, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{4, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{4, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{4, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{4, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{4, 8, 25, "갈색 모험가의 망토", "2ee3c4719c7a42918a543a7eea4c21a1", "cape"},
+			{4, 8, 30, "흰색 세라프의 망토", "94fb777efd0e4ea483aa16152e1715ce", "cape"},
+			{4, 8, 35, "타임리스 문라이트", "f1442b006a98492eaac8351237943a7c", "cape"},
+			{4, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{4, 9, 5, "레모나", "cfbfec45bb1c4f4495f206b81c212f7c", "glove"},
+			{4, 9, 10, "블랙 루티아", "c7da7f8c850448e7b7fb08651d22f324", "glove"},
+			{4, 9, 15, "골드 마누트", "ee7aadbcce6b449b8c85e6e9bd47dd3c", "glove"},
+			{4, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{4, 9, 25, "그린 시아르", "24fe07b2643e42319df31fb8655fc2bc", "glove"},
+			{4, 9, 30, "타임리스 헤르모사", "b16b721c2b814a1f8cfa88c78ecc2636", "glove"},
+			{4, 9, 35, "드래곤테일 메이지피스트", "6b9d6e62662243cfb0be8fba330af22e", "glove"},
+			{5, 3, 0, "그린 오버롤 팬츠", "cfd4440bd412416cb0e6ca2448e4bee0", "longcoat"},
+			{5, 3, 5, "베이지 플레로브", "d913fb3c2f5442baa86eb9284c225a3a", "longcoat"},
+			{5, 3, 10, "구름 로브", "99ad076afd8b4817803518cc7b28df40", "longcoat"},
+			{5, 3, 15, "다크 아나카문", "6e4f1a2f9b6e42d6ae9f03d9e50cb30d", "longcoat"},
+			{5, 3, 20, "블루 바즈라", "14375210d84a4f7dbb7ecbf1c1d86cc3", "longcoat"},
+			{5, 3, 25, "블랙 로타네브", "6b187262abb6465c9a09886f95e7d47b", "longcoat"},
+			{5, 3, 30, "타임리스 미스트 블루", "e86656c2b9704c8bbb128e0551f33557", "longcoat"},
+			{5, 3, 35, "드래곤테일 메이지로브", "8ffcffd0f8994b19bd2e69048be3b0de", "longcoat"},
+			{5, 5, 0, "파란색 고무 장화", "1caf1454526742ffb9691a0b09800af7", "shoes"},
+			{5, 5, 5, "파란색 코우치", "1a1202cd79ec4c20b84b0dcba542a5df", "shoes"},
+			{5, 5, 10, "파란색 가죽 구두", "f5eeb66830ba4db4ab43707b6d251e8c", "shoes"},
+			{5, 5, 15, "블루 문슈즈", "04179e7c41de482d8c3092415e64ef22", "shoes"},
+			{5, 5, 20, "퍼플 크리시아슈즈", "4ef292d72cff4b1ea39dfec05e5fcddc", "shoes"},
+			{5, 5, 25, "블루 바르슈즈", "f393b7ed5d78439291f64961bb533790", "shoes"},
+			{5, 5, 30, "타임리스 카바티나", "0409718bb9ad438fb23ec4e3bdefa4ae", "shoes"},
+			{5, 5, 35, "드래곤테일 메이지슈즈", "fc3466277c2740c0a83b803103732a31", "shoes"},
+			{5, 6, 0, "나무 스태프", "7380b5e5754a4e338e65fa232a8a095b", "weapon"},
+			{5, 6, 2, "사파이어 스태프", "b47b6e1819234198ad5c0b73fa05126d", "weapon"},
+			{5, 6, 4, "고목나무 스태프", "2bb5fd1f15984d6b8ae81e9dd7a5cba9", "weapon"},
+			{5, 6, 6, "위저드 스태프", "48297dc75a6949eab31288dd9162a751", "weapon"},
+			{5, 6, 8, "메이플 스태프", "2425d40177814d208b56b2a8dac4be1c", "weapon"},
+			{5, 6, 10, "페탈 스태프", "fb7d0de7a1034ab19bdc340fe83afa2f", "weapon"},
+			{5, 6, 12, "아크 스태프", "3ed87f7c028c49f9b72eaa68dfa83646", "weapon"},
+			{5, 6, 14, "쏜즈", "376ba6d0a5194c0abb421bfb0c889a5e", "weapon"},
+			{5, 6, 16, "메이플 라마 스태프", "be49540382d54da6a01fefcc4cd10e83", "weapon"},
+			{5, 6, 18, "이블윙즈", "364ee9432c284089a568d1b51059d795", "weapon"},
+			{5, 6, 20, "레이든 스태프", "e7538abd41b04684b43d57b8fa6c57e3", "weapon"},
+			{5, 6, 22, "케이그", "545adac7949b48cf9c14fcf1823ea9f4", "weapon"},
+			{5, 6, 24, "특제 케이그", "28523872811f4a0d8186820046afdc03", "weapon"},
+			{5, 6, 26, "블루마린", "86deed73ea274107b9055048adc4474b", "weapon"},
+			{5, 6, 28, "레바테인", "fff037086ba84ca297a88e47efeadb0e", "weapon"},
+			{5, 6, 30, "드래곤 스태프", "8c026c5e308e4977892f97bc6e2d012b", "weapon"},
+			{5, 6, 32, "알마 반 레온 스태프", "f4e6065d60bc4393b691609ebc356636", "weapon"},
+			{5, 6, 34, "타임리스 에아스 핸드", "d9ec0e6b97ea45ba8f646a4504a7ec2d", "weapon"},
+			{5, 6, 36, "드래곤테일 워스태프", "9c5488ce973346339c78e4973cc2bbd9", "weapon"},
+			{5, 6, 38, "파프니르 마나크라운", "5eff95b61f4445f2a9fa39f793b4c187", "weapon"},
+			{5, 6, 40, "앱솔랩스 스펠링스태프", "63314536db8c43b5b96a17f4b814283e", "weapon"},
+			{5, 6, 42, "아케인셰이드 스태프", "6347ac1db2de4ca6a73cec7a006b37d4", "weapon"},
+			{5, 6, 44, "봉인된 제네시스 스태프", "baa914d1ea3c4e8b954263e7423ebbdb", "weapon"},
+			{5, 7, 0, "파란색 머리띠", "5640eb09571f4be49a46d219c3cf3386", "cap"},
+			{5, 7, 2, "파란색 두건", "d09cb496cf864d11b9ce6031b066a4d3", "cap"},
+			{5, 7, 4, "파란색 낡은 고깔 모자", "8d5c9567deef4be1900cb6ba5c027226", "cap"},
+			{5, 7, 6, "블루문 고깔모자", "14e0b21749ff4e5b850618a431607d8f", "cap"},
+			{5, 7, 8, "파란색 사제의 모자", "5749a4754ec541a3a40d69a35ebc02b8", "cap"},
+			{5, 7, 10, "리본돼지 머리띠", "03b432fbe52d468b9929ee87d18b2563", "cap"},
+			{5, 7, 12, "블루 핀터", "63b8793aec784f5b8940cb10f05af685", "cap"},
+			{5, 7, 14, "블루 매티", "79836b2206074a09ae6032e4eb457034", "cap"},
+			{5, 7, 16, "자쿰의 투구", "81c8cb83df334a599bc6ef68b63a894b", "cap"},
+			{5, 7, 18, "레이븐 페르소나", "bb9b9b7f532e44c398683dac7f97adab", "cap"},
+			{5, 7, 20, "다크 골든서클릿", "b8b41a2e10244543a824958dac3313b5", "cap"},
+			{5, 7, 22, "블루 세라피스", "741701165ff64e6b9eec7d20274cc6cb", "cap"},
+			{5, 7, 24, "다크 세라피스", "f40cf4d93a0f4d80a923ffa8dde1e156", "cap"},
+			{5, 7, 26, "도깨비 감투", "331e9f69747e4c33b04f9fe83395b7fa", "cap"},
+			{5, 7, 28, "블루 바르햇", "c4cfd0b798ac442885ba826e40b1ea57", "cap"},
+			{5, 7, 30, "타르가 모자", "68e3e833646540809c5096fb0ab127b2", "cap"},
+			{5, 7, 32, "타임리스 코럴", "1548a4f5e515456a84b466d866f9d1db", "cap"},
+			{5, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{5, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{5, 7, 38, "시간여행자의 써클렛", "d7d955750ed547e08a78797a9c9caff1", "cap"},
+			{5, 7, 40, "메이플 래티넘 베레모", "3ca2069ab7bb45868042bfc96d427deb", "cap"},
+			{5, 7, 42, "메모리얼 엔젤", "1cb70749254448b59d001f53e0b149e3", "cap"},
+			{5, 7, 44, "드래곤테일 메이지샐릿", "d330321d95b346bd850d0e939b40a079", "cap"},
+			{5, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{5, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{5, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{5, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{5, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{5, 8, 25, "파란색 모험가의 망토", "ef0c6c00ae464af2acc2ce3f76158cff", "cape"},
+			{5, 8, 30, "파란색 세라프의 망토", "9359c8d035954f6eb600787861845174", "cape"},
+			{5, 8, 35, "타임리스 문라이트", "f1442b006a98492eaac8351237943a7c", "cape"},
+			{5, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{5, 9, 5, "레모나", "cfbfec45bb1c4f4495f206b81c212f7c", "glove"},
+			{5, 9, 10, "블루 루티아", "563af8ee1a564d82bd49a4fcb9223df5", "glove"},
+			{5, 9, 15, "스틸 마누트", "85c4b8a936d5460cb3125066a0e1f827", "glove"},
+			{5, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{5, 9, 25, "블루 시아르", "453691633a804142aa2cee8b1cb36ecd", "glove"},
+			{5, 9, 30, "타임리스 헤르모사", "b16b721c2b814a1f8cfa88c78ecc2636", "glove"},
+			{5, 9, 35, "드래곤테일 메이지피스트", "6b9d6e62662243cfb0be8fba330af22e", "glove"},
+			{6, 3, 0, "레드 오버롤 미니", "1cc3baa17c8a494993ad291d61d2d316", "longcoat"},
+			{6, 3, 5, "베이지 플레로브", "d913fb3c2f5442baa86eb9284c225a3a", "longcoat"},
+			{6, 3, 10, "구름 로브", "99ad076afd8b4817803518cc7b28df40", "longcoat"},
+			{6, 3, 15, "다크 아나카문", "6e4f1a2f9b6e42d6ae9f03d9e50cb30d", "longcoat"},
+			{6, 3, 20, "레드 바즈라", "e0cb93e3e9904108a1b69ae6d4dc0a67", "longcoat"},
+			{6, 3, 25, "블랙 로타네브", "6b187262abb6465c9a09886f95e7d47b", "longcoat"},
+			{6, 3, 30, "타임리스 미스트 블루", "e86656c2b9704c8bbb128e0551f33557", "longcoat"},
+			{6, 3, 35, "드래곤테일 메이지로브", "8ffcffd0f8994b19bd2e69048be3b0de", "longcoat"},
+			{6, 5, 0, "파란색 고무 장화", "1caf1454526742ffb9691a0b09800af7", "shoes"},
+			{6, 5, 5, "갈색 코우치", "9bafadbd3c304e62a78bc96236eb8210", "shoes"},
+			{6, 5, 10, "빨간색 가죽 구두", "09e1b97cc131471480d8bcf8adbc1b77", "shoes"},
+			{6, 5, 15, "레드 문슈즈", "003950a831b04798a44a6c98c2369d37", "shoes"},
+			{6, 5, 20, "퍼플 크리시아슈즈", "4ef292d72cff4b1ea39dfec05e5fcddc", "shoes"},
+			{6, 5, 25, "레드 바르슈즈", "dfcc3e69b84b49aca2fc36230c65baa2", "shoes"},
+			{6, 5, 30, "타임리스 카바티나", "0409718bb9ad438fb23ec4e3bdefa4ae", "shoes"},
+			{6, 5, 35, "드래곤테일 메이지슈즈", "fc3466277c2740c0a83b803103732a31", "shoes"},
+			{6, 6, 0, "나무 스태프", "7380b5e5754a4e338e65fa232a8a095b", "weapon"},
+			{6, 6, 2, "에메랄드 스태프", "e3b8c9c46de04405ab6d0f0bf10e5385", "weapon"},
+			{6, 6, 4, "고목나무 스태프", "2bb5fd1f15984d6b8ae81e9dd7a5cba9", "weapon"},
+			{6, 6, 6, "위저드 스태프", "48297dc75a6949eab31288dd9162a751", "weapon"},
+			{6, 6, 8, "메이플 스태프", "2425d40177814d208b56b2a8dac4be1c", "weapon"},
+			{6, 6, 10, "페탈 스태프", "fb7d0de7a1034ab19bdc340fe83afa2f", "weapon"},
+			{6, 6, 12, "아크 스태프", "3ed87f7c028c49f9b72eaa68dfa83646", "weapon"},
+			{6, 6, 14, "쏜즈", "376ba6d0a5194c0abb421bfb0c889a5e", "weapon"},
+			{6, 6, 16, "메이플 라마 스태프", "be49540382d54da6a01fefcc4cd10e83", "weapon"},
+			{6, 6, 18, "이블윙즈", "364ee9432c284089a568d1b51059d795", "weapon"},
+			{6, 6, 20, "레이든 스태프", "e7538abd41b04684b43d57b8fa6c57e3", "weapon"},
+			{6, 6, 22, "케이그", "545adac7949b48cf9c14fcf1823ea9f4", "weapon"},
+			{6, 6, 24, "특제 케이그", "28523872811f4a0d8186820046afdc03", "weapon"},
+			{6, 6, 26, "블루마린", "86deed73ea274107b9055048adc4474b", "weapon"},
+			{6, 6, 28, "레바테인", "fff037086ba84ca297a88e47efeadb0e", "weapon"},
+			{6, 6, 30, "드래곤 스태프", "8c026c5e308e4977892f97bc6e2d012b", "weapon"},
+			{6, 6, 32, "알마 반 레온 스태프", "f4e6065d60bc4393b691609ebc356636", "weapon"},
+			{6, 6, 34, "타임리스 에아스 핸드", "d9ec0e6b97ea45ba8f646a4504a7ec2d", "weapon"},
+			{6, 6, 36, "드래곤테일 워스태프", "9c5488ce973346339c78e4973cc2bbd9", "weapon"},
+			{6, 6, 38, "파프니르 마나크라운", "5eff95b61f4445f2a9fa39f793b4c187", "weapon"},
+			{6, 6, 40, "앱솔랩스 스펠링스태프", "63314536db8c43b5b96a17f4b814283e", "weapon"},
+			{6, 6, 42, "아케인셰이드 스태프", "6347ac1db2de4ca6a73cec7a006b37d4", "weapon"},
+			{6, 6, 44, "봉인된 제네시스 스태프", "baa914d1ea3c4e8b954263e7423ebbdb", "weapon"},
+			{6, 7, 0, "빨간색 머리띠", "8c38474b97ed460ca3bccc52c3ec3634", "cap"},
+			{6, 7, 2, "빨간색 물개모자", "a201c494f4e74d7188eba3bae0b57c3e", "cap"},
+			{6, 7, 4, "갈색 낡은 고깔 모자", "e72340e953214ea384748e4251cdbfab", "cap"},
+			{6, 7, 6, "핑크문 고깔모자", "b5a5366de0654b588100d637f9736f05", "cap"},
+			{6, 7, 8, "초록색 사제의 모자", "7d8bef2d2c334b20986d5265118c21d3", "cap"},
+			{6, 7, 10, "리본돼지 머리띠", "03b432fbe52d468b9929ee87d18b2563", "cap"},
+			{6, 7, 12, "브라운 핀터", "d1154411db3647298fde7919f78a8fd7", "cap"},
+			{6, 7, 14, "브라운 매티", "c019f568f41947f98396d26e2ac80a0e", "cap"},
+			{6, 7, 16, "자쿰의 투구", "81c8cb83df334a599bc6ef68b63a894b", "cap"},
+			{6, 7, 18, "레이븐 페르소나", "bb9b9b7f532e44c398683dac7f97adab", "cap"},
+			{6, 7, 20, "다크 골든서클릿", "b8b41a2e10244543a824958dac3313b5", "cap"},
+			{6, 7, 22, "레드 세라피스", "5dbf026426a244068f151c59371302a7", "cap"},
+			{6, 7, 24, "다크 세라피스", "f40cf4d93a0f4d80a923ffa8dde1e156", "cap"},
+			{6, 7, 26, "도깨비 감투", "331e9f69747e4c33b04f9fe83395b7fa", "cap"},
+			{6, 7, 28, "레드 바르햇", "60a3e13218ee437d91e4bafcd7ad47ff", "cap"},
+			{6, 7, 30, "타르가 모자", "68e3e833646540809c5096fb0ab127b2", "cap"},
+			{6, 7, 32, "타임리스 코럴", "1548a4f5e515456a84b466d866f9d1db", "cap"},
+			{6, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{6, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{6, 7, 38, "시간여행자의 써클렛", "d7d955750ed547e08a78797a9c9caff1", "cap"},
+			{6, 7, 40, "메이플 래티넘 베레모", "3ca2069ab7bb45868042bfc96d427deb", "cap"},
+			{6, 7, 42, "메모리얼 엔젤", "1cb70749254448b59d001f53e0b149e3", "cap"},
+			{6, 7, 44, "드래곤테일 메이지샐릿", "d330321d95b346bd850d0e939b40a079", "cap"},
+			{6, 8, 0, "월묘 꼬리", "c1231944b5b14363a2ddf4080c802085", "cape"},
+			{6, 8, 5, "메이플 망토", "61d1ec102f734455acf7d1399334b2a5", "cape"},
+			{6, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{6, 8, 15, "설빙의 망토", "154277b8d0bb4434b9d8925c3aac622f", "cape"},
+			{6, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{6, 8, 25, "빨간색 모험가의 망토", "724a9e818ddd41ba9825b6fcce789521", "cape"},
+			{6, 8, 30, "빨간색 세라프의 망토", "4bec629a08ea405ab4c70dec185a66b4", "cape"},
+			{6, 8, 35, "타임리스 문라이트", "f1442b006a98492eaac8351237943a7c", "cape"},
+			{6, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{6, 9, 5, "레모나", "cfbfec45bb1c4f4495f206b81c212f7c", "glove"},
+			{6, 9, 10, "레드 루티아", "43e864f8cd77466db4d0d7d342e72410", "glove"},
+			{6, 9, 15, "다크 마누트", "007741a9417b42f7b594fe2b33902983", "glove"},
+			{6, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{6, 9, 25, "레드 시아르", "e41047d25af141428a2751c47564ef9f", "glove"},
+			{6, 9, 30, "타임리스 헤르모사", "b16b721c2b814a1f8cfa88c78ecc2636", "glove"},
+			{6, 9, 35, "드래곤테일 메이지피스트", "6b9d6e62662243cfb0be8fba330af22e", "glove"},
+			-- 도적 2직업: 장비 외형 도적.txt 및 사용자 승인 후보 18종.
+			-- 42강 모자는 사용자 승인 대체 외형인 메이플 기념 모자를 사용한다.
+			{9, 3, 0, "무명의", "b65cd1ce99344dc197af10d0c806196f", "longcoat"},
+			{9, 3, 5, "낙하산 요원 슈트", "f5d967ec4245432aa06e09ea9957543d", "longcoat"},
+			{9, 3, 10, "파란색 가운", "3981fe513b8a43e1a1f0b58807aa7792", "longcoat"},
+			{9, 3, 15, "다크 카티나스", "9c810386bf744a569286bf28477a2195", "longcoat"},
+			{9, 3, 20, "블랙 가리나", "688e0c08b07440dca0a036e8606109bb", "longcoat"},
+			{9, 3, 25, "타임리스 프린지드", "96de625a4c10477d83bf3184b374caa1", "longcoat"},
+			{9, 3, 30, "막스 반 레온 배틀슈트", "6f8d6da40d11468d9fb0d296d9811d0c", "longcoat"},
+			{9, 3, 35, "레이븐혼 체이서아머", "1b24a5155a2d4ce682596e95488b746c", "longcoat"},
+			{9, 5, 0, "흰색 고무신", "ce5a35d9427f486c96628502eeca6946", "shoes"},
+			{9, 5, 5, "낙하산 요원 신발", "99a7238d07e449f8b71804e7d18aee47", "shoes"},
+			{9, 5, 10, "흰색 닌자 샌들", "2340f79f68964785aabd483f8ee25613", "shoes"},
+			{9, 5, 15, "물컹물컹한 신발", "ca7f7822742f40abba4368cde7d791f1", "shoes"},
+			{9, 5, 20, "블랙 아이젠", "e8e38291b8f24a4d87b60613ea37bec9", "shoes"},
+			{9, 5, 25, "다크 가티나부츠", "6f4885c85e9f40e3b21516d8b9ee3bd1", "shoes"},
+			{9, 5, 30, "타임리스 문스티드", "c90d1dffdb8549c8bbca11e3f642eb4a", "shoes"},
+			{9, 5, 35, "레이븐혼 체이서부츠", "6e4cf608f7864ec3a2584459a8b9584a", "shoes"},
+			{9, 6, 0, "가니어", "985e44451afc4730a46eb206716e7ecf", "twohandweapon"},
+			{9, 6, 2, "스틸 티탄즈", "bd139b8315314b70a82778a49d417766", "twohandweapon"},
+			{9, 6, 4, "골드 티탄즈", "c5c130cc74544a819940a01a20557a62", "twohandweapon"},
+			{9, 6, 6, "아다만티움 가즈", "9acce5a9e19a46b793c923703b437b51", "twohandweapon"},
+			{9, 6, 8, "메바", "bfab20d399c044229ccaf21f563ed299", "twohandweapon"},
+			{9, 6, 10, "아다만티움 가즈", "9acce5a9e19a46b793c923703b437b51", "twohandweapon"},
+			{9, 6, 12, "스틸 가즈", "0f196571a462459ab7273b5a63608626", "twohandweapon"},
+			{9, 6, 14, "메이플 스론즈", "470588784c744c5d9004c1736b451b5b", "twohandweapon"},
+			{9, 6, 16, "메이플 칸데오", "1703296c5f194f47ad2fab061685225d", "twohandweapon"},
+			{9, 6, 18, "다크 슬레인", "1b4badbcbe6e4d758e857dc249294727", "twohandweapon"},
+			{9, 6, 20, "다크 기간틱", "893f1d74463a4e1ba6c6c944658e63a2", "twohandweapon"},
+			{9, 6, 22, "베인바이터", "159a098b778a492ab3ae207b0a3557ce", "twohandweapon"},
+			{9, 6, 24, "메이플 스칸다", "b5b88abee14a4353baf371a58b925936", "twohandweapon"},
+			{9, 6, 26, "흑갑충", "b3e362117aa84c4cb34af35d492fd377", "twohandweapon"},
+			{9, 6, 28, "코브라스티어", "6a6ed1cbba0c466ca664e85a916f3c41", "twohandweapon"},
+			{9, 6, 30, "캐스터스", "cf6e8a42aea546f2a9214cec111b45c3", "twohandweapon"},
+			{9, 6, 32, "레드 크리븐", "5b1995dfa3d94971bbaa37d970426069", "twohandweapon"},
+			{9, 6, 34, "드래곤 그린 슬레브", "7870aaff3e71418dbefecd6af6dd3e9f", "twohandweapon"},
+			{9, 6, 36, "타임리스 람피온", "11f2459e6754491b86f6c4f6fdc0a7ba", "twohandweapon"},
+			{9, 6, 38, "파프니르 리스크홀더", "61b4dc223fa64dfe80d49db5b6abf9a0", "twohandweapon"},
+			{9, 6, 40, "앱솔랩스 리벤지가즈", "e6ef5680d9c94b3ebc7be1e0ffbb394a", "twohandweapon"},
+			{9, 6, 42, "아케인셰이드 가즈", "7b8ba75d5150474fb51b25fffe6bf8b9", "twohandweapon"},
+			{9, 6, 44, "봉인된 제네시스 가즈", "a24a934920964d598067ede5add8da4e", "twohandweapon"},
+			{9, 7, 0, "갈색 가죽 모자", "d2011189e7704e7ea96145241a65c0e6", "cap"},
+			{9, 7, 2, "검정색 좀도둑 털모자", "bed1990d5b6a4655a0adbce3ae204110", "cap"},
+			{9, 7, 4, "군밤장수 모자", "e4c6ad04633d44f199a9bad2c698ec3a", "cap"},
+			{9, 7, 6, "블랙 시프 후드", "4807f12be2ee476bab83bd51b0898a07", "cap"},
+			{9, 7, 8, "블랙 루즈캡", "ca657a96142547e1955292d89a8a7583", "cap"},
+			{9, 7, 10, "갈색 삿갓", "226a2cbcb6dc42be9ea5851a269570ba", "cap"},
+			{9, 7, 12, "다크 티베리안", "99730530f71d45b7b07fc455accec827", "cap"},
+			{9, 7, 14, "다크 가이즈", "25b0c17264664762a693a85c612bbdf8", "cap"},
+			{9, 7, 16, "다크 필퍼", "b8e39f9f12dc4dd2bebbbbf97391e1db", "cap"},
+			{9, 7, 18, "역습의 고글", "c6bcd43329d44f629644cb82a646b3ee", "cap"},
+			{9, 7, 20, "브론즈 하이드후드", "32ff1302d1d04bc89bc316d560e19386", "cap"},
+			{9, 7, 22, "라바나 투구", "1612a449db614a26aa0b1ec289c502ee", "cap"},
+			{9, 7, 24, "브라운 쉐이드햇", "d43aa89c04f74695bf5241506b293a98", "cap"},
+			{9, 7, 26, "다크 카날 후드", "02a820421bc54756bd578ced5b95f6bf", "cap"},
+			{9, 7, 28, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{9, 7, 30, "블랙 가리나 후드", "8f14434ad8ab4fea9be7757d479a83bf", "cap"},
+			{9, 7, 32, "타임리스 차이브", "74c68e10e9d449b69d7dd3785e6d6042", "cap"},
+			{9, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{9, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{9, 7, 38, "타르가 모자", "68e3e833646540809c5096fb0ab127b2", "cap"},
+			{9, 7, 40, "메이플 래티넘 베레모", "3ca2069ab7bb45868042bfc96d427deb", "cap"},
+			{9, 7, 42, "메이플 기념 모자", "a730c7fcc69e4b7aa25a08512c6ee532", "cap"},
+			{9, 7, 44, "레이븐혼 체이서햇", "0ce0a99d93b34cdaa36fcaa15dda422f", "cap"},
+			{9, 8, 0, "엔틱 벨벳 망토", "aa8d1e49ff93486986fbb0f9b16d9565", "cape"},
+			{9, 8, 5, "요원망토", "f27c5430124b4e8bad88384d798d9ca9", "cape"},
+			{9, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{9, 8, 15, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{9, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{9, 8, 25, "이카루스의 망토", "06f3692b69e24e98b3a267cfb3a7ffa6", "cape"},
+			{9, 8, 30, "검은색 세라프의 망토", "08879b8c46ea43fa8206b22dff8fce97", "cape"},
+			{9, 8, 35, "타임리스 문라이트", "f1442b006a98492eaac8351237943a7c", "cape"},
+			{9, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{9, 9, 5, "블랙 듀오", "ebc19f39c0c245fab2aecb817645bbb6", "glove"},
+			{9, 9, 10, "골드 실비아", "b308169c69f24c3e9156d6d3fe5835a1", "glove"},
+			{9, 9, 15, "황월 장갑", "8d9ca675bc5e4f8dab8627fc536cbaca", "glove"},
+			{9, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{9, 9, 25, "다크 아날린", "23e920faf70743f79b9384a3eba90895", "glove"},
+			{9, 9, 30, "타임리스 루바브", "8b4f4215d5c74462b35a10330be8cac8", "glove"},
+			{9, 9, 35, "레이븐혼 체이서글러브", "dbc6b5bdeea745358c8e3035987882ad", "glove"},
+			{10, 3, 0, "무명의", "b65cd1ce99344dc197af10d0c806196f", "longcoat"},
+			{10, 3, 5, "낙하산 요원 슈트", "f5d967ec4245432aa06e09ea9957543d", "longcoat"},
+			{10, 3, 10, "파란색 가운", "3981fe513b8a43e1a1f0b58807aa7792", "longcoat"},
+			{10, 3, 15, "다크 카티나스", "9c810386bf744a569286bf28477a2195", "longcoat"},
+			{10, 3, 20, "블랙 가리나", "688e0c08b07440dca0a036e8606109bb", "longcoat"},
+			{10, 3, 25, "타임리스 프린지드", "96de625a4c10477d83bf3184b374caa1", "longcoat"},
+			{10, 3, 30, "막스 반 레온 배틀슈트", "6f8d6da40d11468d9fb0d296d9811d0c", "longcoat"},
+			{10, 3, 35, "레이븐혼 체이서아머", "1b24a5155a2d4ce682596e95488b746c", "longcoat"},
+			{10, 5, 0, "흰색 고무신", "ce5a35d9427f486c96628502eeca6946", "shoes"},
+			{10, 5, 5, "낙하산 요원 신발", "99a7238d07e449f8b71804e7d18aee47", "shoes"},
+			{10, 5, 10, "흰색 닌자 샌들", "2340f79f68964785aabd483f8ee25613", "shoes"},
+			{10, 5, 15, "물컹물컹한 신발", "ca7f7822742f40abba4368cde7d791f1", "shoes"},
+			{10, 5, 20, "블랙 아이젠", "e8e38291b8f24a4d87b60613ea37bec9", "shoes"},
+			{10, 5, 25, "다크 가티나부츠", "6f4885c85e9f40e3b21516d8b9ee3bd1", "shoes"},
+			{10, 5, 30, "타임리스 문스티드", "c90d1dffdb8549c8bbca11e3f642eb4a", "shoes"},
+			{10, 5, 35, "레이븐혼 체이서부츠", "6e4cf608f7864ec3a2584459a8b9584a", "shoes"},
+			{10, 6, 0, "후루츠 대거", "1489702f013a4ba4a1ec080da4df17c3", "weapon"},
+			{10, 6, 2, "삼각 자마다르", "810f17a2db174e10b3299c40055d693e", "weapon"},
+			{10, 6, 4, "삼지 자마다르", "9ee943c699af472eb5789623a471aa08", "weapon"},
+			{10, 6, 6, "넙치검", "b4f3cf4051804d9a909bb79251ffe5b2", "weapon"},
+			{10, 6, 8, "리프 크로", "0551f29b598349d39bb0ec2f1c0cd380", "weapon"},
+			{10, 6, 10, "카스", "74582c03223b4a5683367f42534d30e7", "weapon"},
+			{10, 6, 12, "태극부채", "6e20c1137d674fb0a51789d2a5b0acce", "weapon"},
+			{10, 6, 14, "드래곤 토네일", "fdfbf9a2a604424d80404613a1d0e4fa", "weapon"},
+			{10, 6, 16, "메이플 바그나", "5f1fc0b6620c47439287896706cd341a", "weapon"},
+			{10, 6, 18, "설천도", "0ad277c56af74ba2b2e974af69139617", "weapon"},
+			{10, 6, 20, "게타", "2185a27cb3e34a85854252b18c53751f", "weapon"},
+			{10, 6, 22, "메이플 다크메이트", "ff8bb455821d402b842965c2b79689de", "weapon"},
+			{10, 6, 24, "메이플 아수라 대거", "4d5a0592ea8e42fcb1e8389d211364bb", "weapon"},
+			{10, 6, 26, "칸디네", "bebdc753a0a4472a88701dce9757232c", "weapon"},
+			{10, 6, 28, "금강저", "4ae31faa0b4a4684a4d99182c4259b34", "weapon"},
+			{10, 6, 30, "용천권", "7ad42b76b1334fa1a13b6b616cc48905", "weapon"},
+			{10, 6, 32, "블러드 대거", "1965573dd25047c9a6ec6f6f42a298dd", "weapon"},
+			{10, 6, 34, "드래곤 칸자르", "8ef3241efb7643fabe83cf7011bc5bb6", "weapon"},
+			{10, 6, 36, "타임리스 페스카즈", "aceabe492226477cbabd133550f2c9e7", "weapon"},
+			{10, 6, 38, "파프니르 다마스커스", "14e5c96f960e4eab806ea02dbd9626a2", "weapon"},
+			{10, 6, 40, "앱솔랩스 슬래셔", "dac4563ba6ca4aa4a5cae9a93a6fcd66", "weapon"},
+			{10, 6, 42, "아케인셰이드 대거", "9c8cfc24976e494cb47fde48b30c1760", "weapon"},
+			{10, 6, 44, "봉인된 제네시스 대거", "cc286b5d81c846bfaef90bc36f061e1b", "weapon"},
+			{10, 7, 0, "검은색 머리띠", "3b935d6199c941ee80f24fb555dfbfd1", "cap"},
+			{10, 7, 2, "검정색 좀도둑 털모자", "bed1990d5b6a4655a0adbce3ae204110", "cap"},
+			{10, 7, 4, "군밤장수 모자", "e4c6ad04633d44f199a9bad2c698ec3a", "cap"},
+			{10, 7, 6, "블랙 시프 후드", "4807f12be2ee476bab83bd51b0898a07", "cap"},
+			{10, 7, 8, "블랙 루즈캡", "ca657a96142547e1955292d89a8a7583", "cap"},
+			{10, 7, 10, "갈색 삿갓", "226a2cbcb6dc42be9ea5851a269570ba", "cap"},
+			{10, 7, 12, "다크 티베리안", "99730530f71d45b7b07fc455accec827", "cap"},
+			{10, 7, 14, "다크 가이즈", "25b0c17264664762a693a85c612bbdf8", "cap"},
+			{10, 7, 16, "다크 필퍼", "b8e39f9f12dc4dd2bebbbbf97391e1db", "cap"},
+			{10, 7, 18, "역습의 고글", "c6bcd43329d44f629644cb82a646b3ee", "cap"},
+			{10, 7, 20, "브론즈 하이드후드", "32ff1302d1d04bc89bc316d560e19386", "cap"},
+			{10, 7, 22, "라바나 투구", "1612a449db614a26aa0b1ec289c502ee", "cap"},
+			{10, 7, 24, "브라운 쉐이드햇", "d43aa89c04f74695bf5241506b293a98", "cap"},
+			{10, 7, 26, "다크 카날 후드", "02a820421bc54756bd578ced5b95f6bf", "cap"},
+			{10, 7, 28, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{10, 7, 30, "블랙 가리나 후드", "8f14434ad8ab4fea9be7757d479a83bf", "cap"},
+			{10, 7, 32, "타임리스 차이브", "74c68e10e9d449b69d7dd3785e6d6042", "cap"},
+			{10, 7, 34, "카오스 자쿰의 투구", "5d732d7675cd45d7b935b575e3fb8b05", "cap"},
+			{10, 7, 36, "데비존의 모자", "fe7967e786724b73bb88cf93ff2155f0", "cap"},
+			{10, 7, 38, "타르가 모자", "68e3e833646540809c5096fb0ab127b2", "cap"},
+			{10, 7, 40, "메이플 래티넘 베레모", "3ca2069ab7bb45868042bfc96d427deb", "cap"},
+			{10, 7, 42, "메이플 기념 모자", "a730c7fcc69e4b7aa25a08512c6ee532", "cap"},
+			{10, 7, 44, "레이븐혼 체이서햇", "0ce0a99d93b34cdaa36fcaa15dda422f", "cap"},
+			{10, 8, 0, "엔틱 벨벳 망토", "aa8d1e49ff93486986fbb0f9b16d9565", "cape"},
+			{10, 8, 5, "요원망토", "f27c5430124b4e8bad88384d798d9ca9", "cape"},
+			{10, 8, 10, "허름한 망토", "c33def64db8b48f39b7b125fab1092e1", "cape"},
+			{10, 8, 15, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{10, 8, 20, "온화의 망토", "a50a3a381d52464084baa2de3b256b32", "cape"},
+			{10, 8, 25, "이카루스의 망토", "06f3692b69e24e98b3a267cfb3a7ffa6", "cape"},
+			{10, 8, 30, "검은색 세라프의 망토", "08879b8c46ea43fa8206b22dff8fce97", "cape"},
+			{10, 8, 35, "타임리스 문라이트", "f1442b006a98492eaac8351237943a7c", "cape"},
+			{10, 9, 0, "노가다 목장갑", "2e58683f2f094f099a0813c36e278dd5", "glove"},
+			{10, 9, 5, "블랙 듀오", "ebc19f39c0c245fab2aecb817645bbb6", "glove"},
+			{10, 9, 10, "골드 실비아", "b308169c69f24c3e9156d6d3fe5835a1", "glove"},
+			{10, 9, 15, "황월 장갑", "8d9ca675bc5e4f8dab8627fc536cbaca", "glove"},
+			{10, 9, 20, "여신의 팔찌", "96819ab772d149099a9a62499f26296d", "glove"},
+			{10, 9, 25, "다크 아날린", "23e920faf70743f79b9384a3eba90895", "glove"},
+			{10, 9, 30, "타임리스 루바브", "8b4f4215d5c74462b35a10330be8cac8", "glove"},
+			{10, 9, 35, "레이븐혼 체이서글러브", "dbc6b5bdeea745358c8e3035987882ad", "glove"},
+		}
+		self._T.appearanceByRuid = {}
+		self._T.appearanceByName = {}
+		self._T.appearanceByJobSlot = {}
+		for _, row in ipairs(self._T.appearanceRows) do
+			self._T.appearanceByRuid[row[5]] = row
+			self._T.appearanceByName[row[4]] = row
+			local key = row[1] * 10 + row[2]
+			local stages = self._T.appearanceByJobSlot[key]
+			if stages == nil then stages = {}; self._T.appearanceByJobSlot[key] = stages end
+			table.insert(stages, row)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string AppearanceCategory(string ruid)
+		self:EnsureAppearanceCatalog()
+		local row = self._T.appearanceByRuid[ruid]
+		if row ~= nil then return row[6] end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsLongcoatItem(string itemStr)
+		return self:AppearanceCategory(self:ParseRUID(itemStr)) == "longcoat"
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ResolveAppearance(string itemStr, number jobIdx)
+		if itemStr == "" then return itemStr end
+		local slot = self:ParseSlotIdx(itemStr)
+		self:EnsureAppearanceCatalog()
+		local rows = self._T.appearanceByJobSlot[jobIdx * 10 + slot]
+		if rows == nil then return itemStr end
+		-- 일반 상의는 하의와 함께 착용한다. 기존 기본 상의만 새 성장 장비로 이관한다.
+		if slot == 3 and not self:IsLongcoatItem(itemStr) then
+			local name = self:ParseName(itemStr)
+			if name ~= "상의1" and name ~= "상의2" and name ~= "상의3" and name ~= "상의4" and name ~= "상의5" and name ~= "상의6" and name ~= "상의7" and name ~= "상의8" and name ~= "흰색 반팔티" then return itemStr end
+		end
+		local stars = self:ParseStars(itemStr)
+		local best = nil
+		for i = #rows, 1, -1 do
+			local row = rows[i]
+			if row[3] <= stars then best = row; break end
+		end
+		if best == nil then return itemStr end
+		-- 테스트 지급품의 정체성은 이름과 분리한다. 일반 옵션 1~16번 필드는 그대로 둔다.
+		local oldName = self:ParseName(itemStr)
+		local testKind = ""
+		if oldName == "테스트 모자(99성)" then testKind = "hat" end
+		if slot == 6 and string.match(oldName, "%(99성%)$") ~= nil then testKind = "weapon" end
+		if testKind ~= "" then
+			local fields = _EnhancementManager:SplitItemFieldsPreserve(itemStr)
+			while #fields < 16 do table.insert(fields, "") end
+			table.insert(fields, "appearance-test:" .. testKind)
+			itemStr = table.concat(fields, "|")
+		end
+		-- 3번째 필드부터 끝까지 원문 보존(잠재/에디셔널/빈 필드/미래 필드 포함).
+		local suffix = string.match(itemStr, "^[^|]*|[^|]*(|.*)$")
+		if suffix == nil then return itemStr end
+		return best[4] .. "|" .. best[5] .. suffix
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshEquipmentAppearance()
+		local job = _UIMyInfoManager:GetSelectedCharacterJobIdx()
+		local items = self._T.tabData and self._T.tabData["equip"]
+		if items == nil then return end
+		for i = 1, 128 do items[i] = self:ResolveAppearance(items[i] or "", job) end
+		local changed = false
+		for slot = 3, 9 do
+			local old = self:GetEquip(slot)
+			local updated = self:ResolveAppearance(old, job)
+			if slot == 3 and self:IsLongcoatItem(updated) and self:GetEquip(4) ~= "" then
+				local empty = 0
+				for i = 1, 128 do if (items[i] or "") == "" then empty = i; break end end
+				local locked = _EnhancementManager:HasEnhanceTarget() and _EnhancementManager.enhanceTargetEquipSlot == 4
+				if empty > 0 and not locked then
+					items[empty] = self:GetEquip(4)
+					self:SetEquipStr(4, "")
+					changed = true
+					log("[EquipAppearance] 한벌옷 전환: 하의 인벤토리 이동=" .. tostring(empty))
+				else
+					-- 저장 장비 이관 시 여유 공간이 없으면 전환을 보류한다. 아이템을 버리지 않는다.
+					updated = old
+				end
+			end
+			if updated ~= old then self:SetEquipStr(slot, updated); changed = true end
+		end
+		-- 공간 확보/직업 변경으로 외형이 뒤늦게 바뀐 경우 강화 대상의 이름·아이콘도 따라간다.
+		local enhancement = _EnhancementManager
+		if enhancement:HasEnhanceTarget() then
+			local target = ""
+			if enhancement.enhanceTargetEquipSlot > 0 then
+				target = self:GetEquip(enhancement.enhanceTargetEquipSlot)
+			elseif enhancement.enhanceTargetSrcTab == "" or enhancement.enhanceTargetSrcTab == "equip" then
+				target = self:GetTabItem("equip", enhancement.enhanceTargetInvenIdx)
+			end
+			if target ~= "" and target ~= enhancement.enhanceTargetItemStr then
+				enhancement.enhanceTargetItemStr = target
+				enhancement.enhanceTargetName = self:ParseName(target)
+				enhancement.enhanceTargetRUID = self:ParseRUID(target)
+				enhancement:ApplyEnhanceTargetUI()
+			end
+		end
+		if changed then
+			log("[EquipAppearance] 직업/강화 외형 갱신 job=" .. tostring(job))
+			_DecoWindowManager:ApplyAppearance()
+		end
 	end
 
 end
