@@ -1,8 +1,8 @@
 @Component
 script MiniMapUIManager extends Component
 
-	-- 좌측 상단 미니맵(요청 2026-08-08): 현재 맵의 발판(밝은 선)·벽(어두운 선)과
-	-- 몬스터(빨강)/소환수(초록)/플레이어(노랑) 위치를 실시간 표시한다.
+	-- 실제 타일과 맵 오브젝트를 배경/배우 없이 캡처하고 위치 마커만 실시간 갱신한다.
+	-- 캡처 카메라는 클라이언트에서만 잠깐 사용하며 원래 카메라와 렌더 상태를 복구한다.
 	-- 전용 UI 그룹(MiniMapUI)에 미리 만들어 둔 풀 엔티티를 재배치하는 방식이라
 	-- UI 엔티티를 런타임에 생성하지 않는다(대량 엔티티 함정 회피).
 	-- 클라이언트 전용: 미니맵은 각자 화면 표시일 뿐 서버 상태가 없다.
@@ -10,6 +10,7 @@ script MiniMapUIManager extends Component
 	property integer FhPool = 120                -- 발판 선 풀 크기(.ui의 FH_N 개수와 일치)
 	property integer MobPool = 40                -- 몬스터 점 풀 크기
 	property integer SumPool = 8                 -- 소환수 점 풀 크기
+	property number ZoomMultiplier = 1.6         -- 직전 시야의 절반: 표시 배율은 두 배.
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
@@ -22,6 +23,26 @@ script MiniMapUIManager extends Component
 			return
 		end
 		self._T.board = board
+		-- 전용 캡처 컨트롤러는 유지하고 표시 창만 공용 창 계층으로 옮긴다.
+		local windows = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(windows) then
+			board:AttachTo(windows)
+			_UILogic:SetSiblingIndex(board.UITransformComponent, 1)
+			log("[MiniMap] shared window stack ready: " .. board.Path)
+		end
+		self._T.collapsed = false
+		self._T.expandedSize = board.UITransformComponent.RectSize
+		self._T.viewport = board:GetChildByName("MapViewport", false)
+		if not isvalid(self._T.viewport) then
+			log_warning("[MiniMap] MapViewport 엔티티를 찾지 못함")
+			return
+		end
+		self._T.ending = false
+		self._T.captureTiles = {}
+		for i = 1, 32 do
+			self._T.captureTiles[i] = self._T.viewport:GetChildByName("Tile_" .. tostring(i), false)
+		end
+		self._T.previewRects = {}
 		self._T.fhPool = {}
 		for i = 1, self.FhPool do
 			self._T.fhPool[i] = board:GetChildByName("FH_" .. tostring(i), false)
@@ -35,29 +56,542 @@ script MiniMapUIManager extends Component
 			self._T.sumPool[i] = board:GetChildByName("SUM_" .. tostring(i), false)
 		end
 		self._T.ply = board:GetChildByName("PLY", false)
+		self._T.artwork = board:GetChildByName("RegionArtwork", false)
+		self._T.mapName = board:GetChildByName("MapName", false)
+		self._T.regionName = board:GetChildByName("RegionName", false)
+		if isvalid(self._T.artwork) then self._T.artwork.Enable = false end
+		self:WireWindowControls()
+		self:LayoutChrome()
+		log("[MiniMap] single collapse toggle ready; follow dead zone enabled")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void WireWindowControls()
+		-- 제목줄 드래그와 단일 접기 버튼만 연결한다. 확대율 조절/회색 리사이즈 점은 사용하지 않는다.
+		local board = self._T.board
+		if not isvalid(board) then return end
+		self._T.handlers = {}
+		local moveGrip = board:GetChildByName("MoveGrip", false)
+		local resizeGrip = board:GetChildByName("ResizeGrip", false)
+		local btnDown = board:GetChildByName("BtnSizeDown", false)
+		local btnUp = board:GetChildByName("BtnSizeUp", false)
+
+		if isvalid(moveGrip) then
+			local h = moveGrip:ConnectEvent(UITouchDragEvent, function(evt)
+				---@type UITouchDragEvent
+				local e = evt
+				if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/Board", e.TouchPoint) then return end
+				local tf = board.UITransformComponent
+				local p = tf.anchoredPosition
+				-- 왼쪽/위쪽 테두리는 화면 끝까지 붙일 수 있다.
+				tf.anchoredPosition = Vector2(
+					math.max(0, math.min(1920 - tf.RectSize.x - 8, p.x + e.TouchDelta.x)),
+					math.min(0, math.max(-1080 + tf.RectSize.y + 8, p.y + e.TouchDelta.y)))
+			end)
+			table.insert(self._T.handlers, { entity = moveGrip, eventType = UITouchDragEvent, eventHandler = h })
+		end
+
+		if isvalid(resizeGrip) then resizeGrip.Enable = false end
+		if isvalid(btnUp) then btnUp.Enable = false end
+
+		if isvalid(btnDown) and isvalid(btnDown.ButtonComponent) then
+			local h = btnDown:ConnectEvent(ButtonClickEvent, function()
+				_UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/Board")
+				self:ToggleCollapsed()
+			end)
+			table.insert(self._T.handlers, { entity = btnDown, eventType = ButtonClickEvent, eventHandler = h })
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleCollapsed()
+		-- 접을 때는 제목 한 줄만 남기고 펼칠 때 직전 크기와 표시 상태를 복원한다.
+		local board = self._T.board
+		if not isvalid(board) or self._T.capturing then return end
+		self._T.collapsed = not self._T.collapsed
+		local btn = board:GetChildByName("BtnSizeDown", false)
+		if self._T.collapsed then
+			self._T.expandedSize = board.UITransformComponent.RectSize
+			self._T.collapsedChildren = {}
+			for _, child in ipairs(board.Children:ToTable()) do
+				if child.Name ~= "MiniTitle" and child.Name ~= "MoveGrip" and child.Name ~= "BtnSizeDown" and child.Name ~= "HeaderChrome" and child.Name ~= "OuterFrame" then
+					table.insert(self._T.collapsedChildren, {entity = child, enabled = child.Enable})
+					child.Enable = false
+				end
+			end
+			board.UITransformComponent.RectSize = Vector2(self._T.expandedSize.x, 38)
+		else
+			board.UITransformComponent.RectSize = self._T.expandedSize
+			for _, rec in ipairs(self._T.collapsedChildren or {}) do
+				if isvalid(rec.entity) then rec.entity.Enable = rec.enabled end
+			end
+			self:LayoutPreview()
+			local player = _UserService.LocalPlayer
+			if isvalid(player) and isvalid(player.CurrentMap) then self:UpdateMarkers(player.CurrentMap, player) end
+		end
+		self:LayoutChrome()
+		if isvalid(btn) then btn.TextGUIRendererComponent.Text = self._T.collapsed and "+" or "-" end
+		local tf = board.UITransformComponent
+		local pos = tf.anchoredPosition
+		tf.anchoredPosition = Vector2(
+			math.max(0, math.min(1920 - tf.RectSize.x - 8, pos.x)),
+			math.min(0, math.max(-1080 + tf.RectSize.y + 8, pos.y)))
+		log("[MiniMap] collapsed=" .. tostring(self._T.collapsed) .. " height=" .. tostring(board.UITransformComponent.RectSize.y))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResizeBoard(number deltaWidth, number deltaHeight)
+		-- 같은 캡처를 다시 배치한다. 크기 조절 때 카메라를 다시 캡처하지 않는다.
+		local board = self._T.board
+		if not isvalid(board) then return end
+		local tf = board.UITransformComponent
+		local nextWidth = math.max(300, math.min(720, tf.RectSize.x + deltaWidth))
+		local nextHeight = math.max(240, math.min(432, tf.RectSize.y + deltaHeight))
+		tf.RectSize = Vector2(nextWidth, nextHeight)
+		local moveGrip = board:GetChildByName("MoveGrip", false)
+		if isvalid(moveGrip) then moveGrip.UITransformComponent.RectSize = Vector2(nextWidth - 84, 28) end
+		for _, name in ipairs({"RegionName", "MapName"}) do
+			local label = board:GetChildByName(name, false)
+			if isvalid(label) then label.UITransformComponent.RectSize = Vector2(nextWidth - 106, label.UITransformComponent.RectSize.y) end
+		end
+		if #(self._T.previewRects or {}) == 0 and isvalid(self._T.builtMap) then self:RebuildFootholds(self._T.builtMap) end
+		self:LayoutPreview()
+		log("[MiniMap] 크기 변경 " .. tostring(math.floor(nextWidth)) .. "x" .. tostring(math.floor(nextHeight)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- 도중 종료/맵 이동에도 카메라 및 배경 상태를 남기지 않는다.
+		self._T.ending = true
+		self:RestoreCapture(false)
+		self:ClearPreview()
+		if self._T.handlers ~= nil then
+			for _, rec in ipairs(self._T.handlers) do
+				if isvalid(rec.entity) then rec.entity:DisconnectEvent(rec.eventType, rec.eventHandler) end
+			end
+			self._T.handlers = {}
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
-		-- 0.2초마다 갱신(마커 이동은 이 주기로 충분하고, 매 프레임 갱신은 낭비).
+		-- 지형/마커는 같은 20Hz 좌표계를 사용하고, 맵 엔티티 검색은 5Hz로 제한한다.
 		self._T.acc = (self._T.acc or 0) + delta
-		if self._T.acc < 0.2 then return end
+		self._T.scanAcc = (self._T.scanAcc or 0) + delta
+		if self._T.acc < 0.05 then return end
 		self._T.acc = 0
 		if not isvalid(self._T.board) then return end
 		local player = _UserService.LocalPlayer
 		if not isvalid(player) then return end
 		local map = player.CurrentMap
 		if not isvalid(map) then return end
+		if self._T.capturing then return end
+		if self._T.collapsed then return end
+		if _LoginFlow ~= nil and not _LoginFlow:IsInGame() then return end
 		-- 맵이 바뀌면 발판 레이아웃을 다시 그린다(발판은 정적이라 맵 전환 때만).
 		if self._T.builtMap ~= map then
+			self._T.followInitialized = false
+			self._T.followTargetX, self._T.followTargetY = nil, nil
+			self:UpdateMapIdentity(map)
 			self:RebuildFootholds(map)
+			self:CapturePreview(map)
 		end
+		-- 캡처의 비동기 대기 중 다른 맵으로 이동했으면 다음 틱에 새 맵을 만든다.
+		if not isvalid(player) or not isvalid(map) or player.CurrentMap ~= map then return end
+		local pos = player.TransformComponent.WorldPosition
+		self:FollowPosition(pos.x, pos.y)
 		self:UpdateMarkers(map, player)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearPreview()
+		-- 이전 맵의 RawImage 참조를 해제해 맵을 이동할수록 메모리가 쌓이지 않게 한다.
+		for _, e in ipairs(self._T.captureTiles or {}) do
+			if isvalid(e) then
+				e.RawImageGUIRendererComponent:SetRawImage(nil)
+				e.Enable = false
+			end
+		end
+		self._T.previewRects = {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LayoutChrome()
+		-- 지형 영역은 뚫어 두고 제목/외곽 프레임만 불투명하게 유지한다.
+		local board = self._T.board
+		if not isvalid(board) then return end
+		local s = board.UITransformComponent.RectSize
+		local outer = board:GetChildByName("OuterFrame", false)
+		if isvalid(outer) then
+			outer.UITransformComponent.RectSize = s
+			_UILogic:SetSiblingIndex(outer.UITransformComponent, 1000000)
+		end
+		local header = board:GetChildByName("HeaderChrome", false)
+		if isvalid(header) then
+			header.UITransformComponent.RectSize = Vector2(s.x, self._T.collapsed and 38 or 115)
+			local names = header:GetChildByName("NameSurface", false)
+			if isvalid(names) then names.Enable = not self._T.collapsed end
+		end
+		-- 새로 만든 프레임이 기존 제목/접기 버튼보다 앞에 삽입되지 않도록 명시한다.
+		if not self._T.chromeOrdered then
+			for _, name in ipairs({"BottomChrome", "RightChrome", "LeftChrome", "HeaderChrome"}) do
+				local chrome = board:GetChildByName(name, false)
+				if isvalid(chrome) then _UILogic:SetSiblingIndex(chrome.UITransformComponent, 1) end
+			end
+			self._T.chromeOrdered = true
+		end
+		for _, name in ipairs({"LeftChrome", "RightChrome"}) do
+			local edge = board:GetChildByName(name, false)
+			if isvalid(edge) then edge.UITransformComponent.RectSize = Vector2(18, math.max(0, s.y - 132)) end
+		end
+		local bottom = board:GetChildByName("BottomChrome", false)
+		if isvalid(bottom) then bottom.UITransformComponent.RectSize = Vector2(s.x, 17) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LayoutPreview()
+		-- 프레임, 지형 이미지와 마커가 동일한 월드 좌표 변환을 사용한다.
+		if not isvalid(self._T.board) or self._T.collapsed then return end
+		self:LayoutChrome()
+		local size = self._T.board.UITransformComponent.RectSize
+		local w, h = size.x - 16, size.y - 123
+		self._T.contentOffsetY = -53.5
+		self._T.halfW, self._T.halfH = w / 2 - 6, h / 2 - 6
+		local frame = self._T.board:GetChildByName("MapFrame", false)
+		if isvalid(frame) then
+			frame.UITransformComponent.RectSize = Vector2(w, h)
+			frame.UITransformComponent.anchoredPosition = Vector2(0, self._T.contentOffsetY)
+		end
+		if isvalid(self._T.viewport) then
+			self._T.viewport.UITransformComponent.RectSize = Vector2(w, h)
+			self._T.viewport.UITransformComponent.anchoredPosition = Vector2(0, self._T.contentOffsetY)
+		end
+		if self._T.previewBounds == nil then return end
+		local bounds = self._T.previewBounds
+		local fit = math.min((w - 12) / math.max(0.1, bounds[2] - bounds[1]), (h - 12) / math.max(0.1, bounds[4] - bounds[3]))
+		local scale = fit * math.max(0.2, math.min(5, self.ZoomMultiplier))
+		self._T.mapScale = scale
+		self._T.fitScale = fit
+		self._T.mapCx = self._T.mapCx or (bounds[1] + bounds[2]) / 2
+		self._T.mapCy = self._T.mapCy or (bounds[3] + bounds[4]) / 2
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			local pos = player.TransformComponent.WorldPosition
+			self:FollowPosition(pos.x, pos.y)
+		else
+			self:PlacePreviewGeometry()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FollowPosition(number worldX, number worldY)
+		-- 중앙 여유 구간 안에서는 지도를 고정한다. 구간을 벗어날 때만 목표점을 잡아 부드럽게 이동한다.
+		local b = self._T.previewBounds
+		local scale = self._T.mapScale
+		if b == nil or scale == nil or scale <= 0 or self._T.collapsed then return end
+		local halfX, halfY = self._T.halfW / scale, self._T.halfH / scale
+		local first = not self._T.followInitialized
+		local cx, cy = self._T.mapCx, self._T.mapCy
+		local advance = function(value, center, lo, hi, half, deadRatio, target)
+			if hi - lo <= half * 2 then return (lo + hi) / 2, nil end
+			local desired = math.max(lo + half, math.min(hi - half, value))
+			if first or math.abs(value - center) > half * 1.5 then return desired, nil end
+			if target == nil and math.abs(value - center) > half * deadRatio then target = desired end
+			if target ~= nil then
+				center = center + (target - center) * 0.28
+				if math.abs(target - center) < 0.01 then center, target = target, nil end
+			end
+			return math.max(lo + half, math.min(hi - half, center)), target
+		end
+		cx, self._T.followTargetX = advance(worldX, cx, b[1], b[2], halfX, 0.62, self._T.followTargetX)
+		cy, self._T.followTargetY = advance(worldY, cy, b[3], b[4], halfY, 0.70, self._T.followTargetY)
+		self._T.mapCx, self._T.mapCy = cx, cy
+		self._T.followInitialized = true
+		self:PlacePreviewGeometry()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlacePreviewGeometry()
+		-- 캐시된 지형 이미지만 이동한다. 추적/확대 중에는 카메라 재캡처를 하지 않는다.
+		local scale = self._T.mapScale
+		if scale == nil then return end
+		for i, rec in ipairs(self._T.previewRects or {}) do
+			local e = self._T.captureTiles[i]
+			if isvalid(e) then
+				e.UITransformComponent.anchoredPosition = Vector2((rec.x - self._T.mapCx) * scale, (rec.y - self._T.mapCy) * scale)
+				e.UITransformComponent.RectSize = Vector2(rec.w * scale, rec.h * scale)
+			end
+		end
+		if #(self._T.previewRects or {}) > 0 then return end
+		-- 캡처가 불가능한 맵도 확대/추적과 동일한 좌표로 발판을 그린다.
+		for i, ent in ipairs(self._T.fhPool or {}) do
+			local f = (self._T.footholds or {})[i]
+			if isvalid(ent) then
+				ent.Enable = false
+				if f ~= nil then
+					local sp, ep = f.StartPoint, f.EndPoint
+					local line = self:ClipPreviewLine((sp.x-self._T.mapCx)*scale, (sp.y-self._T.mapCy)*scale, (ep.x-self._T.mapCx)*scale, (ep.y-self._T.mapCy)*scale)
+					if line ~= nil then
+						local dx, dy = line[3]-line[1], line[4]-line[2]
+						local tf = ent.UITransformComponent
+						tf.anchoredPosition = Vector2((line[1]+line[3])/2, (line[2]+line[4])/2 + self._T.contentOffsetY)
+						tf.RectSize = Vector2(math.max(1, math.sqrt(dx*dx+dy*dy)), f.IsBlockVerticalLine and 3 or 4)
+						tf.ZRotation = math.deg(math.atan(dy, dx))
+						ent.Enable = true
+					end
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ClipPreviewLine(number x1, number y1, number x2, number y2)
+		-- Liang–Barsky: 확대한 발판이 미니맵 프레임 밖으로 튀어나오지 않도록 선분을 자른다.
+		local hw, hh = self._T.halfW - 2, self._T.halfH - 2
+		local dx, dy = x2-x1, y2-y1
+		local ps, qs = {-dx, dx, -dy, dy}, {x1+hw, hw-x1, y1+hh, hh-y1}
+		local first, last = 0, 1
+		for i = 1, 4 do
+			local p, q = ps[i], qs[i]
+			if math.abs(p) < 0.00001 then
+				if q < 0 then return nil end
+			elseif p < 0 then
+				first = math.max(first, q/p)
+			else
+				last = math.min(last, q/p)
+			end
+			if first > last then return nil end
+		end
+		return {x1+first*dx, y1+first*dy, x1+last*dx, y1+last*dy}
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreCapture(boolean keepCover)
+		-- 성공/실패/종료 모두 같은 복구 경로를 거친다. 서버의 플레이 상태는 건드리지 않는다.
+		local state = self._T.captureState
+		if state ~= nil then
+			if isvalid(state.camera) then
+				for key, value in pairs(state.cameraValues or {}) do state.camera[key] = value end
+				if state.actualZoom ~= nil then
+					state.camera.IsAllowZoomInOut = true
+					_CameraService:ZoomTo(state.actualZoom, 0)
+					state.camera.IsAllowZoomInOut = state.cameraValues.IsAllowZoomInOut
+				end
+			end
+			for _, rec in ipairs(state.hidden or {}) do
+				local actor = rec.entity
+				if isvalid(rec.nameTag) then rec.nameTag.Enable = rec.enabled end
+				if isvalid(actor) then
+					local monster = actor:GetComponent("script.Monster")
+					local canRestore = not isvalid(monster) or not monster.IsDead
+					if isvalid(actor.PlayerComponent) and not _LoginFlow:IsInGame() then canRestore = false end
+					if canRestore then actor:SetVisible(true, false, false) end
+				end
+			end
+			for _, rec in ipairs(state.backgrounds or {}) do
+				local bg = rec.component
+				if isvalid(bg) then
+					if rec.kind == BackgroundType.Template then bg:ChangeBackgroundByTemplateRUID(rec.template)
+					elseif rec.kind == BackgroundType.SolidColor then bg:ChangeBackgroundBySolidColor(rec.color)
+					elseif rec.kind == BackgroundType.Web then bg:ChangeBackgroundByWebUrl(rec.url)
+					elseif rec.kind == BackgroundType.Gradient then bg:ChangeBackgroundByGradient(bg.TopColor, bg.MiddleTopColor, bg.MiddleBottomColor, bg.BottomColor, bg.MiddleTopRatio, bg.MiddleBottomRatio)
+					else bg.Type = rec.kind end
+				end
+			end
+			_CameraService.TransitionBlendTime = state.blend
+		end
+		self._T.captureState = nil
+		if keepCover then return end
+		local cover = _EntityService:GetEntityByPath("/ui/MiniMapCaptureUI")
+		if isvalid(cover) then
+			cover.Enable = false
+			local screen = cover:GetChildByName("Screen", false)
+			if isvalid(screen) then screen.RawImageGUIRendererComponent:SetRawImage(nil) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CapturePreview(Entity map)
+		-- 30% 카메라 범위를 넘는 맵은 여러 장으로 나누어 실제 타일/오브젝트를 모두 담는다.
+		local function stillHere()
+			local player = _UserService.LocalPlayer
+			return not self._T.ending and isvalid(map) and isvalid(map.MapComponent) and isvalid(player) and player.CurrentMap == map
+		end
+		if not stillHere() then return end
+		self._T.capturing = true
+		self:ClearPreview()
+		local completed = false
+		local success, reason = pcall(function()
+			local camera = _CameraService:GetCurrentCameraComponent()
+			local cover = _EntityService:GetEntityByPath("/ui/MiniMapCaptureUI")
+			if not isvalid(camera) or not isvalid(cover) then return end
+			local code, frozen = _ScreenshotService:CaptureFullScreenAsPixelDataAndWait(true)
+			if code ~= ScreenshotError.Success or not stillHere() or not isvalid(camera) then return end
+			cover:GetChildByName("Screen", false).RawImageGUIRendererComponent:SetRawImage(frozen)
+			cover.Enable = true
+			local state = {camera = camera, map = map, blend = _CameraService.TransitionBlendTime, actualZoom = _CameraService.currentZoomRatio, hidden = {}, backgrounds = {}, cameraValues = {}}
+			for _, key in ipairs({"ConfineCameraArea", "UseCustomBound", "ScreenOffset", "CameraOffset", "Damping", "DeadZone", "SoftZone", "IsAllowZoomInOut", "ZoomRatio", "DutchAngle"}) do state.cameraValues[key] = camera[key] end
+			self._T.captureState = state
+			local backgrounds = map:GetChildComponentsByTypeName("MOD.Core.BackgroundComponent", true)
+			if isvalid(map.BackgroundComponent) then table.insert(backgrounds, map.BackgroundComponent) end
+			for _, bg in ipairs(backgrounds) do
+				table.insert(state.backgrounds, {component = bg, kind = bg.Type, template = bg.TemplateRUID, color = bg.SolidColor, url = bg.WebUrl})
+				bg:ChangeBackgroundBySolidColor(Color(0, 0, 0, 0))
+			end
+			-- 렌더러 Enable을 끄면 진행 중인 모션/표정의 종료 이벤트를 놓칠 수 있다.
+			-- 배우 루트의 클라이언트 표시만 숨기고 애니메이션과 서버 상태는 계속 갱신한다.
+			local hiddenIds = {}
+			for _, typeName in ipairs({"SpriteRendererComponent", "AvatarRendererComponent", "SkeletonRendererComponent", "TextRendererComponent", "NameTagComponent"}) do
+				for _, renderer in ipairs(map:GetChildComponentsByTypeName("MOD.Core." .. typeName, true)) do
+					local e = renderer.Entity
+					local actor = e
+					local dynamic = typeName == "NameTagComponent" or typeName == "AvatarRendererComponent"
+					while isvalid(e) and e ~= map do
+						if isvalid(e.PlayerComponent) or isvalid(e:GetComponent("script.Monster")) or isvalid(e.MovementComponent) then dynamic = true; actor = e; break end
+						e = e.Parent
+					end
+					if dynamic and isvalid(actor.PlayerComponent) then
+						if typeName == "NameTagComponent" then
+							-- 이름표는 애니메이션과 무관하며 플레이어 루트를 숨기지 않고 별도로 제외한다.
+							table.insert(state.hidden, {nameTag = renderer, enabled = renderer.Enable})
+							renderer.Enable = false
+							continue
+						end
+						-- 플레이어 루트 Visible은 맵 이동과 동기화되는 게임 상태다.
+						-- 서버에 없는 로컬 아바타 루트만 가려 맵 전환 뒤에도 플레이어가 숨지 않게 한다.
+						local avatar = actor.AvatarRendererComponent
+						actor = isvalid(avatar) and avatar:GetAvatarRootEntity() or nil
+					end
+					if dynamic and isvalid(actor) and not hiddenIds[actor.Id] and actor.Visible then
+						hiddenIds[actor.Id] = true
+						table.insert(state.hidden, {entity = actor})
+						actor:SetVisible(false, false, false)
+					end
+				end
+			end
+			---@type CameraComponent
+			local previewCamera = camera
+			previewCamera.ConfineCameraArea = false
+			previewCamera.UseCustomBound = false
+			previewCamera.ScreenOffset = Vector2(0.5, 0.5)
+			previewCamera.Damping = Vector2.zero
+			previewCamera.DeadZone = Vector2.zero
+			previewCamera.SoftZone = Vector2.zero
+			previewCamera.IsAllowZoomInOut = true
+			previewCamera.ZoomRatio = 30
+			previewCamera.DutchAngle = 0
+			_CameraService.TransitionBlendTime = 0
+			-- 속성 변경만으로는 실제 줌이 늦게 적용될 수 있어 네이티브 줌도 즉시 맞춘다.
+			_CameraService:ZoomTo(30, 0)
+			wait(0.25)
+			if not stillHere() or not isvalid(previewCamera) then return end
+			local lo, hi = map.MapComponent:GetBound()
+			local minX, maxX, minY, maxY = lo.x, hi.x, lo.y, hi.y
+			if self._T.previewBounds ~= nil then
+				local b = self._T.previewBounds
+				minX, maxX, minY, maxY = b[1], b[2], b[3], b[4]
+			end
+			local a = _UILogic:ScreenToWorldPosition(Vector2.zero)
+			local z = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+			local tileW, tileH = math.abs(z.x-a.x), math.abs(z.y-a.y)
+			if tileW < 1 or tileH < 1 then return end
+			-- 지형뿐 아니라 현재 표시 영역 전체를 덮는다. 반투명 검정에 빈 사각형이 생기지 않는다.
+			local previewSize = self._T.viewport.UITransformComponent.RectSize
+			local previewScale = math.max(0.01, self._T.mapScale or 1)
+			local spanW = math.max(maxX-minX, previewSize.x / previewScale)
+			local spanH = math.max(maxY-minY, previewSize.y / previewScale)
+			local cols = math.max(1, math.ceil(spanW/tileW))
+			local rows = math.max(1, math.ceil(spanH/tileH))
+			if cols * rows > 32 then log_warning("[MiniMap] 맵 캡처 범위 초과"); return end
+			local cx, cy = (minX+maxX)/2, (minY+maxY)/2
+			self._T.previewBounds = {minX,maxX,minY,maxY}
+			for row = 1, rows do
+				for col = 1, cols do
+					if not stillHere() then return end
+					local x = cx + (col-(cols+1)/2)*tileW
+					local y = cy + (row-(rows+1)/2)*tileH
+					-- 고정 대기 시간 대신 실제 화면 중심 도착을 확인해 이전 타일 중복 캡처를 막는다.
+					local settled = false
+					for attempt = 1, 40 do
+						if not stillHere() or not isvalid(previewCamera) then return end
+						local origin = previewCamera.Entity.TransformComponent.WorldPosition
+						previewCamera.CameraOffset = Vector2(x-origin.x,y-origin.y)
+						wait(0.025)
+						if not stillHere() or not isvalid(previewCamera) then return end
+						local center = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth/2, _UILogic.ScreenHeight/2))
+						if math.abs(center.x-x) < 0.04 and math.abs(center.y-y) < 0.04 then settled = true; break end
+					end
+					if not settled then log_warning("[MiniMap] capture camera did not settle"); return end
+					local captureLo = _UILogic:ScreenToWorldPosition(Vector2.zero)
+					local captureHi = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+					local result, pixels = _ScreenshotService:CaptureFullScreenAsPixelDataAndWait(false)
+					if result ~= ScreenshotError.Success or not stillHere() then return end
+					local index = (row-1)*cols+col
+					local tile = self._T.captureTiles[index]
+					tile.RawImageGUIRendererComponent:SetRawImage(pixels)
+					tile.Enable = true
+					self._T.previewRects[index] = {x=(captureLo.x+captureHi.x)/2,y=(captureLo.y+captureHi.y)/2,w=math.abs(captureHi.x-captureLo.x),h=math.abs(captureHi.y-captureLo.y)}
+				end
+			end
+			for _, e in ipairs(self._T.fhPool) do if isvalid(e) then e.Enable = false end end
+			self:LayoutPreview()
+			completed = true
+			log("[MiniMap] actual terrain captured map=" .. map.Name .. " tiles=" .. tostring(cols*rows) .. " background=false actors=false")
+		end)
+		local state = self._T.captureState
+		self:RestoreCapture(true)
+		-- 복구된 카메라를 한 프레임 정착시킨 뒤 덮개를 해제한다.
+		if state ~= nil and isvalid(state.camera) and not self._T.ending then
+			state.camera.Damping = Vector2.zero
+			state.camera.DeadZone = Vector2.zero
+			state.camera.SoftZone = Vector2.zero
+			wait(0.1)
+			if isvalid(state.camera) then
+				state.camera.Damping = state.cameraValues.Damping
+				state.camera.DeadZone = state.cameraValues.DeadZone
+				state.camera.SoftZone = state.cameraValues.SoftZone
+			end
+		end
+		self:RestoreCapture(false)
+		if not stillHere() then completed = false end
+		if not completed then
+			self:ClearPreview()
+			if stillHere() then self:RebuildFootholds(map); self:LayoutPreview()
+			else self._T.builtMap = nil end
+		end
+		self._T.capturing = false
+		if not success then log_warning("[MiniMap] capture failed: " .. tostring(reason)) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateMapIdentity(Entity map)
+		local rawName = map.Name or "Map"
+		local displayName = rawName
+		local region = "빅토리아 아일랜드"
+		local page = _WorldMapManager:GetPageForMap(rawName)
+		local regionNames = {victoria = "빅토리아 아일랜드", sleepywood = "슬리피우드", elnath = "엘나스 산맥", minar = "미나르숲", ludus = "루더스 호수", nautilus = "노틸러스", ellinel = "요정학원 엘리넬", goldbeach = "골드비치", mushroom = "버섯의 성", kerningtower = "커닝타워", ellodin = "비밀의숲 엘로딘", deadmine = "폐광"}
+		if regionNames[page] ~= nil then
+			region = regionNames[page]
+			local regionalName = _WorldMapManager:GetMapDisplayName(rawName)
+			if regionalName ~= "" then displayName = regionalName end
+		end
+		if rawName == "map01" then displayName = "평온한 숲길" end
+		if isvalid(self._T.mapName) then
+			if isvalid(self._T.mapName.TextComponent) then self._T.mapName.TextComponent.Text = displayName
+			elseif isvalid(self._T.mapName.TextGUIRendererComponent) then self._T.mapName.TextGUIRendererComponent.Text = displayName end
+		end
+		if isvalid(self._T.regionName) then
+			if isvalid(self._T.regionName.TextComponent) then self._T.regionName.TextComponent.Text = region
+			elseif isvalid(self._T.regionName.TextGUIRendererComponent) then self._T.regionName.TextGUIRendererComponent.Text = region end
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RebuildFootholds(Entity map)
 		-- 발판 전체(GetFootholdAll)의 경계를 재서 보드 안에 비율 유지로 축소해 그린다.
+		self._T.previewBounds = nil
+		self._T.markerMap = nil
+		self._T.footholds = {}
 		local fhComp = map.FootholdComponent
 		local all = isvalid(fhComp) and fhComp:GetFootholdAll() or nil
 		local list = {}
@@ -83,9 +617,12 @@ script MiniMapUIManager extends Component
 		end
 		-- 풀보다 발판이 많으면 긴 것부터 그린다(짧은 조각 생략이 지형 윤곽 훼손이 가장 적다).
 		table.sort(list, function(a, b) return a.Length > b.Length end)
+		self._T.footholds = list
 		local bs = self._T.board.UITransformComponent.RectSize
-		local w = bs.x - 16
-		local h = bs.y - 16
+		local w = bs.x - 48
+		local h = bs.y - 144
+		minX, maxX, minY, maxY = minX - 0.5, maxX + 0.5, minY - 1.2, maxY + 0.7
+		self._T.previewBounds = {minX, maxX, minY, maxY}
 		local spanX = math.max(0.1, maxX - minX)
 		local spanY = math.max(0.1, maxY - minY)
 		local scale = math.min(w / spanX, h / spanY)
@@ -96,6 +633,7 @@ script MiniMapUIManager extends Component
 		self._T.mapCy = cy
 		self._T.halfW = w * 0.5
 		self._T.halfH = h * 0.5
+		self._T.contentOffsetY = -49
 		for i = 1, self.FhPool do
 			local ent = self._T.fhPool[i]
 			if isvalid(ent) then
@@ -106,15 +644,18 @@ script MiniMapUIManager extends Component
 					local dx = ep.x - sp.x
 					local dy = ep.y - sp.y
 					local ut = ent.UITransformComponent
-					ut.anchoredPosition = Vector2(((sp.x + ep.x) * 0.5 - cx) * scale, ((sp.y + ep.y) * 0.5 - cy) * scale)
-					ut.RectSize = Vector2(math.max(2, math.sqrt(dx * dx + dy * dy) * scale), 2)
+					ut.anchoredPosition = Vector2(((sp.x + ep.x) * 0.5 - cx) * scale, ((sp.y + ep.y) * 0.5 - cy) * scale + self._T.contentOffsetY)
+					local terrainThickness = 4
+					if f.IsBlockVerticalLine then terrainThickness = 3 end
+					ut.RectSize = Vector2(math.max(3, math.sqrt(dx * dx + dy * dy) * scale), terrainThickness)
 					ut.ZRotation = math.deg(math.atan(dy, dx))
 					local spr = ent.SpriteGUIRendererComponent
 					if isvalid(spr) then
+						spr.Type = ImageType.Simple
 						if f.IsBlockVerticalLine then
-							spr.Color = Color(1, 1, 1, 0.22)          -- 벽: 어둡게
+							spr.Color = Color(0.66, 0.74, 0.78, 0.72)
 						else
-							spr.Color = Color(0.86, 0.90, 0.93, 0.62) -- 발판: 밝은 회백
+							spr.Color = Color(0.86, 0.94, 0.78, 0.96)
 						end
 					end
 					ent.Enable = true
@@ -124,32 +665,103 @@ script MiniMapUIManager extends Component
 			end
 		end
 		self._T.builtMap = map
+		self:LayoutPreview()
 		log("[MiniMap] 발판 레이아웃 갱신 - " .. tostring(#list) .. "개")
 	end
 
 	@ExecSpace("ClientOnly")
+	method boolean RebuildMapLayer(Entity map)
+		local renderers = map:GetChildComponentsByTypeName("MOD.Core.SpriteRendererComponent", true)
+		local list = {}
+		local minX = math.huge
+		local maxX = -math.huge
+		local minY = math.huge
+		local maxY = -math.huge
+		for _, renderer in ipairs(renderers) do
+			if renderer.SpriteRUID ~= "" and string.find(tostring(renderer.SortingLayer), "MapLayer", 1, true) ~= nil then
+				local pos = renderer.Entity.TransformComponent.WorldPosition
+				table.insert(list, { renderer = renderer, pos = pos })
+				minX = math.min(minX, pos.x)
+				maxX = math.max(maxX, pos.x)
+				minY = math.min(minY, pos.y)
+				maxY = math.max(maxY, pos.y)
+			end
+		end
+		if #list == 0 then return false end
+		table.sort(list, function(a, b) return a.renderer.OrderInLayer < b.renderer.OrderInLayer end)
+
+		local bs = self._T.board.UITransformComponent.RectSize
+		local w = bs.x - 28
+		local h = bs.y - 82
+		local scale = math.min(w / math.max(0.1, maxX - minX), h / math.max(0.1, maxY - minY))
+		local cx = (minX + maxX) * 0.5
+		local cy = (minY + maxY) * 0.5
+		self._T.mapScale = scale
+		self._T.mapCx = cx
+		self._T.mapCy = cy
+		self._T.halfW = w * 0.5
+		self._T.halfH = h * 0.5
+		self._T.contentOffsetY = -22
+
+		for i = 1, self.FhPool do
+			local ent = self._T.fhPool[i]
+			if isvalid(ent) then
+				if i <= #list then
+					local rec = list[i]
+					local ui = ent.UITransformComponent
+					local spr = ent.SpriteGUIRendererComponent
+					spr.ImageRUID = rec.renderer.SpriteRUID
+					spr.Type = ImageType.Simple
+					spr.Color = Color(1, 1, 1, 0.96)
+					spr:SetNativeSize()
+					local native = ui.RectSize
+					local worldScale = rec.renderer.Entity.TransformComponent.Scale
+					local factor = scale / 100
+					ui.RectSize = Vector2(math.max(2, native.x * math.abs(worldScale.x) * factor), math.max(2, native.y * math.abs(worldScale.y) * factor))
+					ui.anchoredPosition = Vector2((rec.pos.x - cx) * scale, (rec.pos.y - cy) * scale + self._T.contentOffsetY)
+					ui.ZRotation = rec.renderer.Entity.TransformComponent.ZRotation
+					ent.Enable = true
+				else
+					ent.Enable = false
+				end
+			end
+		end
+		self._T.builtMap = map
+		log("[MiniMap] Map Layer 스프라이트 갱신 - " .. tostring(math.min(#list, self.FhPool)) .. "개")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
 	method void UpdateMarkers(Entity map, Entity player)
+		-- 보이는 범위의 대상만 풀에 할당한다. 화면 밖 대상을 가장자리에 몰아넣지 않는다.
 		local scale = self._T.mapScale
 		if scale == nil then return end
 		local cx = self._T.mapCx
 		local cy = self._T.mapCy
 		local hw = self._T.halfW
 		local hh = self._T.halfH
+		local oy = self._T.contentOffsetY or 0
 		-- 몬스터(빨강): 살아있는 것만.
-		local mobs = map:GetChildComponentsByTypeName("script.Monster", true)
+		if self._T.markerMap ~= map or (self._T.scanAcc or 0) >= 0.2 then
+			self._T.markerMobs = map:GetChildComponentsByTypeName("script.Monster", true)
+			self._T.markerPlayers = map:GetChildComponentsByTypeName("MOD.Core.PlayerComponent", true)
+			self._T.markerMap = map
+			self._T.scanAcc = 0
+		end
+		local mobs = self._T.markerMobs
 		local mi = 0
 		for _, comp in ipairs(mobs or {}) do
 			---@type Monster
 			local mc = comp
 			if isvalid(mc) and isvalid(mc.Entity) and mc.Entity.Enable and not mc.IsDead then
+				local wp = mc.Entity.TransformComponent.WorldPosition
+				local x, y = (wp.x - cx) * scale, (wp.y - cy) * scale
+				if math.abs(x) > hw or math.abs(y) > hh then continue end
 				mi = mi + 1
 				if mi > self.MobPool then break end
 				local e = self._T.mobPool[mi]
 				if isvalid(e) then
-					local wp = mc.Entity.TransformComponent.WorldPosition
-					e.UITransformComponent.anchoredPosition = Vector2(
-						math.max(-hw, math.min(hw, (wp.x - cx) * scale)),
-						math.max(-hh, math.min(hh, (wp.y - cy) * scale)))
+					e.UITransformComponent.anchoredPosition = Vector2(x, y + oy)
 					e.Enable = true
 				end
 			end
@@ -158,20 +770,20 @@ script MiniMapUIManager extends Component
 			local e = self._T.mobPool[i]
 			if isvalid(e) then e.Enable = false end
 		end
-		-- 소환수(초록): 용사/궁수/도적 소환(HeroSummon 컴포넌트).
-		local sums = map:GetChildComponentsByTypeName("script.HeroSummon", true)
+		-- 다른 플레이어(빨강). 소환수나 장식 이미지는 미니맵에 표시하지 않는다.
+		local sums = self._T.markerPlayers
 		local si = 0
 		for _, comp in ipairs(sums or {}) do
 			local sc = comp
-			if isvalid(sc) and isvalid(sc.Entity) then
+			if isvalid(sc) and isvalid(sc.Entity) and sc.Entity ~= player then
+				local wp = sc.Entity.TransformComponent.WorldPosition
+				local x, y = (wp.x - cx) * scale, (wp.y - cy) * scale
+				if math.abs(x) > hw or math.abs(y) > hh then continue end
 				si = si + 1
 				if si > self.SumPool then break end
 				local e = self._T.sumPool[si]
 				if isvalid(e) then
-					local wp = sc.Entity.TransformComponent.WorldPosition
-					e.UITransformComponent.anchoredPosition = Vector2(
-						math.max(-hw, math.min(hw, (wp.x - cx) * scale)),
-						math.max(-hh, math.min(hh, (wp.y - cy) * scale)))
+					e.UITransformComponent.anchoredPosition = Vector2(x, y + oy)
 					e.Enable = true
 				end
 			end
@@ -186,7 +798,7 @@ script MiniMapUIManager extends Component
 			local wp = player.TransformComponent.WorldPosition
 			ply.UITransformComponent.anchoredPosition = Vector2(
 				math.max(-hw, math.min(hw, (wp.x - cx) * scale)),
-				math.max(-hh, math.min(hh, (wp.y - cy) * scale)))
+				math.max(-hh, math.min(hh, (wp.y - cy) * scale)) + oy)
 			ply.Enable = true
 		end
 	end

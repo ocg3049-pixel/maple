@@ -443,6 +443,12 @@ script CharacterPersistence extends Logic
 
 	@ExecSpace("Server")
 	method void RequestEnterCharacter(integer index)
+		-- 채널 선택이 확정되기 전에는 인게임 데이터를 활성화하지 않는다.
+		log("[LoginFlow] character load request index=" .. tostring(index) .. " user=" .. tostring(senderUserId))
+		if not _LoginFlow:CanEnterServer(senderUserId) then
+			self:OnPersistLoadError("서버를 먼저 선택해주세요.", senderUserId)
+			return
+		end
 		-- 캐릭터 입장: 최근 접속 기록 갱신 + 저장된 세이브 회신(없으면 빈 문자열 = 신규).
 		local sv = self:EnsureLoadedServer(senderUserId)
 		if sv.loadFailed == true then
@@ -482,6 +488,7 @@ script CharacterPersistence extends Logic
 		sv.lastMeso[id] = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
 		self:AppendAudit(sv, id, "enter", sv.lastMeso[id], 0, false)
 		log("[Persist] 캐릭터 입장: " .. name .. " (저장데이터 " .. (saveStr == "" and "없음-신규" or tostring(#saveStr) .. "바이트") .. ")")
+		_LoginFlow:AuthorizeEntry(senderUserId)
 		self:ReceiveCharacterSave(saveStr, senderUserId)
 	end
 
@@ -572,6 +579,8 @@ script CharacterPersistence extends Logic
 		local capR = ruids[7]
 		if capR == nil then capR = "NONE" end
 		newData = newData .. "|" .. parts[8] .. "|" .. capR
+        local power = string.match("\n" .. saveStr, "\nCP\t(%d+)") or parts[10]
+        if power ~= nil then newData = newData .. "|" .. power end
 		if newData ~= ch.data then
 			ch.data = newData
 			sv.charsDirty = true
@@ -603,14 +612,14 @@ script CharacterPersistence extends Logic
 		log("[Persist] 캐릭터 목록 수신: " .. tostring(#cl.chars) .. "개, 최근접속=" .. (cl.lastName == "" and "(없음)" or cl.lastName))
 
 		if cl.lastName ~= "" then
-			local accountText = _EntityService:GetEntityByPath("/ui/DefaultGroup/LoginGroup/LoginBackground/AccountText")
-			if isvalid(accountText) and isvalid(accountText.TextComponent) then
-				accountText.TextComponent.Text = cl.lastName
+			local accountText = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/LoginGroup/LoginBackground/AccountText")
+			if isvalid(accountText) and isvalid(accountText.TextGUIRendererComponent) then
+				accountText.TextGUIRendererComponent.Text = cl.lastName
 			end
 		end
 
 		-- 캐릭터 선택창이 이미 열려 있으면 즉시 채움
-		local csg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup")
+		local csg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup")
 		if isvalid(csg) and csg.Enable then
 			self:PopulateSelectUI()
 		end
@@ -621,44 +630,25 @@ script CharacterPersistence extends Logic
 		-- 캐릭터 생성 결과: 성공 시 목록 갱신 + (생성창이 열려있었다면) 선택창으로 전환.
 		local cl = self._T.cl
 		cl.pendingCreate = false
+		_LoginFlow.busy = false
 		if not success then
-			print(reason)
+			_LoginFlow:Notice(reason, "")
 			log("[Persist] 캐릭터 생성 거부: " .. reason)
 			return
 		end
 		cl.chars = self:DecodeCharsReply(charsStr)
 
-		local createGroup = _EntityService:GetEntityByPath("/ui/DefaultGroup/CreateCharacter")
+		local createGroup = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CreateCharacter")
 		local wasCreateOpen = isvalid(createGroup) and createGroup.Enable
 		if wasCreateOpen then
 			createGroup.Enable = false
 		end
 
-		-- 선택창 표시 준비 (Enable 전 위치 리셋 - 기존 CreateCharacterok과 동일)
-		local function sp(path, x, y)
-			local e = _EntityService:GetEntityByPath(path)
-			if isvalid(e) then e.UITransformComponent.anchoredPosition = Vector2(x, y) end
-		end
-		local base = "/ui/DefaultGroup/CharacterSelectGroup/SelectBackground/"
-		sp(base .. "CharacterSlot1",          -300,  0)
-		sp(base .. "CharacterSlot1/SlotAvatar",   0, 50)
-		sp(base .. "CharacterSlot2",             0,  0)
-		sp(base .. "CharacterSlot2/SlotAvatar",   0, 50)
-		sp(base .. "CharacterSlot3",           300,  0)
-		sp(base .. "CharacterSlot3/SlotAvatar",   0, 50)
-		sp(base .. "CreateCharacterButton",    700, 100)
-		sp(base .. "DeleteCharacterButton",    700, -100)
-		-- 12칸(3칸 × 4페이지) 페이지 이동 UI
-		sp(base .. "PrevPageButton",          -480,  0)
-		sp(base .. "NextPageButton",           480,  0)
-		sp(base .. "PageText",                   0, -180)
-
-		local charSelectGroup = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup")
-		if isvalid(charSelectGroup) then charSelectGroup.Enable = true end
+		_LoginFlow:ShowCharacters()
 
 		self:PopulateSelectUI()
 		-- 방금 만든 캐릭터(마지막 슬롯) 선택
-		local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
+		local selectBg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup/SelectBackground")
 		if isvalid(selectBg) then
 			local comp = selectBg:GetComponent(CharacterSelectComponent)
 			if isvalid(comp) then comp:SelectSlot(#cl.chars) end
@@ -671,12 +661,12 @@ script CharacterPersistence extends Logic
 		local cl = self._T.cl
 		cl.chars = self:DecodeCharsReply(charsStr)
 		self:PopulateSelectUI()
-		local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
+		local selectBg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup/SelectBackground")
 		if isvalid(selectBg) then
 			local comp = selectBg:GetComponent(CharacterSelectComponent)
 			if isvalid(comp) then comp:SelectSlot(0) end
 		end
-		print("캐릭터가 삭제되었습니다. (7일간 보관 후 영구 삭제)")
+		_LoginFlow:Notice("캐릭터가 삭제되었습니다.\n삭제한 닉네임으로는 7일 동안 캐릭터를 생성할 수 없습니다.", "")
 	end
 
 	@ExecSpace("Client")
@@ -684,7 +674,7 @@ script CharacterPersistence extends Logic
 		-- (유실 방지) 서버 스토리지 일시 장애로 목록/세이브를 못 읽었을 때 - 입장이 거부됐음을
 		-- 알린다. entered가 false로 남아 이 세션에서는 어떤 저장도 나가지 않는다(원본 보호).
 		log_warning("[Persist] " .. msg)
-		_UIToast:ShowMessage(msg)
+		_LoginFlow:EntryFailed(msg)
 	end
 
 	@ExecSpace("Client")
@@ -701,6 +691,7 @@ script CharacterPersistence extends Logic
 		cl.entered = true
 		cl.lastSentStr = ""
 		self:MarkDirty("init")
+		_LoginFlow:CharacterRestored()
 	end
 
 	-- ══════════════════════════ 클라이언트: 공개 API ══════════════════════════
@@ -710,7 +701,7 @@ script CharacterPersistence extends Logic
 		-- 서버에서 받은 캐릭터 목록으로 선택창 12슬롯을 채운다 (loginbutton/DoLogin의 LoadCharacters 직후 호출).
 		-- 화면에는 현재 페이지 3칸만 그려지므로, 데이터를 모두 채운 뒤 RefreshPage로 한 번에 그린다.
 		local cl = self._T.cl
-		local selectBg = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharacterSelectGroup/SelectBackground")
+		local selectBg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup/SelectBackground")
 		if not isvalid(selectBg) then return end
 		local comp = selectBg:GetComponent(CharacterSelectComponent)
 		if not isvalid(comp) then return end
@@ -727,11 +718,18 @@ script CharacterPersistence extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method boolean IsCharacterListReady()
+		-- 지연 수신을 빈 계정으로 오인해 생성·입장을 진행하지 않는다.
+		return self._T.cl ~= nil and self._T.cl.listReceived == true
+	end
+
+	@ExecSpace("ClientOnly")
 	method void ClientRequestCreate(string dataStr)
 		-- 캐릭터 생성 요청 (CreateCharacterok/Y키 자동생성에서 호출). 응답은 OnCreateResult로 온다.
 		local cl = self._T.cl
 		if cl.pendingCreate then return end
 		cl.pendingCreate = true
+		_LoginFlow.busy = true
 		self:RequestCreateCharacter(dataStr)
 	end
 
@@ -803,6 +801,8 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 세이브 포맷 버전 - 향후 포맷 변경 시 RestoreSave가 이 값으로 마이그레이션
 		-- 분기를 태운다. 서버 감사 로그가 첫 줄 "M\t"를 앵커로 파싱하므로 M 다음 줄에 둔다.
 		table.insert(lines, "V\t1")
+        -- 선택 화면용 표시 스냅샷. 게임 전투 판정에는 사용하지 않는다.
+        table.insert(lines, "CP\t" .. tostring(math.max(0, math.floor(_CharInfoManager:CalcCombatPower()))))
 		-- potionAttackBonus(공격력 물약 보너스)는 세션 전용 스탯이라 저장하지 않는다(항상 0으로 기록,
 		-- 포맷 호환 유지) - "물약으로 오른 스탯은 종료 시 사라져야 한다"는 요청 반영.
 		table.insert(lines, "A\t" .. tostring(_CharInfoManager.atkSpeedStage) .. "\t0")
@@ -900,7 +900,7 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 복원 때 이 빌드가 해석하지 못해 보존해 둔 라인들을 그대로 재부착한다 -
 		-- 구버전 빌드가 신버전 세이브를 열어도 모르는 데이터를 지우지 않는다(라운드트립 보존).
 		for _, ln in ipairs(self._T.cl.unknownLines or {}) do
-			table.insert(lines, ln)
+			if string.sub(ln, 1, 3) ~= "CP\t" then table.insert(lines, ln) end
 		end
 		return table.concat(lines, "\n")
 	end
@@ -926,7 +926,9 @@ script CharacterPersistence extends Logic
 			local kind = string.sub(line, 1, 1)
 			if kind == "M" then
 				t.meso = tonumber(string.sub(line, 3)) or 0
-			elseif kind == "V" then
+			elseif string.sub(line, 1, 3) == "CP\t" then
+                -- 표시 요약은 장비/스킬 복원 후 다시 계산하므로 게임 상태로 복원하지 않는다.
+            elseif kind == "V" then
 				-- 세이브 포맷 버전(현재 1) - 향후 포맷이 바뀌면 이 값으로 마이그레이션 분기
 			elseif kind == "A" then
 				local f = self:SplitTabs(line)

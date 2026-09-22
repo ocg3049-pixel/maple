@@ -16,6 +16,8 @@ script Monster extends Component
     property number RespawnDelay = 5.0
     property number DestroyDelay = 0.6
     property integer MonsterLevel = 15
+    property string MonsterDisplayName = ""
+    property boolean Stationary = false
 
     -- (요청 2026-08-09) 어그로 지속시간(초). 마지막으로 맞은 시점부터 이만큼 공격자를 쫓고,
     -- 만료되면 추적을 풀고 다시 혼자 배회한다.
@@ -25,8 +27,9 @@ script Monster extends Component
     -- (전투분석 허수아비) 절대 죽지 않는 샌드백 - HP가 바닥나면 만피로 리필하고 사망 분기를 타지 않는다.
     -- 기본값 false라 기존 몬스터는 영향 없음.
     @Sync property boolean NeverDie = false
-    -- 몬스터별 전용 피격음. 비워두면(기본값) 공용 기본 피격음(DefaultHitSoundRUID)이 재생된다.
+    -- 명시한 전용 소리가 우선한다. 비어 있으면 애니메이션에 대응하는 공식 몬스터 팩에서 선택한다.
     property string HitSoundRUID = ""
+    property string DeathSoundRUID = ""
 
     -- (요청 2026-08-11) 리젠 자리(최초 배치 좌표). 리젠은 항상 이 좌표에서 일어난다(_T.spawnX/Y와
     -- 같은 값). @Sync로 공개하는 이유: 자동사냥(클라)이 "죽어서 리젠 대기 중인 몬스터의 리젠 자리"에
@@ -133,6 +136,9 @@ script Monster extends Component
         }
         local kind = string.gsub(self.Entity.Name, "_%d+$", "")
         local label = labels[kind]
+        if self.MonsterDisplayName ~= "" then
+            label = "Lv." .. tostring(self.MonsterLevel) .. " " .. self.MonsterDisplayName
+        end
         if label == nil then return end
         local tag = self.Entity.NameTagComponent
         if not isvalid(tag) then
@@ -446,18 +452,98 @@ script Monster extends Component
         self._T.deathDeferUntil = nil
     end
 
+    @ExecSpace("ClientOnly")
+    method string ResolveMonsterSound(boolean isDeath)
+        -- 현재 배치의 stand 클립으로 공식 팩의 Damage/Die를 찾는다. 이름 변경과 리젠에도 같은 소리를 사용한다.
+        local overrideRuid = self.HitSoundRUID
+        if isDeath then overrideRuid = self.DeathSoundRUID end
+        if overrideRuid ~= "" then return overrideRuid end
+        if self._T.monsterSoundProfile == nil then
+            -- MSW 리소스 API 확인: 2026-09-22. 빈 값은 해당 팩에 소리가 등록되지 않은 경우다.
+            local profiles = {
+            ["96e955c1bf27415e84f96deea200a8f1"] = {"6eb2ef8a783c4393bd7ee6a2c199bda7", "c49646f7299e4c6e81e953c96e20b294"}, -- 주황버섯 / mob/1210102.img
+            ["cf2a470436cd4b2aa265648e15198c45"] = {"b5430bb5b1da4095a3033a408bdbffe3", "5a1056a232dd422d933f7e9714c24de5"}, -- 스텀프 / mob/0130100.img
+            ["0c69164656d24f64bd1a1f6ee4019dff"] = {"892c25924e3f49f4a42dcb9a39525800", "e704d4ea59f4457ca1833423aef36340"}, -- 파란 달팽이 / mob/0100101.img
+            ["1371f44b1ce643e185ebf5396bddaaf7"] = {"bbec511b4ba4460ea0e2f03c71695053", "c1e92a26ba3444e8a4a7c414995267be"}, -- 빨간 달팽이 / mob/0130101.img
+            ["f84d50d06d1c45308d8497e8bf226308"] = {"30401595b3734c6e9d00ddd299d2a459", "8fb5827f7c0b48c29d9dace900d7fe75"}, -- 스포아 / mob/0120100.img
+            ["74dd2989723d49fea80943f3c8e5fc82"] = {"597cdcc11c6a470697fbe4dbcd0ab1e2", "bbb71a7d0c2d401d897643ff037c647a"}, -- 시니컬한 주황버섯 / mob/2300102.img
+            ["f4915ad47dbf4682a56fcac6b893a597"] = {"876c6bd9ed0a4606a184ff1c9ade7049", "de99395544a84b3095e60e7e020c05d3"}, -- 뿔버섯 / mob/2110200.img
+            ["50faf654ee5d479cb2958edce9feaef0"] = {"4623a7a5a7de4e09891c3f0a70f6fb39", "79c80c07bf104fedada12695846b09c4"}, -- 슬라임 / mob/0210100.img
+            ["f86992ba9c41487c8480fcb893fcbda6"] = {"0909185a3a4245e184e9f33d6fd4d718", "9d6373709f0e413aa563464c7be583e5"}, -- 초록버섯 / mob/1110100.img
+            ["1a176a7afb114fe7aef2bc58ef2d945b"] = {"200b85bd0ce54b65abce48573540faf1", "096c50e7e8e048539fd3be0ca229b3fa"}, -- 우는 파란버섯 / mob/2220110.img
+            ["6a98e7ec155643c4a53ff7a81965a6d9"] = {"869aea67272b44b7a2b12e9249432f87", "6783b7baa93d49eba29b4d56332f0a7f"}, -- 파란버섯 / mob/2220100.img
+            ["df12e31426a944469a763b36e264fde2"] = {"918eee0db98e4c1ba39030cf029f94c1", "731cc3a78a4242759082970dd35457c0"}, -- 분노한 뿔버섯 / mob/2300101.img
+            ["8941cb581adb4d70b49ecfe7a2648efe"] = {"10038a014c684fe88bc8550a8b60ecf8", ""}, -- 스톤골렘 / mob/5130101.img
+            ["3faa2c0a65754f14b4de57c76bffde8b"] = {"ea4285f9a1ce43bf94d504b1bd1daa4b", "a7b34f58947943c588380258e282c467"}, -- 아이스 믹스골렘 / mob/5150002.img
+            ["803ef7a19f244dd39737cdf15960c733"] = {"2d7d750260204873bd8e0f1f8d6c946b", "5f543a3840b04e08a701a9957f02cd09"}, -- 다크 스톤골렘 / mob/5130102.img
+            ["c2a3c3ba031440c9bb41884706d71ebc"] = {"5801bccf76ff4842a511e75fb4959460", "fe5f3e390dd649588a011466cadd9d64"}, -- 파이어 믹스골렘 / mob/5150003.img
+            ["90ae76c7837d48bbbbfa6704520425d0"] = {"2965518287be4e528f7a3e46ed13ca85", "cc0c897de50243b4918e26338ff7ce51"}, -- 믹스골렘 / mob/5150000.img
+            ["1ed0265245594bf0904ceb88ecaf16ba"] = {"64efffa44609420ab59e4f0dd9a6d9ef", "d90855a724004b4f8a6f7a3753b90e8b"}, -- 페어리 / mob/3000001.img
+            ["7765add816404731a1b9cf615ecab042"] = {"0230435a9ffb45c382b1c5fb8acc12c2", "a18ad389cdbc4e53aebf55c12e35ea28"}, -- 버블링 / mob/1210103.img
+            ["4b3afc87ca3e49b0aba5c21de8fe3fca"] = {"e2bee88b9f8a4a4caca5287165424af3", "2078190a014e4509a2cc1ae4ee411c13"}, -- 로얄 페어리 / mob/3000007.img
+            ["4e03ed5336034bc793eb287e875ee5c0"] = {"ba58289ca17a4b469673f6be1adda40d", "1b56d2ac97464de7bbefa792366ec1e5"}, -- 이블아이 / mob/2230100.img
+            ["2166e8eff2fc4321a276c816a69871b3"] = {"bd517ccd5d074dfa988b9615088c2d19", "cd02ae7dfd5d423cba5bd0d1a00e6cb5"}, -- 커즈아이 / mob/3230100.img
+            ["aa79081a0ddb47fa99c686c72ad6913d"] = {"5b164a884dc74a20b4288233ec97d316", "47a46f3e2e8d44638f2d00eaf82b7fee"}, -- 서전아이 / mob/2230113.img
+            ["ed3908e24d694bb786023fc1ed073489"] = {"0d7e09281e0047318ba7832299328f77", "0eddcb1bca304e7197cf1449dcedf463"}, -- 다크 스텀프 / mob/1110101.img
+            ["c7c3133cbaeb45fc913c8d6638096b9d"] = {"bcc1777320e547d092985fea3ebff559", "21d2706d79c04c8e97a65bb4cebb9006"}, -- 엑스텀프 / mob/1130100.img
+            ["4d6afe038613457c84a8b4e2525a12e0"] = {"288954a3875748fcbd2ea0063bafd1d7", "0182687638eb42cf9802ea29a2026b27"}, -- 다크 엑스텀프 / mob/2130100.img
+            ["af64c62c1dcf427998c3c52f0a060fec"] = {"99a644b128b347e892a23011eca61cde", "d0dc707313934804b4c2c50942154382"}, -- 와일드보어 / mob/2230102.img
+            ["84a47945d8734a8a9e9317eaed427ca9"] = {"b5794d2885614ef4bc482ea6ea1ee75b", "f2dfb743f9f84037a74c904bc9ba34a0"}, -- 아이언 호그 / mob/4090000.img
+            ["52fc9a75b6174bfa96af66c49dbb3369"] = {"fc9be19cb20c4804b9dca70a7de140d9", "c450be552dba47c88cf1e55ca1e7f109"}, -- 고스텀프 / mob/1140100.img
+            ["4286356e1f6a4c03a6ef125123a49bbe"] = {"216d4e07d636406e8343aa90861f3363", "fd7ea34f2ea14e5bb14e440292abfa85"}, -- 히죽대는 고스텀프 / mob/1140130.img
+            ["d8f014043ce8418f96700c2b6c9ebf6c"] = {"590b667674334ad1aa86eb17e509fbdd", "5deff8b7062042b0a0f87da58c43fba5"}, -- 옥토퍼스 / mob/1120100.img
+            ["d8316fab961249cd9e1740c7fe5b3632"] = {"f60e21e0f80a4f14845514ea1e4dbdd5", "277360414e3b42ed86a6c12f36cd7d8e"}, -- 겁먹은 와일드보어 / mob/2230112.img
+            ["e6c2fd7213d44cd3a5dd5eed2e8fb1ce"] = {"576159ab8c50436684aabce36a4ea8ff", "eaec67e7c7ea4f59a580476e170a614f"}, -- 아이언 보어 / mob/4230400.img
+            ["48c10437ae8344a9b2a1d3f36185728f"] = {"fe85652078c143c69255af4edddad33a", "53e057d84eb143e4a2cf517b7ccc52d7"}, -- 주니어 네키 / mob/2130103.img
+            ["ea1cb448952a4e469b3ee39946a7617a"] = {"5ac7f36bb57a47ae98c43b25c3697692", "d0f86660ef254fb3b8ccf71d943d1699"}, -- 리게이터 / mob/3110100.img
+            ["c6b23cd8cb044b2181e4466e86052704"] = {"1037731cc0034d2f897a80a6abd38aca", "8a24e94aee1742308a6bf3faf87db144"}, -- 크로코 / mob/5130103.img
+            ["17b55730c26f4fd6b8fcfa288da388de"] = {"0f213b255ab34a0e8ed258c89f3b62fe", "30e5a789e9204111924cafc1bc1ce33f"}, -- 달팽이 / mob/0100100.img
+            ["096e9a374aa74156976f83f25a3f49b4"] = {"f8705d174c7f4d3da3abb1f7658fa9c9", "2993f17999f94c44a3862d1b6594fde5"}, -- 늪진흙괴물 / mob/2230114.img
+            ["1d71a3b269544d85a94f38feecdd2b89"] = {"d372ec233f8f4628b633092a2c81d473", "7dfabece349c4f7482bea41ab7af7acb"}, -- 짜증내는 좀비버섯 / mob/2230131.img
+            }
+            local key = ""
+            local animation = self.Entity.StateAnimationComponent
+            if isvalid(animation) then key = animation.ActionSheet["stand"] or "" end
+            if key == "" and isvalid(self.Entity.SpriteRendererComponent) then
+                key = self.Entity.SpriteRendererComponent.SpriteRUID
+            end
+            self._T.monsterSoundProfile = profiles[key] or {"", ""}
+            if profiles[key] == nil then
+                log_warning("[MonsterSound] unmapped " .. self.Entity.Name .. " clip=" .. key)
+            end
+        end
+        if isDeath then return self._T.monsterSoundProfile[2] end
+        return self._T.monsterSoundProfile[1]
+    end
+
     @ExecSpace("Multicast")
     method void PlayHitSound()
-        -- 몬스터마다 전용 피격음(HitSoundRUID)이 지정돼 있으면 그것을, 없으면 공용 기본 피격음을 1회 재생한다.
-        -- (버그 수정) 기존 ExecSpace("Client")는 "이 엔티티를 소유한 클라이언트"에게 보내는 RPC인데,
-        -- 몬스터는 소유 클라이언트가 없어 대상이 지정되지 않으면 어느 클라이언트에도 도착하지 않아 소리가
-        -- 전혀 들리지 않았다(실측 확인 - 한방에 죽는 경우 포함 모든 피격에서 재생되지 않음). 몬스터를 보고
-        -- 있는 모든 클라이언트에게 브로드캐스트하는 Multicast로 바꿔야 실제로 들린다.
+        -- 모든 관전자에게 이 몬스터의 피격음을 재생한다. 공용 임의 효과음으로 대체하지 않는다.
         if not self:IsClient() then return end
-        local ruid = (self.HitSoundRUID ~= "") and self.HitSoundRUID or "e890aa0726504b8abdfb0518cb12c9ef"
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap ~= self.Entity.CurrentMap then return end
+        local ruid = self:ResolveMonsterSound(false)
+        if ruid == "" then return end
         _SoundService:PlaySound(ruid, 1.0)
-        -- (성능) 히트마다 전 클라이언트에서 log를 찍으면 5인 난사 시 초당 수십 줄의 로그 스팸이
-        -- 발생한다 - 검증 끝난 핫패스 로그라 제거.
+        if not self._T.hitSoundVerified then
+            self._T.hitSoundVerified = true
+            log("[MonsterSound] hit " .. self.Entity.Name .. " ruid=" .. ruid)
+        end
+    end
+
+    @ExecSpace("Multicast")
+    method void PlayDeathSound()
+        -- 실제 Dead() 진입 때만 1회 전파한다. 맵 입장이나 IsDead 동기화로 사망음을 다시 재생하지 않는다.
+        if not self:IsClient() then return end
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap ~= self.Entity.CurrentMap then return end
+        local ruid = self:ResolveMonsterSound(true)
+        if ruid == "" then return end
+        _SoundService:PlaySound(ruid, 1.0)
+        if not self._T.deathSoundVerified then
+            self._T.deathSoundVerified = true
+            log("[MonsterSound] die " .. self.Entity.Name .. " ruid=" .. ruid)
+        end
     end
 
     -- (표창 재고) 이 몬스터를 마지막으로 때린 플레이어 엔티티를 기억한다.
@@ -474,10 +560,96 @@ script Monster extends Component
 
     @ExecSpace("ServerOnly")
     method void EnsureWanderAI()
-		-- AIChase와 AIWander를 한 엔티티에 런타임으로 중복 추가하면 두 네이티브 AI가 물리 이동을
-		-- 번갈아 갱신하고, 대량 몬스터 맵에서 LWA-3048과 이동 끊김을 만든다. 모델에 원래 들어 있는
-		-- AI만 사용한다. AIChase 전용 몬스터는 피격 전에는 대기하고 피격 시에만 추적한다.
-		return
+        -- 추적형도 하나의 BT 안에서 배회한다. 두 네이티브 AI를 동시에 붙이지 않는다.
+        local ai = self.Entity.AIChaseComponent
+        if self.NeverDie or not isvalid(ai) or self._T.fieldPatrolReady then return end
+        if ai.BehaviourTreeId ~= "" then return end
+        local movement = self.Entity.MovementComponent
+        local body = self.Entity.RigidbodyComponent
+        if not isvalid(movement) or not isvalid(body) then return end
+        self._T.fieldPatrolReady = true
+        self._T.patrolDirection = _UtilLogic:RandomDouble() < 0.5 and -1 or 1
+        self._T.patrolRemaining = 2 + _UtilLogic:RandomDouble() * 2
+        self._T.patrolResting = false
+        self._T.patrolTarget = nil
+        ai.IsChaseNearPlayer = false
+        local root = ai:CreateLeafNode("FieldPatrolAndAggro", function(delta)
+            self:TickFieldPatrol(delta)
+            return BehaviourTreeStatus.Running
+        end)
+        ai:SetRootNode(root)
+        ai.Enable = true
+        log("[MonsterPatrol] single-tree patrol ready " .. self.Entity.Name)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickFieldPatrol(number delta)
+        -- AI 트리만 이동을 소유하며 피격·빙결·사망 중의 모션을 덮어쓰지 않는다.
+        local movement = self.Entity.MovementComponent
+        local body = self.Entity.RigidbodyComponent
+        local state = self.Entity.StateComponent
+        if not isvalid(movement) or not isvalid(body) or not isvalid(state) then return end
+        if self.IsDead or self.Hp <= 0 or not movement.Enable or not body.Enable then return end
+        if state.CurrentStateName == "HIT" or state.CurrentStateName == "DEAD" then
+            movement:Stop()
+            return
+        end
+        if self.Stationary then
+            movement:Stop()
+            if state.CurrentStateName ~= "IDLE" then state:ChangeState("IDLE") end
+            return
+        end
+        local position = self.Entity.TransformComponent.WorldPosition
+        local target = self._T.patrolTarget
+        local direction = self._T.patrolDirection or 1
+        local chasing = isvalid(target) and target.CurrentMap == self.Entity.CurrentMap
+        if chasing and isvalid(target.PlayerComponent) and target.PlayerComponent:IsDead() then chasing = false end
+        if chasing then
+            local targetPos = target.TransformComponent.WorldPosition
+            local detection = self.Entity.AIChaseComponent.DetectionRange
+            if math.abs(targetPos.x - position.x) > detection or math.abs(targetPos.y - position.y) > 2.5 then
+                direction = 0
+            elseif math.abs(targetPos.x - position.x) < 0.25 then
+                direction = 0
+            else
+                direction = targetPos.x > position.x and 1 or -1
+            end
+        else
+            self._T.patrolRemaining = (self._T.patrolRemaining or 0) - delta
+            if self._T.patrolRemaining <= 0 then
+                self._T.patrolResting = not self._T.patrolResting
+                self._T.patrolRemaining = self._T.patrolResting and (0.6 + _UtilLogic:RandomDouble()) or (2 + _UtilLogic:RandomDouble() * 2)
+                if not self._T.patrolResting then
+                    direction = _UtilLogic:RandomDouble() < 0.5 and -1 or 1
+                    self._T.patrolDirection = direction
+                end
+            end
+            if self._T.patrolResting then direction = 0 end
+            if direction ~= 0 and math.abs(position.x - self.SpawnX) > 4 then
+                direction = position.x > self.SpawnX and -1 or 1
+                self._T.patrolDirection = direction
+            end
+        end
+        -- 네이티브 반환값 true는 해당 거리까지 걸을 수 있다는 뜻이다.
+        -- 비행형은 발판이 없어도 이동하므로 지상용 가장자리 검사를 생략한다.
+        if direction ~= 0 and not body.KinematicMove and body:IsOnGround() and not body:PredictFootholdEnd(0.2, direction > 0) then
+            if chasing then
+                direction = 0
+            else
+                direction = -direction
+                if not body:PredictFootholdEnd(0.2, direction > 0) then direction = 0 end
+                if direction ~= 0 then self._T.patrolDirection = direction end
+            end
+        end
+        if direction == 0 then
+            movement:Stop()
+            if state.CurrentStateName ~= "IDLE" then state:ChangeState("IDLE") end
+        else
+            local scale = self.Entity.TransformComponent.Scale
+            self.Entity.TransformComponent.Scale = Vector3(math.abs(scale.x) * -direction, scale.y, scale.z)
+            movement:MoveToDirection(Vector2(direction, 0), 0)
+            if state.CurrentStateName ~= "MOVE" then state:ChangeState("MOVE") end
+        end
     end
 
     @ExecSpace("ServerOnly")
@@ -486,6 +658,12 @@ script Monster extends Component
         -- ⚠ SetTarget은 호출 시 IsChaseNearPlayer를 자동으로 끈다(엔진 사양) - 지정 대상만 쫓는다.
         local ai = self.Entity.AIChaseComponent
         local aw = self.Entity.AIWanderComponent
+        if self._T.fieldPatrolReady and isvalid(ai) then
+            self._T.patrolTarget = (aggro and isvalid(target)) and target or nil
+            ai:SetTarget(self._T.patrolTarget)
+            ai.IsChaseNearPlayer = false
+            return
+        end
         if aggro and isvalid(ai) and isvalid(target) then
             if isvalid(aw) and aw.Enable then aw.Enable = false end
             if not ai.Enable then ai.Enable = true end
@@ -606,6 +784,7 @@ script Monster extends Component
 	method void Dead()
         if self.IsDead then return end
         self.IsDead = true
+        self:PlayDeathSound()
         self.HealthBarUntil = 0
         -- (표창 재고) 처치 통보 - 모든 처치가 지나는 유일한 길목이라 여기 한 곳이면 충분하다.
         local killer = self._T.lastKiller
@@ -841,8 +1020,38 @@ script Monster extends Component
     end
 
     @ExecSpace("ClientOnly")
+    method void SyncFieldAnimation()
+        -- 일부 필드 모델은 AnimationClipEvent의 이름만 받고 실제 SpriteRUID를 바꾸지 않는다.
+        -- 현재 상태를 처음 볼 때와 상태 전환 때만 실제 클립을 연결해 늦은 맵 입장도 처리한다.
+        if self.NeverDie then return end
+        if not isvalid(self.Entity.AIChaseComponent) and not isvalid(self.Entity.AIWanderComponent) then return end
+        local sprite = self.Entity.SpriteRendererComponent
+        local animation = self.Entity.StateAnimationComponent
+        local state = self.Entity.StateComponent
+        if not isvalid(sprite) or not isvalid(animation) or not isvalid(state) then return end
+        if not sprite.Enable or not animation.Enable then
+            self._T.fieldAnimationState = nil
+            return
+        end
+        local stateName = state.CurrentStateName
+        if self._T.fieldAnimationState == stateName and self._T.fieldAnimationRenderer == sprite then return end
+        local key = animation:StateStringToAnimationKey(stateName)
+        local ruid = animation.ActionSheet[key]
+        if ruid == nil or ruid == "" then return end
+        if sprite.StartFrameIndex == 0 and sprite.EndFrameIndex == 0 then sprite.EndFrameIndex = 2147483647 end
+        sprite.SpriteRUID = ruid
+        if self._T.fieldAnimationRenderer == nil then
+            log("[MonsterAnimation] state clip connected " .. self.Entity.Name .. " state=" .. stateName)
+        end
+        self._T.fieldAnimationState = stateName
+        self._T.fieldAnimationRenderer = sprite
+        -- 빙결·히트스톱이 소유하는 PlayRate와 커스텀 스킬의 프레임 범위는 변경하지 않는다.
+    end
+
+    @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
         -- 서버가 승인한 마지막 플레이어 피격 시각을 기준으로 5초간 머리 위를 따라간다.
+        self:SyncFieldAnimation()
         self:UpdateMonsterNameTag()
         self._T.nameTagColorElapsed = (self._T.nameTagColorElapsed or 0) + delta
         if self._T.nameTagColorElapsed >= 0.25 then

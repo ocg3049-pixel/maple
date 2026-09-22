@@ -1,0 +1,924 @@
+@Logic
+script LoginFlow extends Logic
+    property string phase = "login"
+    property boolean busy = false
+    property boolean sessionReady = false
+    property integer selectedChannel = 1
+    property integer channelPage = 1
+    property number clock = 0
+
+    method void OnInitialize()
+        -- 플레이어가 사냥 맵에 먼저 생성되지 않도록 서버 초기 스폰을 분리한다.
+        if self:IsServer() then
+            _DefaultUserEnterLeaveLogic.StartPoint = "/maps/login"
+            self._T.sessions = {}
+        end
+    end
+
+    method void OnBeginPlay()
+        -- UI 수명과 별개인 월드 세션 상태를 초기화한다.
+        if self:IsServer() then
+            _DefaultUserEnterLeaveLogic.StartPoint = "/maps/login"
+            self._T.sessions = {}
+            return
+        end
+        self.phase = "intro"
+        self._T.introTime = 0
+        self._T.introPlayed = false
+        self._T.introWizetStarted = false
+        self._T.introTailTime = nil
+        self._T.introRevealing = false
+        self._T.introSkipElapsed = nil
+        self._T.introSkipAlpha = 1
+        self._T.introSkipDuration = 3
+        self._T.introMarginSignature = nil
+        self._T.resumeAfterIntro = false
+        self.busy = false
+        self.sessionReady = false
+        self.clock = 0
+        self._T.entryTransition = false
+        self._T.entryFadeReady = false
+        self._T.entryFadeElapsed = nil
+        self._T.visiblePlayer = nil
+        self._T.visibleMap = nil
+        self._T.visibilityRestoreUntil = 0
+        self:EnableUI("EntryFade", false)
+        self._T.cameraY = 0
+        self._T.panTime = 0
+        self._T.channels = {}
+        -- Load selection-circle pixels before channel entry; each frame keeps its own ORI rect.
+        _ResourceService:PreloadAsync({"2a5fa34250c24e1899ea6848ed09423f", "22c573d32bfb4e42a45f2258021caf7f",
+            "409d0231f2dc413e8a3bad6cfe4a878f", "ed12494291e045ca9a1b3764a899d8b1"}, function()
+            log("[LoginFlow] channel marker frames preloaded")
+        end)
+        self._T.nextSessionRequest = 0
+        self._T.navBase = nil
+        self._T.clouds = nil
+        self._T.birds = nil
+        -- Maker의 증분 Refresh에 남을 수 있는 교체 전 장식만 비활성화한다.
+        self:EnableUI("Stage/Scenery/Create/Tree", false)
+        self:EnableUI("Stage/Navigation/StepCustom/Texture", false)
+        self:EnableUI("Stage/Navigation/StepCustom/Text", false)
+        self:EnableUI("Stage/Navigation/StepCustom/Sub", false)
+        self:EnableUI("Stage/Navigation/WorldLabel/Value", false)
+        local stage = self:UI("Stage")
+        if isvalid(stage) then stage.UITransformComponent.UIScale = Vector3(1.8, 1.8, 1) end
+        -- 증분 Refresh에서도 구름은 나무 뒤, 팻말은 두루마리 앞에 둔다.
+        for i, name in ipairs({"Sky", "Atmosphere", "Panorama"}) do
+            local e = self:UI("Stage/Scenery/" .. name)
+            if isvalid(e) then _UILogic:SetSiblingIndex(e.UITransformComponent, i) end
+        end
+        for i, name in ipairs({"Hanger", "ScrollClosed", "Scroll", "Channels", "Scania"}) do
+            local e = self:UI("Stage/WorldGroup/" .. name)
+            if isvalid(e) then _UILogic:SetSiblingIndex(e.UITransformComponent, i) end
+        end
+        for i = 1, 19 do
+            local label = self:UI("Stage/WorldGroup/Channels/Channel" .. tostring(i) .. "/Label")
+            if isvalid(label) then _UILogic:SetSiblingIndex(label.UITransformComponent, 3) end
+        end
+        for i = 0, 5 do
+            local shine = self:UI("Stage/LoginGroup/LoginBackground/Shine" .. tostring(i))
+            if isvalid(shine) then _UILogic:SetSiblingIndex(shine.UITransformComponent, 100) end
+        end
+        for _, name in ipairs({"Top", "Bottom", "Left", "Right"}) do
+            local frame = self:UI("Stage/CreateCharacter/CreateCharacterBackground/Frame" .. name)
+            if isvalid(frame) then _UILogic:SetSiblingIndex(frame.UITransformComponent, 100) end
+        end
+        local channels = self:UI("Stage/WorldGroup/Channels")
+        if isvalid(channels) then channels.UITransformComponent.UIScale = Vector3(0.85, 0.85, 1) end
+        for i = 1, 3 do
+            local avatar = self:UI("Stage/CharacterSelectGroup/SelectBackground/CharacterSlot" .. tostring(i) .. "/SlotAvatar")
+            if isvalid(avatar) then avatar.UITransformComponent.UIScale = Vector3(0.8, 0.8, 1) end
+        end
+        local preview = self:UI("Stage/CreateCharacter/CreateCharacterBackground/PreviewAvatar")
+        if isvalid(preview) then preview.UITransformComponent.UIScale = Vector3(0.8, 0.8, 1) end
+        local backing = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel/PaperBacking")
+        if isvalid(backing) then _UILogic:SetSiblingIndex(backing.UITransformComponent, 1) end
+        self:SetWorldScroll(1)
+        self:ShowPhase("intro", false)
+        self:UpdateIntro(0)
+        log("[LoginFlow] startup logo started")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateIntro(number delta)
+        -- Wizet 마지막 프레임 2초 → NEXON 2초 → 로그인 위에서 전체 로고 화면 2초 페이드.
+        local scale = self:UI("Stage").UITransformComponent.UIScale
+        local cover = self:UI("IntroCover")
+        cover:GetChildByName("View").UITransformComponent.UIScale = Vector3(scale.x, scale.y, 1)
+        local nexon = self:UI("IntroCover/View/Nexon")
+        local wizet = self:UI("IntroCover/View/Wizet")
+        local animation = wizet:GetComponent("script.LoginSpriteAnimation")
+        self:UpdateIntroMargins(nexon.Enable and nexon or wizet)
+        if self._T.introSkipElapsed ~= nil then
+            -- Fade the current logo frame without advancing to the other logo or flashing white.
+            local fadeDuration = self._T.introSkipDuration
+            local elapsed = math.min(fadeDuration, self._T.introSkipElapsed + delta)
+            self._T.introSkipElapsed = elapsed
+            local t = elapsed / fadeDuration
+            cover.CanvasGroupComponent.GroupAlpha = self._T.introSkipAlpha * (1 - t * t * (3 - 2 * t))
+            if elapsed >= fadeDuration then
+                self._T.introPlayed = true
+                self._T.introSkipElapsed = nil
+                if self._T.resumeAfterIntro then self:ShowCharacters() else self:ShowPhase("login", false) end
+                log("[LoginFlow] startup logo skipped with fade=" .. tostring(fadeDuration) .. "; completed once")
+            end
+            return
+        end
+        if not self._T.introWizetStarted then
+            self._T.introWizetStarted = true
+            cover.CanvasGroupComponent.GroupAlpha = 1
+            nexon.Enable = false
+            wizet.Enable = true
+            animation:Replay()
+            log("[LoginFlow] Wizet logo started")
+            return
+        end
+        if self._T.introTailTime == nil then
+            if (animation._T.index or 0) < 62 then return end
+            self._T.introTailTime = 0
+            log("[LoginFlow] logo white hold started")
+        end
+        self._T.introTailTime = self._T.introTailTime + delta
+        local t = self._T.introTailTime
+        if t < 2 then return end
+        if not nexon.Enable then
+            wizet.Enable = false
+            nexon.Enable = true
+            nexon.SpriteGUIRendererComponent:SetAlpha(1)
+            self:UpdateIntroMargins(nexon)
+            log("[LoginFlow] NEXON logo hold started")
+        end
+        if t < 4 then return end
+        if not self._T.introRevealing then
+            self._T.introRevealing = true
+            self:ApplyCamera()
+            log("[LoginFlow] logo to login fade started")
+        end
+        cover.CanvasGroupComponent.GroupAlpha = math.max(0, 1 - (t - 4) / 2)
+        if t < 6 then return end
+        self._T.introPlayed = true
+        if self._T.resumeAfterIntro then self:ShowCharacters() else self:ShowPhase("login", false) end
+        log("[LoginFlow] startup logo completed once")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateIntroMargins(Entity logo)
+        -- The logo PNGs are opaque white rectangles. Fill only outside them so a
+        -- shared fade has one white layer everywhere, never alpha over alpha.
+        local cover = self:UI("IntroCover")
+        local view = self:UI("IntroCover/View")
+        if not isvalid(logo) or not isvalid(cover) or not isvalid(view) then return end
+        local outer = cover.UITransformComponent.RectSize
+        local vt = view.UITransformComponent
+        local lt = logo.UITransformComponent
+        local sx = vt.UIScale.x * lt.UIScale.x
+        local sy = vt.UIScale.y * lt.UIScale.y
+        local x = vt.anchoredPosition.x + lt.anchoredPosition.x * vt.UIScale.x
+        local y = vt.anchoredPosition.y + lt.anchoredPosition.y * vt.UIScale.y
+        local left = math.max(-outer.x / 2, x - lt.RectSize.x * lt.Pivot.x * sx)
+        local right = math.min(outer.x / 2, x + lt.RectSize.x * (1 - lt.Pivot.x) * sx)
+        local bottom = math.max(-outer.y / 2, y - lt.RectSize.y * lt.Pivot.y * sy)
+        local top = math.min(outer.y / 2, y + lt.RectSize.y * (1 - lt.Pivot.y) * sy)
+        local signature = tostring(outer.x) .. ":" .. tostring(outer.y) .. ":" .. tostring(left) .. ":" .. tostring(right) .. ":" .. tostring(bottom) .. ":" .. tostring(top)
+        if self._T.introMarginSignature == signature then return end
+        self:SetIntroMargin("Top", -outer.x / 2, outer.x / 2, top, outer.y / 2)
+        self:SetIntroMargin("Bottom", -outer.x / 2, outer.x / 2, -outer.y / 2, bottom)
+        self:SetIntroMargin("Left", -outer.x / 2, left, bottom, top)
+        self:SetIntroMargin("Right", right, outer.x / 2, bottom, top)
+        self._T.introMarginSignature = signature
+        log("[LoginFlow] single-layer intro margins logo=" .. logo.Name .. " bounds=" .. signature)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetIntroMargin(string side, number left, number right, number bottom, number top)
+        -- Adjacent rectangles share an edge, without any overlapping fill or rounded seam.
+        local margin = self:UI("IntroCover/Margin" .. side)
+        if not isvalid(margin) then return end
+        local width, height = right - left, top - bottom
+        if width <= 0 or height <= 0 then margin.Enable = false return end
+        local transform = margin.UITransformComponent
+        transform.RectSize = Vector2(width, height)
+        transform.anchoredPosition = Vector2((left + right) / 2, (bottom + top) / 2)
+        local points = margin.PolygonGUIRendererComponent.Points
+        points:Clear()
+        points:AddRange({Vector2(-width / 2, -height / 2), Vector2(width / 2, -height / 2), Vector2(width / 2, height / 2), Vector2(-width / 2, height / 2)})
+        margin.Enable = true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SkipIntro()
+        -- Any key starts a single fade from the currently visible logo, consuming that key.
+        if self.phase ~= "intro" or self._T.introPlayed or self._T.introSkipElapsed ~= nil then return end
+        local cover = self:UI("IntroCover")
+        if not isvalid(cover) or not isvalid(cover.CanvasGroupComponent) then return end
+        self._T.introSkipAlpha = cover.CanvasGroupComponent.GroupAlpha
+        -- Late input must not restart an almost-finished fade with another 3 seconds.
+        local tail = self._T.introTailTime or 0
+        local late = tail >= 3 or self._T.introRevealing
+        self._T.introSkipDuration = late and 1.5 or 3
+        if tail >= 4 then
+            self._T.introSkipDuration = math.max(0.05, math.min(1.5, 6 - tail))
+        end
+        self._T.introRevealing = true
+        local wizet = self:UI("IntroCover/View/Wizet")
+        if isvalid(wizet) then
+            local animation = wizet:GetComponent("script.LoginSpriteAnimation")
+            if isvalid(animation) then animation.Enable = false end
+        end
+        self:ApplyCamera()
+        self._T.introSkipElapsed = 0
+        log("[LoginFlow] any-key intro fade started alpha=" .. tostring(self._T.introSkipAlpha) .. " duration=" .. tostring(self._T.introSkipDuration) .. " late=" .. tostring(late))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsInGame()
+        -- 모든 게임 입력의 공통 게이트.
+        return self.phase == "ingame"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestoreInGameVisibility()
+        -- 승인된 입장 후 맵별 플레이어 표현에 남은 로그인 숨김 상태만 복구한다.
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or not self:IsInGame() then return end
+        local map = player.CurrentMap
+        if not isvalid(map) or map.Name == "login" then return end
+        if self._T.visiblePlayer ~= player or self._T.visibleMap ~= map then
+            self._T.visiblePlayer = player
+            self._T.visibleMap = map
+            self._T.visibilityRestoreUntil = self.clock + 1.5
+        end
+        -- 맵 전환 직후의 지연 동기화까지만 처리하며 스킬의 알파/사망 연출은 변경하지 않는다.
+        if self.clock <= self._T.visibilityRestoreUntil and not player.Visible then
+            player:SetVisible(true, true, false)
+            log("[LoginFlow] local player visibility restored map=" .. map.Name)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- 로그인 UI는 독립된 최상위 그룹에만 존재한다.
+        return _EntityService:GetEntityByPath("/ui/LoginScene/" .. path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EnableUI(string path, boolean enabled)
+        -- 비활성 화면은 입력도 받지 않게 한다.
+        local e = self:UI(path)
+        if isvalid(e) then e.Enable = enabled end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Text(string path, string value)
+        -- 최신 텍스트 렌더러를 통해 상태를 표시한다.
+        local e = self:UI(path)
+        if isvalid(e) and isvalid(e.TextGUIRendererComponent) then e.TextGUIRendererComponent.Text = value end
+    end
+
+    @ExecSpace("ClientOnly")
+    method any SelectComponent()
+        -- 기존 12슬롯 데이터 구조를 그대로 재사용한다.
+        local e = self:UI("Stage/CharacterSelectGroup/SelectBackground")
+        if not isvalid(e) then return nil end
+        return e:GetComponent("script.CharacterSelectComponent")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowPhase(string nextPhase, boolean animate)
+        -- 단계 전환을 단일 경로로 수행해 HUD 노출과 잘못된 뒤로 가기를 막는다.
+        if nextPhase == "intro" and self._T.introPlayed then return end
+        self:EnableUI("IntroCover", nextPhase == "intro")
+        if nextPhase == "character" then self._T.infoSelection = nil end
+        local previousPhase = self.phase
+        self.phase = nextPhase
+        if nextPhase == "login" then self._T.logoTime = 0 end
+        local sameWorld = (previousPhase == "world" or previousPhase == "channel") and (nextPhase == "world" or nextPhase == "channel")
+        local sameCreate = (previousPhase == "create" or previousPhase == "job") and (nextPhase == "create" or nextPhase == "job")
+        if not sameWorld and not sameCreate then
+            self._T.navTime = 0
+            self._T.navWasVisible = previousPhase ~= "login" and previousPhase ~= "ingame"
+        end
+        self:EnableUI("Stage/LoginGroup", nextPhase == "login")
+        self:EnableUI("Stage/WorldGroup", nextPhase == "world" or nextPhase == "channel")
+        self:EnableUI("Stage/WorldGroup/ScrollClosed", nextPhase == "world")
+        self:EnableUI("Stage/WorldGroup/Scroll", nextPhase == "channel")
+        self:EnableUI("Stage/WorldGroup/Channels", nextPhase == "channel")
+        self:EnableUI("Stage/CharacterSelectGroup", nextPhase == "character")
+        self:EnableUI("Stage/CreateCharacter", nextPhase == "create" or nextPhase == "job")
+        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel", nextPhase == "create")
+        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/JobSelectPanel", nextPhase == "job")
+        self:EnableUI("Stage/Navigation", nextPhase ~= "login" and nextPhase ~= "ingame" and nextPhase ~= "intro")
+        self:EnableUI("Stage/Navigation/StepCustom", nextPhase == "character" or nextPhase == "create" or nextPhase == "job")
+        self:EnableUI("Stage/Navigation/WorldLabel", nextPhase == "character" or nextPhase == "create" or nextPhase == "job")
+        for _, label in ipairs({"Title", "Subtitle", "WorldValue"}) do
+            self:EnableUI("Stage/Navigation/" .. label, nextPhase == "character" or nextPhase == "create" or nextPhase == "job")
+        end
+        local scenery = "Login"
+        if nextPhase == "world" or nextPhase == "channel" then scenery = "WorldScene" end
+        if nextPhase == "character" then scenery = "Character" end
+        if nextPhase == "create" or nextPhase == "job" then scenery = "Create" end
+        local heights = { Login = 0, WorldScene = 600, Character = 1217, Create = 1813 }
+        self._T.scenery = scenery
+        self._T.cameraFrom = self._T.cameraY or 0
+        self._T.cameraTo = heights[scenery]
+        self._T.panTime = animate and math.abs(self._T.cameraTo - self._T.cameraFrom) > 1 and 1.2 or 0
+        if self._T.panTime == 0 then self._T.cameraY = self._T.cameraTo end
+        self:ApplyCamera()
+        self:Text("Stage/Navigation/Title", nextPhase == "character" and "캐릭터 선택" or "캐릭터 만들기")
+        self:Text("Stage/Navigation/Subtitle", nextPhase == "character" and "CHARACTER SELECT" or "CHARACTER CREATE")
+        self:Text("Stage/Navigation/WorldValue", "스카니아\nCH." .. tostring(self.selectedChannel))
+        self:UpdatePresentation(0)
+        log("[LoginFlow] phase=" .. nextPhase)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyCamera()
+        -- 원본 배경 11~18을 이어 놓은 하나의 나무를 따라 시점을 이동한다.
+        -- 화면마다 그림을 교체하지 않고 간판과 선택 UI에도 같은 좌표 변환을 적용한다.
+        -- 한 부모의 연속 좌표를 사용해 픽셀 반올림에 의한 계단식 움직임을 없앤다.
+        local camera = self._T.cameraY or 0
+        self:UI("Stage/Scenery/Panorama").UITransformComponent.anchoredPosition = Vector2(0, -camera)
+        local rows = {
+            { "Login", "LoginGroup", 0 },
+            { "WorldScene", "WorldGroup", 600 },
+            { "Character", "CharacterSelectGroup", 1217 },
+            { "Create", "CreateCharacter", 1813 }
+        }
+        for _, row in ipairs(rows) do
+            local offset = row[3] - camera
+            local scene = self:UI("Stage/Scenery/" .. row[1])
+            if isvalid(scene) then
+                scene.Enable = false
+            end
+            local controls = self:UI("Stage/" .. row[2])
+            if isvalid(controls) then
+                controls.UITransformComponent.anchoredPosition = Vector2(0, offset)
+                controls.Enable = self.phase ~= "ingame" and (self.phase ~= "intro" or self._T.introRevealing) and math.abs(offset) < 600
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- 전환 애니메이션과 플레이어 생성 직후의 입력 잠금만 처리한다. 저장소 호출은 없다.
+        self.clock = self.clock + delta
+        if self.phase == "intro" then self:UpdateIntro(delta) end
+        if self._T.entryFadeElapsed ~= nil then
+            self._T.entryFadeElapsed = math.min(1, self._T.entryFadeElapsed + delta)
+            self:UI("EntryFade").SpriteGUIRendererComponent:SetAlpha(self._T.entryFadeElapsed)
+        end
+        if self:IsInGame() then
+            self:RestoreInGameVisibility()
+            return
+        end
+        self:UpdatePresentation(delta)
+        if self._T.screenWidth ~= _UILogic.ScreenWidth or self._T.screenHeight ~= _UILogic.ScreenHeight then
+            self._T.screenWidth = _UILogic.ScreenWidth
+            self._T.screenHeight = _UILogic.ScreenHeight
+            local a = _UILogic:ScreenToUIPosition(Vector2.zero)
+            local b = _UILogic:ScreenToUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+            local scale = math.min(math.abs(b.x - a.x) / 800, math.abs(b.y - a.y) / 600)
+            if scale > 0 then self:UI("Stage").UITransformComponent.UIScale = Vector3(scale, scale, 1) end
+        end
+        if (self._T.scrollTime or 0) > 0 then
+            self._T.scrollTime = math.max(0, self._T.scrollTime - delta)
+            self:SetWorldScroll(1 - self._T.scrollTime / 0.45)
+            if self._T.scrollTime == 0 and self.phase == "channel" then
+                self:EnableUI("Stage/WorldGroup/Channels", true)
+                self:RefreshChannels()
+                log("[LoginFlow] channel scroll unfolded")
+            end
+        end
+        local player = _UserService.LocalPlayer
+        if isvalid(player) then
+            if isvalid(player.PlayerControllerComponent) then player.PlayerControllerComponent.Enable = false end
+            if not self.sessionReady and self.clock >= (self._T.nextSessionRequest or 0) then
+                self._T.nextSessionRequest = self.clock + 3
+                self:RequestSession()
+            end
+        end
+        if (self._T.panTime or 0) > 0 then
+            self._T.panTime = math.max(0, self._T.panTime - delta)
+            local t = 1 - self._T.panTime / 1.2
+            t = t * t * (3 - 2 * t)
+            self._T.cameraY = self._T.cameraFrom + (self._T.cameraTo - self._T.cameraFrom) * t
+            self:ApplyCamera()
+            if self._T.panTime == 0 then log("[LoginFlow] camera settled=" .. tostring(self._T.cameraY)) end
+        end
+        if self._T.entryApproved and self._T.entryFadeReady and isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "map01" then
+            self._T.entryApproved = false
+            self:ShowPhase("ingame", false)
+            self.busy = false
+            player.PlayerControllerComponent.Enable = true
+            local group = _EntityService:GetEntityByPath("/ui/LoginScene")
+            if isvalid(group) then group.Enable = false end
+            log("[LoginFlow] ingame map=" .. player.CurrentMap.Name)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetWorldScroll(number progress)
+        -- 원본 윗봉과 끈을 늘리지 않고 종이를 드러내며 아랫봉만 내린다.
+        local t = math.max(0, math.min(1, progress))
+        local eased = 1 - (1 - t) * (1 - t) * (1 - t)
+        local height = (130 + 249 * eased) * 0.85
+        local full = 401 * 0.85
+        local paper = self:UI("Stage/WorldGroup/Scroll/Reveal")
+        paper.UITransformComponent.RectSize = Vector2(436.05, height)
+        paper.UITransformComponent.anchoredPosition = Vector2(0, (full - height) / 2)
+        paper:GetChildByName("Art").UITransformComponent.anchoredPosition = Vector2(0, (height - full) / 2)
+        self:UI("Stage/WorldGroup/Scroll/Roller").UITransformComponent.anchoredPosition = Vector2(0, full / 2 - height - 11 * 0.85)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void NavigateChannel(integer offset)
+        -- 4열 채널 목록에서 방향키로 선택과 페이지를 함께 이동한다.
+        if self.phase ~= "channel" or self.busy or (self._T.panTime or 0) > 0 then return end
+        local modal = self:UI("Modal")
+        if isvalid(modal) and modal.Enable then return end
+        local count = #self._T.channels
+        if count == 0 then return end
+        self.selectedChannel = math.max(1, math.min(count, self.selectedChannel + offset))
+        self.channelPage = math.floor((self.selectedChannel - 1) / 19) + 1
+        self:RefreshChannels()
+        log("[LoginFlow] keyboard channel=" .. tostring(self.selectedChannel))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePresentation(number delta)
+        -- 로고, 팻말, 구름과 새는 UI 픽셀 좌표에서만 움직인다. 저장소와 게임 캐릭터는 건드리지 않는다.
+        if self.phase == "login" then
+            self._T.logoTime = math.min(24, (self._T.logoTime or 0) + delta)
+            local t = self._T.logoTime / 24
+            self:UI("Stage/LoginGroup/LoginBackground/Logo").SpriteGUIRendererComponent:SetAlpha(0.18 + 0.82 * t * t * (3 - 2 * t))
+        end
+        self._T.navTime = math.min(3.85, (self._T.navTime or 0) + delta)
+        if self._T.navBase == nil then
+            self._T.navBase = {}
+            for _, name in ipairs({"StepShadow", "WorldShadow", "Step", "StepCustom", "WorldLabel", "Title", "Subtitle", "WorldValue"}) do
+                local e = self:UI("Stage/Navigation/" .. name)
+                if isvalid(e) then table.insert(self._T.navBase, { entity = e, pos = e.UITransformComponent.anchoredPosition }) end
+            end
+        end
+        local nt = self._T.navTime
+        -- 새 화면의 팻말은 숨겨진 위치에서 한 번만 나온다.
+        local t = math.min(1, nt / 0.85)
+        local slide = -145 * (1 - t * t * (3 - 2 * t))
+        for _, row in ipairs(self._T.navBase) do row.entity.UITransformComponent.anchoredPosition = Vector2(row.pos.x + slide, row.pos.y) end
+        local shadowAlpha = math.max(0, math.min(1, (nt - 0.85) / 3))
+        self:UI("Stage/Navigation/StepShadow").SpriteGUIRendererComponent:SetAlpha(shadowAlpha)
+        local worldShadow = self:UI("Stage/Navigation/WorldShadow")
+        worldShadow.Enable = self:UI("Stage/Navigation/WorldLabel").Enable
+        worldShadow.SpriteGUIRendererComponent:SetAlpha(shadowAlpha)
+        if (self._T.infoTime or 0) > 0 then
+            self._T.infoTime = math.max(0, self._T.infoTime - delta)
+            if self._T.infoTime == 0 then self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", true) end
+        end
+        local atmosphere = self:UI("Stage/Scenery/Atmosphere")
+        local active = self.phase ~= "intro" and self.phase ~= "ingame"
+        atmosphere.Enable = active
+        if not active then return end
+        if self._T.clouds == nil then
+            self._T.clouds = {}
+            for i = 3, 10 do
+                local e = self:UI("Stage/Scenery/Atmosphere/Cloud" .. tostring(i))
+                table.insert(self._T.clouds, { entity = e, x = e.UITransformComponent.anchoredPosition.x, y = e.UITransformComponent.anchoredPosition.y, speed = 2 + i * 0.55 })
+            end
+            self._T.birds = {}
+            self._T.birdCountdown = 3
+        end
+        for _, row in ipairs(self._T.clouds) do
+            row.x = row.x - row.speed * delta
+            local half = row.entity.UITransformComponent.RectSize.x / 2
+            if row.x < -410 - half then row.x = 420 + half end
+            row.entity.UITransformComponent.anchoredPosition = Vector2(row.x, row.y + ((self._T.cameraY or 1217) - 1217) * 0.025)
+        end
+        self._T.birdCountdown = self._T.birdCountdown - delta
+        if self._T.birdCountdown <= 0 then
+            self._T.birdCountdown = _UtilLogic:RandomIntegerRange(20, 32)
+            local count = _UtilLogic:RandomIntegerRange(3, 7)
+            local y = _UtilLogic:RandomIntegerRange(30, 220)
+            local speed = _UtilLogic:RandomIntegerRange(40, 58)
+            for i = 1, count do
+                local e = self:UI("Stage/Scenery/Atmosphere/Bird" .. tostring(i))
+                local size = 0.65 + _UtilLogic:RandomDouble() * 0.8
+                e.UITransformComponent.UIScale = Vector3(size, size, 1)
+                e.Enable = true
+                e:GetChildByName("Wings"):GetComponent("script.LoginSpriteAnimation"):Replay()
+                self._T.birds[i] = { entity = e, x = 440 + i * 24, y = y + math.abs(i - 4) * 12, speed = speed + i * 0.6 }
+            end
+            log("[LoginFlow] bird flock=" .. tostring(count))
+        end
+        for _, bird in pairs(self._T.birds) do
+            bird.x = bird.x - bird.speed * delta
+            bird.entity.UITransformComponent.anchoredPosition = Vector2(bird.x, bird.y + math.sin(self.clock * 3 + bird.y) * 2)
+            if bird.x < -440 then bird.entity.Enable = false end
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestSession()
+        -- 다른 유저의 세션에는 접근하지 않는다. 워프 뒤에는 캐릭터 선택부터 재개한다.
+        local userId = senderUserId
+        local player = _UserService:GetUserEntityByUserId(userId)
+        if not isvalid(player) then return end
+        local session = self._T.sessions[userId]
+        if session == nil then
+            session = { channel = false, authorized = false, entered = false, allowed = {}, lastList = -100 }
+            self._T.sessions[userId] = session
+            player.Visible = false
+            _TeleportService:TeleportToMapPosition(player, Vector3(0, 0, 0), "login")
+            if Environment:IsPublishedPlay() then
+                local record = _TeleportService:GetWarpRecord(userId)
+                if record ~= nil and record.PreviousWorldId == Environment.WorldId and string.sub(record.Data or "", 1, 10) == "loginflow:" then
+                    session.channel = true
+                    session.channelNumber = tonumber(string.sub(record.Data, 11)) or 1
+                end
+            end
+            log("[LoginFlow] staged user on login map")
+        end
+        self:SessionReady(session.channel, session.channelNumber or 1, userId)
+    end
+
+    @ExecSpace("Client")
+    method void SessionReady(boolean resumed, integer channelNumber)
+        -- MSW 인증 계정을 표시하며 비밀번호를 수집하지 않는다.
+        if self.sessionReady then return end
+        self.sessionReady = true
+        local player = _UserService.LocalPlayer
+        if isvalid(player) then self:Text("Stage/LoginGroup/LoginBackground/AccountText", player.Name) end
+        if resumed then
+            self.selectedChannel = channelNumber
+            if self.phase == "intro" then self._T.resumeAfterIntro = true else self:ShowCharacters() end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Action(string action)
+        -- 버튼·키보드가 같은 단계 검사를 거치므로 빠른 연타도 순서를 건너뛰지 않는다.
+        if self.phase == "intro" then return end
+        if action == "back" then action = "previous" end
+        if action == "noticeNo" then self:EnableUI("Modal", false) self._T.confirmAction = nil return end
+        if action == "noticeYes" then
+            local pending = self._T.confirmAction
+            self._T.confirmAction = nil
+            self:EnableUI("Modal", false)
+            if pending == "delete" then _CharacterPersistence:ClientRequestDelete(self._T.deleteIndex) end
+            if pending == "quit" then self:Notice("MSW 메뉴의 나가기 버튼으로 게임을 종료할 수 있습니다.", "") end
+            return
+        end
+        local modal = self:UI("Modal")
+        if isvalid(modal) and modal.Enable then
+            if action == "previous" then self:EnableUI("Modal", false) self._T.confirmAction = nil end
+            return
+        end
+        if self.busy or (self._T.panTime or 0) > 0 then return end
+        if action == "login" and self.phase == "login" then
+            if not self.sessionReady then self:Notice("접속을 준비하고 있습니다. 잠시 후 다시 시도해주세요.", "") return end
+            self:ShowPhase("world", true)
+        elseif action == "world" and (self.phase == "world" or self.phase == "channel") then
+            self:ShowPhase("channel", false)
+            self:SetWorldScroll(0)
+            self._T.markerChannel = nil
+            self:EnableUI("Stage/WorldGroup/Channels", false)
+            self._T.scrollTime = 0.45
+            self:RequestChannels()
+        elseif (action == "channelPrev" or action == "channelNext") and self.phase == "channel" then
+            local pages = math.max(1, math.ceil(#self._T.channels / 19))
+            self.channelPage = math.max(1, math.min(pages, self.channelPage + (action == "channelPrev" and -1 or 1)))
+            self.selectedChannel = (self.channelPage - 1) * 19 + 1
+            self:RefreshChannels()
+        elseif string.sub(action, 1, 8) == "channel:" and self.phase == "channel" then
+            local idx = (self.channelPage - 1) * 19 + (tonumber(string.sub(action, 9)) or 0)
+            if self._T.channels[idx] == nil then return end
+            self.selectedChannel = idx
+            self:RefreshChannels()
+        elseif action == "channelEnter" and self.phase == "channel" then
+            local ch = self._T.channels[self.selectedChannel]
+            if ch == nil then self:Notice("접속 가능한 서버를 선택해주세요.", "") return end
+            self.busy = true
+            self:RequestChannel(ch.id, self.selectedChannel)
+        elseif action == "enter" and self.phase == "character" then
+            _KeyboardInputManager:DoEnterGame()
+        elseif action == "create" and self.phase == "character" then
+            if not _CharacterPersistence:IsCharacterListReady() then self:Notice("캐릭터 목록을 불러오는 중입니다. 잠시 후 다시 시도해주세요.", "") return end
+            local comp = self:SelectComponent()
+            if comp == nil or comp:FirstEmptySlot() == 0 then self:Notice("캐릭터 슬롯이 가득 찼습니다.", "") return end
+            self:ShowPhase("create", true)
+            local panel = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
+            panel:GetComponent("script.CharacterSettingComponent"):Init()
+            self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName").TextGUIRendererInputComponent.Text = ""
+            self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok").ButtonComponent.Enable = true
+        elseif action == "createNext" and self.phase == "create" then
+            local name = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName").TextGUIRendererInputComponent.Text
+            if name == nil or string.match(name, "^%s*$") ~= nil then
+                self:Notice("캐릭터 이름을 입력해주세요.", "")
+                return
+            end
+            self:ShowPhase("job", false)
+            self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok").ButtonComponent.Enable = true
+        elseif action == "createNext" and self.phase == "job" then
+            local e = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok")
+            e:GetComponent("script.CreateCharacterok"):Submit()
+        elseif action == "cancelCreate" then
+            if self.phase == "job" then self:ShowPhase("create", false) else self:ShowCharacters() end
+        elseif action == "delete" and self.phase == "character" then
+            local comp = self:SelectComponent()
+            local data = comp:GetSlotData(comp.selectedSlot)
+            if data == "" then self:Notice("삭제할 캐릭터를 선택해주세요.", "") return end
+            self._T.deleteIndex = math.floor(comp.selectedSlot)
+            self:Notice((string.match(data, "^[^|]+") or "") .. " 캐릭터를 삭제하시겠습니까?\n삭제한 닉네임으로는 7일 동안 캐릭터를 생성할 수 없습니다.", "delete")
+        elseif action == "prevPage" and self.phase == "character" then self:SelectComponent():MovePage(-1)
+        elseif action == "nextPage" and self.phase == "character" then self:SelectComponent():MovePage(1)
+        elseif action == "previous" then
+            if self.phase == "job" then self:ShowPhase("create", false)
+            elseif self.phase == "create" then self:ShowCharacters()
+            elseif self.phase == "character" then self:ShowPhase("channel", true) self:RequestChannels()
+            elseif self.phase == "channel" then self:ShowPhase("world", false)
+            elseif self.phase == "world" then self:ShowPhase("login", true) end
+
+        elseif action == "quit" then self:Notice("게임을 종료하시겠습니까?", "quit") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Notice(string message, string confirmAction)
+        -- 게임 HUD보다 위에 제공된 안내 두루마리로 오류와 확인을 표시한다.
+        self._T.confirmAction = confirmAction
+        self:Text("Modal/Paper/Message", message)
+        local hasCancel = confirmAction ~= ""
+        self:EnableUI("Modal/Paper/No", hasCancel)
+        local yes = self:UI("Modal/Paper/Yes").UITransformComponent
+        yes.anchoredPosition = Vector2(hasCancel and -65 or 0, yes.anchoredPosition.y)
+        self:EnableUI("Modal", true)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowCharacters()
+        -- 목록 수신 전에는 빈 슬롯을 생성 가능 상태로 오인하지 않는다.
+        self.busy = false
+        self:ShowPhase("character", true)
+        _CharacterPersistence:PopulateSelectUI()
+        local comp = self:SelectComponent()
+        if comp ~= nil and comp.selectedSlot < 1 and comp:GetSlotData(1) ~= "" then comp:SelectSlot(1) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectionChanged()
+        -- 선택한 캐릭터의 이름과 직업을 원본 두루마리에 표시한다.
+        local comp = self:SelectComponent()
+        if comp == nil then return end
+        local data = comp:GetSlotData(comp.selectedSlot)
+        self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll", data ~= "")
+        local e = self:UI("Stage/CharacterSelectGroup/SelectBackground/EnterButton")
+        if isvalid(e) then e.ButtonComponent.Enable = data ~= "" end
+        if data == "" then return end
+        local parts = {}
+        for part in string.gmatch(data, "[^|]+") do table.insert(parts, part) end
+        local setting = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
+        local jobs = setting:GetComponent("script.CharacterSettingComponent"):GetJobItems()
+        local power = tonumber(parts[10])
+        local powerText = power ~= nil and tostring(math.floor(power)) or "접속 후 갱신"
+        self:Text("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", "직업\n" .. (jobs[tonumber(parts[8]) or 1] or "모험가") .. "\n\n전투력\n" .. powerText)
+        local slot = _EntityService:GetEntityByPath(comp:UISlotPath(comp:UISlotOfIndex(comp.selectedSlot)))
+        local paper = self:UI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll")
+        if isvalid(slot) and isvalid(paper) then
+            paper.UITransformComponent.anchoredPosition = Vector2(slot.UITransformComponent.anchoredPosition.x, 113.5)
+            local stamp = tostring(comp.selectedSlot) .. ":" .. data
+            if self._T.infoSelection ~= stamp then
+                self._T.infoSelection = stamp
+                self._T.infoTime = 0.32
+                self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", false)
+                paper:GetComponent("script.LoginSpriteAnimation"):Replay()
+                log("[LoginFlow] character scroll opened slot=" .. tostring(comp.selectedSlot))
+            end
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestChannels()
+        -- 실제 인스턴스만 나열한다. Maker에서는 릴리스 전용 API를 호출하지 않는다.
+        local userId = senderUserId
+        local s = self._T.sessions[userId]
+        if s == nil or s.entered then return end
+        if _UtilLogic.ElapsedSeconds - s.lastList < 3 then
+            self:ReceiveChannels(s.channels or {}, userId)
+            return
+        end
+        s.lastList = _UtilLogic.ElapsedSeconds
+        local rows = {}
+        if Environment:IsMakerPlay() then
+            -- Maker에는 서버 인스턴스가 하나이므로 선택 흐름을 19개 테스트 채널로 검증한다.
+            for i = 1, 19 do
+                table.insert(rows, { id = _WorldInstanceService.WorldInstanceId, count = _UserService:GetUserCount(), max = 5, label = "테스트 채널 " .. tostring(i) })
+            end
+        else
+            local ok, pages = _WorldInstanceService:GetWorldInstanceInfoPagesAndWait()
+            if not ok or pages == nil then self:ChannelError("서버 목록을 불러오지 못했습니다. 다시 월드를 선택해주세요.", userId) return end
+            while true do
+                for _, info in ipairs(pages:GetCurrentPageDatas()) do
+                    table.insert(rows, { id = info.Id, count = info.CurrentUserCount, max = info.MaxUserCount, label = info.ShortCode })
+                end
+                if pages.IsLastPage then break end
+                if not pages:MoveToNextPageAndWait() then self:ChannelError("서버 목록 조회에 실패했습니다.", userId) return end
+            end
+            table.sort(rows, function(a, b) return a.label < b.label end)
+        end
+        s.allowed = {}
+        for _, row in ipairs(rows) do s.allowed[row.id] = row end
+        s.channels = rows
+        self:ReceiveChannels(rows, userId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveChannels(table rows)
+        -- 서버 응답을 보관하고 현재 선택을 유효한 범위로 맞춘다.
+        self._T.channels = rows
+        self.selectedChannel = math.max(1, math.min(self.selectedChannel, #rows))
+        self.channelPage = math.floor((self.selectedChannel - 1) / 19) + 1
+        self:RefreshChannels()
+        log("[LoginFlow] channels=" .. tostring(#rows))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshChannels()
+        -- 접속 인원 비율을 실제 게이지에 반영하며 빈 서버 칸은 비활성화한다.
+        for i = 1, 19 do
+            local e = self:UI("Stage/WorldGroup/Channels/Channel" .. tostring(i))
+            local index = (self.channelPage - 1) * 19 + i
+            local row = self._T.channels[index]
+            if isvalid(e) then
+                e.ButtonComponent.Enable = row ~= nil
+                e.SpriteGUIRendererComponent.Color = row ~= nil and Color.white or Color(1, 1, 1, 0.25)
+                local label = e:GetChildByName("Label")
+                if isvalid(label) then label.TextGUIRendererComponent.FontColor = row ~= nil and Color(0.38, 0.28, 0.22, 1) or Color(0.38, 0.28, 0.22, 0.3) end
+                local gauge = e:GetChildByName("Gauge")
+                gauge.SpriteGUIRendererComponent.FillAmount = row ~= nil and math.min(1, row.count / math.max(1, row.max)) or 0
+                self:Text("Stage/WorldGroup/Channels/Channel" .. tostring(i) .. "/Label", "CH." .. tostring(index))
+            end
+        end
+        local marker = self:UI("Stage/WorldGroup/Channels/Selection")
+        marker.Enable = #self._T.channels > 0
+        local i = (self.selectedChannel - 1) % 19
+        local animation = marker:GetComponent("script.LoginSpriteAnimation")
+        local selected = self:UI("Stage/WorldGroup/Channels/Channel" .. tostring(i + 1))
+        local center = selected.UITransformComponent.anchoredPosition
+        local label = selected:GetChildByName("Label").UITransformComponent.anchoredPosition
+        -- 마지막 프레임(59×33, ori 29,16)의 중심을 채널명에 고정한다.
+        animation.OriginX = center.x + label.x - 0.5
+        animation.TopY = center.y + label.y + 0.5
+        if self._T.markerChannel ~= self.selectedChannel then
+            self._T.markerChannel = self.selectedChannel
+            animation:Replay()
+            log("[LoginFlow] channel marker replay=" .. tostring(self.selectedChannel))
+        end
+        local row = self._T.channels[self.selectedChannel]
+        self:Text("Stage/WorldGroup/Channels/Status", row ~= nil and (row.label .. "   " .. tostring(row.count) .. " / " .. tostring(row.max)) or "접속 가능한 서버가 없습니다.")
+        local pages = math.max(1, math.ceil(#self._T.channels / 19))
+        self:EnableUI("Stage/WorldGroup/Channels/Prev", self.channelPage > 1)
+        self:EnableUI("Stage/WorldGroup/Channels/Next", self.channelPage < pages)
+        self:EnableUI("Stage/WorldGroup/Channels/Page", pages > 1)
+        self:Text("Stage/WorldGroup/Channels/Page", tostring(self.channelPage) .. "/" .. tostring(pages))
+    end
+
+    @ExecSpace("Server")
+    method void RequestChannel(string instanceId, integer number)
+        -- 목록에서 확인한 현재 월드의 서버로만 이동을 허용한다.
+        local userId = senderUserId
+        local s = self._T.sessions[userId]
+        if s == nil or s.entered or s.warping then return end
+        local row = s.allowed[instanceId]
+        if row == nil then self:ChannelError("서버 목록을 다시 확인해주세요.", userId) return end
+        if number < 1 or s.channels == nil or s.channels[number] == nil or s.channels[number].id ~= instanceId then return end
+        s.channelNumber = number
+        if instanceId == _WorldInstanceService.WorldInstanceId then
+            s.channel = true
+            self:ChannelReady(userId)
+            return
+        end
+        if row.count >= row.max then self:ChannelError("서버가 가득 찼습니다. 다른 서버를 선택해주세요.", userId) return end
+        s.warping = true
+        _TeleportService:WarpUserToWorldInstanceAsync(userId, instanceId, "loginflow:" .. tostring(number), function(ok)
+            if not ok then s.warping = false self:ChannelError("서버에 접속하지 못했습니다. 다시 선택해주세요.", userId) end
+        end)
+    end
+
+    @ExecSpace("Client")
+    method void ChannelReady()
+        -- 채널 접속 승인 후 캐릭터 선택으로 넘어간다.
+        self:ShowCharacters()
+    end
+
+    @ExecSpace("Client")
+    method void ChannelError(string reason)
+        -- 서버 이동 실패 시 같은 화면에서 재시도할 수 있다.
+        self.busy = false
+        self:Notice(reason, "")
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BeginEntry()
+        -- 저장 복원 중의 중복 입장과 단계 건너뛰기를 막는다.
+        if self.phase ~= "character" or self.busy or not _CharacterPersistence:IsCharacterListReady() then return false end
+        self.busy = true
+        log("[LoginFlow] loading selected character")
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean CanEnterServer(string userId)
+        -- 서버의 채널 선택 상태가 확정된 세션만 캐릭터 입장을 요청할 수 있다.
+        local s = self._T.sessions[userId]
+        return s ~= nil and s.channel and not s.entered
+    end
+
+    @ExecSpace("ServerOnly")
+    method void AuthorizeEntry(string userId)
+        -- 캐릭터 저장 데이터를 정상적으로 읽은 서버만 입장 권한을 부여한다.
+        local s = self._T.sessions[userId]
+        if s ~= nil then s.authorized = true end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CharacterRestored()
+        -- 장비·스킬·재화 복원이 끝난 뒤에만 사냥 맵으로 이동한다.
+        if self.phase ~= "character" or not self.busy then return end
+        self._T.entryTransition = true
+        self._T.entryFadeReady = false
+        _ScreenTransitionService:SetFadeInOutEnable(true)
+        _ScreenTransitionService:SetFadeOutTime(1.0)
+        _ScreenTransitionService:SetFadeInTime(1.0)
+        self:RequestEnterMap()
+    end
+
+    @ExecSpace("Server")
+    method void RequestEnterMap()
+        -- 유효한 저장 데이터가 승인된 자기 플레이어만 인게임으로 이동시킨다.
+        local s = self._T.sessions[senderUserId]
+        if s == nil or not s.authorized or s.entered then return end
+        local player = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) then return end
+        s.entered = true
+        _TeleportService:TeleportToMapPosition(player, Vector3(0, 0, 0), "map01")
+        -- 로그인 대기 중의 숨김 상태가 다른 맵의 클라이언트 표현에 남지 않게 표시 이벤트도 재전송한다.
+        player:SetVisible(true, true, true)
+        self:EntryApproved(senderUserId)
+        log("[LoginFlow] server approved ingame entry")
+    end
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "ScreenTransitionService")
+    handler HandleEntryFadeOut(FadeOutStartEvent event)
+        -- 책 UI도 맵과 같은 1초 동안 검게 덮어 전환 레이어 위에 남지 않게 한다.
+        if not self._T.entryTransition then return end
+        self._T.entryFadeElapsed = 0
+        self:UI("EntryFade").SpriteGUIRendererComponent:SetAlpha(0)
+        self:EnableUI("EntryFade", true)
+        log("[LoginFlow] entry fade out started")
+    end
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "ScreenTransitionService")
+    handler HandleEntryFadeIn(FadeInStartEvent event)
+        -- 완전히 어두워진 경계에서만 책 화면을 내리고 도착 맵을 드러낸다.
+        if not self._T.entryTransition then return end
+        self._T.entryFadeElapsed = nil
+        self:UI("EntryFade").SpriteGUIRendererComponent:SetAlpha(1)
+        self._T.entryFadeReady = true
+        log("[LoginFlow] entry fade in started")
+    end
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "ScreenTransitionService")
+    handler HandleEntryFadeEnd(FadeInEndEvent event)
+        -- 이후의 일반 맵 이동에는 로그인 전용 오버레이를 적용하지 않는다.
+        if not self._T.entryTransition then return end
+        self._T.entryTransition = false
+        self._T.entryFadeElapsed = nil
+        log("[LoginFlow] entry fade completed")
+    end
+
+    @ExecSpace("Client")
+    method void EntryApproved()
+        -- 실제 맵 전환이 클라이언트에 반영될 때까지 책 화면을 유지한다.
+        self._T.entryApproved = true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EntryFailed(string reason)
+        -- 저장 실패 시 게임 진입 없이 선택 화면에서 복구한다.
+        self.busy = false
+        self._T.entryTransition = false
+        self._T.entryFadeElapsed = nil
+        self._T.entryFadeReady = false
+        self:EnableUI("EntryFade", false)
+        self:Notice(reason, "")
+    end
+
+    @ExecSpace("ServerOnly")
+    @EventSender("Service", "UserService")
+    handler HandleLeave(UserLeaveEvent event)
+        -- 재접속과 채널 이동 시 이전 세션 상태가 남지 않도록 정리한다.
+        self._T.sessions[event.UserId] = nil
+    end
+end

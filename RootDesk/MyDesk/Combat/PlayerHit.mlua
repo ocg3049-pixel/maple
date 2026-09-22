@@ -18,6 +18,7 @@ script PlayerHit extends HitComponent
     property number HpRegenTickSeconds = 0.25
 
     method void OnBeginPlay()
+        -- 피격 판정과 복구 타이머를 준비하되 네이티브 표정 처리는 계속 활성화한다.
         if self:IsServer() then
             -- BoxSize/ColliderOffset가 (0,0)으로 비어있으면 아바타 크기에 맞춘 자동 판정 박스가
             -- TransformComponent 원점(발밑)을 중심으로 계산되어 절반이 땅 밑으로 파고들었다 - 몬스터가
@@ -67,6 +68,7 @@ script PlayerHit extends HitComponent
     end
 
     method void OnEndPlay()
+        -- 플레이 종료 시 이 컴포넌트가 만든 반복 타이머를 해제한다.
         if self._T.serverWatchdogId then
             _TimerService:ClearTimer(self._T.serverWatchdogId)
             self._T.serverWatchdogId = nil
@@ -115,13 +117,12 @@ script PlayerHit extends HitComponent
     --   자체 상한(20초)을 둬서 해제 호출이 유실돼도 영구 무적이 되지 않게 한다.
     @ExecSpace("ServerOnly")
     method void SetClimbInvincible(boolean on)
-        -- 켤 때는 피격 컴포넌트를 끄고, 끌 때는 원상복구한다(OnHit의 무적 처리와 같은 방식).
+        -- 판정 플래그로만 무적을 제어한다. 컴포넌트를 끄면 표정의 자동 복귀도 멈춘다.
         if not isvalid(self.Entity) then return end
         if on then
             self._T.climbInvincible = true
             self._T.climbInvincibleFor = 0
             self.IsInvincible = true
-            self.Enable = false
             log("[PlayerHit] 로프 등반 무적 ON")
         else
             if self._T.climbInvincible ~= true then return end
@@ -165,9 +166,49 @@ script PlayerHit extends HitComponent
     end
 
     @ExecSpace("ClientOnly")
+    method void KeepAvatarAboveTerrain()
+        -- 발판의 낮은 레이어가 아바타를 전경 지형 뒤로 보내지 않도록 렌더 순서만 분리한다.
+        local map = self.Entity.CurrentMap
+        local avatar = self.Entity.AvatarRendererComponent
+        local body = self.Entity.RigidbodyComponent
+        if not isvalid(map) or not isvalid(avatar) or not isvalid(body) then return end
+        if map.MapComponent.TileMapMode ~= TileMapMode.MapleTile then return end
+        if self._T.avatarLayerMap ~= map then
+            local layerName = "MapLayer0"
+            local highest = -2147483648
+            for _, layer in ipairs(map:GetChildComponentsByTypeName("MOD.Core.MapLayerComponent", true)) do
+                if layer.LayerSortOrder > highest then
+                    highest = layer.LayerSortOrder
+                    -- Layer1/Layer8은 편집용 이름이며 렌더러는 MapLayer0/MapLayer7을 사용한다.
+                    layerName = "MapLayer" .. tostring(layer.LayerSortOrder)
+                end
+            end
+            self._T.avatarLayerMap = map
+            self._T.avatarLayerName = layerName
+            self._T.entryFaceResetPending = true
+            log("[PlayerLayer] map=" .. map.Name .. " avatar=" .. layerName)
+        end
+        -- 맵 진입/발판 동기화가 늦게 도착해도 낮은 레이어로 다시 내려가지 않는다.
+        if body.LayerSettingType ~= AutomaticLayerOption.None then body.LayerSettingType = AutomaticLayerOption.None end
+        if avatar.IgnoreMapLayerCheck then avatar.IgnoreMapLayerCheck = false end
+        if avatar.SortingLayer ~= self._T.avatarLayerName then avatar.SortingLayer = self._T.avatarLayerName end
+        local order = self.Entity == _UserService.LocalPlayer and 4 or 3
+        if avatar.OrderInLayer ~= order then avatar.OrderInLayer = order end
+        local state = self.Entity.StateComponent
+        if self._T.entryFaceResetPending and isvalid(avatar:GetFaceEntity()) and isvalid(state)
+            and state.CurrentStateName ~= "HIT" and state.CurrentStateName ~= "DEAD" then
+            avatar:PlayEmotion(EmotionalType.Default, 0.1)
+            self._T.entryFaceResetPending = false
+            log("[PlayerFace] neutral face restored on map entry " .. map.Name)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
     method void ClientWatchdogTick()
         -- 내 캐릭터에 대해서만 동작해야 한다 - 다른 플레이어의 상태를 내 클라이언트에서 바꾸려 하면
         -- 권한이 없어 [LEA-3022]가 다시 발생한다.
+        if not isvalid(self.Entity) then return end
+        self:KeepAvatarAboveTerrain()
         local localPlayer = _UserService.LocalPlayer
         if not isvalid(localPlayer) or localPlayer ~= self.Entity then return end
         local sc = self.Entity.StateComponent
@@ -557,7 +598,7 @@ script PlayerHit extends HitComponent
         -- 무적 상태면 판정을 거부한다 - 실측 결과 이 프로젝트의 몬스터 근접공격(MonsterAttack)에는 이 훅이
         -- 전혀 호출되지 않는 것으로 확인됐지만, 다른 공격 경로가 이 훅을 실제로 참조할 경우를 대비한
         -- 보조 방어선으로 남겨둔다 - 주 방어선은 MonsterAttack.IsAttackTarget의 IsInvincible 체크.
-        if self._T.invincible then return false end
+        if self.IsInvincible or self._T.invincible or self._T.climbInvincible then return false end
         return true
     end
 
@@ -565,10 +606,10 @@ script PlayerHit extends HitComponent
         -- 서버가 유일한 권위 - OnHit의 부모 ExecSpace가 미지정(=All)이라 클라이언트에서도 호출될 수 있어
         -- 클라이언트 쪽 실행은 맨 앞에서 걸러낸다.
         if not self:IsServer() then return end
-        if self._T.invincible then return end
+        if self._T.invincible or self._T.climbInvincible then return end
         self._T.invincible = true
         self.IsInvincible = true
-        self.Enable = false
+        -- 무적은 IsInvincible/IsHitTarget으로 판정한다. Enable=false는 HIT·표정 종료를 끊는다.
         self._T.invincibleFor = 0
 
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
@@ -617,7 +658,7 @@ script PlayerHit extends HitComponent
             if isvalid(self.Entity) then
                 self.Enable = true
                 self._T.invincible = false
-                self.IsInvincible = false
+                self.IsInvincible = self._T.climbInvincible == true
                 self._T.invincibleFor = 0
             end
         end, self.ImmuneCooldown)

@@ -1,0 +1,235 @@
+@Logic
+script CashShopManager extends Logic
+
+	property string halfEarringRUID = "837093d12dd344e59956d8f88f1aaf34"
+	property string productId = "G1BADOYWB"
+	property integer expectedPrice = 10
+	property string windowPath = "/ui/DefaultGroup/CashShopWindow"
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Reuse nine cards; catalog entries drive category filtering, details and pagination.
+		self._T.handlers = {}
+		self._T.catalog = self:BuildCatalog()
+		self._T.category = "all"
+		self._T.page = 1
+		self._T.selectedId = self.productId
+		local bindings = {
+			{path="/ui/DefaultGroup/MapleHUD/BtnCashShop", action=function() self:ToggleWindow() end},
+			{path=self.windowPath .. "/Close", action=function() self:SetOpen(false) end},
+			{path=self.windowPath .. "/Buy", action=function() self:RequestPurchase() end}
+			,{path="/ui/DefaultGroup/EquipWindow/SlotEarring", action=function()
+				if _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EquipWindow", _InputService:GetCursorPosition()) then
+					_UIEquipInventoryManager:OnSlotClick("equip", 14)
+				end
+			end}
+		}
+		for _, category in ipairs({"all", "equip", "consume", "decorate", "pet", "package", "etc"}) do
+			local key = category
+			table.insert(bindings, {path=self.windowPath .. "/Tabs/" .. key, action=function() self:SelectCategory(key) end})
+		end
+		for i = 1, 9 do
+			local slot = i
+			table.insert(bindings, {path=self.windowPath .. "/Catalog/Card" .. tostring(slot), action=function() self:SelectCard(slot) end})
+		end
+		table.insert(bindings, {path=self.windowPath .. "/Next", action=function() self:ChangePage(1) end})
+		table.insert(bindings, {path=self.windowPath .. "/Previous", action=function() self:ChangePage(-1) end})
+		for _, binding in ipairs(bindings) do
+			local entity = _EntityService:GetEntityByPath(binding.path)
+			if isvalid(entity) then
+				local action = binding.action
+				local guarded = string.sub(binding.path, 1, #self.windowPath) == self.windowPath
+				local connection = entity:ConnectEvent(ButtonClickEvent, function()
+					if guarded and not _UIClickArbiter:AcceptClickAt(self.windowPath, _InputService:GetCursorPosition()) then return end
+					action()
+				end)
+				table.insert(self._T.handlers, {entity=entity, connection=connection})
+			end
+		end
+		self:SetOpen(false)
+		self:RefreshCatalog()
+		log("[CashShop] catalog ready product=" .. self.productId .. "; paid checkout disabled pending fulfillment verification")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		for _, record in ipairs(self._T.handlers or {}) do
+			if isvalid(record.entity) then record.entity:DisconnectEvent(ButtonClickEvent, record.connection) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleWindow()
+		if not _LoginFlow:IsInGame() then return end
+		local window = _EntityService:GetEntityByPath(self.windowPath)
+		if isvalid(window) then self:SetOpen(not window.Enable) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetOpen(boolean opened)
+		local window = _EntityService:GetEntityByPath(self.windowPath)
+		if not isvalid(window) then return end
+		window.Enable = opened
+		if opened then
+			_UIEquipInventoryManager:PushWin(self.windowPath)
+			_UIEquipInventoryManager:BringWindowToFront(self.windowPath)
+			self:RefreshCatalog()
+		else
+			_UIEquipInventoryManager:RemoveWin(self.windowPath)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshCatalog()
+		-- Rebuild only the visible page; empty categories never display a stale product.
+		local filtered = self:GetFilteredCatalog()
+		self._T.pageCount = math.max(1, math.ceil(#filtered / 9))
+		self._T.page = math.max(1, math.min(self._T.page or 1, self._T.pageCount))
+		self._T.visibleProducts = {}
+		local selected = nil
+		for _, product in ipairs(filtered) do
+			if product.id == self._T.selectedId then selected = product end
+		end
+		if selected == nil then selected = filtered[(self._T.page - 1) * 9 + 1] end
+		self._T.selectedId = selected ~= nil and selected.id or ""
+		for i = 1, 9 do
+			local product = filtered[(self._T.page - 1) * 9 + i]
+			self._T.visibleProducts[i] = product
+			local path = self.windowPath .. "/Catalog/Card" .. tostring(i)
+			local card = _EntityService:GetEntityByPath(path)
+			if isvalid(card) then
+				card.ButtonComponent.Enable = product ~= nil
+				card.SpriteGUIRendererComponent.Color = product ~= nil and Color(0.83, 0.91, 0.95, 1) or Color(0.37, 0.46, 0.51, 0.55)
+				local edge = card:GetChildByName("Selected")
+				edge.Enable = product ~= nil and product.id == self._T.selectedId
+				local icon = card:GetChildByName("Icon")
+				icon.Enable = product ~= nil
+				if product ~= nil then icon.SpriteGUIRendererComponent.ImageRUID = DataRef(product.icon) end
+				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Name", product ~= nil and product.name or "")
+				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Price", product ~= nil and tostring(product.price) .. " 월드코인" or "")
+				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Tag", product ~= nil and product.tag or "상품 준비 중")
+				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Hint", product ~= nil and "상세 보기" or "")
+			end
+		end
+		for _, key in ipairs({"all", "equip", "consume", "decorate", "pet", "package", "etc"}) do
+			local tab = _EntityService:GetEntityByPath(self.windowPath .. "/Tabs/" .. key)
+			if isvalid(tab) then
+				tab.SpriteGUIRendererComponent.Color = key == self._T.category and Color(0.18, 0.73, 0.80, 1) or Color(0.32, 0.41, 0.47, 1)
+			end
+		end
+		self:SetLabel("Page", tostring(self._T.page) .. " / " .. tostring(self._T.pageCount))
+		self:SetLabel("Count", "상품 " .. tostring(#filtered) .. "개  ·  한 페이지 9개")
+		self:SetLabel("Price", selected ~= nil and tostring(selected.price) .. " 월드코인" or "")
+		self:SetLabel("Product/Name", selected ~= nil and selected.name or "등록된 상품이 없습니다")
+		self:SetLabel("Product/Details", selected ~= nil and selected.description or "다른 카테고리를 선택해주세요.\n새 상품이 등록되면 이곳에 표시됩니다.")
+		local detailIcon = _EntityService:GetEntityByPath(self.windowPath .. "/Product/Icon")
+		if isvalid(detailIcon) then
+			detailIcon.Enable = selected ~= nil
+			if selected ~= nil then detailIcon.SpriteGUIRendererComponent.ImageRUID = DataRef(selected.icon) end
+		end
+		local buy = _EntityService:GetEntityByPath(self.windowPath .. "/Buy")
+		if isvalid(buy) then buy.Enable = selected ~= nil end
+		local previous = _EntityService:GetEntityByPath(self.windowPath .. "/Previous")
+		local nextPage = _EntityService:GetEntityByPath(self.windowPath .. "/Next")
+		if isvalid(previous) then previous.ButtonComponent.Enable = self._T.page > 1 end
+		if isvalid(nextPage) then nextPage.ButtonComponent.Enable = self._T.page < self._T.pageCount end
+	end
+
+	method table BuildCatalog()
+		-- Add one entry per product here; id must be unique, category must match a tab key.
+		return {{id=self.productId, category="equip", name="하프이어링", price=self.expectedPrice,
+			icon="thumbnail://" .. self.halfEarringRUID, tag="레전드리 · 최대 5성",
+			description="[고정 잠재능력]\n아이템 드롭률 +20%\n메소 획득량 +20%\n\n[스타포스 · 최대 5성]\n1성마다 드롭률 +2%\n메소 획득량 +2% / 공격력 +3\n\n잠재능력·에디셔널 재설정 불가\n구매 캐릭터에게 1개 지급"}}
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetFilteredCatalog()
+		-- Category filters use data keys, not positions or item names.
+		local result = {}
+		for _, product in ipairs(self._T.catalog or {}) do
+			if self._T.category == "all" or product.category == self._T.category then table.insert(result, product) end
+		end
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetLabel(string relativePath, string value)
+		-- Update a text node without introducing a dependency on editor UUIDs.
+		local entity = _EntityService:GetEntityByPath(self.windowPath .. "/" .. relativePath)
+		if isvalid(entity) then entity.TextGUIRendererComponent.Text = value end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectCategory(string category)
+		-- Reset pagination and selection whenever the tab changes.
+		self._T.category = category
+		self._T.page = 1
+		self._T.selectedId = ""
+		self:RefreshCatalog()
+		log("[CashShop] category=" .. category .. " count=" .. tostring(#self:GetFilteredCatalog()))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangePage(integer delta)
+		-- Clamp both ends; page controls cannot select an empty out-of-range page.
+		self._T.page = math.max(1, math.min((self._T.page or 1) + delta, self._T.pageCount or 1))
+		self._T.selectedId = ""
+		self:RefreshCatalog()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectCard(integer index)
+		-- Resolve the currently visible product, including after page or category changes.
+		local product = (self._T.visibleProducts or {})[index]
+		if product ~= nil then
+			self._T.selectedId = product.id
+			self:RefreshCatalog()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestPurchase()
+		-- Fail closed: no local currency substitute, free grant, or paid prompt before durable server delivery.
+		if self._T.selectedId == nil or self._T.selectedId == "" then return end
+		_UIToast:ShowMessage("안전한 지급 연동 준비 중으로, 아직 결제되지 않습니다.")
+		log("[CashShop] checkout blocked: fulfillment not verified; product=" .. self._T.selectedId)
+	end
+
+	method boolean IsHalfEarring(string item)
+		return string.match(item or "", "^[^|]+|([^|]+)") == self.halfEarringRUID
+	end
+
+	method string BuildHalfEarring()
+		return "하프 이어링|" .. self.halfEarringRUID .. "|14|0|0|0|1|0|레전드리|아이템 드롭률 +20%|메소 획득량 +20%|0|0|0|0|0"
+	end
+
+	method integer GetMaxStars(string item)
+		return self:IsHalfEarring(item) and 5 or 100
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetEquippedRewardBonus()
+		local item = _UIEquipInventoryManager:GetEquip(14)
+		if not self:IsHalfEarring(item) then return 0 end
+		return 20 + 2 * math.max(0, math.min(5, _UIEquipInventoryManager:ParseStars(item)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateEarringUI()
+		local item = _UIEquipInventoryManager:GetEquip(14)
+		local icon = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/SlotEarring/Icon")
+		if isvalid(icon) then
+			icon.Enable = item ~= ""
+			icon.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. self.halfEarringRUID)
+		end
+		_SkillManager:RequestSyncDropRatePct(_SkillManager:GetBeginnerDropRatePct() + self:GetEquippedRewardBonus())
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleKeyDownEvent(KeyDownEvent event)
+		if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return end
+		if _KeySettingManager:GetFuncForKeyEnum(event.key) == "cashshop" then self:ToggleWindow() end
+	end
+
+end

@@ -7,8 +7,8 @@ script MapleHUDManager extends Logic
     property TextComponent hpText = "ce1cb4ad-ea67-47a8-b476-b79b8af34db2"
     property SpriteGUIRendererComponent mpFill = "d9bd1fb9-e25a-474d-9a29-3be7e1eae1e8"
     property TextComponent mpText = "64519d7e-641b-4fe0-8fff-6bdb2e0ded35"
-    property TextComponent levelText = "35fc53d7-e296-4358-825a-c65c915b6ea7"
-    property TextComponent nameText = "4cdaa49d-6a30-408b-acd2-6e7cd68df892"
+    property TextGUIRendererComponent levelText = "35fc53d7-e296-4358-825a-c65c915b6ea7"
+    property TextGUIRendererComponent nameText = "4cdaa49d-6a30-408b-acd2-6e7cd68df892"
     property ButtonComponent btnEquip = "8c75fac1-af72-4025-b06f-9905fb2316e7"
     property ButtonComponent btnEnhance = "152a8836-ad06-4ed3-b85a-f3544467385b"
     property ButtonComponent btnMap = "e3eeb78b-4375-4e90-9e9f-eb57ad3b6aec"
@@ -27,6 +27,7 @@ script MapleHUDManager extends Logic
         if not self:IsClient() then return end
 
         self._T.buttonHandlers = {}
+        self._T.dragHandlers = {}
         self:ConnectMenuButton(self.btnEquip, function()
             _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/EquipWindow")
         end)
@@ -45,6 +46,15 @@ script MapleHUDManager extends Logic
         self:ConnectMenuButton(self.btnCharInfo, function()
             _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/CharInfoWindow")
         end)
+        local keys = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnKeySetting")
+        if isvalid(keys) then
+            self:ConnectMenuButton(keys.ButtonComponent, function() _KeySettingManager:ToggleWindow() end)
+        end
+
+        self:WireChatWindow()
+        self:WireSimpleChatMessages()
+        self:SendLevelFadeBehindText()
+        self:RefreshChatLayout()
 
         self.updateTimer = _TimerService:SetTimerRepeat(self.UpdateHUD, 0.25)
         -- (버그 수정 2026-08-15, 신고 "HP UI가 안 움직이는데 MP는 정상") HP/MP 바만 갱신하는 **독립 타이머**.
@@ -82,6 +92,7 @@ script MapleHUDManager extends Logic
     end
 
     method void OnEndPlay()
+		if self:IsClient() then _UICursorManager:ReleaseForcedCursor() end
         -- 타이머/이벤트 해제
         if self.updateTimer ~= 0 then
             _TimerService:ClearTimer(self.updateTimer)
@@ -99,6 +110,380 @@ script MapleHUDManager extends Logic
             end
             self._T.buttonHandlers = {}
         end
+        if self._T.dragHandlers ~= nil then
+            for _, rec in ipairs(self._T.dragHandlers) do
+                if isvalid(rec.entity) then
+                    rec.entity:DisconnectEvent(rec.eventType, rec.eventHandler)
+                end
+            end
+            self._T.dragHandlers = {}
+        end
+        if self._T.chatHandler ~= nil and isvalid(self.chatBox) then
+            self.chatBox:DisconnectEvent(ChatEvent, self._T.chatHandler)
+            self._T.chatHandler = nil
+        end
+        if self._T.chatKeyHandler ~= nil then
+            _InputService:DisconnectEvent(KeyDownEvent, self._T.chatKeyHandler)
+            self._T.chatKeyHandler = nil
+        end
+        if self._T.chatFocusTimer ~= nil then _TimerService:ClearTimer(self._T.chatFocusTimer) end
+        if self._T.chatResetTimer ~= nil then _TimerService:ClearTimer(self._T.chatResetTimer) end
+        self._T.chatFocusTimer, self._T.chatResetTimer = nil, nil
+        self._T.chatTyping = false
+        self._T.chatClosing = false
+        self._T.chatSendTimes = nil
+    end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateLoginWorldTransition()
+		local world = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/WorldGroup")
+		if not isvalid(world) then return end
+		local select = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup")
+		local create = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CreateCharacter")
+		local nonWorld = (isvalid(select) and select.Enable) or (isvalid(create) and create.Enable)
+		local paths = {
+			"Step", "StepShadow", "StepCustom", "Title", "Subtitle",
+			"WorldLabel", "WorldShadow", "WorldValue"
+		}
+		local baseX = { -334.5, -333.5, -336, -336, -336, -334.5, -333.5, -312 }
+		local baseY = { 234.5, 227.5, 234, 239, 219, 169.5, 162.5, 170 }
+		local navRoot = "/ui/LoginScene/Stage/Navigation/"
+
+		if self._T.loginSignPhase == nil then
+			self._T.loginSignPhase = nonWorld and "out" or "in"
+			self._T.loginSignTargetNonWorld = nonWorld
+		end
+
+		if self._T.loginSignTargetNonWorld ~= nonWorld then
+			self._T.loginSignTargetNonWorld = nonWorld
+			self._T.loginSignPhase = nonWorld and "leaving" or "entering"
+			self._T.loginSignStart = _UtilLogic.ElapsedSeconds
+			log(nonWorld and "[LoginTransition] 두 푯말 왼쪽 퇴장 시작" or "[LoginTransition] 두 푯말 왼쪽 진입 시작")
+		end
+
+		local phase = self._T.loginSignPhase
+		local t = 1
+		if phase == "leaving" or phase == "entering" then
+			t = math.min(1, (_UtilLogic.ElapsedSeconds - self._T.loginSignStart) / 0.36)
+		end
+		local ease = t * t * (3 - 2 * t)
+		local offset = 0
+		if phase == "leaving" then offset = -190 * ease
+		elseif phase == "entering" then offset = -190 * (1 - ease)
+		elseif phase == "out" then offset = -190 end
+
+		for i = 1, #paths do
+			local e = _EntityService:GetEntityByPath(navRoot .. paths[i])
+			if isvalid(e) then
+				e.UITransformComponent.anchoredPosition = Vector2(baseX[i] + offset, baseY[i])
+			end
+		end
+
+		if t >= 1 and phase == "leaving" then
+			self._T.loginSignPhase = "out"
+			log("[LoginTransition] 두 푯말 왼쪽 퇴장 완료")
+		elseif t >= 1 and phase == "entering" then
+			self._T.loginSignPhase = "in"
+			log("[LoginTransition] 두 푯말 왼쪽 진입 완료")
+		end
+	end
+
+    @ExecSpace("ClientOnly")
+    method void WireChatWindow()
+        -- 채팅 제목줄 이동과 위쪽 가장자리 높이 조절을 연결한다.
+        if not isvalid(self.chatBox) then return end
+        local resizeGrip = self.chatBox:GetChildByName("ResizeGrip", false)
+        local moveGrip = self.chatBox:GetChildByName("MoveGrip", false)
+
+        if isvalid(resizeGrip) then
+			local hd = resizeGrip:ConnectEvent(UITouchDownEvent, function() _UICursorManager:ForceCursor("chat-resize") end)
+			local hu = resizeGrip:ConnectEvent(UITouchUpEvent, function() _UICursorManager:ReleaseForcedCursor() end)
+			table.insert(self._T.dragHandlers, { entity = resizeGrip, eventType = UITouchDownEvent, eventHandler = hd })
+			table.insert(self._T.dragHandlers, { entity = resizeGrip, eventType = UITouchUpEvent, eventHandler = hu })
+            local h = resizeGrip:ConnectEvent(UITouchDragEvent, function(evt)
+                if self._T.chatCollapsed then return end
+                ---@type UITouchDragEvent
+                local e = evt
+                local tf = self.chatBox.UITransformComponent
+                local nextHeight = math.max(120, math.min(520, tf.RectSize.y + e.TouchDelta.y))
+                tf.RectSize = Vector2(tf.RectSize.x, nextHeight)
+                self._T.chatExpandedHeight = nextHeight
+                self:RefreshChatGripWidth()
+				self:RefreshChatLayout()
+            end)
+            table.insert(self._T.dragHandlers, { entity = resizeGrip, eventType = UITouchDragEvent, eventHandler = h })
+        end
+
+        if isvalid(moveGrip) then
+			local hd = moveGrip:ConnectEvent(UITouchDownEvent, function() _UICursorManager:ForceCursor("chat-move") end)
+			local hu = moveGrip:ConnectEvent(UITouchUpEvent, function() _UICursorManager:ReleaseForcedCursor() end)
+			table.insert(self._T.dragHandlers, { entity = moveGrip, eventType = UITouchDownEvent, eventHandler = hd })
+			table.insert(self._T.dragHandlers, { entity = moveGrip, eventType = UITouchUpEvent, eventHandler = hu })
+            local h = moveGrip:ConnectEvent(UITouchDragEvent, function(evt)
+                ---@type UITouchDragEvent
+                local e = evt
+                local tf = self.chatBox.UITransformComponent
+                local p = tf.anchoredPosition
+                -- 왼쪽/위쪽은 여백 없이, 아래쪽은 기존 HUD 보호 영역을 유지한다.
+                local maxX = math.max(0, 1920 - tf.RectSize.x - 8)
+                local maxY = math.max(52, 1080 - tf.RectSize.y)
+                tf.anchoredPosition = Vector2(
+                    math.max(0, math.min(maxX, p.x + e.TouchDelta.x)),
+                    math.max(52, math.min(maxY, p.y + e.TouchDelta.y)))
+            end)
+            table.insert(self._T.dragHandlers, { entity = moveGrip, eventType = UITouchDragEvent, eventHandler = h })
+        end
+        log("[MapleHUD] 채팅창 이동/세로 리사이즈 핸들 연결")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshChatGripWidth()
+        -- 접기 버튼과 이동 영역이 겹치지 않도록 제목줄의 오른쪽 여백을 둔다.
+        if not isvalid(self.chatBox) then return end
+        local width = self.chatBox.UITransformComponent.RectSize.x
+        local resizeGrip = self.chatBox:GetChildByName("ResizeGrip", false)
+        local moveGrip = self.chatBox:GetChildByName("MoveGrip", false)
+        if isvalid(resizeGrip) then resizeGrip.UITransformComponent.RectSize = Vector2(width, 5) end
+        if isvalid(moveGrip) then moveGrip.UITransformComponent.RectSize = Vector2(width - 48, 24) end
+    end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshChatLayout()
+		-- 한 줄 접기 / 최소 두 줄 펼치기와 사용자 지정 높이를 같은 레이아웃으로 처리한다.
+		if not isvalid(self.chatBox) then return end
+		local box = self.chatBox
+		local collapsed = self._T.chatCollapsed == true
+		local size = box.UITransformComponent.RectSize
+		-- Default 20px 폰트의 한글 한 줄은 약 30px이다. 32px를 확보해 잘림을 막는다.
+		local height = collapsed and 68 or math.max(120, self._T.chatExpandedHeight or size.y)
+		box.UITransformComponent.RectSize = Vector2(size.x, height)
+		local pos = box.UITransformComponent.anchoredPosition
+		box.UITransformComponent.anchoredPosition = Vector2(
+			math.max(0, math.min(1920 - size.x - 8, pos.x)),
+			math.max(52, math.min(1080 - height, pos.y)))
+		local bg = box:GetChildByName("SimpleChatBG", false)
+		if isvalid(bg) then
+			bg.Enable = true
+			bg.UITransformComponent.RectSize = Vector2(size.x, height)
+			bg.SpriteGUIRendererComponent.Color = Color(0.08, 0.09, 0.11, 0.64)
+		end
+		local toggle = box:GetChildByName("BtnCollapse", false)
+		if isvalid(toggle) then toggle.TextGUIRendererComponent.Text = collapsed and "+" or "-" end
+		local grip = box:GetChildByName("ResizeGrip", false)
+		if isvalid(grip) then grip.Enable = not collapsed end
+		local title = box:GetChildByName("Title", false)
+		if isvalid(title) then title.Enable = not collapsed end
+		local input = self._T.chatInput
+		if isvalid(input) then
+			-- 포커스 해제 중에도 입력란 배경은 계속 남겨 깜빡이지 않게 한다.
+			input.Enable = true
+			input.UITransformComponent.RectSize = Vector2(size.x - 20, 26)
+		end
+		local view = box:GetChildByName("Messages", false)
+		if isvalid(view) then
+			view.Enable = true
+			view.UITransformComponent.RectSize = Vector2(size.x - (collapsed and 52 or 24), collapsed and 32 or height - 56)
+			view.UITransformComponent.anchoredPosition = Vector2(12, 32)
+		end
+		self:RefreshChatGripWidth()
+		self:RenderSimpleChatMessages()
+	end
+
+    @ExecSpace("ClientOnly")
+    method void WireSimpleChatMessages()
+        -- 기본 말풍선 버튼을 끄고 포커스 가능한 입력란과 금칙어 필터가 설정된 텍스트 로그를 연결한다.
+        if not isvalid(self.chatBox) then return end
+        self._T.chatCollapsed = false
+        self._T.chatExpandedHeight = math.max(120, self.chatBox.UITransformComponent.RectSize.y)
+        self._T.chatMessages = {}
+        self._T.chatTyping = false
+        self._T.chatClosing = false
+        self._T.chatInput = self.chatBox:GetChildByName("Input", false)
+        if isvalid(self.chatBox.ChatComponent) then self.chatBox.ChatComponent.Enable = false end
+        local input = self._T.chatInput
+        if isvalid(input) then
+            local submit = input:ConnectEvent(TextInputSubmitEvent, function(evt)
+                ---@type TextInputSubmitEvent
+                local event = evt
+                self:SubmitChat(event.Text)
+            end)
+            table.insert(self._T.dragHandlers, {entity=input, eventType=TextInputSubmitEvent, eventHandler=submit})
+            local finish = input:ConnectEvent(TextInputEndEditEvent, function()
+                self._T.chatTyping = false
+                self:RefreshChatLayout()
+            end)
+            table.insert(self._T.dragHandlers, {entity=input, eventType=TextInputEndEditEvent, eventHandler=finish})
+        end
+        local toggle = self.chatBox:GetChildByName("BtnCollapse", false)
+        if isvalid(toggle) then
+            local click = toggle:ConnectEvent(ButtonClickEvent, function() self:ToggleChatCollapsed() end)
+            table.insert(self._T.buttonHandlers, {entity=toggle, eventHandler=click})
+        end
+        self._T.chatKeyHandler = _InputService:ConnectEvent(KeyDownEvent, function(evt)
+            ---@type KeyDownEvent
+            local event = evt
+            if event.key == KeyboardKey.Return or event.key == KeyboardKey.KeypadEnter then
+                if not self:IsChatTyping() and not self:HasOpenChatBlockingWindow() then self:FocusChat() end
+            elseif event.key == KeyboardKey.Escape and self:IsChatTyping() then
+                self:FinishChatInput()
+            end
+        end)
+        log("[MapleHUD] plain chat ready; Enter focus and collapse enabled")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderSimpleChatMessages()
+        -- 별도 말풍선 없이 흰색 '닉네임 : 내용'을 표시한다. 히스토리는 80개로 제한한다.
+        if not isvalid(self.chatBox) then return end
+        for i = 1, 18 do
+            local line = self.chatBox:GetChildByName("SimpleLine" .. tostring(i), false)
+            if isvalid(line) then line.Enable = false end
+        end
+        local view = self.chatBox:GetChildByName("Messages", false)
+        if not isvalid(view) then return end
+        local label = view:GetChildByName("Log", false)
+        if not isvalid(label) then return end
+        local messages = self._T.chatMessages or {}
+        local text = table.concat(messages, "\n")
+        if self._T.chatCollapsed then text = messages[#messages] or "" end
+        local width = view.UITransformComponent.RectSize.x
+        local tc = label.TextGUIRendererComponent
+        tc.Text = text
+        local height = 32
+        if not self._T.chatCollapsed and text ~= "" then height = math.max(32, math.ceil(tc:GetPreferredHeight(text, width)) + 2) end
+        label.UITransformComponent.RectSize = Vector2(width, height)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsChatTyping()
+        -- 게임 단축키가 채팅 입력을 가로채지 않도록 현재 포커스 상태를 공유한다.
+        local input = self._T.chatInput
+        return self._T.chatTyping == true or (isvalid(input) and input.EnabledInHierarchy and input.TextGUIRendererInputComponent.IsFocused)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean HasOpenChatBlockingWindow()
+        -- 게임 창이나 다른 입력창이 열렸다면 Enter의 기존 용도를 먼저 보장한다.
+        if not _LoginFlow:IsInGame() or _UIItemDiscardManager:BlocksInput() then return true end
+        for _, path in ipairs(_UIClickArbiter:GetWindowPaths()) do
+            local win = _EntityService:GetEntityByPath(path)
+            if isvalid(win) and win.EnabledInHierarchy then return true end
+        end
+        for _, path in ipairs({"/ui/DefaultGroup/CommandInputBar", "/ui/DefaultGroup/QuickSlotDialog", "/ui/DefaultGroup/MapSelectGroup", "/ui/WorldMapGroup", "/ui/ShopGroup/ShopPopup", "/ui/PopupGroup/PopupBack"}) do
+            local win = _EntityService:GetEntityByPath(path)
+            if isvalid(win) and win.EnabledInHierarchy then return true end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FocusChat()
+        -- Enter 처리 프레임 뒤에 포커스를 줘서 여는 Enter가 빈 메시지를 제출하지 않게 한다.
+        if not isvalid(self._T.chatInput) or not _LoginFlow:IsInGame() or self._T.chatClosing then return end
+        if _UtilLogic.ElapsedSeconds - (self._T.chatClosedAt or -10) < 0.2 then return end
+        self._T.chatTyping = true
+        self:RefreshChatLayout()
+        if self._T.chatFocusTimer ~= nil then _TimerService:ClearTimer(self._T.chatFocusTimer) end
+        self._T.chatFocusTimer = _TimerService:SetTimerOnce(function()
+            self._T.chatFocusTimer = nil
+            if isvalid(self._T.chatInput) and self._T.chatTyping then
+                self._T.chatInput.TextGUIRendererInputComponent:ActivateInputField()
+                log("[MapleHUD] Enter requested chat focus")
+            end
+        end, 0.05)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FinishChatInput()
+        -- 입력을 마치면 게임 키보드 제어를 돌려주고 접힌 상태를 유지한다.
+        self._T.chatTyping = false
+        self._T.chatClosing = true
+        self._T.chatClosedAt = _UtilLogic.ElapsedSeconds
+        if self._T.chatFocusTimer ~= nil then
+            _TimerService:ClearTimer(self._T.chatFocusTimer)
+            self._T.chatFocusTimer = nil
+        end
+        local input = self._T.chatInput
+        if isvalid(input) then
+            input.TextGUIRendererInputComponent.Text = ""
+            input.TextGUIRendererInputComponent.Enable = false
+        end
+        self:RefreshChatLayout()
+        -- 입력 컴포넌트만 재설정한다. 배경/글자 엔티티를 껐다 켜지 않는다.
+        if self._T.chatResetTimer ~= nil then _TimerService:ClearTimer(self._T.chatResetTimer) end
+        self._T.chatResetTimer = _TimerService:SetTimerOnce(function()
+            self._T.chatResetTimer = nil
+            self._T.chatClosing = false
+            if isvalid(input) then input.TextGUIRendererInputComponent.Enable = true end
+            self:RefreshChatLayout()
+        end, 0.08)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SubmitChat(string text)
+        -- 빈 메시지는 전송하지 않고 내용은 서버에서 사용자 식별/길이/빈도를 검증한다.
+        self:FinishChatInput()
+        text = (string.gsub(text or "", "[%c]", " "))
+        text = string.match(text, "^%s*(.-)%s*$") or ""
+        if text ~= "" then self:RequestChat(text) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestChat(string text)
+        -- 이름을 클라이언트에서 받지 않는다. 접속 중인 요청자만 인스턴스 채팅에 참여할 수 있다.
+        local player = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) or not isvalid(player.PlayerComponent) then return end
+        if #text > 840 then return end
+        text = (string.gsub(text, "[%c]", " "))
+        text = string.match(text, "^%s*(.-)%s*$") or ""
+        if text == "" then return end
+        self._T.chatSendTimes = self._T.chatSendTimes or {}
+        local now = _UtilLogic.ElapsedSeconds
+        if now - (self._T.chatSendTimes[senderUserId] or -10) < 0.7 then return end
+        self._T.chatSendTimes[senderUserId] = now
+        local name = player.PlayerComponent.Nickname
+        if name == nil or name == "" then name = player.Name end
+        name = (string.gsub(name, "[%c]", " "))
+        for _, recipient in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(recipient) and isvalid(recipient.PlayerComponent) then
+                self:ReceiveChat(name, text, recipient.PlayerComponent.UserId)
+            end
+        end
+        log("[MapleHUD] chat accepted and delivered")
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveChat(string nickname, string text)
+        -- TextGUIRendererComponent의 Maker 금칙어 필터를 거쳐 표시하고 리치 텍스트는 해석하지 않는다.
+        self._T.chatMessages = self._T.chatMessages or {}
+        table.insert(self._T.chatMessages, nickname .. " : " .. text)
+        if #self._T.chatMessages > 80 then table.remove(self._T.chatMessages, 1) end
+        self:RenderSimpleChatMessages()
+        log("[MapleHUD] chat line rendered count=" .. tostring(#self._T.chatMessages))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleChatCollapsed()
+        -- 펼친 높이를 기억해서 다시 +를 누르면 사용자가 조절한 높이를 복원한다.
+        self._T.chatCollapsed = not self._T.chatCollapsed
+        self:RefreshChatLayout()
+        log("[MapleHUD] chat collapsed=" .. tostring(self._T.chatCollapsed) .. " height=" .. tostring(self.chatBox.UITransformComponent.RectSize.y))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SendLevelFadeBehindText()
+        -- 잘게 겹치던 페이드 조각은 숨기고 단일 이미지 위에 글자만 표시한다.
+        local plate = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/LevelPlate")
+        if not isvalid(plate) then return end
+        for i = 1, 12 do
+            local fade = plate:GetChildByName("Fade" .. tostring(i), false)
+            if isvalid(fade) then fade.Enable = false end
+        end
+        if isvalid(self.levelText) then
+            self.levelText.FontColor = Color(1, 1, 1, 1)
+			_UILogic:SetSiblingIndex(self.levelText.Entity.UITransformComponent, 100)
+		end
+		if isvalid(self.nameText) then _UILogic:SetSiblingIndex(self.nameText.Entity.UITransformComponent, 101) end
     end
 
     @ExecSpace("ClientOnly")
@@ -128,13 +513,7 @@ script MapleHUDManager extends Logic
         -- 로그인/캐릭터선택/생성 화면에서는 HUD 전체 숨김, 인게임에서는 표시 + 수치 갱신
         if not isvalid(self.hudRoot) then return end
 
-        local function isUIOpen(path)
-            local e = _EntityService:GetEntityByPath(path)
-            return isvalid(e) and e.Enable
-        end
-        local inMenu = isUIOpen("/ui/DefaultGroup/LoginGroup")
-                    or isUIOpen("/ui/DefaultGroup/CharacterSelectGroup")
-                    or isUIOpen("/ui/DefaultGroup/CreateCharacter")
+        local inMenu = not _LoginFlow:IsInGame()
 
         local playerEntity = self:FindLocalPlayerEntity()
 
@@ -176,10 +555,13 @@ script MapleHUDManager extends Logic
         -- (구버전 "전투력 ÷ 10" 선형 환산 잔재가 여기 남아 Lv756 같은 기괴한 표시를 냈었다)
         local displayLevel = _CharInfoManager:GetDisplayLevel()
         if isvalid(self.levelText) then
+			self.levelText.FontColor = Color(1, 1, 1, 1)
             self.levelText.Text = "Lv." .. tostring(displayLevel)
         end
         if isvalid(self.nameText) then
-            self.nameText.Text = _CharInfoManager:GetCurrentCharName()
+			local nickname = playerEntity.PlayerComponent.Nickname
+			if nickname == nil or nickname == "" then nickname = _CharInfoManager:GetCurrentCharName() end
+			self.nameText.Text = nickname
         end
     end
 

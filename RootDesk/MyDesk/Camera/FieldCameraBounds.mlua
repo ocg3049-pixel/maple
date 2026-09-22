@@ -1,0 +1,72 @@
+@Logic
+script FieldCameraBounds extends Logic
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 짧은 맵은 세로 시야를 고정하고, 맵 이동/줌/화면 비율 변경 때 네이티브 경계를 다시 적용한다.
+		self._T.tick = (self._T.tick or 0) + delta
+		if self._T.tick < 0.25 then return end
+		self._T.tick = 0
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or not isvalid(player.CurrentMap) then return end
+		local camera = _CameraService:GetCurrentCameraComponent()
+		if not isvalid(camera) or camera.Entity ~= player then return end
+		-- 미니맵 촬영은 일시적으로 같은 카메라의 경계와 줌을 해제한다. 촬영 동안에는 건드리지 않는다.
+		local mini = _EntityService:GetEntityByPath("/ui/MiniMapUI")
+		if isvalid(mini) then
+			local controller = mini:GetFirstChildComponentByTypeName("script.MiniMapUIManager", true)
+			if isvalid(controller) and controller._T.capturing then return end
+		end
+		local map = player.CurrentMap
+		if self._T.map ~= map or self._T.camera ~= camera then
+			if self._T.restoreZoom ~= nil then
+				local allowed = camera.IsAllowZoomInOut
+				camera.IsAllowZoomInOut = true
+				_CameraService:ZoomTo(self._T.restoreZoom, 0)
+				camera.IsAllowZoomInOut = allowed
+				self._T.restoreZoom = nil
+			end
+			camera.UseCustomBound = false
+			camera.ConfineCameraArea = true
+			local lo, hi = camera:GetBound()
+			if hi.y <= lo.y or hi.x <= lo.x then return end
+			self._T.map = map
+			self._T.camera = camera
+			self._T.lo = lo
+			self._T.hi = hi
+			self._T.height = nil
+		end
+		local a = _UILogic:ScreenToWorldPosition(Vector2.zero)
+		local b = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+		local height = math.abs(b.y - a.y)
+		if height <= 0 then return end
+		if self._T.height ~= nil and math.abs(self._T.height - height) < 0.001 then return end
+		self._T.height = height
+		local lo, hi = self._T.lo, self._T.hi
+		local mapHeight = hi.y - lo.y
+		-- 시야보다 배경 경계가 낮으면 경계 안에 맞도록 확대한다(맵 밖 빈 공간 방지).
+		if height > mapHeight + 0.01 then
+			local previousZoom = _CameraService.currentZoomRatio
+			local zoom = math.min(500, previousZoom * height / mapHeight)
+			if self._T.restoreZoom == nil then self._T.restoreZoom = previousZoom end
+			local allowed = camera.IsAllowZoomInOut
+			camera.IsAllowZoomInOut = true
+			_CameraService:ZoomTo(zoom, 0)
+			camera.IsAllowZoomInOut = allowed
+			height = height * previousZoom / zoom
+		end
+		camera.ConfineCameraArea = true
+		camera.UseCustomBound = true
+		if mapHeight <= height * 1.25 then
+			local centerY = (lo.y + hi.y) * 0.5
+			local half = math.min(height, mapHeight) * 0.5
+			camera.LeftBottom = Vector2(lo.x, centerY - half)
+			camera.RightTop = Vector2(hi.x, centerY + half)
+			log("[FieldCamera] 세로 고정 " .. map.Name .. " centerY=" .. tostring(centerY))
+		else
+			camera.LeftBottom = lo
+			camera.RightTop = hi
+			log("[FieldCamera] 맵 경계 제한 " .. map.Name)
+		end
+	end
+end
