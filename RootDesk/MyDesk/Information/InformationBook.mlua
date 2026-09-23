@@ -1,0 +1,345 @@
+@Logic
+script InformationBook extends Logic
+    property integer tab = 1
+    property integer page = 1
+    property integer grade = 1
+    property integer equipType = 1
+    property boolean additional = false
+    property integer selectedRank = 1
+    property table ranks = {}
+    property table pages = {}
+    property table handlers = {}
+    property any keyHandler = nil
+    property string rankMessage = ""
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string name)
+        return _EntityService:GetEntityByPath("/ui/InformationBook/Book" .. (name == "" and "" or "/" .. name))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self:Close()
+        self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        self:Bind("Close", function() self:Close() end)
+        self:Bind("Prev", function() self:Turn(-1) end)
+        self:Bind("Next", function() self:Turn(1) end)
+        self:Bind("Refresh", function() self:RefreshRanks() end)
+        for i = 1, 5 do
+            local index = i
+            self:Bind("Tab" .. tostring(i), function()
+                self:SelectTab(index)
+            end)
+        end
+        for i = 1, 4 do
+            local value = i
+            self:Bind("Grade" .. tostring(i), function() self.grade = value self.page = 1 self:Render() _UIAudio:Play("Tab") end)
+        end
+        for i = 1, 3 do
+            local value = i
+            self:Bind("Type" .. tostring(i), function() self.equipType = value self.page = 1 self:Render() end)
+        end
+        for i = 1, 2 do
+            local value = i
+            self:Bind("Potential" .. tostring(i), function() self.additional = value == 2 self.page = 1 self:Render() end)
+        end
+        for i = 1, 10 do
+            local index = i
+            self:Bind("Rank" .. tostring(i), function()
+                self.selectedRank = (self.page - 1) * 10 + index
+                self:Render()
+            end)
+        end
+        log("[InformationBook] ready key=1")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        if self.keyHandler ~= nil then _InputService:DisconnectEvent(KeyDownEvent, self.keyHandler) end
+        for _, h in ipairs(self.handlers) do
+            if isvalid(h.e) then h.e:DisconnectEvent(ButtonClickEvent, h.h) end
+        end
+        self.handlers = {}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string name, any action)
+        local e = self:UI(name)
+        if not isvalid(e) then log_warning("[InformationBook] missing " .. name) return end
+        table.insert(self.handlers, {e = e, h = e:ConnectEvent(ButtonClickEvent, action)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen()
+        local e = self:UI("")
+        return isvalid(e) and e.Enable
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        local e = self:UI("")
+        if isvalid(e) then e.Enable = false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Toggle()
+        if self:IsOpen() then self:Close() return end
+        local e = self:UI("")
+        if not isvalid(e) then return end
+        e.Enable = true
+        self:Render()
+        if self.tab == 5 then self:RefreshRanks() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        if not _LoginFlow:IsInGame() or _KeySettingManager:IsCapturingKey() or _MapleHUDManager:IsChatTyping() or _GameSystemMenu:BlocksInput() then return end
+        if event.key == KeyboardKey.Tab and self:IsOpen() then self:SelectTab(self.tab % 5 + 1) return end
+        if _KeySettingManager:GetFuncForKeyEnum(event.key) == "information" then self:Toggle() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectTab(integer index)
+        -- Mouse and Tab share the same per-tab page memory.
+        self.pages[self.tab] = self.page
+        self.tab = math.max(1, math.min(5, index))
+        self.page = self.pages[self.tab] or 1
+        self:Render()
+        _UIAudio:Play("Tab")
+        if self.tab == 5 then self:RefreshRanks() end
+        log("[InformationBook] selected tab=" .. tostring(self.tab))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Text(string name, string value)
+        local e = self:UI(name)
+        if isvalid(e) then e.TextGUIRendererComponent.Text = value end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Show(string name, boolean visible)
+        local e = self:UI(name)
+        if isvalid(e) then e.Enable = visible end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Turn(integer direction)
+        self.page = math.max(1, math.min(self._T.maxPage or 1, self.page + direction))
+        self.pages[self.tab] = self.page
+        self:Render()
+    end
+
+    @ExecSpace("ClientOnly")
+    method table GuideLines()
+        if self.tab == 4 and self._T.dropLines ~= nil then return self._T.dropLines end
+        local lines = {}
+        if self.tab == 1 then
+            local types = {"모자", "장갑", "무기"}
+            local kinds = _UIEquipInventoryManager:GetPotOptionKinds(types[self.equipType])
+            table.insert(lines, "옵션 등급: " .. _UIEquipInventoryManager:NormalizeGradeName(tostring(self.grade)))
+            table.insert(lines, "종류별 균등 추첨 / 수치 1~3 균등")
+            table.insert(lines, "표시 확률은 해당 옵션 등급 내 확률입니다.")
+            table.insert(lines, "일반 방어구는 모자·상의·하의·신발·망토 공통")
+            table.insert(lines, "")
+            local labels, probability, order = {}, {}, {}
+            for _, kind in ipairs(kinds) do
+                local multiple = kind == "str_pct" or kind == "dex_pct" or kind == "int_pct" or kind == "luk_pct" or kind == "hp_pct" or kind == "mp_pct"
+                local count = multiple and 3 or 1
+                for n = 1, count do
+                    local label = _UIEquipInventoryManager:FormatPotOption(kind, self.grade, n * self.grade)
+                    if self.additional then
+                        local value = tonumber(string.match(label, "%+(%d+)")) or 0
+                        label = (string.gsub(label, "%+%d+", "+" .. tostring(math.max(1, math.floor(value / 2 + 0.5))), 1))
+                    end
+                    if probability[label] == nil then table.insert(order, label) probability[label] = 0 end
+                    probability[label] += 100 / #kinds / count
+                end
+            end
+            for _, label in ipairs(order) do table.insert(lines, label .. "   ·   " .. string.format("%.4f%%", probability[label])) end
+        elseif self.tab == 2 then
+            table.insert(lines, "큐브 등급 상승 · 1회 사용 기준")
+            local cubes = {
+                {"레드", "b2300eda46f3445e9b1c6e774a2ee95a"}, {"블랙", "b8f0af90c30b462f859f45bdc1878d8b"},
+                {"에디셔널", "af5404f4c8fc4ec78ccc1a57446f69db"}, {"화이트 에디", "9c2a12b9a92f44d4b6dd95c7fb182ac9"}
+            }
+            for _, cube in ipairs(cubes) do
+                table.insert(lines, cube[1] .. "  레어→에픽 / 에픽→유니크 / 유니크→레전드리")
+                local p = {}
+                for g = 1, 3 do table.insert(p, string.format("%.4f%%", _EnhancementManager:GetGradeUpgradeProb(cube[2], g) * 100)) end
+                table.insert(lines, "  " .. table.concat(p, " / "))
+            end
+            table.insert(lines, "")
+            table.insert(lines, "옵션 1줄: 현재 등급 100%")
+            table.insert(lines, "레드 2줄 / 3줄: 현재 등급 10% / 1%")
+            table.insert(lines, "블랙 2줄 / 3줄: 현재 등급 20% / 5%")
+            table.insert(lines, "에디 계열 2·3줄: 에픽 4.7619%, 그 위 1.9608%")
+            table.insert(lines, "나머지는 한 단계 낮은 등급 / 레어는 레어 100%")
+            table.insert(lines, "")
+            table.insert(lines, "스타포스 · 현재 성수 → 다음 성수")
+            for _, level in ipairs({0, 5, 10, 12, 15, 17, 20, 22, 25, 30, 40}) do
+                local b = _EnhancementManager:GetStarforceBand(level)
+                table.insert(lines, tostring(level) .. "성: 성공 " .. tostring(b.success) .. "% / 파괴 " .. tostring(b.destroy) .. "%")
+                table.insert(lines, "  유지 " .. tostring(b.keep) .. "% · 하락 " .. tostring(b.drop) .. "% · " .. tostring(b.cost) .. " 메소")
+            end
+            table.insert(lines, "")
+            table.insert(lines, "드롭 아이템 상자 · 0성 70%")
+            table.insert(lines, "1~29성: 30% ÷ 2^성수 / 30성: 30% ÷ 2^29")
+            table.insert(lines, "장비 종류는 상자 사용 시 직접 선택합니다.")
+            table.insert(lines, "각 시도는 독립 추첨이며 이전 실패 횟수와 무관합니다.")
+            table.insert(lines, "")
+            table.insert(lines, "주문서 확률")
+            table.insert(lines, "잠재·에디셔널 부여: 성공 70% / 파괴 30%")
+            table.insert(lines, "장비 강화 주문서: 성공 90% / 파괴 10%")
+            table.insert(lines, "성공 시 +1~5성 각각 20% (최대 성수 제한)")
+            table.insert(lines, "프로텍트: 다음 스타포스 1회 파괴 방지")
+            table.insert(lines, "일반 60% 주문서: 성공 여부와 무관하게 횟수 소모")
+        elseif self.tab == 3 then
+            lines = {
+                "전투력의 기본값", "A = (기본 공마 + 스타포스 공마 + 고정 잠재)", "     × (1 + 해당 공격력·마력 잠재% / 100)",
+                "S = 주스탯 × (1 + 주스탯 잠재% / 100) ÷ 4", "T = 내림(A + S)", "기본 전투력 = 내림(T² ÷ 100)",
+                "양수 전투력은 최소 1을 보장합니다.", "마법 직업은 마력·INT, 나머지는 공격력·주스탯.", "버프·스킬 공마와 최종 전투력 보너스는 별도 반영.", "",
+                "실제 공격 피해", "스킬별 전투력 배율 / 고정 피해를 먼저 계산합니다.", "무기·스킬별 난수, 치명타, 추가타가 적용됩니다.",
+                "몬스터가 높은 레벨이면 1레벨당 피해 2% 감소.", "배율 = 최대(0, 1 − 최대(0, 몬스터Lv−내Lv)×0.02)", "최종 피해는 정수 내림합니다.",
+                "달팽이 세 마리: 고정 40 × 레벨 보정 / MP 10.", "공격속도·크리티컬은 기본 전투력에 중복 합산 안 함.", "",
+                "장비와 성장", "스타포스 1성: 직업 주스탯 +4, 공마 +3.", "표시 레벨은 순수 장비 성능으로 계산합니다.", "버프는 장비 레벨을 올리지 않습니다.", "",
+                "명예의 전당 점수", "장비 하나의 T² 중 가장 적합한 직업 조합을 사용.", "착용자 레벨·다른 장비·버프는 제외합니다.", "HP·MP·공격속도·크리티컬은 점수에 포함 안 함.", "같은 점수의 장비도 각각 별도 아이템으로 표시.", "세부 스킬 배율은 스킬창 설명을 참고해주세요."
+            }
+        else
+            table.insert(lines, "전 몬스터 공통 드롭 테이블 · 기본 확률")
+            for _, item in ipairs(_MonsterDropRules:GetItems()) do
+                table.insert(lines, item.name .. "   " .. string.format("%.3f%%", item.rate * 100) .. (item.fixedRate and " (고정)" or ""))
+            end
+            table.insert(lines, "")
+            table.insert(lines, "각 아이템을 독립 추첨하므로 여러 개가 함께 나옵니다.")
+            table.insert(lines, "아이템 감각: 메소량·비고정 아이템 확률에 적용.")
+            table.insert(lines, "메소·아이템 확률: 레벨 차이 0~10 / 11~20 / 21~30 / 31~40 / 41+")
+            table.insert(lines, "동일 레벨: 100% / 50레벨 이상 차이: 0%")
+            table.insert(lines, "메소량 = 몬스터 레벨 구간 기본값의 80~120%")
+            table.insert(lines, "각각 100% / 80% / 60% / 40% / 20% 배율 적용")
+            table.insert(lines, "공격 속도의 비약도 레벨 패널티 적용 · 아이템 감각 제외")
+            table.insert(lines, "아바타 장비는 드롭 아이템 상자로 획득합니다.")
+            table.insert(lines, "")
+            table.insert(lines, "메소 기본값 · 아이템 감각 적용 전")
+            local tiers = {}
+            for i = 1, 11 do
+                local info = _RegionTierLogic:GetTierInfo(i)
+                table.insert(tiers, info)
+                table.insert(lines, "Lv." .. tostring(info.openLevel) .. "부터: " .. tostring(info.meso) .. " 메소 (±20%)")
+            end
+            table.insert(lines, "")
+            table.insert(lines, "몬스터 도감 · 모든 몬스터는 위 공통 드롭을 사용")
+            _WorldMapManager:GetMapMonsters("")
+            local seen, catalog = {}, {}
+            for _, monsters in pairs(_WorldMapManager._T.mapMonsterCatalog or {}) do
+                for _, monster in ipairs(monsters) do
+                    local key = monster.name .. tostring(monster.level)
+                    if not seen[key] then seen[key] = true table.insert(catalog, monster) end
+                end
+            end
+            table.sort(catalog, function(a,b) if a.level == b.level then return a.name < b.name end return a.level < b.level end)
+            for _, monster in ipairs(catalog) do
+                local info = tiers[1]
+                for _, tier in ipairs(tiers) do if monster.level >= tier.openLevel then info = tier end end
+                table.insert(lines, "Lv." .. tostring(monster.level) .. " " .. monster.name .. "  ·  " .. tostring(math.floor(info.meso * 0.8)) .. "~" .. tostring(math.floor(info.meso * 1.2)) .. " 메소")
+            end
+        end
+        if self.tab == 4 then self._T.dropLines = lines end
+        return lines
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Render()
+        local titles = {"큐브 등장 옵션", "각종 확률", "데미지 공식", "몬스터 드롭", "명예의 전당"}
+        self:Text("Title", titles[self.tab])
+        for i = 1, 5 do
+            local e = self:UI("Tab" .. tostring(i))
+            if isvalid(e) then
+                e.SpriteGUIRendererComponent.Color = i == self.tab and Color(0.23,0.29,0.30,1) or Color(0.89,0.85,0.76,1)
+                e.TextGUIRendererComponent.FontColor = i == self.tab and Color.white or Color(0.18,0.20,0.20,1)
+            end
+        end
+        for _, group in ipairs({{name="Grade", count=4, selected=self.grade}, {name="Type", count=3, selected=self.equipType}, {name="Potential", count=2, selected=self.additional and 2 or 1}}) do
+            for i = 1, group.count do
+                local name = group.name .. tostring(i)
+                self:Show(name, self.tab == 1)
+                local button = self:UI(name)
+                button.SpriteGUIRendererComponent.Color = i == group.selected and Color(0.16,0.38,0.40,1) or Color(0.94,0.92,0.85,1)
+                button.TextGUIRendererComponent.FontColor = i == group.selected and Color.white or Color(0.18,0.20,0.20,1)
+            end
+        end
+        for _, name in ipairs({"GradeLabel", "TypeLabel", "PotentialLabel"}) do self:Show(name, self.tab == 1) end
+        for _, name in ipairs({"BodyLeft", "BodyRight"}) do
+            local tr = self:UI(name).UITransformComponent
+            tr.anchoredPosition = Vector2(name == "BodyLeft" and -325 or 325, self.tab == 1 and -68 or -44)
+            tr.RectSize = Vector2(565, self.tab == 1 and 520 or 590)
+        end
+        self:Show("Refresh", self.tab == 5)
+        self:Show("BodyLeft", self.tab ~= 5)
+        self:Show("BodyRight", self.tab ~= 5)
+        self:Show("Details", self.tab == 5)
+        self:Show("ItemIcon", self.tab == 5)
+        self:Show("HallNote", self.tab == 5)
+        if self.tab == 5 then
+            self._T.maxPage = 10
+            for i = 1, 10 do
+                local index = (self.page - 1) * 10 + i
+                local row = self.ranks[index]
+                self:Show("Rank" .. tostring(i), true)
+                self:Text("Rank" .. tostring(i) .. "/RankNumber", tostring(index) .. "위" .. (row == nil and "  —" or ""))
+                self:Text("Rank" .. tostring(i) .. "/Name", row ~= nil and _UIEquipInventoryManager:ParseName(row.item) or "등록 장비 없음")
+                local icon = self:UI("Rank" .. tostring(i) .. "/Icon")
+                if isvalid(icon) then
+                    icon.Enable = row ~= nil
+                    if row ~= nil then icon.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. _UIEquipInventoryManager:ParseRUID(row.item)) end
+                end
+            end
+            local selected = self.ranks[self.selectedRank]
+            if selected ~= nil then
+                local s = selected.item
+                local name = _UIEquipInventoryManager:ParseName(s)
+                local text = tostring(self.selectedRank) .. "위  " .. name .. "\n소유자: " .. selected.owner
+                    .. "\n장비 점수: " .. tostring(selected.score) .. "\n스타포스: " .. tostring(_UIEquipInventoryManager:ParseStars(s)) .. "성\n\n"
+                    .. _UIEquipInventoryManager:BuildTooltipStatsText(name, _UIEquipInventoryManager:ParseStars(s), _UIEquipInventoryManager:ParseUpgrade(s))
+                    .. _UIEquipInventoryManager:BuildPotentialText(s)
+                self:Text("Details", text)
+                self:UI("ItemIcon").SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. _UIEquipInventoryManager:ParseRUID(s))
+            else
+                self:Show("ItemIcon", false)
+                self:Text("Details", self.rankMessage ~= "" and self.rankMessage or "장비를 선택하면\n상세 능력치를 볼 수 있습니다.")
+            end
+            self:Text("HallNote", self.rankMessage ~= "" and self.rankMessage or "월드 전체 장비 순위 · 접속·저장 시 반영\n조회 후 30초 동안 같은 순위가 표시될 수 있습니다.")
+        else
+            for i = 1, 10 do self:Show("Rank" .. tostring(i), false) end
+            local lines = self:GuideLines()
+            local perSide = self.tab == 1 and 13 or 15
+            local perPage = perSide * 2
+            self._T.maxPage = math.max(1, math.ceil(#lines / perPage))
+            self.page = math.max(1, math.min(self.page, self._T.maxPage))
+            local left, right = {}, {}
+            for i = 1, perPage do
+                local line = lines[(self.page - 1) * perPage + i] or ""
+                if i <= perSide then table.insert(left, line) else table.insert(right, line) end
+            end
+            self:Text("BodyLeft", table.concat(left, "\n"))
+            self:Text("BodyRight", table.concat(right, "\n"))
+        end
+        self:Text("Page", tostring(self.page) .. " / " .. tostring(self._T.maxPage))
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveRanks(string raw, string message)
+        self.rankMessage = message
+        if raw ~= "" then
+            local ok, rows = pcall(function() return _HttpService:JSONDecode(raw) end)
+            if ok and rows ~= nil then self.ranks = rows end
+        end
+        if self:IsOpen() then self:Render() end
+    end
+    @ExecSpace("ClientOnly")
+    method void RefreshRanks()
+        self.rankMessage = "월드 장비 순위를 불러오는 중…"
+        self:Render()
+        _ItemHallOfFame:Request()
+    end
+
+end

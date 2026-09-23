@@ -151,9 +151,10 @@ script StarforcePresentation extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean Begin(integer level, any onResolve)
-		-- Lock before one attempt flash; currency is not charged until onResolve.
+		-- Lock before two audio-synchronized flashes; currency is charged once after the second.
 		if self.busy or self._T.starting then return false end
-		if not self:AreFramesReady(true) then
+		local audioEntity = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/Starforce")
+		if not isvalid(audioEntity) or not audioEntity.SoundComponent:IsAudioClipLoaded() or not self:AreFramesReady(true) then
 			_EnhancementManager:AppendLog("강화 이펙트를 불러오는 중입니다. 잠시 후 다시 시도하세요.")
 			return false
 		end
@@ -171,16 +172,33 @@ script StarforcePresentation extends Logic
 		self._T.attemptSound = self:GetFillSound(level + 1)
 		self.busy = true
 		self._T.starting = false
-		self:SetStatus("강화 중…")
-		self:PlayClip(self.itemPath .. "/TryFx1", self.tryRUID, 1, function()
-			log("[StarforceFX] attempt 1/1 completed")
-			local resolve = self._T.resolve
-			self._T.resolve = nil
-			if resolve then resolve() end
-		end)
+		self:SetStatus("강화 준비 중…")
+        self._T.waitingForSecondSound = true
+        self._T.secondSoundAt = audioEntity.SoundComponent:GetTotalTime() / 2
+        _GameAudio:PlayCue("Starforce")
+        self:PlayClip(self.itemPath .. "/TryFx1", self.tryRUID, 1, nil)
+        log("[StarforceFX] first sound; waiting until audio=" .. tostring(self._T.secondSoundAt))
 		log("[StarforceFX] begin level=" .. tostring(level))
 		return true
 	end
+
+
+    @ExecSpace("ClientOnly")
+    method void StartAttemptVisual()
+        -- Start the existing transaction animation exactly once at the second cue.
+        if not self.busy or not self._T.waitingForSecondSound then return end
+        self._T.waitingForSecondSound = false
+        self:SetStatus("강화 중…")
+        local audio = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/Starforce")
+        log("[StarforceFX] second sound; visual begins audio=" .. tostring(audio.SoundComponent:GetTimePosition()))
+        self:CompleteClip(self.itemPath .. "/TryFx1")
+        self:PlayClip(self.itemPath .. "/TryFx2", self.tryRUID, 1, function()
+            log("[StarforceFX] attempt 2/2 completed")
+            local resolve = self._T.resolve
+            self._T.resolve = nil
+            if resolve then resolve() end
+        end)
+    end
 
 	@ExecSpace("ClientOnly")
 	method boolean BeginScroll(integer level)
@@ -251,8 +269,7 @@ script StarforcePresentation extends Logic
 		-- Loading/renderer activation time is not part of the clip's playback duration.
 		job.remaining = job.duration + 0.5
 		if job.ruid == self.tryRUID then
-			_SoundService:PlaySound(self._T.attemptSound, 0.7)
-			log("[StarforceFX] attempt sound=" .. self._T.attemptSound .. " volume=0.7")
+			log("[StarforceFX] attempt visual started path=" .. path)
 		end
 	end
 
@@ -272,7 +289,9 @@ script StarforcePresentation extends Logic
 		local level = self._T.fillLevel
 		self.displayedLevel = level
 		_EnhancementManager:UpdateStarforceUI(level)
-		log("[StarforceFX] star filled=" .. tostring(level) .. " progress=0.6 sound=none")
+		local sound = self:GetFillSound(level)
+		_GameAudio:PlaySound(sound, 0.7)
+		log("[StarforceFX] star filled=" .. tostring(level) .. " sound=" .. sound)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -300,6 +319,7 @@ script StarforcePresentation extends Logic
 		self._T.resolve = nil
 		self._T.rebuySlot = rebuySlot
 		log("[StarforceFX] result=" .. result .. " next=" .. tostring(nextLevel))
+		if self._T.scrollResult then _UIAudio:Play(result == "success" and "EnchantSuccess" or "EnchantFailure") end
 		if result == "success" then
 			self:SetStatus("강화 성공!")
 			self:PlayFrames(self.screenPath .. "/SuccessFx", self._T.successTextFrames, 1.23 / self.successPlayRate, false)
@@ -328,8 +348,8 @@ script StarforcePresentation extends Logic
 			if isvalid(lead) then lead.Enable = true end
 			self._T.destroyed = true
 			log("[StarforceFX] destroy: both 1.5x-gain sounds started, fixed ori.txt frames started")
-			_SoundService:PlaySound(self._T.destroySound, 1)
-			_SoundService:PlaySound(self._T.destroyItemSound, 1)
+			_GameAudio:PlaySound(self._T.destroySound, 1)
+			_GameAudio:PlaySound(self._T.destroyItemSound, 1)
 		else
 			self:SetStatus(result == "drop" and "강화 실패 · 단계 하락" or "강화 실패 · 단계 유지")
 			self:PlayClip(self.itemPath .. "/ResultFx", self.failureRUID, 0.84, function()
@@ -450,7 +470,7 @@ script StarforcePresentation extends Logic
 	@ExecSpace("ClientOnly")
 	method void PlaySuccessSound()
 		-- One shared cue for the Starforce success text and newly rerolled options.
-		_SoundService:PlaySound(self._T.successSound, 1)
+		_GameAudio:PlaySound(self._T.successSound, 1)
 		log("[EnhanceSFX] success sound=" .. self._T.successSound)
 	end
 
@@ -470,7 +490,7 @@ script StarforcePresentation extends Logic
 		self._T.jobs[path] = {entity=group, frames=frames, duration=duration, elapsed=0,
 			remaining=duration + 0.5, lastFrame=1, fillsStar=fillsStar, onDone=onDone, started=true}
 		self:DrawFrame(path, frames[1])
-		if not fillsStar then
+		if not fillsStar and not self._T.scrollResult then
 			self:PlaySuccessSound()
 			log("[StarforceFX] SUCCESS supplied text visible; sound=" .. self._T.successSound)
 		end
@@ -489,6 +509,16 @@ script StarforcePresentation extends Logic
 		end
 		self._T.totalTime = self._T.totalTime + delta
 		if self._T.totalTime > 15 then self:Cancel() return end
+        if self._T.waitingForSecondSound then
+            local audio = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/Starforce")
+            if not isvalid(audio) or not audio.SoundComponent:IsAudioClipLoaded() then self:Cancel() return end
+            local sound = audio.SoundComponent
+            local position = sound:GetTimePosition()
+            if position >= self._T.secondSoundAt or (not sound:IsPlaying() and self._T.totalTime >= sound:GetTotalTime()) then
+                self:StartAttemptVisual()
+            end
+            return
+        end
 		-- A cold texture upload/frame hitch must not jump straight past the opening frames.
 		local visualDelta = math.max(0, math.min(delta, 0.05))
 		local expired = {}
@@ -574,6 +604,9 @@ script StarforcePresentation extends Logic
 		-- Invalidate callbacks before touching native renderers, which can emit end events.
 		self._T.sequence = (self._T.sequence or 0) + 1
 		self._T.jobs = {}
+        self._T.waitingForSecondSound = false
+        local audio = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/Starforce")
+        if isvalid(audio) then audio.SoundComponent:Stop() end
 		self._T.resolve = nil
 		self._T.starting = false
 		self._T.fillLevel = nil

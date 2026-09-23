@@ -1,0 +1,92 @@
+@Logic
+script AcquisitionLog extends Logic
+    property EntityRef logRoot = "be686784-eaeb-43d4-abb6-5761942d0213"
+    property EntityRef rowTemplate = "23bc1af4-3a42-4228-a8cd-632bc65d00d9"
+    property number holdSeconds = 1
+    property number fadeSeconds = 2
+    property number lineHeight = 28
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- 획득 로그는 캐릭터별 클라이언트에서만 표시하며 각 줄의 시간을 독립적으로 관리한다.
+        self._T.rows = {}
+        self._T.pool = {}
+        self._T.serial = 0
+        if isvalid(self.rowTemplate) then self.rowTemplate.Enable = false end
+        log("[AcquisitionLog] ready hold=1 fade=2")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Push(string message, boolean isMeso)
+        -- 새 줄은 아래에 추가하고 기존 줄은 위로 한 칸씩 이동한다. 기존 줄의 수명은 초기화하지 않는다.
+        if message == "" or not isvalid(self.rowTemplate) or not isvalid(self.logRoot) then return end
+        if self._T.rows == nil then self._T.rows = {} self._T.pool = {} end
+        local row = table.remove(self._T.pool)
+        if not isvalid(row) then
+            self._T.serial = (self._T.serial or 0) + 1
+            row = self.rowTemplate:Clone("Acquired_" .. tostring(self._T.serial))
+        end
+        row.TextGUIRendererComponent.Text = message
+        row.TextGUIRendererComponent.FontColor = Color(1, 1, 1, 1)
+        row.CanvasGroupComponent.GroupAlpha = 1
+        row.Enable = true
+        self.logRoot.Enable = true
+        table.insert(self._T.rows, {entity = row, age = 0})
+        self:LayoutRows()
+        log("[AcquisitionLog] add " .. message)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LayoutRows()
+        -- 표시 순서는 오래된 항목이 위, 가장 최근 항목이 퀵슬롯 바로 위다.
+        local rows = self._T.rows or {}
+        for i, row in ipairs(rows) do
+            if isvalid(row.entity) then
+                row.entity.UITransformComponent.anchoredPosition = Vector2(0, (#rows - i) * self.lineHeight)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- 1초 동안 불투명하게 유지하고 이후 2초 동안 선형으로 페이드한다.
+        local rows = self._T.rows
+        if rows == nil or #rows == 0 then return end
+        if _LoginFlow.phase ~= "ingame" then self:ClearRows() return end
+        local removed = false
+        for i = #rows, 1, -1 do
+            local row = rows[i]
+            row.age = row.age + delta
+            if row.age >= self.holdSeconds + self.fadeSeconds or not isvalid(row.entity) then
+                if isvalid(row.entity) then
+                    row.entity.Enable = false
+                    row.entity.CanvasGroupComponent.GroupAlpha = 0
+                    table.insert(self._T.pool, row.entity)
+                end
+                table.remove(rows, i)
+                removed = true
+                log("[AcquisitionLog] expire")
+            else
+                row.entity.CanvasGroupComponent.GroupAlpha = math.max(0, math.min(1, 1 - (row.age - self.holdSeconds) / self.fadeSeconds))
+            end
+        end
+        if removed then self:LayoutRows() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearRows()
+        -- 캐릭터 선택 화면으로 나갈 때 이전 캐릭터의 로그가 남지 않도록 비운다.
+        for _, row in ipairs(self._T.rows or {}) do
+            if isvalid(row.entity) then row.entity.Enable = false table.insert(self._T.pool, row.entity) end
+        end
+        self._T.rows = {}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- 생성한 UI 복제본을 정리한다.
+        self:ClearRows()
+        for _, row in ipairs(self._T.pool or {}) do if isvalid(row) then row:Destroy() end end
+        self._T.pool = {}
+    end
+end

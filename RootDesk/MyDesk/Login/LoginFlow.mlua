@@ -26,6 +26,16 @@ script LoginFlow extends Logic
         self._T.introTime = 0
         self._T.introPlayed = false
         self._T.introWizetStarted = false
+        self._T.introFramesReady = false
+        local logoAnimation = self:UI("IntroCover/View/Wizet"):GetComponent("script.LoginSpriteAnimation")
+        logoAnimation._T.paused = true
+        logoAnimation._T.limitFrameDelta = true
+        local introFrames = {}
+        for ruid in string.gmatch(logoAnimation.Frames, "[^,]+") do table.insert(introFrames, ruid) end
+        _ResourceService:PreloadAsync(introFrames, function()
+            self._T.introFramesReady = true
+            log("[LoginFlow] Wizet frames ready")
+        end)
         self._T.introTailTime = nil
         self._T.introRevealing = false
         self._T.introSkipElapsed = nil
@@ -37,6 +47,8 @@ script LoginFlow extends Logic
         self.sessionReady = false
         self.clock = 0
         self._T.entryTransition = false
+        self._T.entryApproved = false
+        self._T.entryArrivalElapsed = 0
         self._T.entryFadeReady = false
         self._T.entryFadeElapsed = nil
         self._T.visiblePlayer = nil
@@ -126,11 +138,14 @@ script LoginFlow extends Logic
             return
         end
         if not self._T.introWizetStarted then
+            if not self._T.introFramesReady then return end
             self._T.introWizetStarted = true
+            animation._T.paused = false
             cover.CanvasGroupComponent.GroupAlpha = 1
             nexon.Enable = false
             wizet.Enable = true
             animation:Replay()
+            _UIAudio:Play("WzLogo")
             log("[LoginFlow] Wizet logo started")
             return
         end
@@ -147,6 +162,7 @@ script LoginFlow extends Logic
             nexon.Enable = true
             nexon.SpriteGUIRendererComponent:SetAlpha(1)
             self:UpdateIntroMargins(nexon)
+            _UIAudio:Play("NxLogo")
             log("[LoginFlow] NEXON logo hold started")
         end
         if t < 4 then return end
@@ -291,6 +307,19 @@ script LoginFlow extends Logic
         self:EnableUI("IntroCover", nextPhase == "intro")
         if nextPhase == "character" then self._T.infoSelection = nil end
         local previousPhase = self.phase
+        if previousPhase ~= nextPhase then
+            if previousPhase == "channel" then _UIAudio:Play("RollUp") end
+            if nextPhase == "channel" then _UIAudio:Play("RollDown") end
+            local pair = previousPhase .. ":" .. nextPhase
+            if pair == "login:world" or pair == "world:login" or pair == "channel:character" or pair == "character:channel" or pair == "character:create" or pair == "create:character" or pair == "job:character" then _UIAudio:Play("ScrollUp") end
+        end
+        if previousPhase == "character" and (nextPhase == "create" or nextPhase == "job") then
+            local selection = self:SelectComponent()
+            if selection ~= nil then
+                self._T.returnSelection = selection.selectedSlot
+                selection:SelectSlot(0)
+            end
+        end
         self.phase = nextPhase
         if nextPhase == "login" then self._T.logoTime = 0 end
         local sameWorld = (previousPhase == "world" or previousPhase == "channel") and (nextPhase == "world" or nextPhase == "channel")
@@ -363,6 +392,7 @@ script LoginFlow extends Logic
     method void OnUpdate(number delta)
         -- 전환 애니메이션과 플레이어 생성 직후의 입력 잠금만 처리한다. 저장소 호출은 없다.
         self.clock = self.clock + delta
+        self:UpdateFullScreenCover(delta)
         if self.phase == "intro" then self:UpdateIntro(delta) end
         if self._T.entryFadeElapsed ~= nil then
             self._T.entryFadeElapsed = math.min(1, self._T.entryFadeElapsed + delta)
@@ -406,13 +436,21 @@ script LoginFlow extends Logic
             self:ApplyCamera()
             if self._T.panTime == 0 then log("[LoginFlow] camera settled=" .. tostring(self._T.cameraY)) end
         end
-        if self._T.entryApproved and self._T.entryFadeReady and isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "map01" then
+        -- 서버 입장 승인과 실제 필드 도착을 모두 확인한다. 시작/저장 맵은 캐릭터마다 다르다.
+        local arrived = self._T.entryApproved and isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "login"
+        self._T.entryArrivalElapsed = arrived and ((self._T.entryArrivalElapsed or 0) + delta) or 0
+        -- 페이드 이벤트가 누락되어도 도착한 캐릭터의 화면과 입력이 영구 잠기지 않는다.
+        if arrived and (self._T.entryFadeReady or self._T.entryArrivalElapsed >= 3) then
             self._T.entryApproved = false
+            self._T.entryTransition = false
+            self._T.entryFadeElapsed = nil
+            self:EnableUI("EntryFade", false)
             self:ShowPhase("ingame", false)
             self.busy = false
             player.PlayerControllerComponent.Enable = true
             local group = _EntityService:GetEntityByPath("/ui/LoginScene")
             if isvalid(group) then group.Enable = false end
+            _GameAudio:PlayCue("Portal")
             log("[LoginFlow] ingame map=" .. player.CurrentMap.Name)
         end
     end
@@ -439,7 +477,17 @@ script LoginFlow extends Logic
         if isvalid(modal) and modal.Enable then return end
         local count = #self._T.channels
         if count == 0 then return end
-        self.selectedChannel = math.max(1, math.min(count, self.selectedChannel + offset))
+        local next = self.selectedChannel + offset
+        local rowStart = math.floor((self.selectedChannel - 1) / 4) * 4 + 1
+        local rowEnd = math.min(count, rowStart + 3)
+        if offset == -1 and next < rowStart then next = rowEnd end
+        if offset == 1 and next > rowEnd then next = rowStart end
+        if offset == -4 and next < 1 then
+            next = self.selectedChannel + math.floor((count - self.selectedChannel) / 4) * 4
+        elseif offset == 4 and next > count then
+            next = (self.selectedChannel - 1) % 4 + 1
+        end
+        self.selectedChannel = math.max(1, math.min(count, next))
         self.channelPage = math.floor((self.selectedChannel - 1) / 19) + 1
         self:RefreshChannels()
         log("[LoginFlow] keyboard channel=" .. tostring(self.selectedChannel))
@@ -473,7 +521,7 @@ script LoginFlow extends Logic
         worldShadow.SpriteGUIRendererComponent:SetAlpha(shadowAlpha)
         if (self._T.infoTime or 0) > 0 then
             self._T.infoTime = math.max(0, self._T.infoTime - delta)
-            if self._T.infoTime == 0 then self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", true) end
+            if self._T.infoTime == 0 and self.phase == "character" and self._T.infoSelection ~= nil then self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", true) end
         end
         local atmosphere = self:UI("Stage/Scenery/Atmosphere")
         local active = self.phase ~= "intro" and self.phase ~= "ingame"
@@ -645,6 +693,7 @@ script LoginFlow extends Logic
     method void Notice(string message, string confirmAction)
         -- 게임 HUD보다 위에 제공된 안내 두루마리로 오류와 확인을 표시한다.
         self._T.confirmAction = confirmAction
+        _UIAudio:Play("DlgNotice")
         self:Text("Modal/Paper/Message", message)
         local hasCancel = confirmAction ~= ""
         self:EnableUI("Modal/Paper/No", hasCancel)
@@ -657,9 +706,14 @@ script LoginFlow extends Logic
     method void ShowCharacters()
         -- 목록 수신 전에는 빈 슬롯을 생성 가능 상태로 오인하지 않는다.
         self.busy = false
+        local comp = self:SelectComponent()
+        if comp ~= nil and self._T.returnSelection ~= nil then
+            comp.selectedSlot = self._T.returnSelection
+            comp.currentPage = comp:PageOfIndex(math.max(1, comp.selectedSlot))
+            self._T.returnSelection = nil
+        end
         self:ShowPhase("character", true)
         _CharacterPersistence:PopulateSelectUI()
-        local comp = self:SelectComponent()
         if comp ~= nil and comp.selectedSlot < 1 and comp:GetSlotData(1) ~= "" then comp:SelectSlot(1) end
     end
 
@@ -672,14 +726,19 @@ script LoginFlow extends Logic
         self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll", data ~= "")
         local e = self:UI("Stage/CharacterSelectGroup/SelectBackground/EnterButton")
         if isvalid(e) then e.ButtonComponent.Enable = data ~= "" end
-        if data == "" then return end
+        if data == "" then
+            self._T.infoSelection = nil
+            self._T.infoTime = 0
+            self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", false)
+            return
+        end
         local parts = {}
         for part in string.gmatch(data, "[^|]+") do table.insert(parts, part) end
-        local setting = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
-        local jobs = setting:GetComponent("script.CharacterSettingComponent"):GetJobItems()
         local power = tonumber(parts[10])
-        local powerText = power ~= nil and tostring(math.floor(power)) or "접속 후 갱신"
-        self:Text("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", "직업\n" .. (jobs[tonumber(parts[8]) or 1] or "모험가") .. "\n\n전투력\n" .. powerText)
+        local powerText = power ~= nil and power >= 0 and tostring(math.floor(power)) or "접속 후 갱신"
+        local level = tonumber(parts[11])
+        local levelText = level ~= nil and ("Lv." .. tostring(math.max(1, math.min(200, math.floor(level))))) or "접속 후 갱신"
+        self:Text("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", levelText .. "\n\n" .. (level ~= nil and _UIMyInfoManager:GetClassNameForLevel(tonumber(parts[8]) or 1, level) or "접속 후 갱신") .. "\n\n전투력 " .. powerText)
         local slot = _EntityService:GetEntityByPath(comp:UISlotPath(comp:UISlotOfIndex(comp.selectedSlot)))
         local paper = self:UI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll")
         if isvalid(slot) and isvalid(paper) then
@@ -687,6 +746,8 @@ script LoginFlow extends Logic
             local stamp = tostring(comp.selectedSlot) .. ":" .. data
             if self._T.infoSelection ~= stamp then
                 self._T.infoSelection = stamp
+                _UIAudio:Play("CharSelect")
+                _UIAudio:Play("RollDown")
                 self._T.infoTime = 0.32
                 self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", false)
                 paper:GetComponent("script.LoginSpriteAnimation"):Replay()
@@ -697,32 +758,19 @@ script LoginFlow extends Logic
 
     @ExecSpace("Server")
     method void RequestChannels()
-        -- 실제 인스턴스만 나열한다. Maker에서는 릴리스 전용 API를 호출하지 않는다.
         local userId = senderUserId
         local s = self._T.sessions[userId]
         if s == nil or s.entered then return end
-        if _UtilLogic.ElapsedSeconds - s.lastList < 3 then
-            self:ReceiveChannels(s.channels or {}, userId)
-            return
-        end
-        s.lastList = _UtilLogic.ElapsedSeconds
         local rows = {}
-        if Environment:IsMakerPlay() then
-            -- Maker에는 서버 인스턴스가 하나이므로 선택 흐름을 19개 테스트 채널로 검증한다.
-            for i = 1, 19 do
-                table.insert(rows, { id = _WorldInstanceService.WorldInstanceId, count = _UserService:GetUserCount(), max = 5, label = "테스트 채널 " .. tostring(i) })
+        local counts = {}
+        for _, session in pairs(self._T.sessions) do
+            if session.channel then
+                local index = session.channelNumber or 1
+                counts[index] = (counts[index] or 0) + 1
             end
-        else
-            local ok, pages = _WorldInstanceService:GetWorldInstanceInfoPagesAndWait()
-            if not ok or pages == nil then self:ChannelError("서버 목록을 불러오지 못했습니다. 다시 월드를 선택해주세요.", userId) return end
-            while true do
-                for _, info in ipairs(pages:GetCurrentPageDatas()) do
-                    table.insert(rows, { id = info.Id, count = info.CurrentUserCount, max = info.MaxUserCount, label = info.ShortCode })
-                end
-                if pages.IsLastPage then break end
-                if not pages:MoveToNextPageAndWait() then self:ChannelError("서버 목록 조회에 실패했습니다.", userId) return end
-            end
-            table.sort(rows, function(a, b) return a.label < b.label end)
+        end
+        for i = 1, 10 do
+            table.insert(rows, {id = "channel_" .. tostring(i), count = counts[i] or 0, max = 5, label = tostring(i) .. "서버"})
         end
         s.allowed = {}
         for _, row in ipairs(rows) do s.allowed[row.id] = row end
@@ -748,6 +796,7 @@ script LoginFlow extends Logic
             local index = (self.channelPage - 1) * 19 + i
             local row = self._T.channels[index]
             if isvalid(e) then
+                e.Enable = i <= 10
                 e.ButtonComponent.Enable = row ~= nil
                 e.SpriteGUIRendererComponent.Color = row ~= nil and Color.white or Color(1, 1, 1, 0.25)
                 local label = e:GetChildByName("Label")
@@ -769,38 +818,35 @@ script LoginFlow extends Logic
         animation.TopY = center.y + label.y + 0.5
         if self._T.markerChannel ~= self.selectedChannel then
             self._T.markerChannel = self.selectedChannel
+            _UIAudio:Play("WorldSelect")
             animation:Replay()
             log("[LoginFlow] channel marker replay=" .. tostring(self.selectedChannel))
         end
         local row = self._T.channels[self.selectedChannel]
         self:Text("Stage/WorldGroup/Channels/Status", row ~= nil and (row.label .. "   " .. tostring(row.count) .. " / " .. tostring(row.max)) or "접속 가능한 서버가 없습니다.")
         local pages = math.max(1, math.ceil(#self._T.channels / 19))
-        self:EnableUI("Stage/WorldGroup/Channels/Prev", self.channelPage > 1)
-        self:EnableUI("Stage/WorldGroup/Channels/Next", self.channelPage < pages)
+        self:EnableUI("Stage/WorldGroup/Channels/Prev", false)
+        self:EnableUI("Stage/WorldGroup/Channels/Next", false)
         self:EnableUI("Stage/WorldGroup/Channels/Page", pages > 1)
         self:Text("Stage/WorldGroup/Channels/Page", tostring(self.channelPage) .. "/" .. tostring(pages))
     end
 
     @ExecSpace("Server")
     method void RequestChannel(string instanceId, integer number)
-        -- 목록에서 확인한 현재 월드의 서버로만 이동을 허용한다.
         local userId = senderUserId
         local s = self._T.sessions[userId]
         if s == nil or s.entered or s.warping then return end
-        local row = s.allowed[instanceId]
-        if row == nil then self:ChannelError("서버 목록을 다시 확인해주세요.", userId) return end
-        if number < 1 or s.channels == nil or s.channels[number] == nil or s.channels[number].id ~= instanceId then return end
-        s.channelNumber = number
-        if instanceId == _WorldInstanceService.WorldInstanceId then
-            s.channel = true
-            self:ChannelReady(userId)
-            return
+        if number < 1 or number > 10 or instanceId ~= "channel_" .. tostring(number) then return end
+        if s.allowed[instanceId] == nil then self:ChannelError("서버 목록을 다시 확인해주세요.", userId) return end
+        local count = 0
+        for id, other in pairs(self._T.sessions) do
+            if id ~= userId and other.channel and other.channelNumber == number then count = count + 1 end
         end
-        if row.count >= row.max then self:ChannelError("서버가 가득 찼습니다. 다른 서버를 선택해주세요.", userId) return end
-        s.warping = true
-        _TeleportService:WarpUserToWorldInstanceAsync(userId, instanceId, "loginflow:" .. tostring(number), function(ok)
-            if not ok then s.warping = false self:ChannelError("서버에 접속하지 못했습니다. 다시 선택해주세요.", userId) end
-        end)
+        if count >= 5 then self:ChannelError("서버가 가득 찼습니다. 다른 서버를 선택해주세요.", userId) return end
+        s.channelNumber = number
+        s.channel = true
+        self:ChannelReady(userId)
+        log("[Channel] selected " .. tostring(number) .. " user=" .. userId)
     end
 
     @ExecSpace("Client")
@@ -821,6 +867,9 @@ script LoginFlow extends Logic
         -- 저장 복원 중의 중복 입장과 단계 건너뛰기를 막는다.
         if self.phase ~= "character" or self.busy or not _CharacterPersistence:IsCharacterListReady() then return false end
         self.busy = true
+        self._T.entryApproved = false
+        self._T.entryArrivalElapsed = 0
+        self._T.entryFadeReady = false
         log("[LoginFlow] loading selected character")
         return true
     end
@@ -858,8 +907,11 @@ script LoginFlow extends Logic
         if s == nil or not s.authorized or s.entered then return end
         local player = _UserService:GetUserEntityByUserId(senderUserId)
         if not isvalid(player) then return end
+        if not _CharacterPersistence:EnterSavedMap(senderUserId, player) then
+            _CharacterPersistence:OnPersistLoadError("입장할 지역을 찾을 수 없습니다.", senderUserId)
+            return
+        end
         s.entered = true
-        _TeleportService:TeleportToMapPosition(player, Vector3(0, 0, 0), "map01")
         -- 로그인 대기 중의 숨김 상태가 다른 맵의 클라이언트 표현에 남지 않게 표시 이벤트도 재전송한다.
         player:SetVisible(true, true, true)
         self:EntryApproved(senderUserId)
@@ -869,6 +921,9 @@ script LoginFlow extends Logic
     @ExecSpace("ClientOnly")
     @EventSender("Service", "ScreenTransitionService")
     handler HandleEntryFadeOut(FadeOutStartEvent event)
+        self._T.fullScreenFade = "out"
+        self._T.fullScreenFadeAlpha = 0
+        self:UpdateFullScreenCover(0)
         -- 책 UI도 맵과 같은 1초 동안 검게 덮어 전환 레이어 위에 남지 않게 한다.
         if not self._T.entryTransition then return end
         self._T.entryFadeElapsed = 0
@@ -880,6 +935,9 @@ script LoginFlow extends Logic
     @ExecSpace("ClientOnly")
     @EventSender("Service", "ScreenTransitionService")
     handler HandleEntryFadeIn(FadeInStartEvent event)
+        self._T.fullScreenFade = "in"
+        self._T.fullScreenFadeAlpha = 1
+        self:UpdateFullScreenCover(0)
         -- 완전히 어두워진 경계에서만 책 화면을 내리고 도착 맵을 드러낸다.
         if not self._T.entryTransition then return end
         self._T.entryFadeElapsed = nil
@@ -891,6 +949,9 @@ script LoginFlow extends Logic
     @ExecSpace("ClientOnly")
     @EventSender("Service", "ScreenTransitionService")
     handler HandleEntryFadeEnd(FadeInEndEvent event)
+        self._T.fullScreenFade = nil
+        self._T.fullScreenFadeAlpha = 0
+        self:UpdateFullScreenCover(0)
         -- 이후의 일반 맵 이동에는 로그인 전용 오버레이를 적용하지 않는다.
         if not self._T.entryTransition then return end
         self._T.entryTransition = false
@@ -906,8 +967,12 @@ script LoginFlow extends Logic
 
     @ExecSpace("ClientOnly")
     method void EntryFailed(string reason)
+        self._T.fullScreenFade = nil
+        self:UpdateFullScreenCover(0)
         -- 저장 실패 시 게임 진입 없이 선택 화면에서 복구한다.
         self.busy = false
+        self._T.entryApproved = false
+        self._T.entryArrivalElapsed = 0
         self._T.entryTransition = false
         self._T.entryFadeElapsed = nil
         self._T.entryFadeReady = false
@@ -920,5 +985,47 @@ script LoginFlow extends Logic
     handler HandleLeave(UserLeaveEvent event)
         -- 재접속과 채널 이동 시 이전 세션 상태가 남지 않도록 정리한다.
         self._T.sessions[event.UserId] = nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateFullScreenCover(number delta)
+        local scene = _EntityService:GetEntityByPath("/ui/LoginScene")
+        if isvalid(scene) then
+            local a = _UILogic:ScreenToLocalUIPosition(Vector2.zero, scene.UITransformComponent)
+            local b = _UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight), scene.UITransformComponent)
+            local size = Vector2(math.abs(b.x-a.x)+128, math.abs(b.y-a.y)+128)
+            local center = Vector2((a.x+b.x)/2,(a.y+b.y)/2)
+            for _, name in ipairs({"Cover", "IntroCover", "EntryFade"}) do
+                local cover = scene:GetChildByName(name)
+                if isvalid(cover) then
+                    cover.UITransformComponent.RectSize = size
+                    cover.UITransformComponent.anchoredPosition = center
+                end
+            end
+        end
+        local cover = _EntityService:GetEntityByPath("/ui/ScreenTransitionCover/Black")
+        if not isvalid(cover) then return end
+        local mode = self._T.fullScreenFade
+        cover.Enable = mode ~= nil
+        if mode == nil then return end
+        local alpha = self._T.fullScreenFadeAlpha or 0
+        if mode == "out" then alpha = math.min(1,alpha+delta)
+        elseif mode == "in" then alpha = math.max(0,alpha-delta) end
+        self._T.fullScreenFadeAlpha = alpha
+        cover.CanvasGroupComponent.GroupAlpha = alpha
+        local group = cover.Parent
+        local a = _UILogic:ScreenToLocalUIPosition(Vector2.zero,group.UITransformComponent)
+        local b = _UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight),group.UITransformComponent)
+        cover.UITransformComponent.anchoredPosition = Vector2((a.x+b.x)/2,(a.y+b.y)/2)
+        cover.UITransformComponent.UIScale = Vector3((math.abs(b.x-a.x)+128)/4096,(math.abs(b.y-a.y)+128)/4096,1)
+    end
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "ScreenTransitionService")
+    handler HandleFullScreenBlack(FadeOutEndEvent event)
+        self._T.fullScreenFade = "hold"
+        self._T.fullScreenFadeAlpha = 1
+        self:UpdateFullScreenCover(0)
+        log("[ScreenCover] viewport fully covered")
     end
 end

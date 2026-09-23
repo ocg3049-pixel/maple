@@ -1,0 +1,261 @@
+@Logic
+script ItemHallOfFame extends Logic
+    property string IndexName = "ItemHallIndexV1"
+    property string DetailName = "ItemHallDetailsV1"
+
+    method string Field(string item, integer index)
+        local at, n = 1, 1
+        for i = 1, #item + 1 do
+            if i > #item or string.sub(item, i, i) == "|" then
+                if n == index then return string.sub(item, at, i - 1) end
+                at, n = i + 1, n + 1
+            end
+        end
+        return ""
+    end
+
+    method integer Score(string item)
+        local fields = {}
+        for value in string.gmatch(item .. "|", "(.-)|") do table.insert(fields, value) end
+        local slot = tonumber(fields[3]) or 0
+        if slot < 3 or slot > 25 then return 0 end
+        local stars = math.max(0, math.min(100, tonumber(fields[4]) or 0))
+        if fields[1] == "하프 이어링" then return math.max(1, (math.min(5, stars) * 3) ^ 2) end
+        local base = stars * 3 + (slot == 6 and 30 or 0)
+        local options = {}
+        for _, field in ipairs({10, 11, 12, 14, 15, 16}) do
+            local opt = fields[field] or ""
+            table.insert(options, {text=opt, value=tonumber(string.match(opt, "%+(%d+)")) or 0, percent=string.sub(opt,-1)=="%"})
+        end
+        local best = 0
+        for _, main in ipairs({"STR", "DEX", "INT", "LUK"}) do
+            local stat, pct, atk, atkPct = stars * 4, 0, base, 0
+            for _, option in ipairs(options) do
+                local opt, value, percent = option.text, option.value, option.percent
+                if string.find(opt, main, 1, true) or string.find(opt, "올스탯", 1, true) then
+                    if percent then pct += value else stat += value end
+                elseif (main == "INT" and string.find(opt, "마력", 1, true)) or (main ~= "INT" and string.find(opt, "공격력", 1, true)) then
+                    if percent then atkPct += value else atk += value end
+                end
+            end
+            local total = math.floor(atk * (1 + atkPct / 100) + stat * (1 + pct / 100) / 4)
+            best = math.max(best, total * total)
+        end
+        return math.min(2147483647, math.max(1, best))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Queue(string userId, string charId, string owner, string save)
+        if self._T.pending == nil then self._T.pending = {} end
+        local key = userId .. "_" .. charId
+        self._T.pending[key] = {owner = owner, save = save}
+        if self._T.timer == nil then
+            self._T.timer = _TimerService:SetTimerOnce(function()
+                self._T.timer = nil
+                self:Flush()
+            end, 10)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Flush()
+        if self._T.flushing then return end
+        self._T.flushing = true
+        for key, record in pairs(self._T.pending or {}) do
+            if self:Publish(key, record.owner, record.save) and self._T.pending[key] == record then
+                self._T.pending[key] = nil
+            end
+        end
+        self._T.flushing = false
+        if next(self._T.pending or {}) ~= nil and self._T.timer == nil then
+            self._T.timer = _TimerService:SetTimerOnce(function() self._T.timer = nil self:Flush() end, 30)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Publish(string ownerKey, string owner, string save)
+        if self._T.published == nil then self._T.published = {} end
+        local rows = {}
+        for _, line in ipairs(_CharacterPersistence:SplitLines(save)) do
+            local f = _CharacterPersistence:SplitTabs(line)
+            local item, suffix = "", ""
+            if f[1] == "E" then item, suffix = f[3] or "", "E" .. (f[2] or "") end
+            if f[1] == "I" and f[2] == "equip" then item, suffix = f[4] or "", "I" .. (f[3] or "") end
+            if item ~= "" then table.insert(rows, {key = ownerKey .. "_" .. suffix, item = item}) end
+        end
+        table.sort(rows, function(a, b) return a.key < b.key end)
+        local fingerprint = owner .. _HttpService:JSONEncode(rows)
+        if self._T.published[ownerKey] == fingerprint then return true end
+        local detail = _DataStorageService:GetGlobalDataStorage(self.DetailName)
+        local index = _DataStorageService:GetSortableDataStorage(self.IndexName)
+        if self._T.manifests == nil then self._T.manifests = {} end
+        local manifest = self._T.manifests[ownerKey]
+        if manifest == nil then
+            local ec, raw = detail:GetAndWait("m_" .. ownerKey)
+            if ec ~= 0 and ec ~= 1000002 then return false end
+            manifest = {}
+            for key in string.gmatch(raw or "", "[^\n]+") do manifest[ownerKey .. "_" .. key] = true end
+        end
+        local scores, values = {}, {}
+        for key, _ in pairs(manifest) do scores[key] = 0 end
+        for _, row in ipairs(rows) do
+            row.score = self:Score(row.item)
+            manifest[row.key] = true
+            scores[row.key] = row.score
+            values[row.key] = _HttpService:JSONEncode({owner = owner, item = row.item, score = row.score, key = row.key})
+        end
+        local allKeys = {}
+        for key, _ in pairs(manifest) do table.insert(allKeys, string.sub(key, #ownerKey + 2)) end
+        table.sort(allKeys)
+        -- 먼저 합집합 명세를 기록: 중간 실패/재접속에도 사라진 슬롯의 옛 순위를 정리할 수 있다.
+        local ec = detail:SetAndWait("m_" .. ownerKey, table.concat(allKeys, "\n"))
+        if ec ~= 0 then return false end
+        self._T.manifests[ownerKey] = manifest
+        if next(values) ~= nil then
+            if not self:WriteBatches(detail, values) then return false end
+        end
+        if next(scores) ~= nil then
+            if not self:WriteBatches(index, scores) then return false end
+        end
+        self._T.published[ownerKey] = fingerprint
+        self._T.cacheUntil = 0
+        log("[ItemHall] indexed owner=" .. owner .. " items=" .. tostring(#rows))
+        return true
+    end
+
+    @ExecSpace("Server")
+    method void Request()
+        local user = senderUserId
+        self._T.requests = self._T.requests or {}
+        if (self._T.requests[user] or 0) > _UtilLogic.ServerElapsedSeconds then return end
+        self._T.requests[user] = _UtilLogic.ServerElapsedSeconds + 2
+        if self._T.cache ~= nil and (self._T.cacheUntil or 0) > _UtilLogic.ServerElapsedSeconds then
+            _InformationBook:ReceiveRanks(self._T.cache, "", user)
+            return
+        end
+        if self._T.reading then
+            _InformationBook:ReceiveRanks("", "순위를 갱신 중입니다. 잠시 후 새로고침해주세요.", user)
+            return
+        end
+        self._T.reading = true
+        local ok, raw = pcall(function()
+            if not self:Backfill() then return "" end
+            self:Flush()
+            return self:ReadRanking()
+        end)
+        self._T.reading = false
+        if not ok or raw == "" then
+            _InformationBook:ReceiveRanks("", "순위를 불러오지 못했습니다. 새로고침으로 다시 시도해주세요.", user)
+            return
+        end
+        self._T.cache = raw
+        self._T.cacheUntil = _UtilLogic.ServerElapsedSeconds + 30
+        _InformationBook:ReceiveRanks(raw, "", user)
+    end
+
+    @ExecSpace("ServerOnly")
+    method string ReadRanking()
+        local index = _DataStorageService:GetSortableDataStorage(self.IndexName)
+        local detail = _DataStorageService:GetGlobalDataStorage(self.DetailName)
+        local ec, pages = index:GetSortedAndWait(SortDirection.Descending, 1, 2147483647)
+        if ec ~= 0 or pages == nil then return "" end
+        local keys, scores = {}, {}
+        while true do
+            for _, row in ipairs(pages:GetCurrentPageDatas()) do
+                if #keys >= 100 then break end
+                table.insert(keys, row.KeyInfo.Key)
+                scores[row.KeyInfo.Key] = row.Value
+            end
+            if #keys >= 100 or pages.IsLastPage then break end
+            if pages:LoadNextPageAndWait() ~= 0 then return "" end
+            pages:MoveToNextPageAndWait()
+        end
+        if #keys == 0 then return "[]" end
+        local code, details = detail:BatchGetAndWait(keys)
+        if code ~= 0 or details == nil then return "" end
+        local records = {}
+        while true do
+            for _, row in ipairs(details:GetCurrentPageDatas()) do
+                local ok, value = pcall(function() return _HttpService:JSONDecode(row.Value) end)
+                if ok and value ~= nil and value.score == scores[row.KeyInfo.Key] then records[row.KeyInfo.Key] = value end
+            end
+            if details.IsLastPage then break end
+            if details:LoadNextPageAndWait() ~= 0 then return "" end
+            details:MoveToNextPageAndWait()
+        end
+        local result = {}
+        for _, key in ipairs(keys) do
+            if records[key] ~= nil then table.insert(result, records[key]) end
+        end
+        return _HttpService:JSONEncode(result)
+    end
+    @ExecSpace("ServerOnly")
+    method boolean Backfill()
+        if self._T.backfilled then return true end
+        local details = _DataStorageService:GetGlobalDataStorage(self.DetailName)
+        local ec, done = details:GetAndWait("backfill_v1")
+        if ec ~= 0 and ec ~= 1000002 then return false end
+        if done == "done" then self._T.backfilled = true return true end
+        local code, users = _DataStorageService:GetUserDataStoragePagesAndWait()
+        if code ~= 0 or users == nil then return false end
+        local count = 0
+        while true do
+            for _, storage in ipairs(users:GetCurrentPageDatas()) do
+                local err, chars = storage:GetAndWait("chars")
+                if err ~= 0 and err ~= 1000002 then return false end
+                local keys, names = {}, {}
+                for _, line in ipairs(_CharacterPersistence:SplitLines(chars or "")) do
+                    local f = _CharacterPersistence:SplitTabs(line)
+                    if f[1] == "C" and f[2] ~= nil and f[4] ~= nil then
+                        local key = "save_" .. f[2]
+                        table.insert(keys, key)
+                        names[key] = {id = f[2], name = string.match(f[4], "([^|]+)") or ""}
+                    end
+                end
+                if #keys > 0 then
+                    local loadCode, saves = storage:BatchGetAndWait(keys)
+                    if loadCode ~= 0 or saves == nil then return false end
+                    while true do
+                        for _, row in ipairs(saves:GetCurrentPageDatas()) do
+                            local character = names[row.KeyInfo.Key]
+                            if character ~= nil then
+                                local ownerKey = storage.UserId .. "_" .. character.id
+                                -- 접속 중 최신 스냅샷이 있으면 DB의 이전 저장본보다 우선한다.
+                                local current = _CharacterPersistence._T.sv[storage.UserId]
+                                local snapshot = current ~= nil and current.saves[character.id] or nil
+                                if not self:Publish(ownerKey, character.name, snapshot or row.Value) then return false end
+                                count += 1
+                            end
+                        end
+                        if saves.IsLastPage then break end
+                        if saves:LoadNextPageAndWait() ~= 0 then return false end
+                        saves:MoveToNextPageAndWait()
+                    end
+                end
+            end
+            if users.IsLastPage then break end
+            if users:LoadNextPageAndWait() ~= 0 then return false end
+            users:MoveToNextPageAndWait()
+        end
+        if details:SetAndWait("backfill_v1", "done") ~= 0 then return false end
+        self._T.backfilled = true
+        log("[ItemHall] initial world scan complete characters=" .. tostring(count))
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean WriteBatches(any storage, table values)
+        local batch, count = {}, 0
+        for key, value in pairs(values) do
+            batch[key] = value
+            count += 1
+            if count == 100 then
+                if storage:BatchSetAndWait(batch) ~= 0 then return false end
+                batch, count = {}, 0
+            end
+        end
+        if count > 0 and storage:BatchSetAndWait(batch) ~= 0 then return false end
+        return true
+    end
+
+end

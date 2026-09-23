@@ -6,6 +6,9 @@ script Monster extends Component
     -- 그래서 이 기본값만 올리면 배치 몬스터 전체에 반영된다.
     @Sync property integer MaxHp = 3000
     @Sync property integer Hp = 0
+    @Sync property integer IncomingHitDamage = 0
+    @Sync property number IncomingHitExpires = 0
+    @Sync property integer LifeSerial = 0
     @Sync property boolean RespawnOn = false
     @Sync property boolean IsDead = false
     @Sync property number HealthBarUntil = 0
@@ -134,7 +137,7 @@ script Monster extends Component
             ["monster-499"] = "Lv.42 아이언호그",
             ["monster-2511"] = "Lv.45 아이언보어",
         }
-        local kind = string.gsub(self.Entity.Name, "_%d+$", "")
+        local kind = (string.gsub(self.Entity.Name, "_%d+$", ""))
         local label = labels[kind]
         if self.MonsterDisplayName ~= "" then
             label = "Lv." .. tostring(self.MonsterLevel) .. " " .. self.MonsterDisplayName
@@ -146,7 +149,7 @@ script Monster extends Component
             tag = self.Entity.NameTagComponent
         end
         if not isvalid(tag) then return end
-        local separator = string.find(label, " ")
+        local separator = (string.find(label, " "))
         if separator == nil then return end
         local level = string.sub(label, 1, separator - 1)
         local monsterName = string.sub(label, separator + 1)
@@ -253,6 +256,9 @@ script Monster extends Component
 
     @ExecSpace("ServerOnly")
     method void OnBeginPlay()
+        -- 수동 MISS/숫자 표시와 엔진 자동 숫자의 중복을 차단한다.
+        local spawner = self.Entity.DamageSkinSpawnerComponent
+        if isvalid(spawner) then spawner.Enable = false end
         -- 필드 모델의 EndFrameIndex=0은 첫 프레임만 재생한다.
         -- 상태별 ActionSheet는 유지하고 모든 동작의 전체 프레임을 허용한다.
         local sprite = self.Entity.SpriteRendererComponent
@@ -300,10 +306,15 @@ script Monster extends Component
         -- 예약 데미지(ReserveDamage)로 미리 잡아둔 몫이 실제로 들어왔으므로 그만큼 덜어낸다.
         -- 안 덜면 "Hp는 이미 줄었는데 예약은 그대로" 상태가 되어 아직 여유가 있는 몬스터까지
         -- 치사 예약으로 오판해 대상 선정에서 빠진다.
-        self:ConsumeReservedDamage(event.TotalDamage)
+        local incomingProjectile = isvalid(event.AttackerEntity) and event.AttackerEntity:GetComponent("script.LuckySevenProjectile") or nil
+        if incomingProjectile == nil or not incomingProjectile.GuaranteedHit then self:ConsumeReservedDamage(event.TotalDamage) end
         -- (표창 재고) 마지막으로 때린 **플레이어**를 기억해 둔다 - 처치 시 그 플레이어에게만
         -- 표창 보충을 준다(Dead 참고). 직접 타격은 공격자가 플레이어지만, 투사체 스킬은 공격자가
         -- 투사체 엔티티라 판정 컴포넌트의 시전자 참조(OwnerEntity)로 주인을 되짚는다.
+        local directAttack = isvalid(event.AttackerEntity) and event.AttackerEntity:GetComponent("script.PlayerAttack") or nil
+        if isvalid(directAttack) and directAttack:GetExpectedDamageLineCount(event.Extra or "") > 0 then
+            directAttack:ShowResolvedDamage(self.Entity, event.TotalDamage, event.IsCritical, directAttack:GetHitDamageSkinId())
+        end
         self:RememberLastAttacker(event.AttackerEntity)
         -- (요청 2026-08-09) 맞았으니 이제부터 **그 공격자만** 쫓는다.
         -- ⚠ 공격자 해석은 _T.lastKiller(RememberLastAttacker)가 아니라 BattleStatsManager.ResolveOwner를
@@ -311,6 +322,8 @@ script Monster extends Component
         --   다른 투사체로 때렸을 때 어그로가 안 걸린다. ResolveOwner는 OwnerComponentNames 목록으로
         --   모든 투사체/소환수를 커버한다(새 투사체는 그 목록에 등록하면 여기도 자동으로 따라온다).
         local aggroOwner = _BattleStatsManager:ResolveOwner(event.AttackerEntity)
+        local ownerAttack = isvalid(aggroOwner) and aggroOwner:GetComponent("script.PlayerAttack") or nil
+        if isvalid(ownerAttack) then ownerAttack:RecordAutoHuntContact(self.Entity, self.LifeSerial) end
         if event.TotalDamage > 0 and isvalid(aggroOwner) then
             self.HealthBarUntil = _UtilLogic.ServerElapsedSeconds + 5.0
         end
@@ -374,10 +387,48 @@ script Monster extends Component
     --   빈 자리로 날아가 데미지 숫자만 뜬다(신고: "죽은 몬스터 자리에 다음 공격을 하며 데미지가 뜬다").
     --   → 대상 선정에서 이 상태를 죽은 것으로 취급한다.
     --   유예 창이 만료되면(마지막 타 유실) 다시 정상 대상이 되어 영구 무적이 되지 않는다.
+    -- 기본공격의 예약은 개별 토큰으로 관리한다. 다른 공격의 피해로 예약을 잘못 차감하지 않는다.
     @ExecSpace("ServerOnly")
+    method integer ReserveIncomingHit(integer damage, number duration)
+        if self.IsDead or damage <= 0 then return 0 end
+        self._T.incomingHits = self._T.incomingHits or {}
+        self._T.incomingHitSerial = (self._T.incomingHitSerial or 0) + 1
+        local token = self._T.incomingHitSerial
+        self._T.incomingHits[token] = {damage=damage, expires=_UtilLogic.ServerElapsedSeconds + duration}
+        self:RefreshIncomingHits()
+        _TimerService:SetTimerOnce(function()
+            if isvalid(self.Entity) then self:ReleaseIncomingHit(token) end
+        end, duration)
+        return token
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReleaseIncomingHit(integer token)
+        if self._T.incomingHits ~= nil then self._T.incomingHits[token] = nil end
+        self:RefreshIncomingHits()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void RefreshIncomingHits()
+        local sum, expiry = 0, 0
+        for token, hit in pairs(self._T.incomingHits or {}) do
+            if hit.expires <= _UtilLogic.ServerElapsedSeconds then
+                self._T.incomingHits[token] = nil
+            else
+                sum = sum + hit.damage
+                expiry = math.max(expiry, hit.expires)
+            end
+        end
+        self.IncomingHitDamage = sum
+        self.IncomingHitExpires = expiry
+    end
+
     method boolean IsDeathPending()
         -- 치명타를 받고 사망 유예 창 안에서 대기 중인지, 또는 **아직 도달하지 않은 공격의 예약
         -- 데미지만으로 이미 죽는 것이 확정**됐는지(ReserveDamage 참고).
+        if self.NeverDie then return false end
+        if self.IncomingHitExpires > _UtilLogic.ServerElapsedSeconds and self.IncomingHitDamage >= self.Hp and self.IncomingHitDamage > 0 then return true end
+        if self:IsClient() then return false end
         if self:IsLethalReserved() then return true end
         if self._T.pendingDeath ~= true then return false end
         if self._T.deathDeferUntil == nil then return false end
@@ -524,7 +575,7 @@ script Monster extends Component
         if not isvalid(player) or player.CurrentMap ~= self.Entity.CurrentMap then return end
         local ruid = self:ResolveMonsterSound(false)
         if ruid == "" then return end
-        _SoundService:PlaySound(ruid, 1.0)
+        _GameAudio:PlaySound(ruid, 1.0)
         if not self._T.hitSoundVerified then
             self._T.hitSoundVerified = true
             log("[MonsterSound] hit " .. self.Entity.Name .. " ruid=" .. ruid)
@@ -539,7 +590,7 @@ script Monster extends Component
         if not isvalid(player) or player.CurrentMap ~= self.Entity.CurrentMap then return end
         local ruid = self:ResolveMonsterSound(true)
         if ruid == "" then return end
-        _SoundService:PlaySound(ruid, 1.0)
+        _GameAudio:PlaySound(ruid, 1.0)
         if not self._T.deathSoundVerified then
             self._T.deathSoundVerified = true
             log("[MonsterSound] die " .. self.Entity.Name .. " ruid=" .. ruid)
@@ -800,6 +851,10 @@ script Monster extends Component
         self._T.deathDeferUntil = nil
         self._T.reservedDamage = nil
         self._T.reservedUntil = nil
+        self._T.incomingHits = nil
+        self.IncomingHitDamage = 0
+        self.IncomingHitExpires = 0
+        self.LifeSerial = self.LifeSerial + 1
         local sc = self.Entity.StateComponent
         if isvalid(sc) then
             sc:ChangeState("DEAD")
@@ -826,89 +881,7 @@ script Monster extends Component
 			local pa=fireMarkOwner:GetComponent("script.PlayerAttack")
 			if isvalid(pa) then pa:TrySummonFireDemonMinion(deathPos,fireMarkLevel) end
 		end
-		local dropMap = self.Entity.CurrentMap
-        if isvalid(dropMap) then
-            -- (요청 2026-08-12) 초보자 패시브 "아이템 감각" - 마지막 공격자의 보너스(%)를 **메소 획득량과
-            -- 모든 확률 아이템 드랍**에 함께 곱한다(분배당 +1%, 마스터 100 = 2배). 킬러를 못 찾으면 1.0.
-            -- 메소·아이템 두 블록이 같은 값을 쓰므로 여기서 한 번만 구한다.
-            local dropMult = 1.0
-            local killerEnt = killer
-            if isvalid(killerEnt) then
-                ---@type PlayerAttack
-                local killerPa = killerEnt:GetComponent("script.PlayerAttack")
-                if isvalid(killerPa) then
-                    dropMult = 1.0 + killerPa:GetDropRateBonusPct() / 100
-                end
-            end
-
-            -- 메소 획득 확률만 레벨 차이당 2% 낮춘다. 성공 시 기존 티어·아이템 감각 지급량을 유지한다.
-            local mesoRate = 1.0
-            if isvalid(killer) then
-                local killerLevel = _RegionTierLogic:GetServerLevelOf(killer)
-                local monsterLevel = self.NameTagLevel > 0 and self.NameTagLevel or self.MonsterLevel
-                if killerLevel > 0 then mesoRate = _RegionTierLogic:GetLevelMesoRate(monsterLevel, killerLevel) end
-            end
-            if _UtilLogic:RandomDouble() < mesoRate then
-            local mesoAmount = math.floor(_RegionTierLogic:RollMesoForMap(dropMap.Name) * dropMult)
-            local mesoEnt = _SpawnService:SpawnByModelId("droppedmeso", self.Entity.Name .. "_meso", deathPos, dropMap)
-            if isvalid(mesoEnt) then
-                mesoEnt.DroppedItemComponent.ItemName = tostring(mesoAmount)
-                local sr = mesoEnt.SpriteRendererComponent
-                if isvalid(sr) then
-                    if mesoAmount < 50 then
-                        sr.SpriteRUID = "a724200c454c4fcf878b0a3cdbb706d6"
-                    elseif mesoAmount < 100 then
-                        sr.SpriteRUID = "5c78b56b91964dcaa83c1d30b8cd3cce"
-                    elseif mesoAmount < 1000 then
-                        sr.SpriteRUID = "c3fe3ffa606f41069ce8b36278e9e7e8"
-                    else
-                        sr.SpriteRUID = "f0aa7764ff5344848d59accafa2dbf6e"
-                    end
-                end
-                log("[Monster] 메소 드랍: " .. tostring(mesoAmount))
-            end
-
-            end
-
-            -- 확률 아이템 드랍 (매 사망마다 랜덤 롤)
-            -- type 미지정 = "sprite"(아이콘 스프라이트), "avataritem" = 장비 아바타 아이템(장비 탭으로 들어가고
-            -- 월드 드롭 아이콘은 thumbnail://로 렌더).
-            local itemDrops = {
-                -- (재보정) 드롭 아이템 박스: 파괴가 5성부터로 잦아진 만큼 공급도 늘림 (0.05% → 1.5%)
-                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", name = "드롭 아이템", rate = 0.015 },
-                { ruid = "b2300eda46f3445e9b1c6e774a2ee95a", name = "레드큐브", rate = 0.005 },
-                { ruid = "b8f0af90c30b462f859f45bdc1878d8b", name = "블랙큐브", rate = 0.002 },
-                { ruid = "af5404f4c8fc4ec78ccc1a57446f69db", name = "에디셔널큐브", rate = 0.004 },
-                { ruid = "9c2a12b9a92f44d4b6dd95c7fb182ac9", name = "화이트 에디셔널큐브", rate = 0.0015 },
-                { ruid = "0f134eebddee4b368062790b46afc26a", name = "에디셔널 잠재능력 부여주문서", rate = 0.0005 },
-                { ruid = "a6c6ff42196548dd874b83332ad5b336", name = "프로텍트 주문서", rate = 0.0002 },
-                { ruid = "14267ae8e168458480697c148ddfdcab", name = "잠재능력 부여주문서", rate = 0.0005 },
-                -- (요청) 아바타 장비(상의/하의/망토/장갑/신발)는 몬스터가 드롭하지 않는다 -
-                -- 소비 탭의 "드롭 아이템" 박스로만 뽑을 수 있다(UIEquipInventoryManager 박스 지급 경로).
-            }
-            -- dropMult는 위 메소 블록에서 이미 구했다(아이템 감각 보너스 - 메소·아이템 공용).
-            for i, drop in ipairs(itemDrops) do
-                if _UtilLogic:RandomDouble() < drop.rate * dropMult then
-                    local dropEnt = _SpawnService:SpawnByModelId("droppedshell", self.Entity.Name .. "_item" .. tostring(i), deathPos, dropMap)
-                    if isvalid(dropEnt) then
-                        local dic = dropEnt.DroppedItemComponent
-                        if isvalid(dic) then
-                            -- 공용 모델의 기본 이름(껍질)을 물려받지 않도록 명시한다.
-                            dic.ItemName = drop.name
-                            dic.ItemRUID = drop.ruid
-                            local itype = drop.type or "sprite"
-                            dic.ItemType = itype
-                            local sr = dropEnt.SpriteRendererComponent
-                            if isvalid(sr) then
-                                -- 아바타 아이템은 RUID를 스프라이트에 그대로 넣으면 안 보인다 - thumbnail://로 아이콘 렌더.
-                                sr.SpriteRUID = (itype == "avataritem") and ("thumbnail://" .. drop.ruid) or drop.ruid
-                            end
-                        end
-                        log("[Monster] 아이템 드랍: " .. drop.ruid)
-                    end
-                end
-            end
-        end
+        _MonsterDropRules:Drop(self.Entity, killer, self.NameTagLevel > 0 and self.NameTagLevel or self.MonsterLevel)
 
         local entity = self.Entity
         local me = self
@@ -946,6 +919,10 @@ script Monster extends Component
         self._T.deathDeferUntil = nil
         self._T.reservedDamage = nil
         self._T.reservedUntil = nil
+        self._T.incomingHits = nil
+        self.IncomingHitDamage = 0
+        self.IncomingHitExpires = 0
+        self.LifeSerial = self.LifeSerial + 1
         -- (요청 2026-08-09) 리젠하면 원한도 초기화 - 다시 맞기 전까지는 아무도 쫓지 않고 배회한다.
         self._T.lastKiller = nil
         self._T.aggroUntil = nil
@@ -1050,6 +1027,9 @@ script Monster extends Component
 
     @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
+        -- 클라이언트 기본 스포너도 비활성화하여 MISS와 0이 겹치지 않게 한다.
+        local spawner = self.Entity.DamageSkinSpawnerComponent
+        if isvalid(spawner) and spawner.Enable then spawner.Enable = false end
         -- 서버가 승인한 마지막 플레이어 피격 시각을 기준으로 5초간 머리 위를 따라간다.
         self:SyncFieldAnimation()
         self:UpdateMonsterNameTag()

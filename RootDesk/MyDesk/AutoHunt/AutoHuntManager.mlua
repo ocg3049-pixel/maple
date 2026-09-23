@@ -64,19 +64,46 @@ script AutoHuntManager extends Logic
 			log("[AutoHunt] 시작 거부: 현재 맵 생존 몬스터 없음")
 			return
 		end
+		self._T.combatJump = nil
+		self._T.combatJumpSample = nil
+        self._T.chaseSample = nil
+        self._T.attackProbe = nil
+        self._T.rangeCorrection = nil
+		local p = _UserService.LocalPlayer
+		local pa = isvalid(p) and p:GetComponent("script.PlayerAttack") or nil
+		if pa ~= nil then pa._T.basicAirMotion = nil end
 		self.autoOn = not self.autoOn
 		local keyName = _KeySettingManager:GetKeyForFunc("autohunt")
 		if keyName == "" then keyName = "F7" end
 		if self.autoOn then
+            self._T.huntMap = _UserService.LocalPlayer.CurrentMap
+            self._T.holdMoveUntil = nil
 			self._T.target = nil
 			self._T.chaseStart = _UtilLogic.ElapsedSeconds
 			self._T.elemDwellUntil = nil   -- (팔라딘) 속성 순환 주기 초기화 - 켜자마자 전환하지 않게 ElementChainTick이 새로 잡는다
 			self._T.noTargetSince = nil   -- 이전 세션 잔재로 켜자마자 복귀하는 것 방지
 			_UIToast:ShowMessage("자동사냥 시작 (" .. keyName .. "로 중지)")
+			_MapleIslandTutorial:Notify("autohunt")
 		else
 			_UIToast:ShowMessage("자동사냥 중지")
 			self._T.elemDwellUntil = nil
 			self._T.rideFlight = false   -- (다크나이트) 비행 이동 중 OFF - 탑승 상태는 유저 조작에 맡긴다
+            -- 중지 후 재시작해도 이전 맵의 이동/충전 예약을 재실행하지 않는다.
+            for _, generation in ipairs({"fjGen", "djGen", "csGen", "snGen", "pcGen"}) do
+                self._T[generation] = (self._T[generation] or 0) + 1
+            end
+            if (_SkillManager._T.rapidFireAutoHoldUntil or 0) > 0 then _SkillManager:EndRapidFire() end
+            if (_SkillManager._T.hurricaneAutoHoldUntil or 0) > 0 then _SkillManager:EndHurricane() end
+            if _SkillManager._T.snipingAutoHold then _SkillManager:CancelSniping() end
+            if _SkillManager._T.piercingAutoHold then _SkillManager:CancelPiercing() end
+            _SkillManager._T.rapidFireAutoHoldUntil = 0
+            _SkillManager._T.hurricaneAutoHoldUntil = 0
+            _SkillManager:SetChargeAutoHold("sniping", false)
+            _SkillManager:SetChargeAutoHold("piercing", false)
+            self._T.huntMap = nil
+            self._T.target = nil
+            self._T.holdMoveUntil = nil
+            self._T.noTargetSince = nil
 			self:StopMoving()
 		end
 		-- (팔라딘) 서버 자동 가드(피격 타이밍 25% 자동 발동) 상태 동기화 - 가드 투자 레벨 동봉.
@@ -225,6 +252,149 @@ script AutoHuntManager extends Logic
 	-- 자동사냥이 지금 스스로 걷는 중인지(컨트롤러를 끄고 MoveToDirection으로 이동).
 	-- PlayerAttack의 방향 잠금 강제 IDLE이 이 걷기와 싸우며 MOVE↔IDLE로 튕기지 않게,
 	-- 걷는 동안은 방향 잠금이 물러나는 판단(ShouldEnforceDirectionLock)에 쓰인다.
+
+
+	@ExecSpace("ClientOnly")
+	method boolean HasUpperFootholdInCombatJump(Entity player, number direction)
+		local map = player.CurrentMap
+		local footholds = isvalid(map) and map.FootholdComponent or nil
+		if not isvalid(footholds) then return true end
+		local pp = player.TransformComponent.WorldPosition
+		-- 점프력 버프도 반영하고, 실측 높이에서 빼 둔 여유를 되돌려 보수적으로 검사한다.
+		local top = pp.y + math.max(0, self:GetPlainJumpReach(player)) + 0.20
+		local left = math.min(pp.x, pp.x + direction * 2.0) - 0.25
+		local right = math.max(pp.x, pp.x + direction * 2.0) + 0.25
+		for _, foothold in pairs(footholds:GetFootholdAll()) do
+			-- 선분 전체를 검사하므로 폭이 좁거나 기울어진 발판도 놓치지 않는다.
+			if not foothold:IsVertical() then
+				local x1 = math.max(left, foothold.StartPoint.x)
+				local x2 = math.min(right, foothold.EndPoint.x)
+				if x1 <= x2 then
+					local y1 = foothold:GetYByX(x1)
+					local y2 = foothold:GetYByX(x2)
+					if math.max(y1, y2) > pp.y + 0.08 and math.min(y1, y2) <= top then
+						if (self._T.upperJumpLogAt or 0) <= _UtilLogic.ElapsedSeconds then
+							self._T.upperJumpLogAt = _UtilLogic.ElapsedSeconds + 2
+							log("[JumpCombat] 위쪽 발판으로 올라갈 수 있어 점프 공격 생략 foothold=" .. tostring(foothold.Id))
+						end
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasSafeCombatJumpPath(Entity player, number direction)
+		if self:HasUpperFootholdInCombatJump(player, direction) then return false end
+		local pp = player.TransformComponent.WorldPosition
+		local here = self:GetFootholdIdBelow(player, pp.x, pp.y + 0.12, 0.35)
+		if here <= 0 then return false end
+		-- 착지점뿐 아니라 도중의 틈/낭떠러지도 검사한다. 다른 층으로 도약하지 않는다.
+		for i = 1, 8 do
+			local nextId = self:GetFootholdIdBelow(player, pp.x + direction * i * 0.25, pp.y + 0.18, 0.45)
+			if nextId <= 0 or not self:AreFootholdIdsConnected(player, here, nextId) then return false end
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean TryCombatJump(number now, Entity player, Entity target)
+		local rb = player.RigidbodyComponent
+		local ctrl = player.PlayerControllerComponent
+		local mv = player.MovementComponent
+		local pa = player:GetComponent("script.PlayerAttack")
+		if not isvalid(rb) or not rb:IsOnGround() or not isvalid(ctrl) or not isvalid(mv) or pa == nil then return false end
+		if not (_SkillManager:IsClawEquipped() or _SkillManager:IsArcherJob()) then return false end
+		if (self._T.ropeState or "") ~= "" or (self._T.jumpAtkUntil or 0) > now or pa:IsSwingMotionActive() then return false end
+		local pp = player.TransformComponent.WorldPosition
+		local tp = target.TransformComponent.WorldPosition
+		local dx = tp.x - pp.x
+		local distance = math.abs(dx)
+		local face = (dx >= 0) and 1 or -1
+		local old = self._T.combatJumpSample
+		local closing = false
+		if old ~= nil and old.target == target then
+			local dt = now - old.time
+			if dt >= 0.12 and dt <= 2 then closing = (tp.x - old.x) * face / dt < -0.08 end
+		end
+		if old == nil or old.target ~= target or now - old.time >= 0.12 then self._T.combatJumpSample = {target=target, x=tp.x, time=now} end
+		if (self._T.combatJumpCooldown or 0) > now or (self._T.nextAtk or 0) > now or math.abs(tp.y - pp.y) > 0.3 then return false end
+		local strong = self:GetTargetRemainHp(target) > math.max(1, _SkillManager:PeekEffectiveCombatPower()) * 2
+		local retreat = closing and strong and distance >= 0.85 and distance <= 2.3
+		local advance = distance > pa:GetBasicProjectileRange() - 0.15 and distance <= pa:GetBasicProjectileRange() + 1.1
+			and not self:HasUsableAttackInRange(player, target)
+		if not retreat and not advance then return false end
+		local direction = retreat and -face or face
+		if not self:HasSafeCombatJumpPath(player, direction) then return false end
+		self._T.combatJump = {map=player.CurrentMap, target=target, start=now, x=pp.x, move=direction, face=face, fired=false, retreat=retreat}
+		self._T.combatJumpCooldown = now + (retreat and 3.5 or 2.5)
+		self._T.holdMoveUntil = now + 1.4
+		self._T.moving = false
+		ctrl.Enable = false
+		rb.MoveVelocity = Vector2(direction * mv.InputSpeed, 0)
+		ctrl.LookDirectionX = face
+		if not mv:Jump() then
+			self._T.combatJump = nil
+			self._T.holdMoveUntil = nil
+			self:StopMoving()
+			return false
+		end
+		self._T.jumpedAt = now
+		log("[JumpCombat] 자동 " .. (retreat and "후퇴" or "전진") .. " 점프 distance=" .. string.format("%.2f", distance))
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CombatJumpTick(number now, Entity player)
+		local jump = self._T.combatJump
+		if jump == nil then return false end
+		local rb = player.RigidbodyComponent
+		local ctrl = player.PlayerControllerComponent
+		local mv = player.MovementComponent
+		local pa = player:GetComponent("script.PlayerAttack")
+		local age = now - jump.start
+		local sc = player.StateComponent
+		if jump.map ~= player.CurrentMap or not isvalid(rb) or not isvalid(ctrl) or not isvalid(mv) or pa == nil
+			or age > math.max(1.4, (jump.releaseAt or 0) + 0.4)
+			or (age > 0.15 and rb:IsOnGround() and (not jump.fired or age > jump.releaseAt + (jump.retreat and 0.3 or 0)))
+			or (isvalid(sc) and (sc.CurrentStateName == "DEAD" or sc.CurrentStateName == "CLIMB" or sc.CurrentStateName == "LADDER")) then
+			self._T.combatJump = nil
+			self._T.holdMoveUntil = nil
+			if pa ~= nil then pa._T.basicAirMotion = nil end
+			if isvalid(mv) then mv:Stop() end
+			self:StopMoving()
+			return true
+		end
+		local pp = player.TransformComponent.WorldPosition
+		-- 예약한 착지 범위를 넘기 전에 수평 입력을 끊는다. 공격 자세/시선은 유지한다.
+		local fleeing = jump.retreat and jump.fired and age > jump.releaseAt
+		local moving = (not rb:IsOnGround() or fleeing) and math.abs(pp.x - jump.x) < 1.5
+		self._T.moving = fleeing and moving
+		if self._T.moving and rb:IsOnGround() and isvalid(sc) and sc.CurrentStateName ~= "MOVE" then sc:ChangeState("MOVE") end
+		local inputX = moving and jump.move * mv.InputSpeed or 0
+		rb.MoveVelocity = Vector2(inputX, 0)
+		if pa._T.basicAirMotion ~= nil then pa._T.basicAirMotion.x = inputX end
+		ctrl.LookDirectionX = (jump.fired and age > jump.releaseAt and jump.retreat) and jump.move or jump.face
+		if not jump.fired and age >= 0.06 and not rb:IsOnGround() and isvalid(jump.target) and self:GetTargetRemainHp(jump.target) > 0 then
+			local tp = jump.target.TransformComponent.WorldPosition
+			local dx = tp.x - pp.x
+			if dx * jump.face > 0 and math.abs(dx) <= pa:GetBasicProjectileRange() - 0.15 then
+				local claw = _SkillManager:IsClawEquipped()
+				if claw then pa:CastClawBasicAttack() else _SkillManager:DoArcherBasicAttack() end
+				jump.fired = true
+				jump.releaseAt = age + (claw and 0.72 or math.max(0.45, 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()))
+				self._T.nextAtk = now + (claw and 0.72 or 0.8)
+				self._T.lastAttackTime = now
+				log("[JumpCombat] 자동 공중 발사 move=" .. tostring(jump.move) .. " face=" .. tostring(jump.face))
+			end
+		end
+		self._T.stuckLastX = nil
+		self._T.stuckLastY = nil
+		return true
+	end
+
 	@ExecSpace("ClientOnly")
 	method boolean IsAutoMoving()
 		return self.autoOn == true and self._T.moving == true
@@ -253,6 +423,7 @@ script AutoHuntManager extends Logic
 	@ExecSpace("ClientOnly")
 	method string GetSkillRole(string skillName)
 		local roles = {
+            ["달팽이 세마리"] = "single",
 			-- 버프 (지속형 - 만료 전 주기 재시전)
 			["부스터"] = "buff", ["분노"] = "buff", ["파워가드"] = "buff", ["메디테이션"] = "buff",
 			["블레스"] = "buff", ["헤이스트"] = "buff", ["샤프 아이즈"] = "buff",
@@ -432,6 +603,13 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+        -- 다른 맵에서는 이전 목표/이동 예약을 이어가지 않는다.
+        local mapPlayer = _UserService.LocalPlayer
+        if self.autoOn and isvalid(mapPlayer) and mapPlayer.CurrentMap ~= self._T.huntMap then
+            self:Toggle()
+            log("[AutoHunt] stopped on map change")
+            return
+        end
 		-- (신고 2026-08-04) 수동 조작 중에도 지형 턱/발판 이음매에 끼어 좌우 이동이 안 먹는 경우가
 		-- 있다 - 자동사냥이 꺼져 있어도 수동 끼임 탈출 감시는 항상 돌린다(자동사냥 중에는 기존
 		-- CheckStuckAndJump가 담당하므로 중복 방지를 위해 OFF일 때만).
@@ -449,6 +627,8 @@ script AutoHuntManager extends Logic
 			return
 		end
 		local now = _UtilLogic.ElapsedSeconds
+        self:ResolveJumpAttack(now)
+        self:UpdateChaseAim(now, player)
 
 		-- (다크나이트, 요청 사양) 드래곤 라이딩 = "이동할 때만 탑승"하는 이동기.
 		-- ① 자동사냥이 스스로 탑승한 비행 이동(rideFlight) 중이면 목표점까지 날아가고 도착 즉시 하차한다
@@ -481,6 +661,7 @@ script AutoHuntManager extends Logic
 
 		-- (P2) 자동 HP 물약: 위급 상황이라 홀드보다 먼저 본다
 		self:TryAutoPotion(now, player)
+		if self:CombatJumpTick(now, player) then return end
 
 		-- (신고 2026-08-06) "암살의 투명이 풀리기 전에 이곳저곳 이동한다"
 		-- 암살은 **몸이 사라진 채 제자리에서** 연쇄 타격을 하고 그 자리로 돌아오는 연출이다. 그 사이에
@@ -511,7 +692,7 @@ script AutoHuntManager extends Logic
 		-- 켜져 있는 동안은 다음 행동을 하지 않는다 - 파이널어택은 60% 확률 후발동이라 고정 홀드로는 못 잡는다.
 		---@type PlayerAttack
 		local paGuard = player:GetComponent(PlayerAttack)
-		if isvalid(paGuard) and paGuard:IsBrandishMotionGuardOn() then
+		if isvalid(paGuard) and (paGuard:IsBrandishMotionGuardOn() or paGuard._T.isMagicClawMotionPlaying == true or paGuard._T.isMagicClawDirectionLocked == true) then
 			-- 가드가 풀린 직후를 알기 위해 마지막으로 켜져 있던 시각을 남긴다.
 			self._T.motionGuardLastOn = now
 			return
@@ -526,6 +707,7 @@ script AutoHuntManager extends Logic
 
 		self:RefreshSlotRoles()
 		if self:TryHealSummonTick(now, player, delta) then return end
+		self:RefreshPlatformTarget(player, now)
 
 		-- 대상 탐색 (0.3초 주기 캐시)
 		-- ⚠ (버그 수정 2026-08-09) 로프 등반 중에는 재탐색을 멈춘다. 0.3초마다 최근접 대상이 바뀌면
@@ -546,7 +728,7 @@ script AutoHuntManager extends Logic
 		local curAlive = false
 		if curT0 ~= nil and isvalid(curT0) then
 			local mcLock = curT0:GetComponent("script.Monster")
-			curAlive = (mcLock ~= nil and mcLock.IsDead ~= true)
+			curAlive = (mcLock ~= nil and mcLock.IsDead ~= true and not mcLock:IsDeathPending())
 		end
 		local targetLocked = curAlive and ((self._T.targetLockUntil or 0) > now)
 		if not ropeBusy and not targetLocked
@@ -561,7 +743,7 @@ script AutoHuntManager extends Logic
 			--   포기 경로는 그대로 살아 있다 - 5초 추적 타임아웃 / 끼임 / 도달 불가 판정이 대상을 바꾼다.
 			local keepTarget = false
 			local curT = self._T.target
-			if newTarget ~= nil and curT ~= nil and isvalid(curT) and newTarget ~= curT
+			if curAlive and newTarget ~= nil and curT ~= nil and isvalid(curT) and newTarget ~= curT
 				and (now - (self._T.chaseStart or now)) >= 1.0 then
 				local pxNow = player.TransformComponent.WorldPosition.x
 				local curDx = curT.TransformComponent.WorldPosition.x - pxNow
@@ -622,7 +804,7 @@ script AutoHuntManager extends Logic
 		self._T.noTargetSince = nil
 
 		local mon = target:GetComponent("script.Monster")
-		if mon == nil or mon.IsDead == true then
+		if mon == nil or (mon.IsDead == true or mon:IsDeathPending()) then
 			-- (요청 2026-08-11) 로프에 매달려 오르는 중(climb)에 대상이 죽으면 등반을 접지 않고
 			-- **끝까지 올라간 뒤** 재탐색한다 - 종전의 "대상 사망 - 재탐색" 즉시 취소는 매달림 중
 			-- 놓고 떨어지는 동작이 어색해서 뒤집었다. approach(로프까지 걷는 중)는 기존대로 접는다.
@@ -683,6 +865,25 @@ script AutoHuntManager extends Logic
 			log("[AutoHunt] px=" .. string.format("%.2f", pp.x) .. " dx=" .. string.format("%.2f", dx) .. " dy=" .. string.format("%.2f", dy) .. " look=" .. tostring(lookX))
 		end
 
+		if self:TryCombatJump(now, player, target) then return end
+
+		-- 시전이 시작된 경우에만 추적을 멈춘다. 후보/방향/쿨다운 탈락은 계속 접근한다.
+		local approachAfterCast = false
+		local grounded = isvalid(player.RigidbodyComponent) and player.RigidbodyComponent:IsOnGround()
+		if grounded and (self._T.ropeState or "") ~= "climb"
+			and (self._T.attackRangeRetryUntil or 0) <= now
+			and self:HasUsableAttackInRange(player, target) then
+			if (self._T.ropeState or "") ~= "" then self:EndRopeClimb(player, "사거리 안") end
+			local usedUtility = self:TryUtilityCast(now)
+			if not usedUtility then self:TryAttackCast(now, player, pp) end
+			if usedUtility or (self._T.holdMoveUntil or 0) > now then
+				if self._T.moving then self:StopMoving() end
+				self._T.chaseStart = now
+				return
+			end
+			approachAfterCast = true
+		end
+
 		-- (요청 2026-08-09) 로프 등반: 앞점프로 닿지 않는 위층 대상은 로프로 올라간다.
 		-- 이 함수가 true를 돌려주면 이번 틱의 이동은 등반 상태 기계가 가져간 것이므로 아래 추적 로직을 건너뛴다.
 		-- ⚠ 등반 중에는 공격도 하지 않는다 - CLIMB 상태에서는 시전 자체가 막혀 있어(각 Attack*의 상태 가드)
@@ -713,16 +914,8 @@ script AutoHuntManager extends Logic
 			end
 			if (now - (self._T.jumpedAt or 0)) > 0.35 then
 				self._T.jumpAtkUntil = 0   -- 착지 - 창 종료 (다음 도약은 nextJumpAtk 쿨 뒤)
-				-- 헛도약 판정: 이번 도약에서 대상이 한 번도 시전 게이트에 못 들었으면 기하적으로
-				-- 못 닿는 자리다 - 2회 연속이면 TryJumpAttack이 포기한다(무한 도약 루프 방지).
-				if self._T.jumpAtkCastDone == true then
-					self._T.jumpAtkFails = 0
-				else
-					self._T.jumpAtkFails = (self._T.jumpAtkFails or 0) + 1
-					log("[AutoHunt] 점프 공격 헛도약 (" .. tostring(self._T.jumpAtkFails)
-						.. "/2) - 공중 시전 게이트에 못 넣음 (dy=" .. string.format("%.2f", dy)
-						.. " dx=" .. string.format("%.2f", dx) .. ")")
-				end
+                -- Damage is evaluated after projectile travel, even if the cast held movement.
+
 			else
 				return   -- 도약 직후 아직 지상 판정인 프레임 - 대기
 			end
@@ -745,6 +938,7 @@ script AutoHuntManager extends Logic
 			end
 		end
 
+		if self:IntermediateStepTick(player, pp, mp, now, delta) then return end
 		if self:RopeClimbTick(now, player, pp, dy, delta) then return end
 
 		-- (버그 수정) 사거리 판정에 수직 거리도 포함한다 - |dx|만 보면 아래/위층 몬스터를 "사거리 내"로
@@ -792,54 +986,6 @@ script AutoHuntManager extends Logic
 			end
 			return
 		end
-		-- (썬콜, 요청 2026-08-08) 마법 사거리 안의 대상은 걸어가 붙지 않고 제자리에서 시전한다.
-		-- "먼 거리 한 명의 적"은 매직클로가, 4차에서는 체인라이트닝이 이 자리를 주로 맡는다
-		-- (각성 표창/연막 저격 제자리 사냥의 자매 규칙 - 실제 스킬 선택은 TryAttackCast의 썬콜 블록).
-		if self:ShouldMageSnipe(player, pp, dx, dy) then
-			if self._T.moving then self:StopMoving() end
-			self._T.chaseStart = now
-			if math.abs(dx) > 0.05 then
-				local pccMg = player.PlayerControllerComponent
-				if isvalid(pccMg) then
-					local wantMg = (dx > 0) and 1 or -1
-					if pccMg.LookDirectionX ~= wantMg then
-						pccMg.LookDirectionX = wantMg
-						self._T.dirChangedAt = now
-					end
-				end
-			end
-			if not self:TryUtilityCast(now) then
-				self:TryAttackCast(now, player, pp)
-			end
-			return
-		end
-		-- (신궁/보우마스터, 요청 2026-08-10) 활 사거리(전방 조준 최대 6유닛) 안의 같은 층 대상은
-		-- 걸어가 붙지 않고 제자리에서 쏜다 - "사거리가 아주 긴데 파워스트라이크처럼 근접으로 쓴다"는
-		-- 신고의 직접 수정(마법 저격 제자리 사냥과 같은 처리).
-		if self:ShouldArcherSnipe(player, pp, dx, dy) then
-			if self._T.moving then self:StopMoving() end
-			self._T.chaseStart = now
-			-- 매 틱 찍히면 넘치므로 3초에 한 번만 남긴다(활 저격 발동 확인용).
-			if (self._T.archerSnipeLogAt or -99) + 3.0 < now then
-				self._T.archerSnipeLogAt = now
-				log("[AutoHunt] 활 저격 - 제자리 시전 (dx=" .. string.format("%.2f", dx)
-					.. " dy=" .. string.format("%.2f", dy) .. ")")
-			end
-			if math.abs(dx) > 0.05 then
-				local pccAr = player.PlayerControllerComponent
-				if isvalid(pccAr) then
-					local wantAr = (dx > 0) and 1 or -1
-					if pccAr.LookDirectionX ~= wantAr then
-						pccAr.LookDirectionX = wantAr
-						self._T.dirChangedAt = now
-					end
-				end
-			end
-			if not self:TryUtilityCast(now) then
-				self:TryAttackCast(now, player, pp)
-			end
-			return
-		end
 		-- (신궁, 요청 2026-08-07) 접근 중이라도 아이언 에로우가 닿으면 그 자리에서 쏜다 -
 		-- 8방향 관통이라 걸어가서 붙을 필요가 없다. 아래 접근 분기보다 **먼저** 본다(접근 분기는
 		-- 이동만 하고 return 하므로, 뒤에 두면 먼 대상에게는 영영 기회가 없다).
@@ -849,7 +995,7 @@ script AutoHuntManager extends Logic
 		-- 안"으로 오인해 제자리에서 계속 헛방을 쳤다(공격 중에는 chaseStart가 갱신돼 5초 타임아웃도
 		-- 안 걸려 영영 반복). 아래 0.6(박스 0.5 + 콜라이더 몫)부터는 접근으로 넘긴다 - 걷기가 경사/
 		-- 턱을 내려가 높이를 맞추고, 더 아래(-0.8↓)는 다운점프가 맡는다.
-		if dist > 1.15 or dy >= 1.2 or dy <= -0.6 then
+		if (approachAfterCast and not self:CanBasicAttackReach(player, target)) or dist > 1.15 or dy >= 1.2 or dy <= -0.6 or not self:HasUsableAttackInRange(player, target) then
 			-- (요청) 맨아래 층에서 남은 적이 수평으로 꽤 멀면(8유닛↑) 걸어가지 않고 위로 복귀해
 			-- 위에서부터 다시 내려오며 잡는다 (하강 순환 동선).
 			-- 살아 있는 추적 대상이 멀다는 이유만으로 스폰 복귀하지 않는다.
@@ -2176,13 +2322,12 @@ script AutoHuntManager extends Logic
 		if awakeningOn then
 			atkTick = math.max(0.12, 0.85 * _CharInfoManager:GetAttackSpeedMultiplier())
 		end
-		self._T.nextAtk = now + atkTick
 		-- (헛빵 수정) 시전 직전 재검증: 0.5초 주기 사이에 대상이 죽었거나 스킬 실판정 반경(1.5)
 		-- 밖으로 벗어났으면 이번 시전을 건너뛴다 - 파스/슬블/차지 블로우 허공 시전 방지.
 		local target = self._T.target
 		if target == nil or not isvalid(target) then return end
 		local monChk = target:GetComponent("script.Monster")
-		if monChk == nil or monChk.IsDead == true then
+		if monChk == nil or (monChk.IsDead == true or monChk:IsDeathPending()) then
 			self._T.target = nil
 			return
 		end
@@ -2216,11 +2361,10 @@ script AutoHuntManager extends Logic
 		elseif self:ShouldSnipeWithAssassinate(cdx, cdy) then
 			-- 연막 중 암살 사거리(9유닛) 안이면 붙지 않고 그대로 시전한다.
 			smokeSniping = math.sqrt(cdx * cdx + cdy * cdy) > 1.3
-		elseif mageBombard or self:ShouldMageSnipe(player, pp, cdx, cdy) then
+		elseif self:HasUsableAttackInRange(player, target) then
+			-- 접근과 시전이 같은 사거리 판정을 공유한다.
+		elseif mageBombard then
 			mageSniping = math.sqrt(cdx * cdx + cdy * cdy) > 1.3
-		elseif self:ShouldArcherSnipe(player, pp, cdx, cdy) then
-			-- (요청 2026-08-10) 활 사거리 안이면 붙지 않고 그대로 시전한다(마법 저격과 같은 처리).
-			archerSniping = math.sqrt(cdx * cdx + cdy * cdy) > 1.3
 		else
 			-- (요청 2026-08-10) 점프 공격 창 동안은 1.45까지 완화 - 가장자리 도약(대각선 위 대상)은
 			-- 1.3을 살짝 넘는다. 서버 실판정(반경 1.5) 안쪽까지만 연다.
@@ -2297,12 +2441,14 @@ script AutoHuntManager extends Logic
 			self._T.dsAmbushDeadline = 0
 			log("[AutoHunt] 다크사이트 기습 - 적 뒤를 잡고 시전")
 		end
+		self._T.nextAtk = now + atkTick
 		-- (팔라딘, 요청 2026-08-10) 속성 연계/순환 - 사거리 검증을 통과한 실제 대상이 있는 지금이
 		-- 기준점이다. 전환한 틱은 공격을 쉬고, 0.35초 뒤 공격 틱의 차지 블로우가 연계를 마무리한다.
 		if self:ElementChainTick(now, player, pp, tp) then return end
 		-- (나이트로드, 요청 2026-08-05) 드레인 샷 = HP 보충기: HP가 90% 아래고 자체 쿨(5초)이 돌았으면
 		-- 로테이션을 기다리지 않고 우선 사용한다. 대상이 사거리에 있는 지금이 기회다 - 맞혀야 회복된다.
-		if self._T.slotDrainShots ~= nil and #self._T.slotDrainShots > 0
+		if self:CanSkillReachTarget("드레인 샷", player, target)
+			and self._T.slotDrainShots ~= nil and #self._T.slotDrainShots > 0
 			and (self._T.nextDrainShot or 0) <= now then
 			local pcDS = player.PlayerComponent
 			if isvalid(pcDS) and (pcDS.MaxHp or 0) > 0 and (pcDS.Hp / pcDS.MaxHp) < 0.90 then
@@ -2812,7 +2958,7 @@ script AutoHuntManager extends Logic
 		for _, c in ipairs(pool) do
 			if c.name == "스피어 버스터" then roarSpearW = c.w end
 		end
-		local roarCrowded = (nearby >= 2)
+		local roarCrowded = self:CountNearbyMonsters(player, pp, 14.0) >= 2
 		-- 소모량(최대 HP의 41~70%)보다 현재 HP가 적으면 시전 자체가 막힌다(SkillManager의 HP 부족 게이트).
 		-- 뽑아 봐야 차단 + 토스트만 나오므로 여기서 미리 제외한다 - 투자 레벨이 낮아 소모율이 60%를
 		-- 넘는 구간에서만 실제로 걸린다(마스터 51%, 30 마스터 41%면 60% 하한이 더 빡빡하다).
@@ -2990,6 +3136,7 @@ script AutoHuntManager extends Logic
 		--   안 하는 "가만히 서 있는" 상태가 된다(MP 소모가 생긴 파워스트라이크/슬래시블러스트 신고).
 		--   전부 빠지면 아래 total<=0 분기가 그대로 기본공격 폴백으로 이어진다 - 분기를 새로 만들지 않는다.
 		for _, c in ipairs(pool) do
+            if not self:CanSkillReachTarget(c.name, player, target) or not self:IsAttackSkillReady(c.name) then c.w = 0 end
 			if c.w > 0 and not _SkillManager:CanAffordSkillCost(c.name) then
 				c.w = 0
 			end
@@ -3017,12 +3164,22 @@ script AutoHuntManager extends Logic
 		local total = 0
 		for _, c in ipairs(pool) do total += c.w end
 		if #pool == 0 or total <= 0 then
-			-- 배정된 공격 스킬이 없거나(또는 전부 자원 부족) 기본공격 (Control 공격과 동일 경로)
+			if not self:CanBasicAttackReach(player, target) then
+				self._T.attackRangeRetryUntil = now + 0.4
+				self._T.nextAtk = now + 0.15
+				return
+			end
+			self:StopMoving()
+			self:BeginAttackProbe(now, target)
+            -- 배정된 공격 스킬이 없거나(또는 전부 자원 부족) 기본공격 (Control 공격과 동일 경로)
 			-- ⚠ (요청 2026-08-13) 신궁·보우마스터는 기본공격이 무기 휘두르기가 아니라 **더블샷 화살 1발**이다.
 			--   여기서 엔진 ActionAttack을 부르면 엔진이 자기 ATTACK 상태로 무기를 휘둘러 활 모션과 섞인다 -
 			--   수동 공격 키와 **같은 경로**(SkillManager.DoArcherBasicAttack)로 보낸다.
 			--   "마나가 없으면 평타" 폴백이 바로 이 지점이라, 이 분기를 빼먹으면 요청이 반쪽만 적용된다.
-			if _SkillManager:IsArcherJob() then
+			if _SkillManager:IsClawEquipped() then
+				local attack = player:GetComponent("script.PlayerAttack")
+				if isvalid(attack) then attack:CastClawBasicAttack() end
+			elseif _SkillManager:IsArcherJob() then
 				_SkillManager:DoArcherBasicAttack()
 			else
 				local pcc = player.PlayerControllerComponent
@@ -3034,7 +3191,7 @@ script AutoHuntManager extends Logic
 			-- holdMoveUntil은 OnUpdate 상단에서 이동/점프/대상 재선정/다음 공격을 통째로 막는
 			-- 기존 장치라 그대로 재사용한다(시전 모션 홀드와 같은 경로).
 			-- 기본공격 모션(임팩트 0.3초)이 온전히 끝난 뒤 다음 행동으로 넘어가게 하는 목적.
-			self._T.holdMoveUntil = now + 0.5
+			self._T.holdMoveUntil = now + (_SkillManager:IsClawEquipped() and 0.72 or 0.5)
 			-- 공격 틱마다 찍히면 로그가 넘치므로 2초에 한 번만 남긴다(폴백에 빠진 이유 추적용).
 			if (self._T.basicAtkLogAt or -99) + 2.0 < now then
 				self._T.basicAtkLogAt = now
@@ -3044,6 +3201,8 @@ script AutoHuntManager extends Logic
 			return
 		end
 
+		self:StopMoving()
+		self:BeginAttackProbe(now, target)
 		local r = _UtilLogic:RandomDouble() * total
 		local pick = pool[#pool]
 		for _, c in ipairs(pool) do
@@ -3084,6 +3243,15 @@ script AutoHuntManager extends Logic
 		-- 공격 틱(0.5초)이 로어 모션 한가운데서 다음 스킬을 뽑아 **스피어 버스터가 겹쳐 나갔다**(신고).
 		-- 잠금이 풀릴 때까지 공격 틱과 걷기를 함께 미뤄, 로테이션 자체가 돌지 않게 한다
 		-- (그냥 시전만 막으면 뽑힌 스킬의 자체 간격 게이트 - 돌진 12초 등 - 이 헛되이 소모된다).
+        if pick.name == "매직클로" then
+            local lock = 0.85 * _CharInfoManager:GetAttackSpeedMultiplier() + 0.15
+            self._T.holdMoveUntil = now + lock
+            self._T.nextAtk = now + lock
+        end
+        if pick.name == "달팽이 세마리" then
+            self._T.holdMoveUntil = now + 0.72
+            self._T.nextAtk = now + 0.72
+        end
 		if pick.name == "드래곤 로어" then
 			self._T.holdMoveUntil = now + 2.0
 			self._T.nextAtk = now + 2.0
@@ -3159,7 +3327,7 @@ script AutoHuntManager extends Logic
 		if comps == nil then return 0 end
 		local count = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e.Visible ~= false then
 					local wp = e.TransformComponent.WorldPosition
@@ -3204,7 +3372,7 @@ script AutoHuntManager extends Logic
 		if comps == nil then return 0 end
 		local count = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e.Visible ~= false then
 					local wp = e.TransformComponent.WorldPosition
@@ -3235,7 +3403,7 @@ script AutoHuntManager extends Logic
 		local best = nil
 		local bestScore = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e ~= target and e.Visible ~= false then
 					local banUntil = nil
@@ -3247,6 +3415,9 @@ script AutoHuntManager extends Logic
 						-- FindTarget의 층 페널티와 같은 결: 다른 층은 수직 거리에 가중을 준다.
 						local score = ddx
 						if ddy >= 1.5 then score = score + ddy * 2 end
+						if _ChannelManager:BaseName(player.CurrentMap.Name) == "001010000" then
+							score = math.sqrt(ddx * ddx + ddy * ddy)
+						end
 						if best == nil or score < bestScore then
 							best = e
 							bestScore = score
@@ -3260,6 +3431,75 @@ script AutoHuntManager extends Logic
 		if math.abs(nx - pp.x) < 0.5 then return 0 end   -- 사실상 제자리 - 방향으로 안 본다
 		self._T.nextDirX = (nx > pp.x) and 1 or -1
 		return self._T.nextDirX
+	end
+
+
+	@ExecSpace("ClientOnly")
+	method Entity FindCurrentPlatformTarget(Entity player)
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return nil end
+		local floor = rb:GetCurrentFoothold()
+		if floor == nil then return nil end
+		local pp = player.TransformComponent.WorldPosition
+		local now = _UtilLogic.ElapsedSeconds
+		local best = nil
+		local bestDistance = 0
+		local retained = nil
+		local intercept = nil
+		local interceptDistance = 1.8
+		local current = self._T.target
+		local targetDx = isvalid(current) and current.TransformComponent.WorldPosition.x - pp.x or 0
+		local chaseDir = targetDx >= 0 and 1 or -1
+		for _, comp in ipairs(self:GetMonsterComps(player) or {}) do
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
+				local e = comp.Entity
+				if isvalid(e) and e.Visible ~= false then
+					local ban = self._T.banned and self._T.banned[e] or 0
+					local mp = e.TransformComponent.WorldPosition
+					local targetFloor = self:GetFootholdIdBelow(player, mp.x, mp.y + 0.1, 0.8)
+					if ban <= now and math.abs(mp.y - pp.y) <= 0.4 and targetFloor > 0
+						and self:AreFootholdIdsConnected(player, floor.Id, targetFloor) then
+						-- 현재 층의 살아 있는 목표는 유지해 왕복 재선정을 막는다.
+						if e == self._T.target and (_ChannelManager:BaseName(player.CurrentMap.Name) ~= "001010000" or math.abs(mp.x-pp.x) <= 3) then retained = e end
+						local distance = math.abs(mp.x - pp.x)
+						if e ~= current and isvalid(current) and (mp.x-pp.x)*chaseDir >= 0
+							and distance + 0.35 < math.abs(targetDx) and distance < interceptDistance then
+							intercept, interceptDistance = e, distance
+						end
+                        if _ChannelManager:BaseName(player.CurrentMap.Name) == "001010000" and distance > 3 then continue end
+						if best == nil or distance < bestDistance then
+							best = e
+							bestDistance = distance
+						end
+					end
+				end
+			end
+		end
+		if isvalid(intercept) then
+			log("[AutoHunt] 추적 경로 앞 몬스터 우선 대응: " .. intercept.Name)
+			return intercept
+		end
+		if isvalid(retained) then return retained end
+		return best
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshPlatformTarget(Entity player, number now)
+		if (self._T.ropeState or "") == "climb" then return end
+		if self._T.platformScanMap ~= player.CurrentMap then
+			self._T.platformScanMap = player.CurrentMap
+			self._T.platformScanAt = 0
+		end
+		if (self._T.platformScanAt or 0) > now then return end
+		self._T.platformScanAt = now + 0.3
+		local nearby = self:FindCurrentPlatformTarget(player)
+		if not isvalid(nearby) or nearby == self._T.target then return end
+		self:EndRopeClimb(player, "현재 발판 몬스터 우선")
+		self._T.target = nearby
+		self._T.chaseStart = now
+		self._T.targetLockUntil = now + 5.0
+		self._T.nextScan = now + 0.3
+		log("[AutoHunt] 현재 발판의 남은 몬스터를 우선 선택")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -3279,64 +3519,9 @@ script AutoHuntManager extends Logic
 		end
 		if myFhId <= 0 then myFhId = self:GetFootholdIdBelow(player, pp.x, pp.y + 0.1, 1.5) end
 
-		-- ⚠ (신고 2026-08-10 "등반해서 위에 적을 잡으려는 것처럼 하다가 등반 이후 바로 다시 내려간다")
-		--   **등반 직후 층 고정.** 올라온 발판 위에 아직 잡을 적이 남아 있으면 그 적부터 정리하고,
-		--   아래층 후보는 아예 보지 않는다.
-		--   근본 원인: 둔덕에 올라서면 아래층(y-0.60)의 적도 `|relY| < 1.5`라 **같은 층으로 분류**되어
-		--   최근접 경쟁에 그대로 끼어든다. 착지 순간 x가 더 가까운 아래층 적이 이기면 곧바로 목표가
-		--   아래로 넘어가고, 하강 보류(1.2초)가 풀리는 즉시 내려간다 - 올라간 의미가 사라진다.
-		--   → 등반 후 3초 동안은 **내 발 높이 ±0.4 안의 적만** 후보로 본다(그런 적이 하나도 없으면
-		--     평소 규칙으로 되돌아가 정상적으로 아래층을 고른다).
-		--   ⚠ 폭이 0.4인 이유(실측 2026-08-10): 이 맵의 둔덕 높이가 **0.60**이라 ±0.8로 두면 바로 아래
-		--     바닥의 적까지 "같은 층"에 들어와, 층 고정 중에도 그쪽으로 걸어가다 가장자리에서 떨어졌다
-		--     (등반 1초 뒤 낙하 2건). 0.4면 0.60 단차를 확실히 가르면서 발판 경사/스프라이트 오차는 견딘다.
-		local layerHold = ((self._T.layerHoldUntil or 0) > now)
-		if layerHold then
-			local sameLayerAny = false
-			for _, comp in ipairs(comps) do
-				if isvalid(comp) and comp.IsDead ~= true then
-					local e = comp.Entity
-					if isvalid(e) and e.Visible ~= false then
-						local banUntil = nil
-						if self._T.banned ~= nil then banUntil = self._T.banned[e] end
-						if banUntil == nil or banUntil <= now then
-							local wpA = e.TransformComponent.WorldPosition
-							-- (신고 2026-08-10) 높이가 같아도 **끊긴 건너편 발판**이면 층 고정 대상이 아니다 -
-							-- 그쪽으로 걸어가면 가장자리에서 그대로 떨어진다.
-							if math.abs(wpA.y - pp.y) <= 0.4
-								and self:IsWalkConnectedToPoint(player, myFhId, wpA.x, wpA.y) then
-								sameLayerAny = true
-							end
-						end
-					end
-				end
-			end
-			if sameLayerAny then
-				local bestHold = nil
-				local bestHoldDx = 0
-				for _, comp in ipairs(comps) do
-					if isvalid(comp) and comp.IsDead ~= true then
-						local e = comp.Entity
-						if isvalid(e) and e.Visible ~= false then
-							local banUntil = nil
-							if self._T.banned ~= nil then banUntil = self._T.banned[e] end
-							if banUntil == nil or banUntil <= now then
-								local wp = e.TransformComponent.WorldPosition
-								if math.abs(wp.y - pp.y) <= 0.4
-									and self:IsWalkConnectedToPoint(player, myFhId, wp.x, wp.y) then
-									local dxH = math.abs(wp.x - pp.x)
-									if bestHold == nil or dxH < bestHoldDx then
-										bestHold = e
-										bestHoldDx = dxH
-									end
-								end
-							end
-						end
-					end
-				end
-				if bestHold ~= nil then return bestHold end
-			end
-		end
+		-- 거리나 등반 후 경과 시간보다 현재 발판의 남은 몬스터를 우선한다.
+		local platformTarget = self:FindCurrentPlatformTarget(player)
+		if isvalid(platformTarget) then return platformTarget end
 
 		-- 1차: 같은 층(|dy|<1.5) 후보의 최근접 수평 거리 - "같은 층 가까운 곳에 적이 있나" 판정.
 		-- 같은 패스에서 아래층(1.1유닛 이상 아래) 최근접 후보도 함께 찾는다 (하강 순환용).
@@ -3344,7 +3529,7 @@ script AutoHuntManager extends Logic
 		local belowBest = nil
 		local belowBestDist = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e.Visible ~= false then
 					local banUntil = nil
@@ -3352,7 +3537,7 @@ script AutoHuntManager extends Logic
 					if banUntil == nil or banUntil <= now then
 						local wp = e.TransformComponent.WorldPosition
 						local relY = wp.y - pp.y
-						if math.abs(relY) < 1.5 then
+						if math.abs(relY) < 1.5 and self:IsWalkConnectedToPoint(player, myFhId, wp.x, wp.y) then
 							local dxA = math.abs(wp.x - pp.x)
 							if sameLayerNearest == nil or dxA < sameLayerNearest then
 								sameLayerNearest = dxA
@@ -3369,24 +3554,7 @@ script AutoHuntManager extends Logic
 				end
 			end
 		end
-		-- (요청) 하강 우선 규칙: 같은 층 적의 수평 거리가 아래층 적까지 거리의 3배 이상이면
-		-- 멀리 걸어가는 대신 아래층 적을 대상으로 삼아 다운점프로 내려간다.
-		-- 같은 층에 적이 아예 없을 때도 아래층 적이 있으면 그쪽으로 내려간다.
-		-- (신고 2026-08-06) 단, 그 대상의 x에 착지 발판이 없으면(플레이어 층 아래가 뚫린 지형)
-		-- 다운점프로 내려갈 수 없다 - 하강 우선권을 주지 않는다(일반 점수 선정으로 넘어가고,
-		-- 거기서 골라져도 다운점프 분기의 발밑 검사가 즉시 제외한다).
-		if belowBest ~= nil then
-			local mapFB = player.CurrentMap
-			local fhFB = isvalid(mapFB) and mapFB.FootholdComponent or nil
-			local belowReachable = true
-			if isvalid(fhFB) then
-				local bx = belowBest.TransformComponent.WorldPosition.x
-				belowReachable = fhFB:Raycast(Vector2(bx, pp.y - 0.3), Vector2(0, -1), 8.0) ~= nil
-			end
-			if belowReachable and (sameLayerNearest == nil or sameLayerNearest >= belowBestDist * 3.0) then
-				return belowBest
-			end
-		end
+		-- 현재 발판을 비웠다면 위·아래 후보를 같은 거리 점수로 비교한다.
 		-- (요청) 같은 층 가까운 곳(4유닛 내)에 적이 없으면 위아래 적의 페널티를 크게 완화해
 		-- 수직 대상을 적극 선택한다 → 섬광(이동기) 사용 기회가 올라간다.
 		local sameLayerClose = (sameLayerNearest ~= nil and sameLayerNearest <= 4.0)
@@ -3406,6 +3574,8 @@ script AutoHuntManager extends Logic
 		-- 실제 도약은 추적 분기의 "앞점프로 위 발판 등반"이 하고, 올라설 발판 확인도 거기서 한다.
 		-- 이게 없으면 히어로처럼 이동기 없는 직업이 바로 위 발판의 적을 영영 후보에서 놓친다.
 		local plainReach = self:GetPlainJumpReach(player)
+		local airAttackExtra = 1.15
+		if self:HasMageAirBlockedSkill() or self:HasOnlyDelayedSnailAttack() then airAttackExtra = 0 end
 		-- (썬콜, 요청 2026-08-08) 텔레포트가 퀵슬롯에 있으면 위 발판 2.31유닛까지 수직 텔레포트로
 		-- 올라갈 수 있다 - 그 높이 안의 위층 적을 후보에 넣는다(실제 도약은 추적 분기의 텔레포트 이동이).
 		local tpReach = 0
@@ -3417,7 +3587,7 @@ script AutoHuntManager extends Logic
 		local aliveSumX = 0
 		local aliveCnt = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local eC = comp.Entity
 				if isvalid(eC) and eC.Visible ~= false then
 					aliveSumX = aliveSumX + eC.TransformComponent.WorldPosition.x
@@ -3435,7 +3605,7 @@ script AutoHuntManager extends Logic
 		local best = nil
 		local bestScore = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e.Visible ~= false then
 					local banUntil = nil
@@ -3453,7 +3623,8 @@ script AutoHuntManager extends Logic
 						-- (점프 사거리 + 위쪽 판정 박스 0.9)이 닿는 높이면 후보에 남긴다 - 실제 공격은
 						-- 추적 분기의 TryJumpAttack이 담당한다(그동안 이런 적은 무시됐다는 신고).
 						if relY >= 1.1 and not hasMobility and relY > hasteReach and relY > flashReach
-							and relY > tpReach and relY > plainReach + 1.15 and not ropeOk then
+							and relY > tpReach and relY > plainReach + airAttackExtra and not ropeOk
+							and self:FindIntermediateStep(player, pp, wp) == nil then
 							continue
 						end
 						-- ⚠ (신고 2026-08-10) **높이는 같으나 끊겨서 서로 갈 수 없는 발판**의 적은 후보가 아니다.
@@ -3468,7 +3639,7 @@ script AutoHuntManager extends Logic
 							-- (신고 2026-08-10 2차) **약간 위**(0.5↑)의 끊긴 선반 위 적은 점프 정점
 							-- 공격이 닿으면 후보에 남긴다 - 실제 공격은 추적 분기의 가장자리 점프
 							-- 공격(TryJumpAttack)이 담당한다. 그 외(같은 높이/아래의 건너편)는 기존대로 제외.
-							if not (relY >= 0.5 and relY <= plainReach + 1.15) then
+							if not (airAttackExtra > 0 and relY >= 0.5 and relY <= plainReach + airAttackExtra) then
 								continue
 							end
 						end
@@ -3488,7 +3659,7 @@ script AutoHuntManager extends Logic
 						-- 몬스터를 잡고").
 						local nbrCnt = 0
 						for _, compN in ipairs(comps) do
-							if isvalid(compN) and compN.IsDead ~= true then
+							if isvalid(compN) and compN.IsDead ~= true and not compN:IsDeathPending() then
 								local eN = compN.Entity
 								if isvalid(eN) and eN ~= e and eN.Visible ~= false then
 									local wpN = eN.TransformComponent.WorldPosition
@@ -3507,7 +3678,21 @@ script AutoHuntManager extends Logic
 							and (((wp.x - pp.x) > 0) == (centroidDir > 0)) then
 							score = score - 0.8
 						end
-						if best == nil or score < bestScore then
+						if _ChannelManager:BaseName(player.CurrentMap.Name) == "001010000" then
+                            score = math.sqrt(dxA*dxA + dyA*dyA)
+                            if relY > 0.4 then
+                                local route = self:FindUsableRope(player,pp,wp.y,wp.x)
+                                local hop = route == nil and self:FindIntermediateStep(player,pp,wp) or nil
+                                if route ~= nil then
+                                    score = math.abs(route.x-pp.x) + math.abs(wp.x-route.x) + dyA
+                                elseif hop ~= nil then
+                                    score = hop.routeCost or (score+1)
+                                elseif relY > plainReach then
+                                    continue
+                                end
+                            end
+                        end
+                        if best == nil or score < bestScore then
 							best = e
 							bestScore = score
 						end
@@ -3783,6 +3968,135 @@ script AutoHuntManager extends Logic
 		return false
 	end
 
+
+	@ExecSpace("ClientOnly")
+	method boolean CanBasicAttackReach(Entity player, Entity target)
+		local pp = player.TransformComponent.WorldPosition
+		local tp = target.TransformComponent.WorldPosition
+		local dx, dy = tp.x - pp.x, tp.y - pp.y
+		if _SkillManager:IsClawEquipped() or _SkillManager:IsArcherJob() then
+			local attack = player:GetComponent("script.PlayerAttack")
+			if not isvalid(attack) then return false end
+			local range = attack:GetBasicProjectileRange() - 0.15 - self:GetChaseRangeInset(player, target, 0.65)
+			return dx * dx + dy * dy <= range * range and dy >= -0.35 and dy <= 0.9
+		end
+		-- Match AttackNormal's one-unit forward box, allowing time for server acquisition.
+        local range = math.max(0.4, 0.95 - self:GetChaseRangeInset(player, target, 0.45))
+        return math.abs(dx) <= range and dy > -0.4 and dy < 0.9
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsAttackSkillReady(string name)
+		if not _SkillManager:IsSkillUsableByInvestment(name) or not _SkillManager:CanAffordSkillCost(name) then return false end
+		if name == "매직 미사일" then return _SkillManager:IsMagicMissileReady() end
+		if name == "블리자드" then return _SkillManager:IsBlizzardReady() end
+		if name == "메테오" then return _SkillManager:IsMeteorReady() end
+		local cooldowns = {
+			["샤이닝 레이"]="shiningRayCooldownUntil", ["제네시스"]="genesisCooldownUntil",
+			["암살"]="assassinateCooldownUntil", ["드레인 샷"]="drainShotCooldownUntil",
+			["익스플로젼"]="explosionCooldownUntil", ["포이즌 미스트"]="poisonMistCooldownUntil"
+		}
+		local field = cooldowns[name]
+		if field ~= nil and (_SkillManager._T[field] or 0) > _UtilLogic.ElapsedSeconds then
+			if name == "익스플로젼" or name == "포이즌 미스트" or not _SkillManager:IsInRecoveryAura() then return false end
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanSkillReachTarget(string name, Entity player, Entity target)
+		if not isvalid(target) then return false end
+		if name == "달팽이 세마리" then return self:CanAimSnail(player, target) end
+		local pp = player.TransformComponent.WorldPosition
+		local tp = target.TransformComponent.WorldPosition
+		local dx, dy = math.abs(tp.x - pp.x), tp.y - pp.y
+        dx = dx + self:GetChaseRangeInset(player, target, 0.65)
+		if name == "럭키세븐" or name == "트리플 스로우" or name == "쿼드러플 스로우" or name == "드레인 샷" then
+			if self:IsAwakeningOn() then return dx <= 15 and math.abs(dy) <= 7.5 end
+			return dx <= 7.6 and math.abs(dy) <= 0.9
+		end
+		if name == "암살" then
+			if self:ShouldSnipeWithAssassinate(tp.x-pp.x, dy) then return true end
+			return dx*dx + dy*dy <= 4.3*4.3
+		end
+		if name == "코마" then
+			local orbs = self:GetComboOrbCount(player)
+			local w = self:GetComaHalfWidth(math.max(1, orbs))
+			return orbs > 0 and dx <= w and math.abs(dy) <= w * 0.5
+		end
+		if name == "패닉" then return dx*dx + dy*dy <= 3.8*3.8 end
+		if name == "스나이핑" or name == "피어싱" then return dx <= 7.6 and math.abs(dy) <= 0.6 end
+		if name == "체인라이트닝" then return dx >= 0.5 and dx <= 5.5 and math.abs(dy) <= 0.8 + dx*0.45 end
+		-- 서버의 전방/광역 박스와 투사체 수명에 맞춘 값(이동 여유 포함).
+		-- {가로, 발 위치 기준 최소 y, 최대 y}. 짧은 스킬이 긴 스킬의 사거리를 물려받지 않는다.
+		if self._T.attackRanges == nil then
+			self._T.attackRanges = {
+				["더블샷"]={5.1,-0.35,1.0}, ["에로우 블로우"]={5.1,-0.35,1.0},
+				["에로우 봄"]={5.1,-0.35,1.0}, ["속사"]={5.6,-0.35,1.0}, ["폭풍의 시"]={5.6,-0.35,1.0},
+				["스트레이프"]={4.7,-0.35,1.0}, ["아이스 샷"]={4.6,-1.0,1.7}, ["파이어 샷"]={4.6,-1.0,1.7},
+				["아이언 에로우"]={6.5,-3.5,3.5}, ["어벤져"]={5.6,-0.6,0.6},
+				["매직클로"]={3.2,-0.9,0.9}, ["썬더볼트"]={2.8,-0.9,0.9},
+				["매직 미사일"]={5.5,-2.8,2.8}, ["파이어에로우"]={7.5,-0.6,0.6},
+				["홀리 에로우"]={8.5,-0.5,0.5}, ["엔젤레이"]={8.5,-0.5,0.5},
+				["샤이닝 레이"]={7.2,-3.5,3.5}, ["익스플로젼"]={2.8,-1.3,1.3},
+				["블리자드"]={12,-4.2,4.2}, ["메테오"]={12,-4.2,4.2}, ["제네시스"]={12,-4.2,4.2},
+				["드래곤 로어"]={14.5,-7.0,7.0},
+				["브랜디쉬"]={2.3,-0.9,0.9}, ["부메랑 스탭"]={3.3,-1.0,1.0},
+				["스피어 버스터"]={2.3,-1.0,1.0}, ["슬래시블러스트"]={1.8,-0.9,0.9},
+				["차지 블로우"]={1.8,-0.9,0.9}, ["어썰터"]={8.5,-1.8,1.8}
+			}
+		end
+		local box = self._T.attackRanges[name]
+		if box ~= nil then return dx <= box[1] and dy >= box[2] and dy <= box[3] end
+		return dx*dx + dy*dy <= 1.3*1.3 and dy > -0.6 and dy < 1.2
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasUsableAttackInRange(Entity player, Entity target)
+		if self:CanBasicAttackReach(player, target) then return true end
+		for _, slots in ipairs({self._T.slotSingles or {}, self._T.slotAoes or {}, self._T.slotComas or {}, self._T.slotPanics or {}, self._T.slotSnipings or {}, self._T.slotPiercings or {}}) do
+			for _, slot in ipairs(slots) do
+				if self:IsAttackSkillReady(slot.name) and self:CanSkillReachTarget(slot.name, player, target) then
+					local allowed = true
+					if slot.name == "슬래시블러스트" or slot.name == "슬래쉬블래스트" or slot.name == "파워스트라이크" then
+						local pos = player.TransformComponent.WorldPosition
+						local dir = target.TransformComponent.WorldPosition.x >= pos.x and 1 or -1
+						local count = self:CountMonstersInFront(player, pos, dir, 2.0)
+						allowed = slot.name == "파워스트라이크" and count < 4 or slot.name ~= "파워스트라이크" and count > 1
+					elseif slot.name == "코마" then
+						local orbs = self:GetComboOrbCount(player)
+						local width = self:GetComaHalfWidth(math.max(1, orbs))
+						local cap = self:GetComboOrbCapClient()
+						local need = 15
+						if orbs >= cap then need = self:IsWeakMonsterTarget(target) and 1 or 2
+						elseif orbs >= cap - 1 then need = 4 end
+						allowed = (self._T.nextComa or 0) <= _UtilLogic.ElapsedSeconds and orbs > 0
+							and self:CountMonstersInBox(player, player.TransformComponent.WorldPosition, width, width*0.5) >= need
+					elseif slot.name == "패닉" then
+						allowed = (self._T.nextPanic or 0) <= _UtilLogic.ElapsedSeconds and self:GetComboOrbCount(player) > 0
+							and self:GetTargetRemainHp(target) >= _SkillManager:PeekEffectiveCombatPower()*5
+					elseif slot.name == "스나이핑" or slot.name == "피어싱" then
+						local pos = player.TransformComponent.WorldPosition
+						local dir = target.TransformComponent.WorldPosition.x >= pos.x and 1 or -1
+						local count = self:CountMonstersInFront(player, pos, dir, 8)
+						allowed = slot.name == "스나이핑" and count >= 2 and (self._T.nextSniping or 0) <= _UtilLogic.ElapsedSeconds
+							or slot.name == "피어싱" and count >= 1 and (self._T.nextPiercing or 0) <= _UtilLogic.ElapsedSeconds
+					elseif slot.name == "드래곤 로어" then
+						local pc = player.PlayerComponent
+						allowed = isvalid(pc) and pc.Hp > pc.MaxHp * 0.6
+							and self:CountNearbyMonsters(player, player.TransformComponent.WorldPosition, 14) >= 2
+					elseif slot.name == "어썰터" then
+						allowed = (self._T.nextAssaulter or 0) <= _UtilLogic.ElapsedSeconds
+					elseif slot.name == "아이언 에로우" then
+						allowed = (self._T.nextIronArrow or 0) <= _UtilLogic.ElapsedSeconds
+					end
+					if allowed then return true end
+				end
+			end
+		end
+		return false
+	end
+
 	@ExecSpace("ClientOnly")
 	method boolean ShouldMageSnipe(Entity player, Vector3 pp, number dx, number dy)
 		-- 제자리 원거리 시전이 "이득인" 상황만 고른다 - 아무 때나 서 버리면 썬더볼트(근거리 주력) 위주
@@ -3893,7 +4207,7 @@ script AutoHuntManager extends Logic
 			-- 살아있는 몬스터가 하나도 없으면 리젠 대기 - 평소 배회/복귀 로직에 맡긴다.
 			local aliveCount = 0
 			for _, comp in ipairs(self:GetMonsterComps(player)) do
-				if isvalid(comp) and comp.IsDead ~= true then aliveCount += 1 end
+				if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then aliveCount += 1 end
 			end
 			if aliveCount == 0 then return false end
 			-- 제자리 난사 조건: 대상이 폭격 범위(가로 ±12 / 세로 ±4.2 - 실범위 12.5/4.7보다 살짝
@@ -4112,6 +4426,18 @@ script AutoHuntManager extends Logic
 		if stepUp <= 0 then return false end          -- 절벽(위에 아무것도 없음) - 뛰어봐야 소용없다
 		local reach = self:GetPlainJumpReach(player)
 		if stepUp > reach then return false end       -- 점프로 못 닿는 벽 - 추적 타임아웃이 대상을 바꾼다
+		-- 머리 위에 발판이 있다는 이유만으로 목표와 무관한 층으로 올라가지 않는다.
+		local target = self._T.target
+		if isvalid(target) then
+			local mp = target.TransformComponent.WorldPosition
+			local landing = self:GetFootholdIdBelow(player, pp.x + dir * 0.5, pp.y + stepUp + 0.1, 0.3)
+			local goal = self:GetFootholdIdBelow(player, mp.x, mp.y + 0.1, 0.8)
+			local current = rb:GetCurrentFoothold()
+			if landing <= 0 or goal <= 0 then return false end
+			local towardGoal = self:AreFootholdIdsConnected(player, landing, goal)
+			local continuousStep = current ~= nil and self:AreFootholdIdsConnected(player, current.Id, landing)
+			if not towardGoal and not continuousStep then return false end
+		end
 		self._T.nextJump = now + 1.0
 		self._T.jumpedAt = now
 		-- 턱을 넘은 직후 곧바로 도로 내려가지 않게: 하강 1.2초 보류 + 3초간 올라온 층 고정(신고 2026-08-10).
@@ -4165,7 +4491,7 @@ script AutoHuntManager extends Logic
 		-- 과확장은 아래 헛도약 안전망(2회 연속 박스 진입 실패 → 포기)이 자동으로 걸러낸다.
 		-- (신고 2026-08-11) 마법사는 공중 시전이 통째로 막혀 있다 - 점프 공격 자체를 봉인해
 		-- 호출부의 제외(ban)/로프·하강 경로가 대신 처리하게 한다.
-		if self:HasMageAirBlockedSkill() then return false end
+		if self:HasMageAirBlockedSkill() or self:HasOnlyDelayedSnailAttack() then return false end
 		if dy > reach + 1.15 then return false end
 		-- 헛도약 안전망: 같은 대상에게 2번 연속 "공중 시전 게이트에 못 넣은" 도약을 했으면 물리적으로
 		-- 못 닿는 기하다 - 더 뛰지 않고 포기해 호출부의 제외(ban)로 넘긴다(무한 도약 루프 방지).
@@ -4175,6 +4501,7 @@ script AutoHuntManager extends Logic
 			self._T.jumpAtkFails = 0
 		end
 		if (self._T.jumpAtkFails or 0) >= 2 then return false end
+        if self._T.jumpAttackProbe ~= nil then return true end
 		local rb = player.RigidbodyComponent
 		if not isvalid(rb) or not rb:IsOnGround() then return true end   -- 직전 도약 낙하 중 - 대기
 		local dir = (dx > 0) and 1 or -1
@@ -4206,11 +4533,13 @@ script AutoHuntManager extends Logic
 			self._T.chaseStart = now
 			return true   -- 도약 간격 대기(제자리)
 		end
+		if self:HasUpperFootholdInCombatJump(player, dir) then return false end
 		self._T.nextJumpAtk = now + 1.5
 		self._T.nextJump = now + 1.2
 		self._T.jumpedAt = now
 		self._T.jumpAtkUntil = now + 1.1
-		self._T.jumpAtkCastDone = false   -- 이번 도약에서 박스 진입(시전 시도)이 있었는지 - 헛도약 판정용
+		self._T.jumpAtkCastDone = false
+        self._T.jumpAttackProbe = {target=tgtJa, hp=self:GetTargetRemainHp(tgtJa), resolveAt=now + 1.45}
 		self._T.chaseStart = now
 		-- 공격 틱 위상(0.5초)이 상승 구간(0.5초)과 어긋나면 도약을 통째로 흘려보낸다 - 창을 여는
 		-- 순간 틱을 초기화해 공중 훅이 조준한 첫 순간에 바로 쏠 수 있게 한다.
@@ -4237,7 +4566,7 @@ script AutoHuntManager extends Logic
 		if not isvalid(map) then return {} end
 		if self._T.ropeCache ~= nil and self._T.ropeCacheMap == map then return self._T.ropeCache end
 
-		local comps = map:GetChildComponentsByTypeName("ClimbableComponent", true)
+		local comps = map:GetChildComponentsByTypeName("MOD.Core.ClimbableComponent", true)
 		-- 1) x별로 세그먼트 구간 모으기
 		local byX = {}
 		for _, c in ipairs(comps or {}) do
@@ -4245,7 +4574,7 @@ script AutoHuntManager extends Logic
 				local wp = c.Entity.TransformComponent.WorldPosition
 				local cx = wp.x + c.BoxOffset.x
 				local half = c.BoxSize.y * 0.5
-				local key = string.format("%.1f", cx)
+				local key = string.format("%.2f", wp.x)
 				if byX[key] == nil then byX[key] = { x = cx, segs = {} } end
 				table.insert(byX[key].segs, {
 					bot = wp.y + c.BoxOffset.y - half,
@@ -4292,13 +4621,11 @@ script AutoHuntManager extends Logic
 				local d = math.abs(r.x - pp.x)
 				-- 너무 먼 로프까지 원정을 가면 사냥 효율이 더 나빠진다(걸어가는 동안 리젠이 끝난다).
 				if d < bestD and d <= 12.0 then
-					-- 올라간 뒤 서게 될 발판(등반이 끝나는 높이 = min(대상 발높이, 로프 상단)의 로프 x 지점).
-					-- 발판을 못 찾으면(로프가 발판 가장자리 틈에 걸친 경우 등) 판정 불가로 보고 막지 않는다.
-					local landY = targetY
-					if r.top < landY then landY = r.top end
-					local landFhId = self:GetFootholdIdBelow(player, r.x, landY + 0.5, 2.5)
-					if targetFhId <= 0 or landFhId <= 0
-						or self:AreFootholdIdsConnected(player, landFhId, targetFhId) then
+					-- 실제 로프 상단의 도착 발판을 검사한다. 중간 높이를 검사하면
+					-- 목표 층을 지나 다른 층까지 올라가는 로프도 잘못 허용된다.
+					local landFhId = self:GetFootholdIdBelow(player, r.x, r.top + 0.3, 0.9)
+					if targetFhId > 0 and landFhId > 0
+						and self:AreFootholdIdsConnected(player, landFhId, targetFhId) then
 						best = r
 						bestD = d
 					end
@@ -4611,6 +4938,120 @@ script AutoHuntManager extends Logic
 		return true
 	end
 
+
+	@ExecSpace("ClientOnly")
+    method table FindIntermediateStep(Entity player, Vector3 pp, Vector3 target)
+        -- Search several intermediate stairs; the left training route is not a single hop.
+        local map = player.CurrentMap
+        if not isvalid(map) or _ChannelManager:BaseName(map.Name) ~= "001010000" then return nil end
+        local fh = map.FootholdComponent
+        if not isvalid(fh) then return nil end
+        local key = tostring(map.Id) .. "|" .. tostring(math.floor(pp.x*3)) .. "|" .. tostring(math.floor(pp.y*5)) .. "|" .. tostring(math.floor(target.x*2)) .. "|" .. tostring(math.floor(target.y*5))
+        if self._T.stepCacheKey == key and (self._T.stepCacheUntil or 0) > _UtilLogic.ElapsedSeconds then return self._T.stepCacheValue end
+        self._T.stepCacheKey = key
+        self._T.stepCacheUntil = _UtilLogic.ElapsedSeconds + 0.4
+        self._T.stepCacheValue = nil
+        local reach = self:GetPlainJumpReach(player)
+        local initialId = self:GetFootholdIdBelow(player, pp.x, pp.y+0.1, 0.6)
+        local targetId = self:GetFootholdIdBelow(player, target.x, target.y+0.1, 0.6)
+        if initialId <= 0 or targetId <= 0 then return nil end
+        local queue = {{point=pp, id=initialId, first=nil, depth=0}}
+        local visited = {[initialId]=true}
+        local footholds = fh:GetFootholdAll()
+        local cursor = 1
+        while cursor <= #queue and cursor <= 160 do
+            local node = queue[cursor]
+            cursor = cursor + 1
+            local from = node.point
+            if node.first ~= nil and (
+                (math.abs(from.y-target.y) < 0.25 and self:AreFootholdIdsConnected(player,node.id,targetId))
+                or self:FindUsableRope(player,from,target.y,target.x) ~= nil
+                or (math.abs(target.x-from.x) <= 2.0 and self:CanReachTargetLayer(player,from,target,reach))) then
+                local result = {x=node.first.x, y=node.first.y, launchX=node.first.launchX,
+                    routeCost=math.abs(node.first.launchX-pp.x)+math.abs(from.x-node.first.x)+math.abs(target.x-from.x)+math.abs(target.y-pp.y)*1.2}
+                self._T.stepCacheValue = result
+                return result
+            end
+            if node.depth >= 8 then continue end
+            local launchFloors = {}
+            for _, floor in pairs(footholds) do
+                if not floor:IsVertical() and self:AreFootholdIdsConnected(player,node.id,floor.Id) then
+                    table.insert(launchFloors,floor)
+                end
+            end
+            for _, step in pairs(footholds) do
+                if step:IsVertical() or visited[step.Id] then continue end
+                local left = math.min(step.StartPoint.x,step.EndPoint.x)+0.08
+                local right = math.max(step.StartPoint.x,step.EndPoint.x)-0.08
+                if right < left then continue end
+                local x = math.max(left,math.min(right,from.x))
+                local y = step:GetYByX(x)
+                if y <= from.y+0.15 or y > from.y+reach or y > target.y+0.1 then continue end
+                local point = Vector3(x,y,pp.z)
+                -- Maple footholds are one-way platforms: upward rays must not reject a valid landing.
+                local landingId = self:GetFootholdIdBelow(player,x,y+0.1,0.25)
+                if landingId <= 0 then continue end
+                -- Walk to the edge of the current platform before measuring the jump gap.
+                -- Measuring from its arrival point rejects the entire left staircase.
+                local launchX = from.x
+                local gap = math.abs(x-from.x)
+                for _, floor in ipairs(launchFloors) do
+                    local floorLeft = math.min(floor.StartPoint.x,floor.EndPoint.x)+0.12
+                    local floorRight = math.max(floor.StartPoint.x,floor.EndPoint.x)-0.12
+                    if floorRight < floorLeft then continue end
+                    local edgeX = math.max(floorLeft,math.min(floorRight,x))
+                    if math.abs(floor:GetYByX(edgeX)-from.y) > 0.3 then continue end
+                    local edgeGap = math.abs(x-edgeX)
+                    if edgeGap < gap then launchX = edgeX gap = edgeGap end
+                end
+                if gap > 1.65 then continue end
+                local first = node.first or {x=x,y=y,launchX=launchX}
+                visited[step.Id] = true
+                table.insert(queue,{point=point,id=step.Id,first=first,depth=node.depth+1})
+            end
+        end
+        return nil
+    end
+
+	@ExecSpace("ClientOnly")
+	method boolean IntermediateStepTick(Entity player, Vector3 pp, Vector3 target, number now, number delta)
+		if (self._T.ropeState or "") ~= "" then return false end
+		local hop = self._T.intermediateHop
+		if self._T.intermediateMap ~= player.CurrentMap then hop = nil self._T.intermediateHop = nil end
+		if hop ~= nil and (self._T.intermediateUntil or 0) <= now then hop = nil self._T.intermediateHop = nil end
+		if hop == nil then
+			if target.y <= pp.y + 0.15 then return false end
+			if self:FindUsableRope(player, pp, target.y, target.x) ~= nil then return false end
+			hop = self:FindIntermediateStep(player, pp, target)
+			if hop == nil then return false end
+		end
+		local rb = player.RigidbodyComponent
+		local controller = player.PlayerControllerComponent
+		if isvalid(controller) then controller.Enable = false end
+		local airborne = isvalid(rb) and not rb:IsOnGround()
+        local aimX = airborne and hop.x or (hop.launchX or hop.x)
+        local dx = aimX - pp.x
+		local dir = dx >= 0 and 1 or -1
+		if math.abs(dx) > 0.08 then
+			if isvalid(controller) then controller.LookDirectionX = dir end
+			player.MovementComponent:MoveToDirection(Vector2(dir, 0), delta)
+			self._T.moving = true
+		end
+		if isvalid(rb) and rb:IsOnGround() and math.abs(dx) <= 0.14 and hop.y > pp.y + 0.15 then
+			self:StopMoving()
+            if isvalid(controller) then controller.Enable = false end
+            local jumpDir = hop.x >= pp.x and 1 or -1
+            if math.abs(hop.x-pp.x) > 0.1 then player.MovementComponent:MoveToDirection(Vector2(jumpDir,0),delta) end
+            player.MovementComponent:Jump()
+            self._T.intermediateHop = hop
+			self._T.intermediateMap = player.CurrentMap
+			self._T.intermediateUntil = now + 0.85
+			log("[AutoHunt] 중간 발판으로 점프 x=" .. tostring(hop.x) .. " y=" .. tostring(hop.y))
+		end
+		self._T.chaseStart = now
+		return true
+	end
+
 	@ExecSpace("ClientOnly")
 	method number GetHasteJumpReach()
 		if _HasteBuffUI:GetRemaining() <= 0 then return 0 end
@@ -4833,7 +5274,7 @@ script AutoHuntManager extends Logic
 		local ny = dirY / len
 		local n = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e.Visible ~= false then
 					local wp = e.TransformComponent.WorldPosition
@@ -4906,7 +5347,7 @@ script AutoHuntManager extends Logic
 		if comps == nil then return 0 end
 		local n = 0
 		for _, comp in ipairs(comps) do
-			if isvalid(comp) and comp.IsDead ~= true then
+			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
 				if isvalid(e) and e.Visible ~= false then
 					local wp = e.TransformComponent.WorldPosition
@@ -4940,6 +5381,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean TryComaCast(number now, Entity player, Vector3 pp, Entity target)
+		if not self:IsAttackSkillReady("코마") or not self:CanSkillReachTarget("코마", player, target) then return false end
 		-- 코마 자기 규칙. 시전했으면 true.
 		if self._T.slotComas == nil or #self._T.slotComas == 0 then return false end
 		-- ⚠ 자체 스로틀 필수: 코마/패닉은 공용 쿨다운(skillOnCooldown, 0.75×공속)을 쓰므로 쿨 중에는
@@ -4984,6 +5426,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean TryPanicCast(number now, Entity player, Vector3 pp, Entity target)
+		if not self:IsAttackSkillReady("패닉") or not self:CanSkillReachTarget("패닉", player, target) then return false end
 		-- 패닉 자기 규칙: **잘 죽지 않는 단일 대상(보스/탱커) 전용.** 시전했으면 true.
 		-- 구슬 1개당 1000%~1200%의 단일기라 잡몹에게 쓰면 구슬만 날린다 - 그 구슬은 코마가 써야 한다.
 		-- 기준: 남은 HP가 전투력의 5배를 넘는다(= 기본 공격 몇 대로는 안 죽는다).
@@ -5116,6 +5559,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean TrySnipingCast(number now, Entity player, Vector3 pp, Entity target)
+		if not self:IsAttackSkillReady("스나이핑") or not self:CanSkillReachTarget("스나이핑", player, target) then return false end
 		if self._T.slotSnipings == nil or #self._T.slotSnipings == 0 then return false end
 		if (self._T.nextSniping or 0) > now then return false end
 		-- (요청 2026-08-13) 스나이핑이 MP 50을 쓰게 됐다 - 못 내면 아예 시작하지 않는다.
@@ -5161,6 +5605,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean TryPiercingCast(number now, Entity player, Vector3 pp, Entity target)
+		if not self:IsAttackSkillReady("피어싱") or not self:CanSkillReachTarget("피어싱", player, target) then return false end
 		if self._T.slotPiercings == nil or #self._T.slotPiercings == 0 then return false end
 		if (self._T.nextPiercing or 0) > now then return false end
 		local lookDirPc = 1
@@ -5216,4 +5661,124 @@ script AutoHuntManager extends Logic
 		self._T.stuckCount = 0
 	end
 
+    @ExecSpace("ClientOnly")
+    method void ResolveJumpAttack(number now)
+        -- A cast attempt is not a hit. Evaluate after the throw delay and flight time.
+        local probe = self._T.jumpAttackProbe
+        if probe == nil or now < probe.resolveAt then return end
+        self._T.jumpAttackProbe = nil
+        self._T.jumpAtkUntil = 0
+        local damaged = not isvalid(probe.target) or self:GetTargetRemainHp(probe.target) < probe.hp
+        if damaged then
+            self._T.jumpAtkFails = 0
+        else
+            if self._T.jumpAtkFailTgt ~= probe.target then self._T.jumpAtkFails = 0 end
+            self._T.jumpAtkFailTgt = probe.target
+            self._T.jumpAtkFails = (self._T.jumpAtkFails or 0) + 1
+            if self._T.jumpAtkFails >= 2 then
+                self._T.banned = self._T.banned or {}
+                self._T.banned[probe.target] = now + 15
+                if self._T.target == probe.target then self._T.target = nil end
+            end
+            log("[AutoHunt] jump attack without damage=" .. tostring(self._T.jumpAtkFails) .. "/2")
+        end
+    end
+    @ExecSpace("ClientOnly")
+    method boolean HasOnlyDelayedSnailAttack()
+        -- Its 0.5-second windup releases after the short jump's aiming window.
+        -- Reach upper platforms by climbing/walking instead of looping jump throws.
+        local hasSnail = false
+        for _, slot in ipairs(self._T.slotSingles or {}) do
+            if slot.name ~= "달팽이 세마리" then return false end
+            hasSnail = true
+        end
+        return hasSnail and #(self._T.slotAoes or {}) == 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanAimSnail(Entity player, Entity target)
+        -- Match the projectile's launch height, four-unit range and vertical acquisition band.
+        if not isvalid(player) or not isvalid(target) or not player.RigidbodyComponent:IsOnGround() then return false end
+        local hit = target.HitComponent
+        if not isvalid(hit) then return false end
+        local offset = hit.IsLegacy and hit.BoxOffset or hit.ColliderOffset
+        local center = target.TransformComponent:ToWorldPoint(Vector3(offset.x, offset.y, 0))
+        local pos = player.TransformComponent.WorldPosition
+        local dir = center.x >= pos.x and 1 or -1
+        local dx, dy = center.x - (pos.x + dir * 0.3), center.y - (pos.y + 0.3)
+        local range = 3.8 - self:GetChaseRangeInset(player, target, 0.85)
+        return dx * dir >= 0 and math.abs(dy) <= 0.95 and dx * dx + dy * dy < range * range
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateChaseAim(number now, Entity player)
+        -- Sample target world motion even while the player's attack animation holds movement.
+        local target = self._T.target
+        local mon = isvalid(target) and target:GetComponent("script.Monster") or nil
+        if not isvalid(mon) or mon.IsDead or target.CurrentMap ~= player.CurrentMap then
+            self._T.chaseSample = nil
+            self._T.attackProbe = nil
+            self._T.rangeCorrection = nil
+            return
+        end
+        local sample = self._T.chaseSample
+        local x = target.TransformComponent.WorldPosition.x
+        if sample == nil or sample.target ~= target or sample.life ~= mon.LifeSerial then
+            self._T.chaseSample = {target=target, life=mon.LifeSerial, x=x, time=now, vx=0}
+            self._T.attackProbe = nil
+            self._T.rangeCorrection = nil
+        elseif now - sample.time >= 0.12 then
+            local dt = now - sample.time
+            local vx = (x - sample.x) / dt
+            sample.vx = dt <= 0.5 and math.abs(vx) <= 8 and vx or 0
+            sample.x = x
+            sample.time = now
+        end
+        local probe = self._T.attackProbe
+        if probe ~= nil and now >= probe.untilTime then
+            self._T.attackProbe = nil
+            if probe.target == target and probe.life == mon.LifeSerial and not probe.hit then
+                local previous = self._T.rangeCorrection
+                local extra = previous ~= nil and previous.target == target and previous.extra or 0
+                extra = math.min(1.2, extra + 0.3)
+                self._T.rangeCorrection = {target=target, extra=extra}
+                self._T.nextAtk = 0
+                log("[AutoHunt] No contact confirmed; approach closer by " .. tostring(extra))
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method number GetChaseRangeInset(Entity player, Entity target, number leadTime)
+        -- Predict outward travel only; successful stationary attacks keep their normal range.
+        local extra = 0
+        local correction = self._T.rangeCorrection
+        if correction ~= nil and correction.target == target then extra = correction.extra end
+        local sample = self._T.chaseSample
+        if sample ~= nil and sample.target == target then
+            local dx = target.TransformComponent.WorldPosition.x - player.TransformComponent.WorldPosition.x
+            local dir = dx >= 0 and 1 or -1
+            extra = math.max(extra, math.min(1.2, math.max(0, sample.vx * dir) * leadTime))
+        end
+        return extra
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BeginAttackProbe(number now, Entity target)
+        -- Do not let repeated shots postpone the no-contact deadline indefinitely.
+        if self._T.attackProbe ~= nil then return end
+        local mon = target:GetComponent("script.Monster")
+        if not isvalid(mon) then return end
+        self._T.attackProbe = {target=target, life=mon.LifeSerial, untilTime=now+2.8, hit=false}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ConfirmAttackContact(Entity target, integer life)
+        -- A zero-damage hit is still contact: accuracy MISS must not trigger distance correction.
+        if not self.autoOn then return end
+        local probe = self._T.attackProbe
+        if probe ~= nil and probe.target == target and probe.life == life then
+            probe.hit = true
+        end
+    end
 end

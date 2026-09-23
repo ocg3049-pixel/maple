@@ -13,12 +13,27 @@ script WorldMapManager extends Logic
             self:WireSleepywoodTouch()
             self:WireRegionTouches()
             self:WireRegionDestinations()
+            self._T.recommendEnabled = false
+            local check = _EntityService:GetEntityByPath("/ui/WorldMapGroup/LevelFilter")
+            if isvalid(check) then
+                self._T.filterButton = check
+                self._T.filterClick = check:ConnectEvent(ButtonClickEvent, function()
+                    self._T.recommendEnabled = not self._T.recommendEnabled
+                    local mark = _EntityService:GetEntityByPath("/ui/WorldMapGroup/LevelFilter/Box/Mark")
+                    if isvalid(mark) then mark.Enable = self._T.recommendEnabled end
+                    self:RefreshLevelFilterMark()
+                    self._T.recommendElapsed = 1
+                    _UIAudio:Play("BtMouseClick")
+                    log("[WorldMap] level filter=" .. tostring(self._T.recommendEnabled))
+                end)
+            end
             log("[WorldMap] 초기화 완료")
         end
     end
 
     method void OnEndPlay()
         if self:IsClient() then
+            if isvalid(self._T.filterButton) and self._T.filterClick then self._T.filterButton:DisconnectEvent(ButtonClickEvent, self._T.filterClick) end
             self:UnwireVictoriaTouch()
             self:UnwireSleepywoodTouch()
             self:UnwireRegionTouches()
@@ -94,6 +109,11 @@ script WorldMapManager extends Logic
     method void OnUpdate(number delta)
         if not self:IsClient() then return end
         self:FollowMapTooltip(delta)
+        self:UpdateLevelRecommendations(delta)
+        local filter = _EntityService:GetEntityByPath("/ui/WorldMapGroup/LevelFilter")
+        if isvalid(filter) then
+            self:LayoutLevelFilter()
+        end
 
         -- 단축키 세팅의 퀵슬롯 리매핑 키 캡처 중에는 월드맵/Esc 폴링을 무시한다 (눌림 상태만 갱신)
         -- 월드맵 키는 키설정(])에서 옮길 수 있으므로 하드코딩(M) 대신 기능 매핑으로 눌림을 확인한다
@@ -140,7 +160,7 @@ script WorldMapManager extends Logic
         end
         local player = _UserService.LocalPlayer
         local mapName = ""
-        if isvalid(player) and isvalid(player.CurrentMap) then mapName = player.CurrentMap.Name end
+        if isvalid(player) and isvalid(player.CurrentMap) then mapName = _ChannelManager:BaseName(player.CurrentMap.Name) end
         self:ShowMapPage(self:GetPageForMap(mapName))
     end
 
@@ -191,6 +211,7 @@ script WorldMapManager extends Logic
         -- 구현된 상세 지도 ID를 먼저 조회하고 빅토리아 기본 맵을 처리한다.
         if self._T.mapPages ~= nil and self._T.mapPages[mapName] ~= nil then return self._T.mapPages[mapName] end
         if string.match(mapName, "^105%d%d%d%d%d%d$") then return "sleepywood" end
+        if string.match(mapName, "^0%d%d%d%d%d%d%d%d$") then return "victoria" end
         if mapName == "map01" or string.match(mapName, "^10%d%d%d%d%d%d%d$") then return "victoria" end
         return "world"
     end
@@ -217,7 +238,12 @@ script WorldMapManager extends Logic
         self._T.lastRegionDot = nil
         self:ClearRegionSelection()
         self:RefreshRegionDestinations()
+        self:LayoutLevelFilter()
+        self:RefreshLevelFilterMark()
+        self._T.recommendElapsed = 1
+        self:UpdateLevelRecommendations(0)
         group.Enable = true
+        _MapleIslandTutorial:Notify("worldmap")
         log("[WorldMap] 페이지 열림: " .. page)
     end
 
@@ -292,7 +318,10 @@ script WorldMapManager extends Logic
             local point = spawn.Entity.TransformComponent.WorldPosition
             position = Vector3(point.x, point.y + 0.1, 0)
         end
-        _TeleportService:TeleportToMapPosition(player, position, mapId)
+        _MapPortalSystem:NotifyMapTravel(mapId, userId)
+        local channelMap = _ChannelManager:EnsureMap(mapId, userId)
+        if channelMap == "" then return end
+        _TeleportService:TeleportToMapPosition(player, position, channelMap)
         log("[WorldMap] 맵 이동: " .. userId .. " → " .. mapId)
     end
 
@@ -1374,15 +1403,25 @@ script WorldMapManager extends Logic
             {page = "ludus", panel = "LudusPanel", name = "RegionDot52", maps = {"220010800"}},
         }
         self:ConfigureSubregions()
+        for _, panelName in pairs(self:GetMapPanels()) do
+            local panel = _EntityService:GetEntityByPath("/ui/WorldMapGroup/" .. panelName)
+            if isvalid(panel) then
+                for _, dot in ipairs(panel.Children:ToTable()) do
+                    if string.match(dot.Name, "^RegionDot%d+$") then self:PrepareRegionDot(dot) end
+                end
+            end
+        end
         self._T.regionPointByEntity = {}
         self._T.regionHoverPages = {}
         for _, entry in ipairs(self._T.regionPointEntries) do
             local dot = _EntityService:GetEntityByPath("/ui/WorldMapGroup/" .. entry.panel .. "/" .. entry.name)
             if isvalid(dot) then
+                entry.animationRUID = self._T.regionDotOriginal[dot.Id]
+                entry.idleRUID = self._T.regionDotIdle[dot.Id]
                 dot.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.NativeSize
                 dot.SpriteGUIRendererComponent.StartFrameIndex = 0
                 dot.SpriteGUIRendererComponent.EndFrameIndex = 0
-                dot.SpriteGUIRendererComponent.PlayRate = 1
+                dot.SpriteGUIRendererComponent.PlayRate = 0
                 self._T.regionPointByEntity[dot.Id] = entry
                 entry.entity = dot
                 self._T.regionHoverPages[entry.page] = self._T.regionHoverPages[entry.page] or {}
@@ -1441,16 +1480,20 @@ script WorldMapManager extends Logic
             if self:IsPageWithin(entry.page, self._T.mapPage or "") and (self._T.regionMapFilter == nil or self._T.regionMapFilter[entry.id]) then table.insert(entries, entry) end
         end
         self._T.visibleDestinations = entries
+        self._T.destinationEntryByRow = {}
         local total = math.max(1, math.ceil(#entries / 20))
         local index = math.max(1, math.min(total, self._T.regionListPage or 1))
         self._T.regionListPage = index
         self._T.destinationPageCount = total
         self._T.lastDestination = nil
+        self:HideMapTooltip()
+        self._T.tooltipRowMap = nil
         for rowIndex = 1, 20 do
             local row = panel:GetChildByName("Row" .. tostring(rowIndex))
             local entry = entries[(index - 1) * 20 + rowIndex]
             if isvalid(row) then
                 row.Enable = entry ~= nil
+                self._T.destinationEntryByRow[row.Id] = entry
                 if entry ~= nil then row.TextGUIRendererComponent.Text = entry.title end
                 row.SpriteGUIRendererComponent.Color = rowIndex % 2 == 1 and Color(0.91, 0.84, 0.68, 0.8) or Color(0.97, 0.94, 0.85, 0.8)
             end
@@ -1478,8 +1521,7 @@ script WorldMapManager extends Logic
         end
         local rowIndex = tonumber(string.match(row.Name, "^Row(%d+)$"))
         if rowIndex == nil then return end
-        local index = ((self._T.regionListPage or 1) - 1) * 20 + rowIndex
-        local entry = self._T.visibleDestinations and self._T.visibleDestinations[index]
+        local entry = self._T.destinationEntryByRow and self._T.destinationEntryByRow[row.Id]
         if entry == nil then return end
         local now = _UtilLogic.ElapsedSeconds
         if self._T.lastDestination == entry.id and now - (self._T.lastDestinationTime or -99) < 0.4 then
@@ -1501,9 +1543,11 @@ script WorldMapManager extends Logic
         end
         if isvalid(self._T.activeRegionDot) then
             local sprite = self._T.activeRegionDot.SpriteGUIRendererComponent
+            local entry = self._T.regionPointByEntity[self._T.activeRegionDot.Id]
+            if entry ~= nil then sprite.ImageRUID = DataRef(entry.idleRUID) end
             sprite.StartFrameIndex = 0
             sprite.EndFrameIndex = 0
-            sprite.PlayRate = 1
+            sprite.PlayRate = 0
         end
         self._T.activeRegionDot = nil
     end
@@ -1530,6 +1574,7 @@ script WorldMapManager extends Logic
         self._T.regionListPage = 1
         self:ClearRegionSelection()
         self._T.activeRegionDot = dot
+        dot.SpriteGUIRendererComponent.ImageRUID = DataRef(entry.animationRUID)
         dot.SpriteGUIRendererComponent.EndFrameIndex = 2147483647
         dot.SpriteGUIRendererComponent.PlayRate = 1
         dot.SpriteGUIRendererComponent.AnimClipPlayType = SpriteAnimClipPlayType.Loop
@@ -1861,9 +1906,14 @@ script WorldMapManager extends Logic
                 local lines = {}
                 for row = 1, rows do
                     local mob = monsters[(col-1)*rows+row]
-                    if mob ~= nil then table.insert(lines, "Lv." .. tostring(mob.level) .. "  " .. mob.name) end
+                    if mob ~= nil then
+                        local difference = mob.level - math.max(1, _UIMyInfoManager.DisplayLevel)
+                        local color = difference > 10 and "#FF3333" or (difference > 5 and "#FF8C1A" or (difference < -5 and "#FFE633" or "#FFFFFF"))
+                        table.insert(lines, "<color=" .. color .. ">Lv." .. tostring(mob.level) .. "  " .. mob.name .. "</color>")
+                    end
                 end
                 if #monsters == 0 then lines = {"출현 몬스터 없음"} end
+                body.TextGUIRendererComponent.IsRichText = true
                 body.TextGUIRendererComponent.Text = table.concat(lines,"\n")
                 body.UITransformComponent.RectSize = Vector2(300,rows*24+4)
                 body.UITransformComponent.anchoredPosition = Vector2(-width/2+16+(col-0.5)*310,-22)
@@ -1904,6 +1954,39 @@ script WorldMapManager extends Logic
         if not isvalid(group) or not group.EnabledInHierarchy then
             if isvalid(self._T.tooltipTarget) then self:HideMapTooltip() end
             return
+        end
+        local panelNameForRows = self:GetMapPanels()[self._T.mapPage or ""]
+        local rowPanel = panelNameForRows and group:GetChildByName(panelNameForRows)
+        local list = isvalid(rowPanel) and rowPanel:GetChildByName("Destinations") or nil
+        if isvalid(list) and list.EnabledInHierarchy then
+            local hoveredRow = nil
+            local hoveredEntry = nil
+            local closest = math.huge
+            for i = 1, 20 do
+                local row = list:GetChildByName("Row" .. tostring(i))
+                local entry = isvalid(row) and self._T.destinationEntryByRow and self._T.destinationEntryByRow[row.Id]
+                if isvalid(row) and row.EnabledInHierarchy and row.VisibleInHierarchy and entry ~= nil then
+                    local tr = row.UITransformComponent
+                    local pos = _UILogic:ScreenToLocalUIPosition(cursor, tr)
+                    local size, pivot = tr.RectSize, tr.Pivot
+                    local dx = pos.x - (0.5-pivot.x)*size.x
+                    local dy = pos.y - (0.5-pivot.y)*size.y
+                    -- 세로 확장은 인접 행과 겹치지 않게 하고 가로 여유는 유지한다.
+                    if math.abs(dx) <= size.x/2+10 and math.abs(dy) <= size.y/2 and math.abs(dy) < closest then
+                        hoveredRow, hoveredEntry, closest = row, entry, math.abs(dy)
+                    end
+                end
+            end
+            if isvalid(hoveredRow) then
+                self._T.tooltipOutsideTime = 0
+                if self._T.tooltipTarget ~= hoveredRow or self._T.tooltipRowMap ~= hoveredEntry.id then
+                    self:ShowMapTooltip({hoveredEntry.id}, hoveredEntry.title, hoveredRow)
+                    self._T.tooltipRowMap = hoveredEntry.id
+                    log("[WorldMapRowTooltip] " .. hoveredRow.Name .. " map=" .. hoveredEntry.id .. " title=" .. hoveredEntry.title)
+                end
+                self:PositionMapTooltip()
+                return
+            end
         end
         local nearest = nil
         local best = math.huge
@@ -2381,4 +2464,114 @@ script WorldMapManager extends Logic
 		end
 		return self._T.mapMonsterCatalog[mapId] or {}
 	end
+    @ExecSpace("ClientOnly")
+    method void UpdateLevelRecommendations(number delta)
+        -- 레벨이 바뀔 때만 추천 목록을 계산하고 점의 기존 애니메이션으로 강조한다.
+        local group = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        if not isvalid(group) or not group.Enable then return end
+        self._T.recommendElapsed = (self._T.recommendElapsed or 0) + delta
+        if self._T.recommendElapsed < 0.2 then return end
+        self._T.recommendElapsed = 0
+        local level = math.max(1, _UIMyInfoManager.DisplayLevel)
+        for _, entry in ipairs(self._T.regionPointEntries or {}) do
+            if entry.recommendLevel ~= level then
+                entry.recommendLevel = level
+                entry.recommended = false
+                for _, mapId in ipairs(entry.maps or {}) do
+                    for _, mob in ipairs(self:GetMapMonsters(mapId)) do
+                        if math.abs(mob.level - level) <= 5 then entry.recommended = true break end
+                    end
+                    if entry.recommended then break end
+                end
+            end
+            local dot = entry.entity
+            if isvalid(dot) then
+                local sprite = dot.SpriteGUIRendererComponent
+                local animate = dot == self._T.activeRegionDot or (self._T.recommendEnabled and entry.recommended)
+                local ruid = animate and entry.animationRUID or entry.idleRUID
+                if sprite.ImageRUID.DataId ~= ruid then sprite.ImageRUID = DataRef(ruid) end
+                local last = animate and 2147483647 or 0
+                if sprite.EndFrameIndex ~= last or sprite.PlayRate ~= (animate and 1 or 0) then
+                    sprite.StartFrameIndex = 0
+                    sprite.EndFrameIndex = last
+                    sprite.PlayRate = animate and 1 or 0
+                    sprite.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LayoutLevelFilter()
+        local group = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        local filter = isvalid(group) and group:GetChildByName("LevelFilter") or nil
+        local panelName = self:GetMapPanels()[self._T.mapPage or "world"]
+        local panel = isvalid(group) and group:GetChildByName(panelName) or nil
+        if not isvalid(filter) or not isvalid(panel) then return end
+        local edge = panel:GetChildByName("Destinations")
+        if not isvalid(edge) then edge = panel end
+        local pt = panel.UITransformComponent
+        local et = edge.UITransformComponent
+        local right = pt.anchoredPosition.x + (1-pt.Pivot.x)*pt.RectSize.x
+        local bottom = pt.anchoredPosition.y - pt.Pivot.y*pt.RectSize.y
+        if edge ~= panel then
+            right = pt.anchoredPosition.x + et.anchoredPosition.x + (1-et.Pivot.x)*et.RectSize.x
+            bottom = math.min(bottom, pt.anchoredPosition.y+et.anchoredPosition.y-et.Pivot.y*et.RectSize.y)
+        end
+        local size = filter.UITransformComponent.RectSize
+        filter.UITransformComponent.anchoredPosition = Vector2(right-size.x/2,bottom-size.y/2-36)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PrepareRegionDot(Entity dot)
+        local sprite = dot.SpriteGUIRendererComponent
+        if not isvalid(sprite) then return end
+        self._T.regionDotOriginal = self._T.regionDotOriginal or {}
+        self._T.regionDotIdle = self._T.regionDotIdle or {}
+        self._T.regionDotFrames = self._T.regionDotFrames or {}
+        local original = self._T.regionDotOriginal[dot.Id] or string.gsub(sprite.ImageRUID.DataId,"^thumbnail://","")
+        local idle = self._T.regionDotFrames[original]
+        if idle == nil then
+            idle = original
+            local ok, clip = pcall(function() return _ResourceService:LoadAnimationClipAndWait(original) end)
+            if ok and clip ~= nil and clip.IsLoadComplete then
+                local smallest = math.huge
+                for _, frame in ipairs(clip.Frames:ToTable()) do
+                    local image = frame.FrameSprite
+                    if image ~= nil and image.Width >= 5 and image.Height >= 5 then
+                        local area = image.Width*image.Height
+                        if area < smallest then smallest = area idle = image.RUID end
+                    end
+                end
+            end
+            self._T.regionDotFrames[original] = idle
+            log("[WorldMap] normal dot sprite " .. original .. " -> " .. idle)
+        end
+        self._T.regionDotOriginal[dot.Id] = original
+        self._T.regionDotIdle[dot.Id] = idle
+        sprite.ImageRUID = DataRef(idle)
+        sprite.StartFrameIndex = 0
+        sprite.EndFrameIndex = 0
+        sprite.PlayRate = 0
+        sprite.Enable = true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshLevelFilterMark()
+        local filter = _EntityService:GetEntityByPath("/ui/WorldMapGroup/LevelFilter")
+        if not isvalid(filter) then return end
+        local surface = filter:GetChildByName("Surface")
+        local label = filter:GetChildByName("Label")
+        local box = filter:GetChildByName("Box")
+        if isvalid(surface) then _UILogic:SetSiblingIndex(surface.UITransformComponent,1) end
+        if isvalid(label) then _UILogic:SetSiblingIndex(label.UITransformComponent,2) end
+        if not isvalid(box) then return end
+        box.Enable = true
+        _UILogic:SetSiblingIndex(box.UITransformComponent,3)
+        local mark = box:GetChildByName("Mark")
+        if isvalid(mark) then
+            _UILogic:SetSiblingIndex(mark.UITransformComponent,100)
+            mark.Enable = self._T.recommendEnabled == true
+        end
+    end
 end

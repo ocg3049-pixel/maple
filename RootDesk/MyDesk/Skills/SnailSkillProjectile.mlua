@@ -40,31 +40,30 @@ script SnailSkillProjectile extends Component
         self:FindNearestTarget(dirX)
     end
 
+    method Vector3 GetTargetCenter(Entity target)
+        -- 발밑 원점 대신 몬스터 이미지에 맞춰진 피격 박스의 중심을 추적한다.
+        local hit = target.HitComponent
+        local offset = hit.IsLegacy and hit.BoxOffset or hit.ColliderOffset
+        return target.TransformComponent:ToWorldPoint(Vector3(offset.x, offset.y, 0))
+    end
+
     @ExecSpace("ServerOnly")
     method void FindNearestTarget(number dirX)
-        local myPos = self.Entity.TransformComponent.Position
+        -- 지형/NPC/아군은 타깃으로 잡지 않는다. 중첩된 몬스터 엔티티도 검색한다.
+        local myPos = self.Entity.TransformComponent.WorldPosition
         local currentMap = self.Entity.CurrentMap
         if not isvalid(currentMap) then return end
-
         local nearest = nil
-        local nearestDist = self.MaxRange + 1
-
-        for _, child in ipairs(currentMap.Children:ToTable()) do
-            if isvalid(child) then
-                local hc = child.HitComponent
-                local tc = child.TransformComponent
-                if isvalid(hc) and isvalid(tc) then
-                    local tPos = tc.Position
-                    local dx = tPos.x - myPos.x
-                    local dy = tPos.y - myPos.y
-                    -- Only consider targets in the firing direction
-                    if (dirX > 0 and dx > 0) or (dirX < 0 and dx < 0) then
-                        local dist = math.sqrt(dx * dx + dy * dy)
-                        if dist < nearestDist and math.abs(dy) <= self.YTolerance * 2 then
-                            nearestDist = dist
-                            nearest = child
-                        end
-                    end
+        local nearestDist = self.MaxRange
+        for _, monster in ipairs(currentMap:GetChildComponentsByTypeName("script.Monster", true)) do
+            local target = monster.Entity
+            if isvalid(target) and target.Enable and not monster.IsDead and monster.Hp > 0 and isvalid(target.HitComponent) and target.HitComponent.Enable then
+                local tPos = self:GetTargetCenter(target)
+                local dx, dy = tPos.x - myPos.x, tPos.y - myPos.y
+                local dist = math.sqrt(dx * dx + dy * dy)
+                if dx * dirX >= 0 and dist < nearestDist and math.abs(dy) <= self.YTolerance then
+                    nearestDist = dist
+                    nearest = target
                 end
             end
         end
@@ -73,57 +72,48 @@ script SnailSkillProjectile extends Component
 
     @ExecSpace("ServerOnly")
     method void OnUpdate(number delta)
-        if self._T.hit then return end
-
-        local moveX = self.SyncDirX
-        local moveY = 0
-
-        if self._T.targetEntity ~= nil and isvalid(self._T.targetEntity) then
-            local myPos = self.Entity.TransformComponent.Position
-            local tPos = self._T.targetEntity.TransformComponent.Position
-            local dx = tPos.x - myPos.x
-            local dy = tPos.y - myPos.y
-            local d = math.sqrt(dx * dx + dy * dy)
-            if d > 0.01 then
-                moveX = dx / d
-                moveY = dy / d
-            end
-        end
-
-        local dist = self.Speed * delta
-        self.Entity.TransformComponent:Translate(moveX * dist, moveY * dist)
-        self._T.moved = self._T.moved + dist
-
-        if self._T.moved >= self.MaxRange then
+        -- 물리 바디 없는 투사체: 지형은 통과하고 이동 경로의 몬스터만 판정한다.
+        if self._T.hit or self.SyncDirX == 0 then return end
+        if not isvalid(self._T.ownerEntity) or self._T.ownerEntity.CurrentMap ~= self.Entity.CurrentMap then
             _EntityService:Destroy(self.Entity)
             return
         end
-
-        -- Start hit detection only after moving 0.5 units to prevent self-damage
-        if self._T.moved >= 0.5 then
+        local remaining = math.min(self.Speed * delta, self.MaxRange - self._T.moved)
+        while remaining > 0 do
+            local pos = self.Entity.TransformComponent.WorldPosition
+            local moveX, moveY = self.SyncDirX, 0
+            local distance = math.min(0.12, remaining)
+            local target = self._T.targetEntity
+            if isvalid(target) and target.CurrentMap == self.Entity.CurrentMap and isvalid(target.Monster) and not target.Monster.IsDead and isvalid(target.HitComponent) then
+                local tPos = self:GetTargetCenter(target)
+                local dx, dy = tPos.x - pos.x, tPos.y - pos.y
+                local d = math.sqrt(dx * dx + dy * dy)
+                if d > 0.001 then moveX, moveY = dx / d, dy / d end
+                distance = math.min(distance, math.max(0.001, d))
+            end
+            self.Entity.TransformComponent:Translate(moveX * distance, moveY * distance)
+            self._T.moved = self._T.moved + distance
+            remaining = remaining - distance
             local ac = self.Entity.SnailSkillProjectileAttack
-            if ac ~= nil then
-                local pos = self.Entity.TransformComponent.Position
-                local hits = ac:AttackFrom(
-                    Vector2(0.6, self.YTolerance * 2),
-                    pos:ToVector2(),
-                    "snailSkill",
-                    CollisionGroups.HitBox
-                )
+            if isvalid(ac) then
+                local position = self.Entity.TransformComponent.WorldPosition
+                local hits = ac:AttackFrom(Vector2(0.20, 0.20), position:ToVector2(), "snailSkill", CollisionGroups.HitBox)
+                for _, defender in ipairs(ac._T.restoreSkins or {}) do
+                    if isvalid(defender) and not isvalid(defender:GetComponent("MOD.Core.DamageSkinSpawnerComponent")) then
+                        defender:AddComponent("MOD.Core.DamageSkinSpawnerComponent")
+                    end
+                end
+                ac._T.restoreSkins = nil
                 if hits ~= nil and #hits > 0 then
                     self._T.hit = true
-                    local hc = hits[1]
-                    if isvalid(hc) and isvalid(hc.Entity) then
-                        local tc = hc.Entity.TransformComponent
-                        if isvalid(tc) then
-                            local tp = tc.Position
-                            self._T.hitTargetPos = Vector3(tp.x, tp.y + 0.1, tp.z)
-                        end
-                    end
+                    self._T.hitTargetPos = position
+                    log("[SnailSkill] hit=" .. hits[1].Entity.Name)
                     self:OnHit()
+                    return
                 end
             end
         end
+        if self._T.moved >= self.MaxRange then _EntityService:Destroy(self.Entity) end
     end
 
     @ExecSpace("ServerOnly")
@@ -144,7 +134,7 @@ script SnailSkillProjectile extends Component
             self.HitEffectRUID, mapEnt,
             Vector3(px, py, pz), 0, Vector3(1, 1, 1), false
         )
-        _SoundService:PlaySound("04edcf3c77b049bc9bfa1fa0f541b063", 1.0)
+        _GameAudio:PlaySound("04edcf3c77b049bc9bfa1fa0f541b063", 1.0)
     end
 
 end

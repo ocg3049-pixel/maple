@@ -24,7 +24,8 @@ script CharacterPersistence extends Logic
 		-- 클라이언트: 월드 입장 후 서버에 캐릭터 목록을 요청(응답 올 때까지 재시도).
 		if self:IsServer() then
 			self._T.sv = {}
-			_UserService:ConnectEvent(UserLeaveEvent, self.OnUserLeave)
+			self._T.locationTimer = _TimerService:SetTimerRepeat(self.CaptureAllLocations, 1.0)
+			self._T.userLeaveListener = _UserService:ConnectEvent(UserLeaveEvent, self.OnUserLeave)
 			self._T.svFlushTimer = _TimerService:SetTimerRepeat(self.ServerFlushTick, 10.0)
 		else
 			self._T.cl = {
@@ -53,12 +54,25 @@ script CharacterPersistence extends Logic
 	end
 
 	method void OnEndPlay()
+		-- 저장 요청이 대기하더라도 종료 시 타이머와 리스너는 먼저 해제한다.
+		if self._T.locationTimer then _TimerService:ClearTimer(self._T.locationTimer) end
+		if self._T.svFlushTimer then _TimerService:ClearTimer(self._T.svFlushTimer) end
+		if self._T.clListTimer then _TimerService:ClearTimer(self._T.clListTimer) end
+		self._T.locationTimer = nil
+		self._T.svFlushTimer = nil
+		self._T.clListTimer = nil
+		if self._T.userLeaveListener then
+			_UserService:DisconnectEvent(UserLeaveEvent, self._T.userLeaveListener)
+			self._T.userLeaveListener = nil
+		end
+		log("[PersistCleanup] timers and listener released server=" .. tostring(self:IsServer()))
 		-- Maker Play Test를 정지하는 경우 개별 유저의 UserLeaveEvent가 발생하지 않고 월드 세션이 통째로
 		-- 끝나버릴 수 있다 - 이 경우 10초 주기 flush 전이면 최근 변경분(메소 등)이 저장소에 반영되지
 		-- 않은 채 유실된다. OnEndPlay(월드 세션 종료)에서 클라이언트는 대기 중인 변경분을 즉시 서버로
 		-- 보내고, 서버는 캐시된 모든 유저의 dirty 데이터를 동기적으로 최종 flush한다.
 		if self:IsServer() then
 			for userId, _ in pairs(self._T.sv) do
+				self:CaptureLocation(userId)
 				self:FlushUserNow(userId)
 			end
 		else
@@ -67,8 +81,7 @@ script CharacterPersistence extends Logic
 				self:FlushToServer()
 			end
 		end
-		if self._T.svFlushTimer then _TimerService:ClearTimer(self._T.svFlushTimer) end
-		if self._T.clListTimer then _TimerService:ClearTimer(self._T.clListTimer) end
+
 	end
 
 	-- ══════════════════════════ 공용: 문자열 유틸 ══════════════════════════
@@ -261,6 +274,7 @@ script CharacterPersistence extends Logic
 
 	@ExecSpace("ServerOnly")
 	method void FlushUserNow(string userId)
+        _ItemHallOfFame:Flush()
 		-- 해당 유저의 dirty 데이터를 전부 동기 저장 (퇴장 시점 - 블로킹 허용).
 		local sv = self._T.sv[userId]
 		if sv == nil then return end
@@ -350,6 +364,7 @@ script CharacterPersistence extends Logic
 		-- 유저 퇴장: 마지막으로 받아둔 상태를 즉시 저장하고 캐시 해제 (로그아웃 시 아이템 유실 방지).
 		local userId = tostring(event.UserId)
 		log("[Persist] 유저 퇴장 - 최종 저장: " .. userId)
+		self:CaptureLocation(userId)
 		self:FlushUserNow(userId)
 		self._T.sv[userId] = nil
 	end
@@ -406,6 +421,8 @@ script CharacterPersistence extends Logic
 		end
 		local now = DateTime.UtcNow.Elapsed
 		local id = tostring(now) .. "_" .. tostring(#sv.list + 1)
+		if pipeCount == 7 then dataStr = dataStr .. "|NONE" end
+        dataStr = dataStr .. "|-1|1"
 		table.insert(sv.list, { id = id, createdAt = now, data = dataStr })
 		local ec2 = self:GetRegistry():SetAndWait(name, senderUserId)
 		if ec2 ~= 0 then
@@ -431,6 +448,7 @@ script CharacterPersistence extends Logic
 		local ch = sv.list[index]
 		if ch == nil then return end
 		table.remove(sv.list, index)
+        _ItemHallOfFame:Queue(senderUserId, ch.id, "", "")
 		table.insert(sv.trash, { id = ch.id, deletedAt = DateTime.UtcNow.Elapsed, data = ch.data })
 		local ecD = sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
 		sv.charsDirty = (ecD ~= 0)
@@ -484,6 +502,10 @@ script CharacterPersistence extends Logic
 		sv.lastName = name
 		sv.accountDirty = true
 		sv.activeId = id
+		sv.newCharacter = saveStr == ""
+        _ItemHallOfFame:Queue(senderUserId, id, name, saveStr)
+		sv.location = string.match("\n" .. saveStr, "\n(L\t[^\n]+)") or ""
+		sv.locationReady = false
 		-- 감사용 기준 메소 기록 (세이브 첫 줄 "M\t<메소>")
 		sv.lastMeso[id] = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
 		self:AppendAudit(sv, id, "enter", sv.lastMeso[id], 0, false)
@@ -499,6 +521,7 @@ script CharacterPersistence extends Logic
 		local sv = self._T.sv[senderUserId]
 		if sv == nil or sv.activeId == "" then return end
 		local id = sv.activeId
+		saveStr = self:WithLocation(saveStr, sv.location or "")
 		if sv.saves[id] == saveStr then return end
 
 		local meso = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
@@ -522,7 +545,7 @@ script CharacterPersistence extends Logic
 		-- (유실 방지) 강화 계열 스냅샷은 10초 주기 flush를 기다리지 않고 즉시 비동기 기록한다 -
 		-- 그 사이 서버가 내려가도 파괴/성공이 롤백되지 않도록. 성공 시에만 dirty를 내리고(그 사이
 		-- 새 스냅샷이 왔으면 유지), 실패하면 dirty가 남아 다음 틱이 재시도한다.
-		if string.find(reason, "enhance", 1, true) ~= nil then
+		if string.find(reason, "enhance", 1, true) ~= nil or string.find(reason, "preferences", 1, true) ~= nil then
 			local writtenStr = saveStr
 			sv.storage:SetAsync("save_" .. id, writtenStr, function(ec, key)
 				if ec == 0 then
@@ -534,6 +557,7 @@ script CharacterPersistence extends Logic
 		end
 		-- 캐릭터 목록의 외형 필드도 최신 장비로 맞춘다 (선택창 슬롯 아바타가 지금 입은 장비를 보여주도록)
 		self:SyncCharDataFromSave(sv, id, saveStr)
+        _ItemHallOfFame:Queue(senderUserId, id, sv.lastName, saveStr)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -580,7 +604,9 @@ script CharacterPersistence extends Logic
 		if capR == nil then capR = "NONE" end
 		newData = newData .. "|" .. parts[8] .. "|" .. capR
         local power = string.match("\n" .. saveStr, "\nCP\t(%d+)") or parts[10]
-        if power ~= nil then newData = newData .. "|" .. power end
+        newData = newData .. "|" .. (power or "-1")
+        local level = string.match("\n" .. saveStr, "\nLV\t(%d+)") or parts[11]
+        if level ~= nil then newData = newData .. "|" .. level end
 		if newData ~= ch.data then
 			ch.data = newData
 			sv.charsDirty = true
@@ -594,7 +620,7 @@ script CharacterPersistence extends Logic
 		local out = {}
 		if charsStr == "" then return out end
 		for _, line in ipairs(self:SplitLines(charsStr)) do
-			local tabPos = string.find(line, "\t", 1, true)
+			local tabPos = (string.find(line, "\t", 1, true))
 			if tabPos ~= nil then
 				table.insert(out, { id = string.sub(line, 1, tabPos - 1), data = string.sub(line, tabPos + 1) })
 			end
@@ -644,10 +670,10 @@ script CharacterPersistence extends Logic
 			createGroup.Enable = false
 		end
 
-		_LoginFlow:ShowCharacters()
+		_LoginFlow._T.returnSelection = #cl.chars
+        _LoginFlow:ShowCharacters()
 
-		self:PopulateSelectUI()
-		-- 방금 만든 캐릭터(마지막 슬롯) 선택
+        -- 방금 만든 캐릭터(마지막 슬롯) 선택
 		local selectBg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup/SelectBackground")
 		if isvalid(selectBg) then
 			local comp = selectBg:GetComponent(CharacterSelectComponent)
@@ -659,9 +685,16 @@ script CharacterPersistence extends Logic
 	method void OnDeleteResult(string charsStr)
 		-- 캐릭터 삭제 결과: 목록 갱신 + 선택창 다시 채움.
 		local cl = self._T.cl
-		cl.chars = self:DecodeCharsReply(charsStr)
-		self:PopulateSelectUI()
-		local selectBg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup/SelectBackground")
+		local beforeSelection = _LoginFlow:SelectComponent()
+        if isvalid(beforeSelection) then beforeSelection:SelectSlot(0) end
+        _LoginFlow._T.infoTime = 0
+        _LoginFlow._T.infoSelection = nil
+        cl.chars = self:DecodeCharsReply(charsStr)
+        _LoginFlow._T.returnSelection = nil
+        local selection = _LoginFlow:SelectComponent()
+        if isvalid(selection) then selection.selectedSlot = 0 end
+        self:PopulateSelectUI()
+        local selectBg = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/CharacterSelectGroup/SelectBackground")
 		if isvalid(selectBg) then
 			local comp = selectBg:GetComponent(CharacterSelectComponent)
 			if isvalid(comp) then comp:SelectSlot(0) end
@@ -683,11 +716,22 @@ script CharacterPersistence extends Logic
 		local cl = self._T.cl
 		-- 직전 캐릭터의 보존 라인이 새 캐릭터 세이브에 섞이지 않게 초기화 (RestoreSave가 다시 채움)
 		cl.unknownLines = {}
+		_MapleIslandTutorial:Restore(saveStr)
+        _GameSystemMenu:RestorePreferences(saveStr)
 		if saveStr ~= "" then
 			self:RestoreSave(saveStr)
 		else
-			log("[Persist] 신규 캐릭터 - 초기 상태를 저장합니다")
+			_DecoWindowManager:ImportDeco({})
+			_CharInfoManager.atkSpeedStage = 4
+			_CharInfoManager.potionAttackBonus = 0
+			_SkillManager:ImportSkillLevels({})
+			_SkillManager:ImportHotkeys({})
+			_SkillManager:ImportRefundedSkillSlots({})
+			_SkillManager:ImportShuriken(1)
+			_SkillManager:ImportShurikenCounts({})
+			log("[Persist] 신규 캐릭터 - 부위별 0성 기본 장비 상태를 저장합니다")
 		end
+		_EnhancementManager:RestorePendingCubeChoice(saveStr)
 		cl.entered = true
 		cl.lastSentStr = ""
 		self:MarkDirty("init")
@@ -801,8 +845,10 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 세이브 포맷 버전 - 향후 포맷 변경 시 RestoreSave가 이 값으로 마이그레이션
 		-- 분기를 태운다. 서버 감사 로그가 첫 줄 "M\t"를 앵커로 파싱하므로 M 다음 줄에 둔다.
 		table.insert(lines, "V\t1")
+		table.insert(lines, "Q\t" .. tostring(_MapleIslandTutorial.step) .. "\t2")
         -- 선택 화면용 표시 스냅샷. 게임 전투 판정에는 사용하지 않는다.
         table.insert(lines, "CP\t" .. tostring(math.max(0, math.floor(_CharInfoManager:CalcCombatPower()))))
+        table.insert(lines, "LV\t" .. tostring(_CharInfoManager:GetDisplayLevel()))
 		-- potionAttackBonus(공격력 물약 보너스)는 세션 전용 스탯이라 저장하지 않는다(항상 0으로 기록,
 		-- 포맷 호환 유지) - "물약으로 오른 스탯은 종료 시 사라져야 한다"는 요청 반영.
 		table.insert(lines, "A\t" .. tostring(_CharInfoManager.atkSpeedStage) .. "\t0")
@@ -879,6 +925,9 @@ script CharacterPersistence extends Logic
 			end
 		end
 		-- (표창+) 던질 표창으로 고른 번호 - "게임을 꺼도 저장되어 있어야 한다"는 요청.
+		table.insert(lines, _GameSystemMenu:ExportPreferences())
+        local pendingCube = _EnhancementManager:ExportPendingCubeChoice()
+        if pendingCube ~= "" then table.insert(lines, pendingCube) end
 		table.insert(lines, "S\t" .. tostring(_SkillManager:ExportShuriken()))
 		-- (표창 재고) "SC\t<표창 번호>\t<보유 개수>" - 2~9번만(1번은 무제한), 0개는 생략한다.
 		local shCounts = _SkillManager:ExportShurikenCounts()
@@ -900,7 +949,7 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 복원 때 이 빌드가 해석하지 못해 보존해 둔 라인들을 그대로 재부착한다 -
 		-- 구버전 빌드가 신버전 세이브를 열어도 모르는 데이터를 지우지 않는다(라운드트립 보존).
 		for _, ln in ipairs(self._T.cl.unknownLines or {}) do
-			if string.sub(ln, 1, 3) ~= "CP\t" then table.insert(lines, ln) end
+			if string.sub(ln, 1, 6) ~= "PCUBE\t" and string.sub(ln, 1, 5) ~= "PREF\t" and string.sub(ln, 1, 3) ~= "CP\t" and string.sub(ln, 1, 3) ~= "LV\t" and string.sub(ln, 1, 2) ~= "Q\t" and string.sub(ln, 1, 2) ~= "L\t" then table.insert(lines, ln) end
 		end
 		return table.concat(lines, "\n")
 	end
@@ -924,9 +973,11 @@ script CharacterPersistence extends Logic
 		local unknown = {}       -- (업데이트 내구성) 이 빌드가 모르는 라인 - 버리지 않고 보존
 		for _, line in ipairs(self:SplitLines(saveStr)) do
 			local kind = string.sub(line, 1, 1)
-			if kind == "M" then
+			if kind == "Q" or kind == "L" or string.sub(line, 1, 5) == "PREF\t" or string.sub(line, 1, 6) == "PCUBE\t" then
+				-- 튜토리얼은 Restore, 위치는 서버가 복원한다.
+			elseif kind == "M" then
 				t.meso = tonumber(string.sub(line, 3)) or 0
-			elseif string.sub(line, 1, 3) == "CP\t" then
+			elseif string.sub(line, 1, 3) == "CP\t" or string.sub(line, 1, 3) == "LV\t" then
                 -- 표시 요약은 장비/스킬 복원 후 다시 계산하므로 게임 상태로 복원하지 않는다.
             elseif kind == "V" then
 				-- 세이브 포맷 버전(현재 1) - 향후 포맷이 바뀌면 이 값으로 마이그레이션 분기
@@ -1069,15 +1120,6 @@ script CharacterPersistence extends Logic
 		-- 항상 0에서 시작한다. 이미 2000이 저장된 기존 캐릭터도 이 줄로 즉시 정상화된다.
 		_CharInfoManager.potionAttackBonus = 0
 		_DecoWindowManager:ImportDeco(deco)
-		-- 치장 시스템 도입 전에 저장된 캐릭터라면 기본 치장 아이템 지급
-		_UIEquipInventoryManager:SeedDecoItemsIfEmpty()
-		-- 공격력 물약 도입 전에 저장된 캐릭터라면 물약 999개 지급
-		_UIEquipInventoryManager:SeedAttackPotionIfEmpty()
-		-- (요청) 테스트용 소모품(드롭 아이템 / 공격 속도의 비약 / 연두색주문서)을 999개로 채워준다.
-		_UIEquipInventoryManager:SeedTestConsumables()
-		-- (테스트 지원 2026-08-08) 4차 소환(궁수 소환 등)을 확인하려면 표시 레벨 120+가 필요한데,
-		-- 표시 레벨은 장비 전투력에서 환산되므로 99성 장비 하나를 장비 탭에 넣어준다.
-		_UIEquipInventoryManager:SeedTestStarforceEquip()
 		self:ApplyCostumeFromEquips()
 		-- 기능(창 열기/공격/점프) 키 매핑을 먼저 복원해야 단축키 복원 시 기능 키 판정이 올바르다
 		_KeySettingManager:ImportFuncKeys(funcMap)
@@ -1103,5 +1145,133 @@ script CharacterPersistence extends Logic
 		-- 복원된 장비+치장 상태를 실제 아바타 외형에 반영한다 (치장이 외형 우선 — DecoWindowManager가 전담)
 		_DecoWindowManager:ApplyAppearance()
 	end
+
+	method string WithLocation(string saveStr, string location)
+		local lines = {}
+		for _, line in ipairs(self:SplitLines(saveStr)) do
+			if string.sub(line, 1, 2) ~= "L\t" then table.insert(lines, line) end
+		end
+		if location ~= nil and location ~= "" then table.insert(lines, location) end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CaptureLocation(string userId)
+		local sv = self._T.sv[userId]
+		if sv == nil or sv.activeId == "" or not sv.locationReady then return end
+		local player = _UserService:GetUserEntityByUserId(userId)
+		if not isvalid(player) or not isvalid(player.CurrentMap) then return end
+		local mapId = _ChannelManager:BaseName(player.CurrentMap.Name)
+		if mapId == "login" then return end
+		local pos = player.TransformComponent.WorldPosition
+		-- 좌표는 서버에서 관측한다. 공중/사다리 좌표 대신 마지막 지상 좌표를 사용한다.
+		local rb = player.RigidbodyComponent
+		if isvalid(rb) and not rb:IsOnGround() then
+			local previousMap = string.match(sv.location or "", "^L\t([^\t]+)")
+			if previousMap == mapId then return end
+			local spawn = player.CurrentMap:GetFirstChildComponentByTypeName("MOD.Core.SpawnLocationComponent", true)
+			if not isvalid(spawn) then return end
+			pos = spawn.Entity.TransformComponent.WorldPosition
+		end
+		local line = "L\t" .. mapId .. "\t" .. string.format("%.2f", pos.x) .. "\t" .. string.format("%.2f", pos.y + 0.1)
+		if sv.location == line then return end
+		sv.location = line
+		local raw = sv.saves[sv.activeId]
+		if raw ~= nil and raw ~= "" then
+			sv.saves[sv.activeId] = self:WithLocation(raw, line)
+			sv.dirtySaves[sv.activeId] = true
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CaptureAllLocations()
+		for userId, _ in pairs(self._T.sv) do self:CaptureLocation(userId) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean EnterSavedMap(string userId, Entity player)
+		local sv = self._T.sv[userId]
+		if sv == nil or sv.activeId == "" then return false end
+		local raw = sv.saves[sv.activeId] or ""
+		local mapId = raw == "" and "001010000" or "104000000"
+		local x, y = nil, nil
+		for _, line in ipairs(self:SplitLines(raw)) do
+			if string.sub(line, 1, 2) == "L\t" then
+				local f = self:SplitTabs(line)
+				mapId = f[2] or mapId
+				x = tonumber(f[3])
+				y = tonumber(f[4])
+			end
+		end
+		-- 신규 초기 스냅샷이 RPC보다 먼저 도착해도 최초 입장 목적지는 유지한다.
+		if sv.newCharacter then mapId = "001010000"; x = nil; y = nil end
+		local destination = _EntityService:GetEntityByPath("/maps/" .. mapId)
+		if mapId == "login" or not isvalid(destination) then
+			mapId = "104000000"
+			destination = _EntityService:GetEntityByPath("/maps/" .. mapId)
+			x = nil; y = nil
+		end
+		if not isvalid(destination) then return false end
+		local pos = Vector3(0, 0, 0)
+		local spawn = destination:GetFirstChildComponentByTypeName("MOD.Core.SpawnLocationComponent", true)
+		if isvalid(spawn) then
+			local p = spawn.Entity.TransformComponent.WorldPosition
+			pos = Vector3(p.x, p.y + 0.1, 0)
+		end
+		if x ~= nil and y ~= nil and x == x and y == y and math.abs(x) < 10000 and math.abs(y) < 10000 then pos = Vector3(x, y, 0) end
+		sv.location = "L\t" .. mapId .. "\t" .. tostring(pos.x) .. "\t" .. tostring(pos.y)
+		sv.locationReady = true
+		if raw ~= "" then
+			sv.saves[sv.activeId] = self:WithLocation(raw, sv.location)
+			sv.dirtySaves[sv.activeId] = true
+		end
+		local channelMap = _ChannelManager:EnsureMap(mapId, userId)
+		if channelMap == "" then return false end
+		_TeleportService:TeleportToMapPosition(player, pos, channelMap)
+		log("[PersistLocation] entry " .. mapId .. " x=" .. tostring(pos.x) .. " y=" .. tostring(pos.y))
+		return true
+	end
+
+    @ExecSpace("Server")
+    method void RequestSessionExit(string mode, string snapshot)
+        if mode ~= "channel" and mode ~= "character" and mode ~= "quit" then return end
+        local uid = senderUserId
+        local session = _LoginFlow._T.sessions[uid]
+        if session == nil or session.leaving then return end
+        session.leaving = true
+        local sv = self._T.sv[uid]
+        if sv ~= nil and sv.activeId ~= "" then
+            self:CaptureLocation(uid)
+            if snapshot ~= "" then self:PushCharacterSave(snapshot, "session_exit") end
+            local id = sv.activeId
+            local data = sv.saves[id]
+            if data ~= nil and data ~= "" then
+                local ec = sv.storage:SetAndWait("save_" .. id, data)
+                if ec ~= 0 then
+                    session.leaving = false
+                    _GameSystemMenu:ExitResult(false, mode, "저장하지 못했습니다. 잠시 후 다시 시도해주세요.", uid)
+                    return
+                end
+                sv.dirtySaves[id] = nil
+            end
+            self:FlushUserNow(uid)
+            sv.activeId = ""
+            sv.locationReady = false
+        end
+        session.entered = false
+        session.authorized = false
+        session.warping = false
+        session.lastList = -100
+        session.leaving = false
+        if mode == "quit" then
+            _GameSystemMenu:ExitResult(true, mode, "", uid)
+            _UserService:KickUser(uid, KickReason.WorldContent)
+            return
+        end
+        local p = _UserService:GetUserEntityByUserId(uid)
+        if isvalid(p) then _TeleportService:TeleportToMapPosition(p, Vector3(0,0,0), "login") end
+        _GameSystemMenu:ExitResult(true, mode, "", uid)
+        log("[SessionExit] saved mode=" .. mode)
+    end
 
 end

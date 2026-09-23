@@ -1,0 +1,99 @@
+@Logic
+script MonsterDropRules extends Logic
+
+    method table GetItems()
+            return {
+                { ruid = "9d6404b526184e85aeddfd6728e39fdb", name = "공격 속도의 비약", rate = 0.0003, fixedRate = true },
+                -- (재보정) 드롭 아이템 박스: 파괴가 5성부터로 잦아진 만큼 공급도 늘림 (0.05% → 1.5%)
+                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", name = "드롭 아이템", rate = 0.015 },
+                { ruid = "b2300eda46f3445e9b1c6e774a2ee95a", name = "레드큐브", rate = 0.005 },
+                { ruid = "b8f0af90c30b462f859f45bdc1878d8b", name = "블랙큐브", rate = 0.002 },
+                { ruid = "af5404f4c8fc4ec78ccc1a57446f69db", name = "에디셔널큐브", rate = 0.004 },
+                { ruid = "9c2a12b9a92f44d4b6dd95c7fb182ac9", name = "화이트 에디셔널큐브", rate = 0.0015 },
+                { ruid = "0f134eebddee4b368062790b46afc26a", name = "에디셔널 잠재능력 부여주문서", rate = 0.0005 },
+                { ruid = "a6c6ff42196548dd874b83332ad5b336", name = "프로텍트 주문서", rate = 0.0002 },
+                { ruid = "14267ae8e168458480697c148ddfdcab", name = "잠재능력 부여주문서", rate = 0.0005 },
+                -- (요청) 아바타 장비(상의/하의/망토/장갑/신발)는 몬스터가 드롭하지 않는다 -
+                -- 소비 탭의 "드롭 아이템" 박스로만 뽑을 수 있다(UIEquipInventoryManager 박스 지급 경로).
+            }
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Drop(Entity monster, Entity killer, integer monsterLevel)
+        if not isvalid(monster) then return end
+        local deathPos = monster.TransformComponent.WorldPosition
+        local dropMap = monster.CurrentMap
+        if isvalid(dropMap) then
+            -- (요청 2026-08-12) 초보자 패시브 "아이템 감각" - 마지막 공격자의 보너스(%)를 **메소 획득량과
+            -- 모든 확률 아이템 드랍**에 함께 곱한다(분배당 +1%, 마스터 100 = 2배). 킬러를 못 찾으면 1.0.
+            -- 메소·아이템 두 블록이 같은 값을 쓰므로 여기서 한 번만 구한다.
+            local dropMult = 1.0
+            local killerEnt = killer
+            if isvalid(killerEnt) then
+                ---@type PlayerAttack
+                local killerPa = killerEnt:GetComponent("script.PlayerAttack")
+                if isvalid(killerPa) then
+                    dropMult = 1.0 + killerPa:GetDropRateBonusPct() / 100
+                end
+            end
+
+            -- 메소와 아이템 모두 같은 레벨 차이 패널티를 한 번만 적용한다.
+            local levelRate = 1.0
+            if isvalid(killer) then
+                local killerLevel = _RegionTierLogic:GetServerLevelOf(killer)
+                if killerLevel > 0 then levelRate = _RegionTierLogic:GetLevelDropRate(monsterLevel, killerLevel) end
+            end
+            if _UtilLogic:RandomDouble() < levelRate then
+            local mesoAmount = math.floor(_RegionTierLogic:RollMesoForLevel(monsterLevel) * dropMult)
+            local mesoEnt = _SpawnService:SpawnByModelId("droppedmeso", monster.Name .. "_meso", deathPos, dropMap)
+            if isvalid(mesoEnt) then
+                mesoEnt.DroppedItemComponent.ItemName = tostring(mesoAmount)
+                local sr = mesoEnt.SpriteRendererComponent
+                if isvalid(sr) then
+                    if mesoAmount < 50 then
+                        sr.SpriteRUID = "a724200c454c4fcf878b0a3cdbb706d6"
+                    elseif mesoAmount < 100 then
+                        sr.SpriteRUID = "5c78b56b91964dcaa83c1d30b8cd3cce"
+                    elseif mesoAmount < 1000 then
+                        sr.SpriteRUID = "c3fe3ffa606f41069ce8b36278e9e7e8"
+                    else
+                        sr.SpriteRUID = "f0aa7764ff5344848d59accafa2dbf6e"
+                    end
+                end
+                log("[Monster] 메소 드랍: " .. tostring(mesoAmount))
+            end
+
+            end
+
+            -- 확률 아이템 드랍 (매 사망마다 랜덤 롤)
+            -- type 미지정 = "sprite"(아이콘 스프라이트), "avataritem" = 장비 아바타 아이템(장비 탭으로 들어가고
+            -- 월드 드롭 아이콘은 thumbnail://로 렌더).
+            local itemDrops = self:GetItems()
+
+            -- dropMult는 위 메소 블록에서 이미 구했다(아이템 감각 보너스 - 메소·아이템 공용).
+            for i, drop in ipairs(itemDrops) do
+                local chance = math.min(1, (drop.fixedRate and drop.rate or drop.rate * dropMult) * levelRate)
+                if _UtilLogic:RandomDouble() < chance then
+                    local dropEnt = _SpawnService:SpawnByModelId("droppedshell", monster.Name .. "_item" .. tostring(i), deathPos, dropMap)
+                    if isvalid(dropEnt) then
+                        local dic = dropEnt.DroppedItemComponent
+                        if isvalid(dic) then
+                            -- 공용 모델의 기본 이름(껍질)을 물려받지 않도록 명시한다.
+                            dic.ItemName = drop.name
+                            dic.ItemRUID = drop.ruid
+                            local itype = drop.type or "sprite"
+                            dic.ItemType = itype
+                            local sr = dropEnt.SpriteRendererComponent
+                            if isvalid(sr) then
+                                -- 아바타 아이템은 RUID를 스프라이트에 그대로 넣으면 안 보인다 - thumbnail://로 아이콘 렌더.
+                                sr.SpriteRUID = (itype == "avataritem") and ("thumbnail://" .. drop.ruid) or drop.ruid
+                            end
+                        end
+                        log("[Monster] 아이템 드랍: " .. drop.ruid)
+                    end
+                end
+            end
+        end
+
+    end
+end

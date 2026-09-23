@@ -68,8 +68,12 @@ script PlayerAttack extends AttackComponent
 		        end, 0.25)
 	end
 
-	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
+        if self:IsClient() then
+            if isvalid(self._T.playerNameOverlay) then self._T.playerNameOverlay:Destroy() end
+            self._T.playerNameOverlay = nil
+            return
+        end
 		-- (성능/누수 수정) 플레이어 퇴장 시 감시 타이머 해제 - 해제하지 않으면 입퇴장이 반복될수록
 		-- 고아 타이머가 4Hz no-op으로 서버에 누적됐다.
 		if self._T.ctrlWatchdogId ~= nil then
@@ -223,6 +227,70 @@ script PlayerAttack extends AttackComponent
 		log("[ClawMotion] 클라 아대 상태=" .. tostring(on))
 	end
 
+
+	-- 공중 기본공격은 점프 관성을 유지한다. 바라보는 방향과 이동 방향은 별개다.
+	@ExecSpace("ClientOnly")
+	method void BeginBasicAirMotion(number duration)
+		self._T.basicAirMotion = nil
+		local rb = self.Entity.RigidbodyComponent
+		local mv = self.Entity.MovementComponent
+		if not isvalid(rb) or not isvalid(mv) or rb:IsOnGround() then return end
+		local vx = rb.RealMoveVelocity.x
+		local inputX = rb.MoveVelocity.x
+		if math.abs(vx) > 0.001 then inputX = ((vx > 0) and 1 or -1) * mv.InputSpeed end
+		self._T.basicAirMotion = {x = inputX, untilTime = _UtilLogic.ElapsedSeconds + duration, map = self.Entity.CurrentMap}
+		log("[JumpCombat] 공중 기본공격 move=" .. tostring(inputX) .. " look=" .. tostring(self.Entity.PlayerControllerComponent.LookDirectionX))
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsBasicAirMotion()
+		local air = self._T.basicAirMotion
+		local rb = self.Entity.RigidbodyComponent
+		return air ~= nil and air.map == self.Entity.CurrentMap and _UtilLogic.ElapsedSeconds < air.untilTime
+			and isvalid(rb) and not rb:IsOnGround()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateBasicAirMotion()
+		if self.Entity ~= _UserService.LocalPlayer or self._T.basicAirMotion == nil then return end
+		local rb = self.Entity.RigidbodyComponent
+		local sc = self.Entity.StateComponent
+		if not self:IsBasicAirMotion() or (isvalid(sc) and (sc.CurrentStateName == "DEAD" or sc.CurrentStateName == "CLIMB" or sc.CurrentStateName == "LADDER")) then
+			self._T.basicAirMotion = nil
+			local ctrl = self.Entity.PlayerControllerComponent
+			if isvalid(ctrl) and not ctrl.Enable and isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+			return
+		end
+		rb.MoveVelocity = Vector2(self._T.basicAirMotion.x, 0)
+	end
+
+
+	@ExecSpace("ClientOnly")
+	method void SyncBasicAttackStats()
+		-- 동일 컴포넌트의 RPC를 발사 요청보다 먼저 보낸다. 활/석궁도 첫 공격부터 최신 스탯을 사용한다.
+		self:SyncCritRate(_SkillManager:GetEffectiveCritRate())
+		self:SyncCritDamage(_CharInfoManager:CalcCritDamage())
+		self:SyncCombatPower(_SkillManager:PeekEffectiveCombatPower())
+	end
+
+	method boolean ShouldWaitForClawHit()
+		local map = self.Entity.CurrentMap
+		local ctrl = self.Entity.PlayerControllerComponent
+		if not isvalid(map) or not isvalid(ctrl) then return false end
+		local pp = self.Entity.TransformComponent.WorldPosition
+		local pending = false
+		for _, monster in ipairs(map:GetChildComponentsByTypeName("script.Monster", true)) do
+			if isvalid(monster) and not monster.IsDead and monster.Entity.Enable then
+				local tp = monster.Entity.TransformComponent.WorldPosition
+				local dx = tp.x - pp.x
+				if dx * ctrl.LookDirectionX >= 0 and math.abs(dx) <= self:GetBasicProjectileTravelRange() and math.abs(tp.y - pp.y) <= 1 then
+					if monster:IsDeathPending() then pending = true else return false end
+				end
+			end
+		end
+		return pending
+	end
+
 	@ExecSpace("ClientOnly")
 	method void CastClawBasicAttack()
 		-- 아대 기본공격(스킬 취급) 시전. 공격 키를 받은 클라이언트에서 곧바로 실행된다.
@@ -234,7 +302,9 @@ script PlayerAttack extends AttackComponent
 		-- (요청 2026-08-05 최종) 드래곤 로어 구조 - 연타 간격(0.72)이 컨트롤 잠금(0.70)보다 길어야
 		-- 시전들이 완전히 직렬화되어 이전 시전의 복구가 새 시전과 절대 겹치지 않는다.
 		if (self._T.clawCastAt or -99) + 0.72 > now then return end
+		if self:ShouldWaitForClawHit() then return end
 		self._T.clawCastAt = now
+		self:SyncBasicAttackStats()
 
 		local sc = self.Entity.StateComponent
 		if isvalid(sc) then
@@ -244,6 +314,7 @@ script PlayerAttack extends AttackComponent
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if not isvalid(playerCtrl) then return end
 		local dirX = playerCtrl.LookDirectionX
+		self:BeginBasicAirMotion(0.70)
 
 		-- 엔진 기본공격이 자기 ATTACK 상태/동작을 띄우지 못하게 **클라에서** 컨트롤러를 끈다.
 		-- (서버에서 끄면 전파가 늦어 이미 엔진 동작이 재생된 뒤가 된다 - 실측)
@@ -271,7 +342,7 @@ script PlayerAttack extends AttackComponent
 		--   두 RPC의 도착 순서가 보장되지 않아 "가끔만 먹히는" 보정이 된다.
 		self:ReportCastOriginFromClient(self.Entity.TransformComponent.WorldPosition)
 		-- 표창 투척은 서버에서 처리한다(데미지 판정/투사체 스폰).
-		self:RequestClawThrow()
+		self:RequestClawThrowAimed(dirX)
 
 		-- 스윙이 끝난 뒤에 컨트롤러를 되돌린다. 스윙 중에 켜면 엔진이 곧바로 stand로 덮어 모션이 끊긴다.
 		-- (요청 2026-08-05 최종) 0.60 → 0.70: 방향 잠금(0.65)이 풀린 뒤에도 조작이 잠겨 있게(드래곤 로어 구조).
@@ -283,6 +354,13 @@ script PlayerAttack extends AttackComponent
 			if isvalid(ar) then ar.ShowDefaultWeaponEffects = true end
 		end, 0.70)
 		log("[ClawMotion] 아대 기본공격 시전 모션=" .. tostring(swing.name) .. " dirX=" .. tostring(dirX))
+	end
+
+	@ExecSpace("Server")
+	method void RequestClawThrowAimed(number direction)
+		local ctrl = self.Entity.PlayerControllerComponent
+		if isvalid(ctrl) then ctrl.LookDirectionX = direction >= 0 and 1 or -1 end
+		self:RequestClawThrow()
 	end
 
 	@ExecSpace("Server")
@@ -316,6 +394,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackNormal()
+        if self._T.isMagicClawing then return end
 		        -- (요청) 아대를 끼고 있으면 기본공격이 근접 판정 대신 럭키세븐과 같은 표창 투척으로 바뀐다.
 		        if self._T.clawEquipped == true then
 		            self:AttackClawThrow()
@@ -337,7 +416,8 @@ script PlayerAttack extends AttackComponent
 		        -- (요청 2026-08-09) 시전 순간의 대상을 잠근다 - 판정이 0.3초 뒤라 그 사이 빠른 적이
 		        -- 자리를 벗어나면 재선정에서 빠져 빗나갔다(파워스트라이크와 같은 원인).
 		        local castPosN = self.Entity.TransformComponent.WorldPosition
-		        local lockedNormal = self:FindNearestMonster(Vector2(castPosN.x, castPosN.y), 1.5)
+		        local normalCandidates = self:FindMonstersInShape(BoxShape(Vector2(castPosN.x + 0.5 * capturedDirX, castPosN.y + 0.5), Vector2.one, 0), Vector2(castPosN.x, castPosN.y), 1)
+                local lockedNormal = normalCandidates[1]
 		        _TimerService:SetTimerOnce(function()
 		            if not isvalid(self.Entity) then return end
 		            local worldPos = self.Entity.TransformComponent.WorldPosition
@@ -348,7 +428,8 @@ script PlayerAttack extends AttackComponent
 		            -- 기본 공격(Control)은 단일 대상 공격이다 - 몬스터가 밀집한 구역에서 AttackFast의 박스 판정이
 		            -- 여러 마리를 동시에 맞히는 문제가 있어, 판정 전에 가장 가까운 몬스터 하나만 골라
 		            -- IsAttackTarget에서 그 대상만 통과시킨다 (파워스트라이크와 동일한 FindNearestMonster 재사용).
-		            self._T.normalAttackTarget = self:FindNearestMonster(Vector2(worldPos.x, worldPos.y), 1.5)
+		            local normalCandidatesNow = self:FindMonstersInShape(BoxShape(attackOffset, Vector2.one, 0), Vector2(worldPos.x, worldPos.y), 1)
+                    self._T.normalAttackTarget = normalCandidatesNow[1]
 		            self._T.shape = BoxShape(attackOffset, Vector2.one, 0)
 		            -- 잠근 대상이 아직 살아 있으면 그쪽을 우선하고, 판정 도형도 그 위치로 옮긴다.
 		            local lockedShapeN = self:ShapeOnLockedTarget(lockedNormal, worldPos, 2.0)
@@ -362,6 +443,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		if not isvalid(defender) or defender.CurrentMap ~= self.Entity.CurrentMap then return false end
 		        -- 작은 불씨는 용사 소환과 같은 아군 소환수다. 판정 전에 제외해 데미지 숫자도 만들지 않는다.
 		        if defender:GetComponent("script.FireAffinityEmber") ~= nil then return false end
 		        -- Skip other players; only hit non-player entities (monsters)
@@ -700,6 +782,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method number GetServerCritRatePercent()
+		if self:GetServerCombatPower() <= 1 then return 0 end
 		-- 서버 판정이 실제로 써야 할 크리티컬 확률(%). 다크사이트 중(그리고 공격으로 풀린 직후 1초)에는
 		-- 무조건 100이다.
 		-- ⚠ 클라가 보내주는 currentCritRatePercent만 믿으면 안 된다 - 은신이 풀리는 순간 클라가 곧바로
@@ -770,6 +853,12 @@ script PlayerAttack extends AttackComponent
 		return dmg
 	end
 
+	method integer RollBeginnerDamage()
+		if _UtilLogic:RandomDouble() < 0.5 then return 0 end
+		local maximum = self:GetServerCombatPower() <= 0 and 2 or 5
+        return 1 + math.min(maximum - 1, math.floor(_UtilLogic:RandomDouble() * maximum))
+	end
+
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
 		-- 실제 공식은 CalcDamageBase에 있고, 여기서는 콤보 어택 버프 보너스(구슬 1개당 +20%)만
 		-- 모든 스킬/기본공격에 일괄 적용한다. 수동 데미지 표시용 캐시(lastDoubleStabDamage 등)는
@@ -806,6 +895,11 @@ script PlayerAttack extends AttackComponent
 		-- 동기화된 값을 쓴다(GetCriticalDamageRate와 동일 소스) - 이 아래의 수동 다중 표시 분기들은 엔진
 		-- 자동배율을 거치지 않으므로 여기서 직접 곱해야 한다.
 		local critMult = (self._T.currentCritDamagePercent or 125) / 100
+		if self:GetServerCombatPower() <= 1 then
+			dmg = math.min(self:GetServerCombatPower() <= 0 and 2 or 5, math.max(0, dmg))
+			critRate = 0
+			critMult = 1
+		end
 
 		-- (버그 수정) 더블스탭/매직클로/스피어버스터(수동 다중 표시 스킬)는 각 타격(hitIndex)이 이미
 		-- 별도의 진짜 Attack() 호출이므로, 이 히트 하나에 대해서만 독립적으로 크리티컬을 굴리고 배율을
@@ -1453,6 +1547,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+		if self:GetServerCombatPower() <= 1 then return false end
 		        -- 더블스탭/매직클로/스피어버스터(수동 다중 표시 스킬)와 쉐도우 파트너 활성 중인 모든 히트는
 		        -- CalcDamage에서 각 줄(원본/보너스, 또는 각 타격)마다 독립적으로 크리티컬을 굴려 배율까지
 		        -- 이미 반환값(dmg)에 직접 곱해뒀다 - 여기서 또 true를 반환하면 엔진이 그 위에 배율을 한 번
@@ -1498,7 +1593,22 @@ script PlayerAttack extends AttackComponent
 		return "3271c3e79bf04ecba9a107d55495970d"
 	end
 
+
 	method int32 GetDisplayHitCount(string attackInfo)
+		-- 엔진의 숫자 0 대신 MISS를 표시하기 위해 실제 HitEvent 결과로 출력한다.
+		return 0
+	end
+
+	@ExecSpace("Client")
+	method void ShowResolvedDamage(Entity target, integer damage, boolean critical, string skin)
+		if not isvalid(target) then return end
+		_DamageSkinService:Play(target, skin, 0,
+			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, critical,
+			Vector2(0, 0), Vector2(1, 1), 1, 1, LitMode.Default)
+		if damage <= 0 then log("[DamageDisplay] zero damage -> MISS") end
+	end
+
+	method int32 GetExpectedDamageLineCount(string attackInfo)
 				-- 스피어 버스터 파이널어택은 쉐도우 파트너 중에도 합산 피해 한 줄만 자동 표시한다.
 				if attackInfo == "skill.spearburst.final" then return 1 end
 		        -- 더블스탭/매직클로/스피어 버스터는 각각 전용 Show*DamageSkin에서 수동으로 다중 줄을
@@ -2352,6 +2462,7 @@ script PlayerAttack extends AttackComponent
 					bonus = math.floor(bonus * 2.0)
 				end
 			end
+			if combatPower <= 1 then dmg = self:RollBeginnerDamage() bonus = 0 dmgCrit = false bonusCrit = false end
 			rolls[i] = { dmg = dmg, bonus = bonus, dmgCrit = dmgCrit, bonusCrit = bonusCrit }
 		end
 		return rolls
@@ -2413,6 +2524,7 @@ script PlayerAttack extends AttackComponent
 					bonus = math.floor(bonus * 2.0)
 				end
 			end
+			if combatPower <= 1 then dmg = self:RollBeginnerDamage() bonus = 0 dmgCrit = false bonusCrit = false end
 			rolls[i] = { dmg = dmg, bonus = bonus, dmgCrit = dmgCrit, bonusCrit = bonusCrit }
 		end
 		log("[StarSpread] 합산기준=" .. tostring(totalBase) .. " shots=" .. tostring(shots)
@@ -2650,7 +2762,7 @@ script PlayerAttack extends AttackComponent
 		-- 서버 상태 토글/RPC는 응답 전에 방향이 바뀌는 틈을 만들므로 사용하지 않는다.
 		if not isvalid(self.Entity) then return end
 		-- 이전 시전의 늦은 종료 타이머가 새 시전의 자세/방향을 해제하지 않게 한다.
-		if self._T[lockKey .. "Generation"] ~= generation then return end
+		if self._T[lockKey .. "Generation"] ~= generation or not self._T[lockKey] then return end
 		local restored = false
 		local hasOtherLock = false
 		local lockKeys = {"isLuckySevenDirectionLocked", "isSlashDirectionLocked", "isDirectionLocked", "isDoubleStabDirectionLocked", "isMagicClawDirectionLocked", "isThunderboltDirectionLocked", "isShiningRayDirectionLocked", "isMagicMissileDirectionLocked", "isHealDirectionLocked", "isHasteDirectionLocked", "isShadowPartnerDirectionLocked", "isBoosterDirectionLocked", "isPoisonMistDirectionLocked", "isExplosionDirectionLocked", "isDragonRoarDirectionLocked", "isFireArrowDirectionLocked", "isIronArrowDirectionLocked", "isAngelRayDirectionLocked", "isHolyArrowDirectionLocked", "isArrowBlowDirectionLocked", "isDoubleShotDirectionLocked", "isStrafeDirectionLocked", "isIceShotDirectionLocked", "isFireShotDirectionLocked", "isAvengerDirectionLocked", "isSpearBurstDirectionLocked", "isSavageBlowDirectionLocked", "isSmokeScreenDirectionLocked"}
@@ -2700,6 +2812,16 @@ script PlayerAttack extends AttackComponent
 		return _UtilLogic.ElapsedSeconds < (self._T.swingMotionUntil or 0)
 	end
 
+	method number GetBasicProjectileRange()
+		-- 자동사냥이 접근을 멈추는 기존 사거리 기준.
+		return 3.6
+	end
+
+	method number GetBasicProjectileTravelRange()
+		-- 도망가는 적을 따라가는 여유만 추가하고 자동사냥의 접근 거리는 유지한다.
+		return self:GetBasicProjectileRange() * 1.1
+	end
+
 	@ExecSpace("ServerOnly")
 	method void AttackClawThrow()
 		        -- 아대 장착 상태의 기본공격 본체. 전방 대상 하나를 잡아 표창 1개를 던진다.
@@ -2727,6 +2849,9 @@ script PlayerAttack extends AttackComponent
 
 		        -- 럭키세븐과 같은 고정 표적 탐색(전방 x축 8.0). 대상이 없으면 이펙트만 재생한다.
 		        local target = self:FindLuckySevenTarget(Vector2(worldPos.x, worldPos.y), dirX)
+		        local range = self:GetBasicProjectileTravelRange()
+		        if not isvalid(target) and self:ShouldWaitForClawHit() then return end
+		        if isvalid(target) and math.abs(target.TransformComponent.WorldPosition.x - worldPos.x) > range then target = nil end
 		        -- 던지는 높이 = 조준 높이(발밑 기준). 몬스터 발 아래로 꺾이지 않게 같은 값으로 맞춘다.
 		        local throwH = _ShurikenLibrary:GetThrowHeight()
 		        local fallbackPos = nil
@@ -2744,11 +2869,27 @@ script PlayerAttack extends AttackComponent
 		        -- (요청) 대상이 없어도 표창은 **허공으로 앞으로** 날아가야 한다(예전엔 스킵해서 안 보였다).
 		        if not isvalid(target) then
 		            -- (요청) 허공 투척은 발사 높이와 같은 y로 **반듯한 수평 직선**으로 앞으로 날린다.
-		            fallbackPos = Vector3(worldPos.x + dirX * 8.0, worldPos.y + throwH, worldPos.z)
+		            fallbackPos = Vector3(worldPos.x + dirX * range, worldPos.y + throwH, worldPos.z)
 		        end
 		        -- ⚠ 대상 엔티티는 프로퍼티로 넘기지 않고 _T에 담아 전달한다 - Entity 타입 파라미터에 nil을
 		        --   넘기면 호출이 조용히 실패해 "허공 투척이 아예 안 보인다"는 신고의 원인이 됐다(실측).
 		        self._T.clawThrowTarget = target
+		        local shot = {map=self.Entity.CurrentMap, target=target, token=0}
+		        if isvalid(target) then
+		            local monster = target:GetComponent("script.Monster")
+		            local damage = math.floor(self:GetServerCombatPower() * (0.5 + _UtilLogic:RandomDouble() * 0.5))
+		            damage = self:ApplyBackstabBonus(damage, self.Entity, target, "skill.luckyseven")
+		            local critical = _UtilLogic:RandomDouble() < self:GetServerCritRatePercent() / 100
+		            if critical then damage = math.floor(damage * 2) end
+		            if self:GetServerCombatPower() <= 1 then critical = false end
+		            shot.damage = damage
+		            shot.critical = critical
+		            shot.monster = monster
+		            shot.life = monster.LifeSerial
+		            shot.token = monster:ReserveIncomingHit(damage, 3.5)
+		            log("[ClawReserve] target=" .. target.Name .. " damage=" .. tostring(damage) .. " lethal=" .. tostring(monster:IsDeathPending()))
+		        end
+
 		        -- 표창 스킬 3종의 [StarThrow] 로그와 같은 항목 - "점프하고 쳤는데 사거리 밖" 류 신고를
 		        -- 로그만으로 가를 수 있게 기준 y(클라 보고)와 서버 자기 y를 남긴다.
 		        log("[ClawThrow] 시전 target=" .. tostring(isvalid(target) and target.Name or "(없음)")
@@ -2758,16 +2899,29 @@ script PlayerAttack extends AttackComponent
 		        -- 스윙 끝자락 0.5초). 드레인 샷과 같은 값을 쓴다(GetClawThrowReleaseDelay).
 		        -- 기본공격 모션은 클라가 재생속도 1.0으로 고정 재생하므로 공속 배율을 곱하지 않는다.
 		        _TimerService:SetTimerOnce(function()
-		            self:FireClawShuriken(fallbackPos)
+		            self:FireClawShurikenReserved(fallbackPos, shot)
 		        end, self:GetClawThrowReleaseDelay())
 	end
 
+
 	@ExecSpace("ServerOnly")
 	method void FireClawShuriken(Vector3 fallbackPos)
+		-- 드레인 샷 등 기존 호출은 원래 표창 규칙을 유지한다.
+		local target = self._T.clawThrowTarget
+		local monster = isvalid(target) and target:GetComponent("script.Monster") or nil
+		self:FireClawShurikenReserved(fallbackPos, {target=target, map=self.Entity.CurrentMap, monster=monster, life=isvalid(monster) and monster.LifeSerial or 0, token=0})
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FireClawShurikenReserved(Vector3 fallbackPos, table shot)
 		        -- 표창 1개를 스폰해 고정 표적에게 발사한다(럭키세븐의 FireLuckySevenShuriken 축소판).
 		        -- 대상은 AttackClawThrow가 _T.clawThrowTarget에 담아둔 것을 쓴다(nil일 수 있다 = 허공 투척).
 		        if not isvalid(self.Entity) then return end
-		        local target = self._T.clawThrowTarget
+		        local target = shot.target
+		        if shot.map ~= self.Entity.CurrentMap or (shot.monster ~= nil and (shot.monster.IsDead or shot.monster.LifeSerial ~= shot.life)) then
+		            if isvalid(shot.monster) then shot.monster:ReleaseIncomingHit(shot.token) end
+		            return
+		        end
 		        if not isvalid(target) and fallbackPos == nil then return end
 		        local parent = self.Entity.CurrentMap
 		        if not isvalid(parent) then return end
@@ -2790,6 +2944,16 @@ script PlayerAttack extends AttackComponent
 		        ---@type LuckySevenProjectile
 		        local pc = proj:GetComponent("script.LuckySevenProjectile")
 		        if pc == nil then return end
+		        pc.MaxLifetime = self:GetBasicProjectileTravelRange() / pc.Speed
+		        if isvalid(target) and shot.damage ~= nil then
+		            pc.GuaranteedHit = true
+		            pc.ReservationToken = shot.token
+		            pc.TargetLifeSerial = shot.life
+		            pc.PreRolled = true
+		            pc.PreDamage = shot.damage
+		            pc.PreDamageCritical = shot.critical
+		        end
+		        pc.SilentOnMiss = true
 		        -- 기본공격이라 전투력은 클라이언트가 주기적으로 동기화해둔 값(SyncCombatPower)을 쓴다.
 		        -- (다크사이트) 해제 직후 1초는 클라가 원래 값을 되돌려 보내도 2배 값을 이어 쓴다.
 		        pc.CombatPower = self:GetServerCombatPower()
@@ -2838,7 +3002,7 @@ script PlayerAttack extends AttackComponent
 		        -- 기본공격은 연타라 럭키세븐(1.0)보다 낮은 볼륨으로 재생한다.
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
-		        _SoundService:PlaySound("879c81c8fc274aea87dc673de48ab5d1", 0.7)
+		        _GameAudio:PlaySound("879c81c8fc274aea87dc673de48ab5d1", 0.7)
 	end
 
 	-- ── 시전 기준 위치(클라 보고) ────────────────────────────────────────
@@ -3034,7 +3198,7 @@ script PlayerAttack extends AttackComponent
 		        -- 스킬 사용 즉시 재생되는 사운드 (같은 리소스팩의 "_audio/Use")
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
-		        _SoundService:PlaySound("879c81c8fc274aea87dc673de48ab5d1", 1.0)
+		        _GameAudio:PlaySound("879c81c8fc274aea87dc673de48ab5d1", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -3071,7 +3235,7 @@ script PlayerAttack extends AttackComponent
 		        if not isvalid(body) then return end
 
 		        local playerCtrl = attacker.PlayerControllerComponent
-		        if isvalid(attacker.MovementComponent) then
+		        if isvalid(attacker.MovementComponent) and not (attacker == _UserService.LocalPlayer and self:IsBasicAirMotion()) then
 		            attacker.MovementComponent:Stop()
 		        end
 		        if isvalid(playerCtrl) then
@@ -3129,34 +3293,10 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method table FindSlashBlastTargets(Vector2 fromPos, number dirX, integer maxCount, number forwardRange, number verticalRange)
-		        -- 슬래쉬블래스트 대상 선정: 전방 판정 범위(가로 2칸, 세로 1칸) 안의 살아있는 script.Monster를
-		        -- 가까운 순으로 정렬해 최대 maxCount명까지 후보로 반환한다 (실제 Attack 판정 없이 위치만으로 탐색).
-		        -- 스피어 버스터도 이 탐색을 그대로 재사용하지만 사거리가 달라야 하므로, forwardRange/verticalRange를
-		        -- 선택 인자로 받는다 - 생략(nil)하면 기존 슬래쉬블래스트 기본값(2.0/1.0)을 그대로 쓴다.
-		        forwardRange = forwardRange or 2.0
-		        verticalRange = verticalRange or 1.0
-		        local map = self.Entity.CurrentMap
-		        if not isvalid(map) then return {} end
-		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		        local candidates = {}
-		        for _, comp in ipairs(monsterComps) do
-		            ---@type Monster
-		            local mc = comp
-		            if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-		                local pos = mc.Entity.TransformComponent.WorldPosition
-		                local dx = pos.x - fromPos.x
-		                local dy = pos.y - fromPos.y
-		                if dx * dirX >= 0 and math.abs(dx) <= forwardRange and math.abs(dy) <= verticalRange then
-		                    table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx) })
-		                end
-		            end
-		        end
-		        table.sort(candidates, function(a, b) return a.dist < b.dist end)
-		        local result = {}
-		        for i = 1, math.min(#candidates, maxCount) do
-		            table.insert(result, candidates[i].entity)
-		        end
-		        return result
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		forwardRange = forwardRange or 2.0
+		verticalRange = verticalRange or 1.0
+		return self:FindNearestMonstersInForwardBox(fromPos, dirX, forwardRange, verticalRange, verticalRange, maxCount)
 	end
 
 	@ExecSpace("Multicast")
@@ -3192,7 +3332,7 @@ script PlayerAttack extends AttackComponent
 		            self:EchoShadowHitEffect(hitEffects[index], target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {})
 		        end
 		        -- 슬래쉬블래스트로 몬스터가 데미지를 받는 순간마다(대상 무관) 지정된 사운드를 1회 재생한다.
-		        _SoundService:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
+		        _GameAudio:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -3811,7 +3951,7 @@ script PlayerAttack extends AttackComponent
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
 		        local hitSoundRUID = "e0178f48602742c0bd8b295fdc27261c"
-		        _SoundService:PlaySound(hitSoundRUID, 1.0)
+		        _GameAudio:PlaySound(hitSoundRUID, 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -3821,7 +3961,7 @@ script PlayerAttack extends AttackComponent
 		        -- (구: 원본 팩 skill/100.img/skill/1001005의 _audio/Use `afbb81b51fed47eaaee26cc403d59ccf`).
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
-		        _SoundService:PlaySound("f6b84a0152ef492e9233f621c81a4920", 1.0)
+		        _GameAudio:PlaySound("f6b84a0152ef492e9233f621c81a4920", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -4096,6 +4236,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+        self:UpdatePlayerNameOverlay()
 		        -- (버그 수정) "여러 스킬을 사용해봤는데 스킬 사용 후 숨고르기 모션을 하지 않는다"는 신고 -
 		        -- 원인은 각 스킬 모션 정리용 IDLE→MOVE→IDLE 강제 토글(PlayAttackMotion 등, 같은 서버 호출
 		        -- 안에서 즉시 IDLE로 되돌아감)이 숨고르기 시작 직후와 시간상 겹쳐, 진짜 이동이 아닌 이 내부
@@ -4346,11 +4487,12 @@ script PlayerAttack extends AttackComponent
 		        -- (스피어 버스터와 같은 방식). Enable=false만으로는 서버 동기화 지연·연타 엇갈림 틈에 이동이
 		        -- 새어 나온다 - 이동은 클라 권한이므로 내 캐릭터에서 직접, 스윙이 끝나면 곧바로 풀린다.
 		        if (self._T.isLuckySevenMotionPlaying or self._T.isAvengerMotionPlaying)
-		            and self.Entity == _UserService.LocalPlayer then
+		            and self.Entity == _UserService.LocalPlayer and not self:IsBasicAirMotion() then
 		            if isvalid(self.Entity.MovementComponent) then
 		                self.Entity.MovementComponent:Stop()
 		            end
 		        end
+		self:UpdateBasicAirMotion()
 	end
 
 	@ExecSpace("Multicast")
@@ -4369,27 +4511,9 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method Entity FindNearestMonster(Vector2 fromPos, number maxRange)
-		        -- 파워스트라이크 대상 선정: 사거리 내 script.Monster 컴포넌트가 있는 살아있는 엔티티 중 가장 가까운 하나
-		        local map = self.Entity.CurrentMap
-		        if not isvalid(map) then return nil end
-		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		        local nearest = nil
-		        local nearestDist = maxRange
-		        for _, comp in ipairs(monsterComps) do
-		            ---@type Monster
-		            local mc = comp
-		            if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-		                local pos = mc.Entity.TransformComponent.WorldPosition
-		                local dx = pos.x - fromPos.x
-		                local dy = pos.y - fromPos.y
-		                local dist = math.sqrt(dx * dx + dy * dy)
-		                if dist <= nearestDist then
-		                    nearest = mc.Entity
-		                    nearestDist = dist
-		                end
-		            end
-		        end
-		        return nearest
+        -- 발 위치가 아닌 실제 피격 박스와 원형 사거리의 겹침으로 대상을 고른다.
+        local targets = self:FindMonstersInShape(CircleShape(fromPos, maxRange), fromPos, 1)
+        return targets[1]
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4415,98 +4539,54 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method table FindMonstersInRadius(Vector2 fromPos, number radius, integer maxCount)
-		-- (다크드래곤) fromPos 반경 radius 안의 살아있는 몬스터를 가까운 순으로 최대 maxCount마리 반환한다.
-		-- 드래곤이 "자기 주변"만 공격하게 하려는 용도(넓은 전방박스 대신 작은 원형 반경).
-		-- (성능) 소환수들이 수초마다 반복 호출하므로 캐시된 목록을 쓴다.
-		local map = self.Entity.CurrentMap
-		local out = {}
-		if not isvalid(map) then return out end
-		local monsterComps = self:GetMonsterCompsCached()
-		local cand = {}
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				local dist = math.sqrt(dx * dx + dy * dy)
-				if dist <= radius then
-					table.insert(cand, { e = mc.Entity, d = dist })
-				end
-			end
-		end
-		table.sort(cand, function(a, b) return a.d < b.d end)
-		for i = 1, math.min(maxCount, #cand) do
-			table.insert(out, cand[i].e)
-		end
-		return out
+        -- 큰 몬스터의 상체도 반경 안에 닿으면 대상으로 포함한다.
+        return self:FindMonstersInShape(CircleShape(fromPos, radius), fromPos, maxCount)
 	end
 
 	method table FindNearestMonstersInForwardBox(Vector2 fromPos, number dirX, number xReach, number upHalf, number downHalf, integer maxCount)
-		-- FindNearestMonsterInForwardBox의 다중 대상판. 전방 사각형 안의 몬스터를 "가까운 순"으로 정렬해
-		-- 최대 maxCount명까지 돌려준다. 위/아래 범위를 따로 받는다(요청: 아래쪽 판정만 줄임).
-		local result = {}
-		local map = self.Entity.CurrentMap
-		if not isvalid(map) then return result end
-		local cands = {}
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				if dx * dirX >= 0 and math.abs(dx) <= xReach and dy <= upHalf and dy >= -downHalf then
-					table.insert(cands, { entity = mc.Entity, dist = math.sqrt(dx * dx + dy * dy) })
-				end
-			end
-		end
-		-- 거리 오름차순 정렬(후보 수가 적어 단순 삽입 정렬로 충분하다).
-		for i = 2, #cands do
-			local cur = cands[i]
-			local j = i - 1
-			while j >= 1 and cands[j].dist > cur.dist do
-				cands[j + 1] = cands[j]
-				j = j - 1
-			end
-			cands[j + 1] = cur
-		end
-		for i = 1, math.min(maxCount, #cands) do
-			table.insert(result, cands[i].entity)
-		end
-		return result
+        -- 전방 공격 도형과 몬스터의 실제 HitComponent를 비교한다.
+        local center = Vector2(fromPos.x + dirX * xReach * 0.5, fromPos.y + (upHalf - downHalf) * 0.5)
+        return self:FindMonstersInShape(BoxShape(center, Vector2(xReach, upHalf + downHalf), 0), fromPos, maxCount)
 	end
 
+    method table FindMonstersInShape(any shape, Vector2 fromPos, integer maxCount)
+        -- 엔진 충돌 조회로 후보를 제한한다. 작은 몬스터나 빈 공간으로 피격 박스를 확대하지 않는다.
+        local result, candidates, seen = {}, {}, {}
+        if not isvalid(self.Entity.CurrentMap) or maxCount <= 0 then return result end
+        local simulator = _CollisionService:GetSimulator(self.Entity)
+        if simulator == nil then return result end
+        local hits = simulator:OverlapAll(CollisionGroups.HitBox, shape)
+        for _, hit in ipairs(hits) do
+            local target = hit.Entity
+            if isvalid(target) and not seen[target] and self:IsLiveMonster(target) then
+                seen[target] = true
+                local center = self:GetMonsterHitCenter(target)
+                local dx, dy = center.x - fromPos.x, center.y - fromPos.y
+                table.insert(candidates, {entity = target, distance = dx * dx + dy * dy})
+            end
+        end
+        table.sort(candidates, function(a, b) return a.distance < b.distance end)
+        for i = 1, math.min(maxCount, #candidates) do result[i] = candidates[i].entity end
+        return result
+    end
+
+    method Vector2 GetMonsterHitCenter(Entity target)
+        -- 로컬 오프셋에 엔티티 스케일을 적용해 실제 피격 중심을 반환한다.
+        local transform = target.TransformComponent
+        local hit = target.HitComponent
+        if isvalid(hit) then
+            local offset = hit.IsLegacy and hit.BoxOffset or hit.ColliderOffset
+            local center = transform:ToWorldPoint(Vector3(offset.x, offset.y, 0))
+            return Vector2(center.x, center.y)
+        end
+        local pos = transform.WorldPosition
+        return Vector2(pos.x, pos.y)
+    end
+
 	method Entity FindNearestMonsterInForwardBox(Vector2 fromPos, number dirX, number xReach, number yHalfHeight)
-		        -- (기능 추가) "히트박스가 네모가 아닌 것 같다" 신고 - FindNearestMonster(전방향 원형 탐색)와
-		        -- 달리, 실제 타격 판정 박스와 완전히 동일한 모양(캐릭터 바로 앞부터 xReach만큼 전방으로,
-		        -- 위아래로 yHalfHeight만큼)의 사각형 범위 안에서만 후보를 찾고, 그중 가장 가까운 하나를 고른다.
-		        -- 박스 밖(등 뒤·대각선 등)에 있는 몬스터는 아무리 가까워도 애초에 후보에 들지 않는다.
-		        local map = self.Entity.CurrentMap
-		        if not isvalid(map) then return nil end
-		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		        local nearest = nil
-		        local nearestDist = xReach + yHalfHeight
-		        for _, comp in ipairs(monsterComps) do
-		            ---@type Monster
-		            local mc = comp
-		            if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-		                local pos = mc.Entity.TransformComponent.WorldPosition
-		                local dx = pos.x - fromPos.x
-		                local dy = pos.y - fromPos.y
-		                -- 박스 안 판정: 바라보는 방향(dirX) 기준 0~xReach 사이, 세로는 ±yHalfHeight 이내
-		                if dx * dirX >= 0 and math.abs(dx) <= xReach and math.abs(dy) <= yHalfHeight then
-		                    local dist = math.sqrt(dx * dx + dy * dy)
-		                    if dist <= nearestDist then
-		                        nearest = mc.Entity
-		                        nearestDist = dist
-		                    end
-		                end
-		            end
-		        end
-		        return nearest
+        -- 투사체 조준과 근접 스킬 모두 같은 몸통 겹침 판정을 사용한다.
+        local targets = self:FindNearestMonstersInForwardBox(fromPos, dirX, xReach, yHalfHeight, yHalfHeight, 1)
+        return targets[1]
 	end
 
 	method Vector2 ComputeArrowAimDirection(number faceDirX, number xReach, number yHalfHeight)
@@ -5763,7 +5843,7 @@ script PlayerAttack extends AttackComponent
 		-- 원본과 동일하게 실제로 몬스터에 적중했을 때만 울린다(빗나가면 무음).
 		if not self:IsClient() then return end
 		if hitCount == nil or hitCount <= 0 then return end
-		_SoundService:PlaySound("d3205fdd08e34b68bc01292a997531ed", 1.0)
+		_GameAudio:PlaySound("d3205fdd08e34b68bc01292a997531ed", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -5802,7 +5882,7 @@ script PlayerAttack extends AttackComponent
 		                _EffectService:PlayEffectAttached(backEffectRUID, target, Vector3(backOffset, 0, 0), 0, Vector3(1, 1, 1), false, backOptions)
 		                -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
 		                self:EchoShadowHitEffect(backEffectRUID, target, Vector3(backOffset, 0, 0), 0, Vector3(1, 1, 1), backOptions)
-		                _SoundService:PlaySound(swingSoundRUID, 1.0)
+		                _GameAudio:PlaySound(swingSoundRUID, 1.0)
 		            end
 		        end
 	end
@@ -6781,33 +6861,9 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method Entity FindDoubleStabTarget(Vector2 fromPos, number dirX)
-		        -- 더블스탭 전용 대상 탐색: 럭키세븐(FindLuckySevenTarget)과 동일하게 바라보는 방향(dirX) 앞쪽에
-		        -- 있는 몬스터만 후보로 삼는다. 파워스트라이크가 쓰는 FindNearestMonster는 방향과 무관하게 그냥
-		        -- 가장 가까운 몬스터를 고르는데, 밀집 몬스터 구역에서 등 뒤의 몬스터를 고르면 좁아진(2/3) 전방
-		        -- 판정 박스가 그 대상을 빗나가는 문제가 실제로 재현되어(테스트로 확인) 방향 필터가 필요했다.
-		        local map = self.Entity.CurrentMap
-		        if not isvalid(map) then return nil end
-		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		        local boxSize = 2.0 * (2.0 / 3.0)
-		        local nearest = nil
-		        local nearestDist = boxSize
-		        for _, comp in ipairs(monsterComps) do
-		            ---@type Monster
-		            local mc = comp
-		            if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-		                local pos = mc.Entity.TransformComponent.WorldPosition
-		                local dx = pos.x - fromPos.x
-		                local dy = pos.y - fromPos.y
-		                if dx * dirX >= 0 and math.abs(dx) <= boxSize and math.abs(dy) <= (boxSize / 2.0) then
-		                    local dist = math.abs(dx)
-		                    if dist <= nearestDist then
-		                        nearest = mc.Entity
-		                        nearestDist = dist
-		                    end
-		                end
-		            end
-		        end
-		        return nearest
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		local size = 2.0 * (2.0 / 3.0)
+		return self:FindNearestMonsterInForwardBox(fromPos, dirX, size, size / 2)
 	end
 
 	method table GetDoubleStabStab()
@@ -6924,7 +6980,7 @@ script PlayerAttack extends AttackComponent
 		        -- Multicast는 서버 자신도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
-		        _SoundService:PlaySound("ca4f802052184c0ba47f6971fde80bd0", 1.0)
+		        _GameAudio:PlaySound("ca4f802052184c0ba47f6971fde80bd0", 1.0)
 	end
 
 	@ExecSpace("Client")
@@ -6954,13 +7010,13 @@ script PlayerAttack extends AttackComponent
 		        -- 대해 CalcDamage에서 독립적으로 굴린 크리티컬 결과를 그대로 전달해 강조 표시가 실제와 맞게 한다.
 		        _DamageSkinService:Play(
 		            target, self:GetHitDamageSkinId(), 0,
-		            { damage }, DamageSkinTweenType.Default, baseIsCritical,
+		            { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 		            Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		        )
 		        if bonus > 0 then
 		            _DamageSkinService:Play(
 		                target, self:GetHitDamageSkinId(), 0,
-		                { bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+		                { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 		                Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		            )
 		        end
@@ -7089,41 +7145,13 @@ script PlayerAttack extends AttackComponent
 		        -- 컨트롤 잠금 해제: 2번째 타격 직후(0.60초 * 배율).
 		        _TimerService:SetTimerOnce(function()
 		            self:RestoreMagicClawControl()
-		        end, 0.60 * mult)
+		        end, 0.85 * mult)
 	end
 
 	@ExecSpace("ServerOnly")
 	method Entity FindMagicClawTarget(Vector2 fromPos, number dirX)
-		        -- 매직클로 전용 대상 탐색: 바라보는 방향 전방(dx*dirX >= 0)의 살아있는 몬스터 중
-		        -- 가장 가까운 하나를 고른다. (재피드백으로 "앞뒤 무관 최근접" 방식에서 전방 전용으로 복원 -
-		        -- 등 뒤 적으로 자동 방향 전환하는 문제 제거.)
-		        -- 사거리는 파워스트라이크 기준 박스(2칸) 대비 x축(전방) 2.5배·y축(위아래) 1.5배.
-		        -- (요청 2026-08-11) 위 배율에서 **x/y 모두 2/3로 축소** - 전방 5.0 → 3.33, 세로 ±1.5 → ±1.0.
-		        -- 자동사냥의 사거리 상수(ShouldMageSnipe / 마법 사거리 게이트)도 같은 값으로 함께 줄였다.
-		        local map = self.Entity.CurrentMap
-		        if not isvalid(map) then return nil end
-		        local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		        local forwardSize = 2.0 * 2.5 * (2.0 / 3.0)
-		        local verticalSize = 2.0 * 1.5 * (2.0 / 3.0)
-		        local nearest = nil
-		        local nearestDist = forwardSize
-		        for _, comp in ipairs(monsterComps) do
-		            ---@type Monster
-		            local mc = comp
-		            if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-		                local pos = mc.Entity.TransformComponent.WorldPosition
-		                local dx = pos.x - fromPos.x
-		                local dy = pos.y - fromPos.y
-		                if dx * dirX >= 0 and math.abs(dx) <= forwardSize and math.abs(dy) <= (verticalSize / 2.0) then
-		                    local dist = math.abs(dx)
-		                    if dist <= nearestDist then
-		                        nearest = mc.Entity
-		                        nearestDist = dist
-		                    end
-		                end
-		            end
-		        end
-		        return nearest
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		return self:FindNearestMonsterInForwardBox(fromPos, dirX, 2.0 * 2.5 * (2.0 / 3.0), 1.0)
 	end
 
 	method table GetMagicClawSwing()
@@ -7193,17 +7221,28 @@ script PlayerAttack extends AttackComponent
 		        local bonus = self._T.shadowEchoBonus or 0
 		        local bonusCrit = self._T.shadowEchoBonusIsCritical or false
 		        if not actuallyHit then
+                    local monster = target:GetComponent("script.Monster")
+                    if not isvalid(monster) or not monster.IsDead then
+                        log("[MagicClaw] no contact: skip phantom damage")
+                        return
+                    end
 		            -- 대상이 1타에 이미 죽어 판정 자체가 실패해도, 럭키세븐과 동일하게 표시용 데미지를
 		            -- 동일 공식으로 새로 굴려 2줄이 항상 뜨도록 한다(실제 Hp에는 영향 없는 표시 전용 값).
 		            -- (버그 수정) 더블스탭과 동일한 이유로, 이 경로도 크리티컬을 독립적으로 굴리고
 		            -- self._T.shadowEchoBonus의 stale 값 대신 쉐도우 파트너 보너스도 여기서 새로 굴린다.
 		            local critRate = self:GetServerCritRatePercent() / 100
 		            local critMult = (self._T.currentCritDamagePercent or 125) / 100
-		            local mult = 1.0 + _UtilLogic:RandomDouble() * (1.5 - 1.0)
+		            local minimum = self._T.pendingMagicClawRateMin or (0.5 / 3.0)
+                    local maximum = self._T.pendingMagicClawRateMax or (2.5 / 3.0)
+                    local mult = minimum + _UtilLogic:RandomDouble() * (maximum - minimum)
 		            damage = math.floor((self._T.pendingMagicClawCombatPower or 0) * mult)
 		            -- 백스탭도 실제 히트와 같은 시전 판정으로 얹는다 - 이 표시 전용 경로에 안 얹으면 앞선 타격에
 		            -- 대상이 죽은 뒤의 줄만 보너스가 빠져 "6줄 중 일부만 백스탭이 걸린 것처럼" 보인다.
-		            damage = self:ApplyBackstabBonus(damage, self.Entity, target, "skill.magicclaw")
+		            damage = self:ApplyComboAttackBonus(self:ApplyBackstabBonus(damage, self.Entity, target, "skill.magicclaw"))
+                    damage = self:ApplyDemonMarkBonuses(damage, target, "skill.magicclaw")
+                    if self:GetServerCombatPower() <= 1 then
+                        damage = math.min(self:GetServerCombatPower() <= 0 and 2 or 5, math.max(0, damage))
+                    end
 		            magicClawBaseCrit = _UtilLogic:RandomDouble() < critRate
 		            if magicClawBaseCrit then damage = math.floor(damage * critMult) end
 		            bonus = 0
@@ -7227,7 +7266,7 @@ script PlayerAttack extends AttackComponent
 		        -- 매직클로 리소스팩(skill/800032.img/skill/80003294)의 사용 사운드. 사용 즉시 재생.
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
-		        _SoundService:PlaySound("96edfa618f6a4fe4a4620a5c56eb93b6", 1.0)
+		        _GameAudio:PlaySound("96edfa618f6a4fe4a4620a5c56eb93b6", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -7262,13 +7301,13 @@ script PlayerAttack extends AttackComponent
 		        -- 하드코딩된 false 대신 CalcDamage가 독립적으로 굴린 결과를 그대로 전달한다.
 		        _DamageSkinService:Play(
 		            target, self:GetHitDamageSkinId(), 0,
-		            { damage }, DamageSkinTweenType.Default, baseIsCritical,
+		            { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 		            Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		        )
 		        if bonus > 0 then
 		            _DamageSkinService:Play(
 		                target, self:GetHitDamageSkinId(), 0,
-		                { bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+		                { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 		                Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		            )
 		        end
@@ -7283,7 +7322,7 @@ script PlayerAttack extends AttackComponent
 		        local serial = _EffectService:PlayEffectAttached("598d2d1859e84eaab18ae460a0a1e0a4", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, hitOptions)
 		        -- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
 		        self:EchoShadowHitEffect("598d2d1859e84eaab18ae460a0a1e0a4", target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), hitOptions)
-		        _SoundService:PlaySound("5f0c2e9b04ee4a3a9d493a863b8a1379", 1.0)
+		        _GameAudio:PlaySound("5f0c2e9b04ee4a3a9d493a863b8a1379", 1.0)
 		        -- 몬스터에 어태치된 이펙트가 자연 종료 전에 몬스터가 죽고(Enable=false) 다시 리젠(Enable=true)되면
 		        -- 재생이 멈췄다가 리젠 순간 다시 보이는 문제가 있었다 - 짧은 타이머로 명시적으로 제거해 방지한다.
 		        _TimerService:SetTimerOnce(function()
@@ -7333,11 +7372,12 @@ script PlayerAttack extends AttackComponent
 		        log("[MagicClaw] PlayMagicClawMotion sent: " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
 
 		        _TimerService:SetTimerOnce(function()
-		            if isvalid(avatarRenderer) then
+		            if self._T.magicClawLockToken ~= myMagicClawLockToken then return end
+                    if isvalid(avatarRenderer) then
 		                avatarRenderer.ShowDefaultWeaponEffects = true
 		            end
 		            self._T.isMagicClawMotionPlaying = false
-		        end, 0.55 * mult)
+		        end, 0.80 * mult)
 
 		_TimerService:SetTimerOnce(function()
 			if self._T.magicClawLockToken ~= myMagicClawLockToken then return end
@@ -7496,7 +7536,7 @@ script PlayerAttack extends AttackComponent
 		        -- 텔레포트 사용 사운드 + 이동 전 위치에 잠깐 나타나는 잔상 이펙트. Multicast는 서버도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
 		        if not self:IsClient() then return end
 		        if not isvalid(attacker) then return end
-		        _SoundService:PlaySound("4c1eb6001e9c47eda239cc58443b79cd", 1.0)
+		        _GameAudio:PlaySound("4c1eb6001e9c47eda239cc58443b79cd", 1.0)
 		        local serial = _EffectService:PlayEffect("b34e818d784f4a3891c2d50e48ca559d", attacker, Vector3(originPos.x, originPos.y, 0), 0, Vector3(1, 1, 1), false, {})
 		        -- 쉐도우 파트너: 텔레포트 잔상 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
 		        local echoSerial = self:EchoShadowSkillEffect("b34e818d784f4a3891c2d50e48ca559d", Vector3(originPos.x, originPos.y, 0), 0, Vector3(1, 1, 1), {}, 0)
@@ -7567,7 +7607,7 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("Multicast")
 	method void PlayColdBeamVisualsFixed(Entity attacker, number hitX, number hitY, number dirX, number atkMultiplier)
 		if not self:IsClient() or not isvalid(attacker) then return end
-		_SoundService:PlaySound("f8fadbcc8e2e4157bda9282f0ac54d95", 1.0)
+		_GameAudio:PlaySound("f8fadbcc8e2e4157bda9282f0ac54d95", 1.0)
 		log("[ColdBeam] use sound played")
 		-- origin.txt의 좌표는 원본 PNG 좌상단 기준 origin이다. 업로드된 단일 스프라이트의 중심
 		-- 피벗과의 차이 ((width/2-originX), (originY-height/2))를 100px=1유닛으로 환산했다.
@@ -7688,31 +7728,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method table FindThunderboltTargets(Vector2 fromPos, integer maxCount)
-		-- 썬더볼트 대상 선정: 다른 스킬과 달리 방향(dirX) 무관 - 앞뒤 판정 범위(가로 6칸, 세로 1칸) 안의
-		-- 살아있는 script.Monster를 가까운 순으로 정렬해 최대 maxCount명까지 후보로 반환한다
-		-- (실제 Attack 판정 없이 위치만으로 탐색). 좌우(가로) 범위는 기존 2.0에서 사용자 요청으로 1.5배인 3.0으로 확대.
-		local map = self.Entity.CurrentMap
-		if not isvalid(map) then return {} end
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		local candidates = {}
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				if math.abs(dx) <= 3.0 and math.abs(dy) <= 1.0 then
-					table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx) })
-				end
-			end
-		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
-		local result = {}
-		for i = 1, math.min(#candidates, maxCount) do
-			table.insert(result, candidates[i].entity)
-		end
-		return result
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		return self:FindMonstersInShape(BoxShape(fromPos, Vector2(6, 2), 0), fromPos, maxCount)
 	end
 
 	@ExecSpace("Server")
@@ -7768,7 +7785,7 @@ script PlayerAttack extends AttackComponent
 		-- 스킬 사용 즉시 재생되는 사운드. Multicast는 서버 자신도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("3a8cf5d7d10f47f79f7bc9bdad81a746", 1.0)
+		_GameAudio:PlaySound("3a8cf5d7d10f47f79f7bc9bdad81a746", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -7861,7 +7878,7 @@ script PlayerAttack extends AttackComponent
 		-- 몬스터 타격음. 맞은 몬스터 수만큼, 0.04초 간격으로 순서대로 재생된다
 		-- (호출 시점 자체가 DealThunderboltHits에서 인덱스*0.04초 딜레이로 예약되어 있음).
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("d3205fdd08e34b68bc01292a997531ed", 1.0)
+		_GameAudio:PlaySound("d3205fdd08e34b68bc01292a997531ed", 1.0)
 	end
 
 	-- ── 샤이닝 레이 (3차) ────────────────────────────────────────────────
@@ -8012,32 +8029,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method table FindShiningRayTargets(Vector2 fromPos, integer maxCount)
-		-- 샤이닝 레이 전용 판정 범위(전방위 - 방향 무관) 안의 살아있는 script.Monster를 가까운 순으로
-		-- 최대 maxCount명까지 반환한다. FindDragonRoarTargets와 같은 구조이지만 범위가 절반
-		-- (가로 15.0→7.5, 세로 7.5→3.75)이라 별도 함수로 분리한다(드래곤 로어 쪽 범위는 그대로 유지).
-		local map = self.Entity.CurrentMap
-		if not isvalid(map) then return {} end
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		local candidates = {}
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				if math.abs(dx) <= 7.5 and math.abs(dy) <= 3.75 then
-					-- 몬스터가 많을 때 진짜 가까운 순으로 뽑히도록 실제 유클리드 거리로 정렬한다.
-					table.insert(candidates, { entity = mc.Entity, dist = math.sqrt(dx * dx + dy * dy) })
-				end
-			end
-		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
-		local result = {}
-		for i = 1, math.min(#candidates, maxCount) do
-			table.insert(result, candidates[i].entity)
-		end
-		return result
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		return self:FindMonstersInShape(BoxShape(fromPos, Vector2(15, 7.5), 0), fromPos, maxCount)
 	end
 
 	@ExecSpace("Server")
@@ -8149,14 +8142,14 @@ script PlayerAttack extends AttackComponent
 	method void PlayShiningRayUseSound()
 		-- 사용음: 라이브러리 원본 팩 skill/231.img/skill/2311004의 _audio/Use.
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("6f972ab4e14841398281f3fc2a8f376e", 1.0)
+		_GameAudio:PlaySound("6f972ab4e14841398281f3fc2a8f376e", 1.0)
 	end
 
 	@ExecSpace("Multicast")
 	method void PlayShiningRayHitSound()
 		-- 적중음: 같은 팩(2311004)의 _audio/Hit. 맞은 순서대로 0.04초 간격(최대 10회)으로 재생된다.
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("01cd44c5de6d45cfbf47938e26243452", 1.0)
+		_GameAudio:PlaySound("01cd44c5de6d45cfbf47938e26243452", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -8351,30 +8344,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method table FindMagicMissileTargets(Vector2 fromPos, number dirX, integer maxCount)
-		-- 매직 미사일 대상 선정: 캐릭터가 바라보는 전방(가로 6칸, 세로 위아래 3칸)의 살아있는
-		-- script.Monster를 가까운 순으로 정렬해 최대 maxCount명까지 반환한다(실제 판정 없이 위치 탐색만).
-		local map = self.Entity.CurrentMap
-		if not isvalid(map) then return {} end
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		local candidates = {}
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				if dx * dirX >= 0 and math.abs(dx) <= 6.0 and math.abs(dy) <= 3.0 then
-					table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx) })
-				end
-			end
-		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
-		local result = {}
-		for i = 1, math.min(#candidates, maxCount) do
-			table.insert(result, candidates[i].entity)
-		end
-		return result
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		return self:FindNearestMonstersInForwardBox(fromPos, dirX, 6, 3, 3, maxCount)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -8509,7 +8480,7 @@ script PlayerAttack extends AttackComponent
 		-- 스킬 사용 즉시 재생되는 사운드 (피드백으로 교체된 전용 사용음).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("a2ade2fb109b490cb95814c0622b4f4f", 1.0)
+		_GameAudio:PlaySound("a2ade2fb109b490cb95814c0622b4f4f", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -8548,7 +8519,7 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
 		_EffectService:PlayEffectAttached("37667e283b994c4a94880227dbe4d387", target, Vector3(0, 0.2, 0), 0, Vector3(1, 1, 1), false, {})
-		_SoundService:PlaySound("5b622d47e7e4412b8217bcfcef140946", 1.0)
+		_GameAudio:PlaySound("5b622d47e7e4412b8217bcfcef140946", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -8815,7 +8786,7 @@ script PlayerAttack extends AttackComponent
 		-- (요청 2026-07-28) 이펙트 RUID 교체: 8d48b1dc(effect0) → 2cdfa538.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("0dd3dfd6b97c4a689deac7f3fde133dc", 1.0)
+		_GameAudio:PlaySound("0dd3dfd6b97c4a689deac7f3fde133dc", 1.0)
 		local serial = _EffectService:PlayEffectAttached("2cdfa53899d2462cb051e958a70b4747", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
@@ -8974,7 +8945,7 @@ script PlayerAttack extends AttackComponent
 		-- 스킬 사용 즉시 재생되는 사운드. Multicast는 서버 자신도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("a1a425ae3c1c49afa068ee212676c5dc", 1.0)
+		_GameAudio:PlaySound("a1a425ae3c1c49afa068ee212676c5dc", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -9002,7 +8973,7 @@ script PlayerAttack extends AttackComponent
 	method void PlayHealUndeadHitSound()
 		-- 언데드 몬스터가 힐로 피해를 입을 때 재생되는 사운드.
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("38052d3003a941759a340ae28611d4dd", 1.0)
+		_GameAudio:PlaySound("38052d3003a941759a340ae28611d4dd", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -9337,7 +9308,7 @@ script PlayerAttack extends AttackComponent
 		local serial = _EffectService:PlayEffectAttached("410e6a09f8ec471f87bd8d55c34cc48d", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
 		local echoSerial = self:EchoShadowSkillEffectAttached("410e6a09f8ec471f87bd8d55c34cc48d", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
-		_SoundService:PlaySound("64795afda95e4b7dbdbdfe731e7d405a", 1.0)
+		_GameAudio:PlaySound("64795afda95e4b7dbdbdfe731e7d405a", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 			if echoSerial ~= 0 then
@@ -9521,7 +9492,7 @@ script PlayerAttack extends AttackComponent
 		_EffectService:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX })
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫)
 		self:EchoShadowSkillEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), { ["FlipX"] = flipX }, dirX)
-		_SoundService:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
+		_GameAudio:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
 		log("[ComboAttack] 시전 이펙트/사운드 재생")
 	end
 
@@ -9703,7 +9674,7 @@ script PlayerAttack extends AttackComponent
 		local flipX = dirX > 0
 		local backSerial = _EffectService:PlayEffectAttached("6db426f91ed54b83beddb7837d96fb4c", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 5 })
 		local frontSerial = _EffectService:PlayEffectAttached("8ef08d990aeb452bad114479f6bc76fd", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = flipX, ["OrderInLayer"] = 10 })
-		_SoundService:PlaySound("6c7c28167b9049419435cc53001cef0c", 1.0)
+		_GameAudio:PlaySound("6c7c28167b9049419435cc53001cef0c", 1.0)
 		log("[ShadowPartner] 시전 이펙트/사운드 재생")
 	end
 
@@ -9748,12 +9719,13 @@ script PlayerAttack extends AttackComponent
 	--   박스를 대상 위치로 옮겨도 옆의 다른 몬스터가 휩쓸릴 수 없다(차지 블로우 다중 대상엔 쓰면 안 된다).
 	-- leash를 두는 이유: 놓친 대상을 맵 반대편까지 따라가 때리면 그건 그것대로 이상하다.
 	method any ShapeOnLockedTarget(Entity locked, Vector3 pos, number leash)
-		if not self:IsLiveMonster(locked) then return nil end
-		local tp = locked.TransformComponent.WorldPosition
-		local ddx = tp.x - pos.x
-		local ddy = tp.y - pos.y
-		if (ddx * ddx + ddy * ddy) > (leash * leash) then return nil end
-		return BoxShape(Vector2(tp.x, tp.y), Vector2(1.2, 1.8), 0)
+        -- 대상 유지 거리도 발점 대신 몸통 겹침으로 검사해 상체 적중이 잠금 단계에서 탈락하지 않게 한다.
+        if not self:IsLiveMonster(locked) then return nil end
+        local targets = self:FindMonstersInShape(CircleShape(Vector2(pos.x, pos.y), leash), Vector2(pos.x, pos.y), 9999)
+        for _, target in ipairs(targets) do
+            if target == locked then return BoxShape(self:GetMonsterHitCenter(locked), Vector2(1.2, 1.8), 0) end
+        end
+        return nil
 	end
 
 	method table AttackShadowSafe(any shape, string attackInfo, Entity target)
@@ -9850,8 +9822,8 @@ script PlayerAttack extends AttackComponent
 		-- (버그 수정) "2줄 중 하나만 뜨는 경우 없이 항상 같이 뜬다" - 원본/보너스가 CalcCritical의 결과
 		-- 하나(isCritical)를 공유해서 생긴 문제였다. CalcDamage에서 각 줄에 대해 독립적으로 굴린 결과를
 		-- 각각 별도 파라미터(originalIsCritical/bonusIsCritical)로 받아 그대로 전달한다.
-		_DamageSkinService:Play(defender, skinRuid, 0, { original }, DamageSkinTweenType.Default, originalIsCritical, Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
-		_DamageSkinService:Play(defender, skinRuid, 0, { bonus }, DamageSkinTweenType.Default, bonusIsCritical, Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		_DamageSkinService:Play(defender, skinRuid, 0, { original > 0 and original or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, originalIsCritical, Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		_DamageSkinService:Play(defender, skinRuid, 0, { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical, Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
 		log("[ShadowPartner] 데미지 2줄 표시 original=" .. tostring(original) .. " bonus=" .. tostring(bonus) .. " originalCrit=" .. tostring(originalIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
 	end
 
@@ -10400,7 +10372,7 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
 		local panicSoundRUID = "d01b135e62a74129b1515c8e0250a2f5"
-		_SoundService:PlaySound(panicSoundRUID, 1.0)
+		_GameAudio:PlaySound(panicSoundRUID, 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -10450,7 +10422,7 @@ script PlayerAttack extends AttackComponent
 				_EffectService:PlayEffectAttached(hitEffectRUID, target, Vector3(0, 0.1, 0), 0, Vector3(hitScale, hitScale, hitScale), false, hitOptions)
 				-- 쉐도우 파트너: 같은 히트 이펙트를 0.25초 시간차를 두고 그 자리에 한 번 더(70% 투명도) 재생
 				self:EchoShadowHitEffect(hitEffectRUID, target, Vector3(0, 0.1, 0), 0, Vector3(hitScale, hitScale, hitScale), hitOptions)
-				_SoundService:PlaySound(swingSoundRUID, 1.0)
+				_GameAudio:PlaySound(swingSoundRUID, 1.0)
 			end
 		end
 		log("[Panic] 히트 이펙트 스케일 orbCount=" .. tostring(orbCount) .. " scale=" .. tostring(hitScale))
@@ -10562,29 +10534,8 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method table FindComaTargets(Vector2 fromPos, integer maxCount, number halfW, number halfH)
-		-- FindDragonRoarTargets와 같은 구조이지만 판정 범위를 인자로 받는다 - 코마의 구슬 수 비례 사거리 전용.
-		local map = self.Entity.CurrentMap
-		if not isvalid(map) then return {} end
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		local candidates = {}
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				if math.abs(dx) <= halfW and math.abs(dy) <= halfH then
-					table.insert(candidates, { entity = mc.Entity, dist = math.sqrt(dx * dx + dy * dy) })
-				end
-			end
-		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
-		local result = {}
-		for i = 1, math.min(#candidates, maxCount) do
-			table.insert(result, candidates[i].entity)
-		end
-		return result
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		return self:FindMonstersInShape(BoxShape(fromPos, Vector2(halfW * 2, halfH * 2), 0), fromPos, maxCount)
 	end
 
 	-- 대상 하나에게만 코마 데미지를 적중시킨다(드래곤로어/익스플로젼과 동일한 단일 대상 패턴 - 밀집
@@ -10647,7 +10598,7 @@ script PlayerAttack extends AttackComponent
 		-- 코마 전용 사용 사운드. Multicast는 서버 자신도 함께 실행하므로 클라이언트에서만 실행되게 막는다.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("15cbdb9c56db4e87a379ba631e06a3d1", 1.0)
+		_GameAudio:PlaySound("15cbdb9c56db4e87a379ba631e06a3d1", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -10741,7 +10692,7 @@ script PlayerAttack extends AttackComponent
 			local p = self.Entity.TransformComponent.WorldPosition
 			local effectPos = Vector3(p.x + dir * 0.25, p.y, p.z)
 			_EffectService:PlayEffect("6cf8c9dcbdf94d539a8d6afe1ef57281", self.Entity, effectPos, 0, Vector3(1, 1, 1), false, { ["FlipX"] = dir > 0, ["SortingLayer"] = "MapLayer0", ["OrderInLayer"] = 7 })
-			_SoundService:PlaySound("c4d8035c4ded408aadc62ebbf6eb54a3", 1.0)
+			_GameAudio:PlaySound("c4d8035c4ded408aadc62ebbf6eb54a3", 1.0)
 		end
 	end
 
@@ -11623,7 +11574,7 @@ script PlayerAttack extends AttackComponent
 		-- 버프 사용음(클라이언트에서만 재생).
 		if not self:IsClient() then return end
 		if soundRuid == nil or soundRuid == "" then return end
-		_SoundService:PlaySound(soundRuid, 1.0)
+		_GameAudio:PlaySound(soundRuid, 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -11744,7 +11695,7 @@ script PlayerAttack extends AttackComponent
 	method void PlayPoisonMistCastEffect(Entity attacker)
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("eb7f504670a14802a48cc94f4eb66848", 1.0)
+		_GameAudio:PlaySound("eb7f504670a14802a48cc94f4eb66848", 1.0)
 		local ctrl = attacker.PlayerControllerComponent
 		local dirX = (isvalid(ctrl) and ctrl.LookDirectionX >= 0) and 1 or -1
 		local mapEntity = attacker.CurrentMap
@@ -12002,28 +11953,8 @@ script PlayerAttack extends AttackComponent
 	-- 익스플로젼 판정 범위(전방위 - 방향 무관) 안의 살아있는 script.Monster를 가까운 순으로 최대 maxCount명까지 반환한다.
 	@ExecSpace("ServerOnly")
 	method table FindExplosionTargets(Vector2 fromPos, integer maxCount)
-		local map = self.Entity.CurrentMap
-		if not isvalid(map) then return {} end
-		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
-		local candidates = {}
-		for _, comp in ipairs(monsterComps) do
-			---@type Monster
-			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and not mc.IsDead then
-				local pos = mc.Entity.TransformComponent.WorldPosition
-				local dx = pos.x - fromPos.x
-				local dy = pos.y - fromPos.y
-				if math.abs(dx) <= 3.0 and math.abs(dy) <= 1.5 then
-					table.insert(candidates, { entity = mc.Entity, dist = math.abs(dx) })
-				end
-			end
-		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
-		local result = {}
-		for i = 1, math.min(#candidates, maxCount) do
-			table.insert(result, candidates[i].entity)
-		end
-		return result
+		-- 발 위치 대신 실제 피격 영역과 겹치는 몬스터를 선택한다.
+		return self:FindMonstersInShape(BoxShape(fromPos, Vector2(6, 3), 0), fromPos, maxCount)
 	end
 
 	-- 드래곤 로어 전용 판정 범위(전방위 - 방향 무관) 안의 살아있는 script.Monster를 가까운 순으로
@@ -12162,7 +12093,7 @@ script PlayerAttack extends AttackComponent
 		_EffectService:PlayEffect(specials[index], mapEntity, Vector3(px, py, pz), 0, Vector3(1, 1, 1), false)
 		-- 쉐도우 파트너: 독구름 파열 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		self:EchoShadowSkillEffect(specials[index], Vector3(px, py, pz), 0, Vector3(1, 1, 1), {}, 0)
-		_SoundService:PlaySound("3edd6d189b9b4bf1ac48162339848e36", 1.0)
+		_GameAudio:PlaySound("3edd6d189b9b4bf1ac48162339848e36", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -12303,7 +12234,7 @@ script PlayerAttack extends AttackComponent
 		_EffectService:PlayEffectAttached("5468cadd2f60428e925bc368968e1a1e", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, {})
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		self:EchoShadowSkillEffectAttached("5468cadd2f60428e925bc368968e1a1e", attacker, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), {}, 0)
-		_SoundService:PlaySound("7dd03981265b4d9a8c638bf0b18649cc", 1.0)
+		_GameAudio:PlaySound("7dd03981265b4d9a8c638bf0b18649cc", 1.0)
 		local cam = _CameraService:GetCurrentCameraComponent()
 		if isvalid(cam) then
 			cam:ShakeCamera(0.3, 0.4)
@@ -12587,12 +12518,12 @@ script PlayerAttack extends AttackComponent
 		_EffectService:PlayEffectAttached("96b261657b0c4aa792bd6f3e7d6c6681", attacker, castOffset, 0, Vector3(1, 1, 1), false, backOption)
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		self:EchoShadowSkillEffectAttached("96b261657b0c4aa792bd6f3e7d6c6681", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
-		_SoundService:PlaySound("267aa4a9324f460b80bc04600aa4d0e0", 1.0)
+		_GameAudio:PlaySound("267aa4a9324f460b80bc04600aa4d0e0", 1.0)
 		-- 시전 시점부터 c50b1e30을 20초간 재생한다(클립이 20초보다 짧을 수 있어 반복 재생 후 20초에 정지).
 		-- (기능 수정) "배경 소리가 잘 안 들린다" - 볼륨 0.5 → 0.8 → (요청) 1.5배인 1.2로.
-		_SoundService:PlayLoopSound("c50b1e30210d4019a97da3e76c33079f", 1.2)
+		_GameAudio:PlayLoopSound("c50b1e30210d4019a97da3e76c33079f", 1.2)
 		_TimerService:SetTimerOnce(function()
-			_SoundService:StopSound("c50b1e30210d4019a97da3e76c33079f")
+			_GameAudio:StopSound("c50b1e30210d4019a97da3e76c33079f")
 		end, 20.0)
 	end
 
@@ -13192,7 +13123,7 @@ script PlayerAttack extends AttackComponent
 		local clip = shardClips[_UtilLogic:RandomIntegerRange(1, #shardClips)]
 		-- (기능 수정) 얼음조각 크기를 원본의 2/4(=50%)로 한다.
 		_EffectService:PlayEffect(clip, map, Vector3(px, py, 0), 0, Vector3(0.5, 0.5, 0.5), false, { ["OrderInLayer"] = -1 })
-		_SoundService:PlaySoundAtPos("3edd6d189b9b4bf1ac48162339848e36", Vector3(px, py, 0), self.Entity, 0.7)
+		_GameAudio:PlaySoundAtPos("3edd6d189b9b4bf1ac48162339848e36", Vector3(px, py, 0), self.Entity, 0.7)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -13698,7 +13629,7 @@ script PlayerAttack extends AttackComponent
 		local serial = _EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), false, castOptions)
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		local echoSerial = self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), castOptions, dirX)
-		_SoundService:PlaySound("6f972ab4e14841398281f3fc2a8f376e", 1.0)
+		_GameAudio:PlaySound("6f972ab4e14841398281f3fc2a8f376e", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 			if echoSerial ~= 0 then
@@ -13975,7 +13906,7 @@ script PlayerAttack extends AttackComponent
 		local serial = _EffectService:PlayEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), false, castOptions)
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		local echoSerial = self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(offsetX, offsetY, 0), angleDeg, Vector3(1, 1, 1), castOptions, dirX)
-		_SoundService:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
+		_GameAudio:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 			if echoSerial ~= 0 then
@@ -14195,7 +14126,7 @@ script PlayerAttack extends AttackComponent
 		-- 매직 미사일 사용음을 임시 재사용한다(전용 사운드가 생기면 교체 가능).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("a2ade2fb109b490cb95814c0622b4f4f", 1.0)
+		_GameAudio:PlaySound("a2ade2fb109b490cb95814c0622b4f4f", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -14396,7 +14327,7 @@ script PlayerAttack extends AttackComponent
 		-- 홀리 에로우 사용음 - MSW 라이브러리 원본 팩(skill/230.img/skill/2301005)의 _audio/Use 재사용.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("9af8818422a04d12877fb9e1c30573a8", 1.0)
+		_GameAudio:PlaySound("9af8818422a04d12877fb9e1c30573a8", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -14770,7 +14701,7 @@ script PlayerAttack extends AttackComponent
 		avatarRenderer.ShowDefaultWeaponEffects = false
 
 		local playerCtrl = attacker.PlayerControllerComponent
-		if isvalid(attacker.MovementComponent) then
+		if isvalid(attacker.MovementComponent) and not (attacker == _UserService.LocalPlayer and self:IsBasicAirMotion()) then
 			attacker.MovementComponent:Stop()
 		end
 		if isvalid(playerCtrl) then
@@ -14895,6 +14826,7 @@ script PlayerAttack extends AttackComponent
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if not isvalid(playerCtrl) then return end
 		local dirX = (playerCtrl.LookDirectionX >= 0) and 1 or -1
+		self:BeginBasicAirMotion(interval)
 
 		-- 엔진 기본공격이 자기 ATTACK 상태/무기 휘두르기를 띄우지 못하게 **클라에서** 컨트롤러를 끈다.
 		local wasEnabled = playerCtrl.Enable
@@ -14905,6 +14837,7 @@ script PlayerAttack extends AttackComponent
 
 		-- 더블샷과 **같은 모션 함수**로 재생한다 - 직업별 활/석궁 구분은 여기서 정해진다.
 		self:PlayDoubleShotMotionLocal(self.Entity, self:GetBowCastMotionForJob(jobIdx), dirX, mult)
+		local directionGeneration = self._T.isDoubleShotDirectionLockedGeneration
 		-- (요청 2026-08-13) 전투분석(F8) 시전 횟수 집계. **여기서** 부르는 이유:
 		--   · ReportCast는 senderUserId로 시전자를 가리므로 반드시 **클라에서** 불러야 한다(서버 호출 불가).
 		--   · 위 연타 간격/상태 가드를 모두 통과해 시전이 확정된 지점이라 과다 집계되지 않는다
@@ -14913,17 +14846,27 @@ script PlayerAttack extends AttackComponent
 		--   데미지/타격 수와 한 줄로 합쳐진다 - 다르면 표에 줄이 둘로 갈린다.
 		_BattleStatsManager:ReportCast("활 기본공격")
 		-- 화살 발사와 판정은 서버가 한다.
-		self:RequestArcherBasicShot(mult, jobIdx)
+		self:SyncBasicAttackStats()
+		self:RequestArcherBasicShotAimed(mult, jobIdx, dirX, _AutoHuntManager.autoOn)
 
 		-- 모션이 끝난 뒤 컨트롤러를 되돌린다(아대 기본공격과 같은 자체 타이머 복구).
 		_TimerService:SetTimerOnce(function()
 			if not isvalid(self.Entity) then return end
+			self:FinishSkillDirectionLock("isDoubleShotDirectionLocked", directionGeneration)
 			local pc2 = self.Entity.PlayerControllerComponent
 			if isvalid(pc2) and wasEnabled then pc2.Enable = true end
 			local ar = self.Entity.AvatarRendererComponent
 			if isvalid(ar) then ar.ShowDefaultWeaponEffects = true end
 		end, interval)
 		log("[ArcherBasic] 기본공격 시전 jobIdx=" .. tostring(jobIdx) .. " dirX=" .. tostring(dirX))
+	end
+
+	@ExecSpace("Server")
+	method void RequestArcherBasicShotAimed(number atkMultiplier, integer jobIdx, number direction, boolean autoAim)
+		local ctrl = self.Entity.PlayerControllerComponent
+		if isvalid(ctrl) then ctrl.LookDirectionX = direction >= 0 and 1 or -1 end
+		self._T.autoArcherAim = autoAim
+        self:RequestArcherBasicShot(atkMultiplier, jobIdx)
 	end
 
 	@ExecSpace("Server")
@@ -14944,7 +14887,9 @@ script PlayerAttack extends AttackComponent
 		-- ⚠ 진입 경로가 둘이다: 클라 시전(RequestArcherBasicShot)과, 컨트롤러를 끄기 직전에 엔진이 이미
 		--   흘려보낸 PlayerActionEvent("Attack") → AttackNormal. 둘이 겹치면 화살이 2발 나가므로
 		--   짧은 간격 중복을 서버에서 걸러낸다(아대 기본공격의 clawThrowAt과 같은 방식).
-		local nowT = _UtilLogic.ServerElapsedSeconds
+		local autoAim = self._T.autoHuntActive == true or self._T.autoArcherAim == true
+        self._T.autoArcherAim = nil
+        local nowT = _UtilLogic.ServerElapsedSeconds
 		if (self._T.archerBasicAt or -99) + 0.2 > nowT then return end
 		self._T.archerBasicAt = nowT
 		local sc = self.Entity.StateComponent
@@ -14954,7 +14899,24 @@ script PlayerAttack extends AttackComponent
 		end
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		local dirX = (isvalid(playerCtrl) and playerCtrl.LookDirectionX >= 0) and 1 or -1
-		local mult = math.max(atkMultiplier or 1.0, 0.001)
+		local lockedTarget = self.Entity
+        local lockedLife = -1
+        local castMap = self.Entity.CurrentMap
+        if autoAim then
+            local castPosition = self.Entity.TransformComponent.WorldPosition
+            local candidate = self:FindLuckySevenTarget(Vector2(castPosition.x, castPosition.y), dirX)
+            if isvalid(candidate) and candidate.CurrentMap == castMap then
+                local cp = candidate.TransformComponent.WorldPosition
+                local pp = self.Entity.TransformComponent.WorldPosition
+                local distance = math.sqrt((cp.x-pp.x)^2 + (cp.y-pp.y)^2)
+                local monster = candidate:GetComponent("script.Monster")
+                if distance <= self:GetBasicProjectileTravelRange() and isvalid(monster) and not monster.IsDead then
+                    lockedTarget = candidate
+                    lockedLife = monster.LifeSerial
+                end
+            end
+        end
+        local mult = math.max(atkMultiplier or 1.0, 0.001)
 		local motionName = self:GetBowCastMotionForJob(self._T.archerJobIdx or 8)
 		-- 신궁은 ball2(37x7 굵은 금색 화살), 보우마스터는 ball1(29x3 가는 주황 화살) - 더블샷과 같은 RUID.
 		local ballRuid = (motionName == "shoot2")
@@ -14964,9 +14926,12 @@ script PlayerAttack extends AttackComponent
 		self:PlayArcherBasicMotion(self.Entity, motionName, dirX, mult)
 		-- 화살이 실제로 나가는 시점은 더블샷과 동일(모션의 릴리즈 프레임 0.2×공속).
 		_TimerService:SetTimerOnce(function()
-			if not isvalid(self.Entity) then return end
-			local aim = self:ComputeArrowAimDirection(dirX, self.ArrowAimXReach, self.ArrowAimYHalfHeight)
-			self:SpawnArcherBasicProjectile(ballRuid, aim.x, aim.y)
+			if not isvalid(self.Entity) or self.Entity.CurrentMap ~= castMap then return end
+			local aimHeight = self.ArrowAimYHalfHeight
+			local rb = self.Entity.RigidbodyComponent
+			if isvalid(rb) and not rb:IsOnGround() then aimHeight = math.max(aimHeight, 1.5) end
+			local aim = self:ComputeArrowAimDirection(dirX, self:GetBasicProjectileTravelRange(), aimHeight)
+			self:SpawnArcherBasicProjectile(ballRuid, aim.x, aim.y, lockedTarget, lockedLife)
 		end, 0.2 * mult)
 	end
 
@@ -14986,7 +14951,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void SpawnArcherBasicProjectile(string ballRuid, number dirX, number dirY)
+	method void SpawnArcherBasicProjectile(string ballRuid, number dirX, number dirY, Entity lockedTarget, integer lockedLife)
 		-- 기본공격 화살 한 발을 스폰해 발사한다. 더블샷 화살(doubleshotprojectile)을 그대로 쓰되
 		-- **퍼지지 않는 단발**(SpreadDir = 0)이고 배율만 기본공격 값이다.
 		-- ⚠ 더블샷의 SpawnDoubleShotProjectile을 재사용하지 않는 이유: 그쪽은 배율을
@@ -15024,7 +14989,18 @@ script PlayerAttack extends AttackComponent
 			projComp.RateMax = 1.0        -- 전투력의 100%
 			-- (요청 2026-08-13) 전투분석(F8)에서 더블샷과 **다른 줄**로 잡히게 태그를 갈아 끼운다.
 			-- 표시 이름은 BattleStatsManager.SkillNameForTag의 매핑("활 기본공격")이 정한다.
+			projComp.MaxLifetime = self:GetBasicProjectileTravelRange() / projComp.Speed
 			projComp.AttackTag = "basic.archerarrow"
+            if lockedLife >= 0 then
+                local monster = isvalid(lockedTarget) and lockedTarget:GetComponent("script.Monster") or nil
+                if not isvalid(monster) or monster.IsDead or monster.LifeSerial ~= lockedLife or lockedTarget.CurrentMap ~= map then
+                    _EntityService:Destroy(proj)
+                    return
+                end
+                projComp.GuaranteedTarget = lockedTarget
+                projComp.TargetLifeSerial = lockedLife
+                log("[ArcherBasic] acquired auto target=" .. lockedTarget.Name)
+            end
 			projComp.DamageSkinRUID = self:GetHitDamageSkinId()
 			projComp:Fire(dirX, dirY)
 		end
@@ -15223,7 +15199,7 @@ script PlayerAttack extends AttackComponent
 		-- 이어져 전방 오프셋 0.5 → 0.2 → 0.1 → 0.0(몸 중앙 완전 겹침)으로 확정.
 		local castOptions = { ["FlipX"] = dirX > 0 }
 		local serial = _EffectService:PlayEffectAttached("028a2e518e6c4713ad7300684d4a39d2", attacker, Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), false, castOptions)
-		_SoundService:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
+		_GameAudio:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
@@ -15376,7 +15352,7 @@ script PlayerAttack extends AttackComponent
 		local offsetY = (safeIndex - 1) * spacing
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
-			{ damage }, DamageSkinTweenType.Default, isCritical,
+			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
 		log("[Strafe] ShowStrafeLockDamageSkin hitIndex=" .. tostring(hitIndex) .. "/" .. tostring(totalLines) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(isCritical))
@@ -15392,7 +15368,7 @@ script PlayerAttack extends AttackComponent
 		if isvalid(hitComp) then offsetY = hitComp.ColliderOffset.y end
 		offsetY = offsetY + hitYOffset
 		local serial = _EffectService:PlayEffectAttached("2d66c100851845ec902a98ede7c88b78", target, Vector3(0, offsetY, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 5 })
-		_SoundService:PlaySound("eb49560ca2a84e0585e0e83cd61c9dc6", 1.0)
+		_GameAudio:PlaySound("eb49560ca2a84e0585e0e83cd61c9dc6", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.0)
@@ -15513,7 +15489,7 @@ script PlayerAttack extends AttackComponent
 		-- 아이스 샷 사용음(화살류 공용 시전음 재사용 - 아이스샷 원본 폴더에 오디오가 없음).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
+		_GameAudio:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
 	end
 
 	@ExecSpace("Server")
@@ -15785,7 +15761,7 @@ script PlayerAttack extends AttackComponent
 		-- 아이스 샷 히트음(화살류 공용 히트음 재사용).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("eb49560ca2a84e0585e0e83cd61c9dc6", 1.0)
+		_GameAudio:PlaySound("eb49560ca2a84e0585e0e83cd61c9dc6", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -15936,7 +15912,7 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("Multicast")
 	method void PlayIceStrikeSound()
 		-- 사용자 지정 RUID(원본 Ice Strike Hit)를 재생한다.
-		if self:IsClient() then _SoundService:PlaySound("452571b69b534d91a993de876f3c7887", 1.0) end
+		if self:IsClient() then _GameAudio:PlaySound("452571b69b534d91a993de876f3c7887", 1.0) end
 	end
 
 	@ExecSpace("Multicast")
@@ -16522,7 +16498,7 @@ script PlayerAttack extends AttackComponent
 		local castOptions = { ["FlipX"] = dirX > 0 }
 		-- (요청) 시전 화염 폭발을 아래로 내려 캐릭터 몸쪽에서 나오도록 한다(y 0.35 -> 0.0).
 		local serial = _EffectService:PlayEffectAttached("bde5b9e6e2c2462ab596f0f287b06c62", attacker, Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), false, castOptions)
-		_SoundService:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
+		_GameAudio:PlaySound("7d5ef2c392a34251990a9dc8b51deb12", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 		end, 1.5)
@@ -17011,10 +16987,10 @@ script PlayerAttack extends AttackComponent
 		end, prepDur)
 		-- (피드백) "사용 사운드를 3배로 많이" - 기본 루프 재생에 더해 0.35초마다 같은 사운드를
 		-- 한 번씩 겹쳐 재생해 연사(0.1초/발)에 맞는 촘촘한 소리를 만든다.
-		_SoundService:PlayLoopSound("5be2bfc98ac5406485fd89dac2278ad4", 1.0)
+		_GameAudio:PlayLoopSound("5be2bfc98ac5406485fd89dac2278ad4", 1.0)
 		self._T.hurricaneSndTimerId = _TimerService:SetTimerRepeat(function()
 			if self._T.hurricaneVisualsActive ~= true then return end
-			_SoundService:PlaySound("5be2bfc98ac5406485fd89dac2278ad4", 1.0)
+			_GameAudio:PlaySound("5be2bfc98ac5406485fd89dac2278ad4", 1.0)
 		end, 0.35)
 		log("[Hurricane] 시전 이펙트 시작 prepDur=" .. string.format("%.2f", prepDur) .. " dirX=" .. tostring(dirX))
 	end
@@ -17068,7 +17044,7 @@ script PlayerAttack extends AttackComponent
 			_EffectService:RemoveEffect(self._T.hurricaneLoopSerial)
 			self._T.hurricaneLoopSerial = nil
 		end
-		_SoundService:StopSound("5be2bfc98ac5406485fd89dac2278ad4")
+		_GameAudio:StopSound("5be2bfc98ac5406485fd89dac2278ad4")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -17128,14 +17104,14 @@ script PlayerAttack extends AttackComponent
 	method void StartChargeLoopSfx()
 		if self._T.chargeSfxOn == true then return end
 		self._T.chargeSfxOn = true
-		_SoundService:PlayLoopSound("cd440aa30a954f54b41e45172b849ffb", 1.0)
+		_GameAudio:PlayLoopSound("cd440aa30a954f54b41e45172b849ffb", 1.0)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void StopChargeLoopSfx()
 		if self._T.chargeSfxOn ~= true then return end
 		self._T.chargeSfxOn = false
-		_SoundService:StopSound("cd440aa30a954f54b41e45172b849ffb")
+		_GameAudio:StopSound("cd440aa30a954f54b41e45172b849ffb")
 	end
 
 	-- ═════════ 피어싱(신궁 4차 차지, 2026-08-06 신설) ═════════
@@ -17335,7 +17311,7 @@ script PlayerAttack extends AttackComponent
 		)
 		-- (요청 2026-08-07) 발사음 교체 - 원본 팩 3221017의 _audio/Use(a25d89fe…)에서
 		-- skill/6300.img/skill/63001100("[발현] 스트라이크 애로우")의 _audio/Use로.
-		_SoundService:PlaySound("e01294d012d247c1a5bc07949484778b", 1.0)
+		_GameAudio:PlaySound("e01294d012d247c1a5bc07949484778b", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(tailSerialPc)
 		end, 2.0)
@@ -17948,7 +17924,7 @@ script PlayerAttack extends AttackComponent
 		-- 체인샷 사용음(원본 팩의 _audio/Use).
 		if not self:IsClient() then return end
 		if not isvalid(caster) then return end
-		_SoundService:PlaySound("176fcaa19ead485393cd3fd2c2f715d4", 1.0)
+		_GameAudio:PlaySound("176fcaa19ead485393cd3fd2c2f715d4", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -18805,7 +18781,7 @@ script PlayerAttack extends AttackComponent
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		local echoSerial = self:EchoShadowSkillEffectAttached(effectRuid, attacker, Vector3(0, 0.0, 0), 0, Vector3(1, 1, 1), castOptions, dirX)
 		-- (기능 추가) "사용시 사운드입니다" 요청 - 스킬 사용 시점에 1회 재생.
-		_SoundService:PlaySound("28d565bf11b242f8b55b05c1fe252b69", 1.0)
+		_GameAudio:PlaySound("28d565bf11b242f8b55b05c1fe252b69", 1.0)
 		_TimerService:SetTimerOnce(function()
 			_EffectService:RemoveEffect(serial)
 			if echoSerial ~= 0 then
@@ -18940,7 +18916,7 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(attacker) then return end
 		-- (기능 추가) "스킬 사용 즉시 사운드"를 넣어달라는 요청 - 도착 사운드와 별개로, 시전 시작 시점에
 		-- 1회만 재생한다(쉐도우 파트너 에코는 없음 - 다른 즉시발동 캐스트 사운드들과 동일한 패턴).
-		_SoundService:PlaySound("3cc6e9d3ad6b41fbbe2a6ab17b364b94", 1.0)
+		_GameAudio:PlaySound("3cc6e9d3ad6b41fbbe2a6ab17b364b94", 1.0)
 		local avatarRenderer = attacker.AvatarRendererComponent
 		if isvalid(avatarRenderer) then
 			avatarRenderer:SetAlpha(0, nil)
@@ -19115,7 +19091,7 @@ script PlayerAttack extends AttackComponent
 		-- 않도록 세대 번호로 구분한다.
 		self._T.assaulterMotionSerial = (self._T.assaulterMotionSerial or 0) + 1
 		local motionSerial = self._T.assaulterMotionSerial
-		_SoundService:PlaySound("bbb8c45c0d21491a97deb363a9d95e0c", 1.0)
+		_GameAudio:PlaySound("bbb8c45c0d21491a97deb363a9d95e0c", 1.0)
 		local arrival = attacker.TransformComponent.WorldPosition
 		local playerCtrl = attacker.PlayerControllerComponent
 		local arrivalDirX = self._T.shadowCloneAssaulterArrivalDirX
@@ -19838,7 +19814,7 @@ script PlayerAttack extends AttackComponent
 		-- 피드백으로 제거하고, 다른 스킬과 동일하게 고정 속도로 재생한다.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("fcac442d953049d980da4b8d7bd766d8", 1.0)
+		_GameAudio:PlaySound("fcac442d953049d980da4b8d7bd766d8", 1.0)
 		log("[SpearBurst] PlaySpearBurstAttackSound 재생됨 t=" .. tostring(_UtilLogic.ElapsedSeconds))
 	end
 
@@ -20243,13 +20219,13 @@ script PlayerAttack extends AttackComponent
 		-- 이 타격(hitIndex)에 대해 독립적으로 굴린 결과를 그대로 전달한다.
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
-			{ damage }, DamageSkinTweenType.Default, baseIsCritical,
+			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
 		if bonus > 0 then
 			_DamageSkinService:Play(
 			    target, self:GetHitDamageSkinId(), 0,
-			    { bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+			    { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 			    Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
 		end
@@ -20679,13 +20655,13 @@ script PlayerAttack extends AttackComponent
 		end
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
-			{ damage }, DamageSkinTweenType.Default, baseIsCritical,
+			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
 		if bonus > 0 then
 			_DamageSkinService:Play(
 				target, self:GetHitDamageSkinId(), 0,
-				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+				{ bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
 		end
@@ -21137,7 +21113,7 @@ script PlayerAttack extends AttackComponent
 		-- 더블 점프 사용음. 주변 모든 클라이언트에서 재생한다(돌진 PlayRushUseSound와 동일한 패턴).
 		if not self:IsClient() then return end
 		if not isvalid(caster) then return end
-		_SoundService:PlaySound("83efc24157d04c67b152d6782ce82b6b", 1.0)
+		_GameAudio:PlaySound("83efc24157d04c67b152d6782ce82b6b", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -21191,7 +21167,7 @@ script PlayerAttack extends AttackComponent
 		-- 플래시 점프 사용음. 주변 모든 클라이언트에서 재생한다(더블 점프 PlayDoubleJumpSound와 동일한 패턴).
 		if not self:IsClient() then return end
 		if not isvalid(caster) then return end
-		_SoundService:PlaySound("de98060353f946dea96cf5b66692cd0a", 1.0)
+		_GameAudio:PlaySound("de98060353f946dea96cf5b66692cd0a", 1.0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -21256,7 +21232,7 @@ script PlayerAttack extends AttackComponent
 		-- 그대로 살아있어 업로드 없이 참조한다(아트만 구버전이 없어 직접 조달했다).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("d9522927411a4f8f9dc7e083ee891f7f", 1.0)
+		_GameAudio:PlaySound("d9522927411a4f8f9dc7e083ee891f7f", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -21537,7 +21513,7 @@ script PlayerAttack extends AttackComponent
 	method void PlayBoomerangStepEffect(Entity attacker, number dirX)
 		-- ori.txt의 0~14 프레임을 0.06초 간격으로 캐릭터에 부착해 재생한다.
 		if not self:IsClient() or not isvalid(attacker) then return end
-		_SoundService:PlaySound("65aaec279c494c81a3c2890187ddd125", 1.0)
+		_GameAudio:PlaySound("65aaec279c494c81a3c2890187ddd125", 1.0)
 		local avatarRenderer = attacker.AvatarRendererComponent
 		if isvalid(avatarRenderer) then avatarRenderer:SetAlpha(0, nil) end
 		self:SetPlayerNameTagHidden(attacker, true)
@@ -21606,7 +21582,7 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("Multicast")
 	method void PlayBoomerangStepHitSound()
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("f3fa95742daa4c77b56c161c9df475d6", 1.0)
+		_GameAudio:PlaySound("f3fa95742daa4c77b56c161c9df475d6", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -21923,13 +21899,13 @@ script PlayerAttack extends AttackComponent
 		local skinRuid = self:GetHitDamageSkinId()
 		_DamageSkinService:Play(
 			target, skinRuid, 0,
-			{ damage }, DamageSkinTweenType.Default, baseIsCritical,
+			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
 		if bonus > 0 then
 			_DamageSkinService:Play(
 				target, skinRuid, 0,
-				{ bonus }, DamageSkinTweenType.Default, bonusIsCritical,
+				{ bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
 		end
@@ -22154,7 +22130,7 @@ script PlayerAttack extends AttackComponent
 		-- 브랜디쉬2 사용음(요청 RUID).
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("1488e238bb474c9087cd563a892d5dcb", 1.0)
+		_GameAudio:PlaySound("1488e238bb474c9087cd563a892d5dcb", 1.0)
 	end
 
 	-- (요청 2026-08-12 3차) 데미지 배율을 함께 받는다. ⚠ 기존 SummonDarkDragon에 인자를 더하지 않고
@@ -22275,7 +22251,7 @@ script PlayerAttack extends AttackComponent
 		-- 브랜디쉬 사용음. MSW 라이브러리의 구버전 원본 팩(skill/112.img/skill/1121008)에 그대로 살아있다.
 		if not self:IsClient() then return end
 		if not isvalid(attacker) then return end
-		_SoundService:PlaySound("6c06fe8ab27b469eb61f466ea7f7e182", 1.0)
+		_GameAudio:PlaySound("6c06fe8ab27b469eb61f466ea7f7e182", 1.0)
 	end
 
 	@ExecSpace("Multicast")
@@ -22581,6 +22557,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method integer ApplyBackstabBonus(integer dmg, Entity attacker, Entity defender, string attackInfo)
+		if self:GetServerCombatPower() <= 1 then return self:RollBeginnerDamage() end
 		-- 본체·투사체·표창 사전 예약·수동 데미지 표시가 공유하는 피해 후처리 출구.
 		local damage = self:ApplyBackstabBonusBase(dmg, attacker, defender, attackInfo)
 		return _RegionTierLogic:ApplyMonsterLevelDamage(damage, self.Entity, defender)
@@ -23184,7 +23161,7 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		local mapEntity = self.Entity.CurrentMap
 		if not isvalid(mapEntity) then return end
-		_SoundService:PlaySound("6d345fda6041465680c0238ff8a1f12d", 1.0)
+		_GameAudio:PlaySound("6d345fda6041465680c0238ff8a1f12d", 1.0)
 		local ruids = {
 			"288e10be2948421ebd107829c10f07ba", "923441a3738d45acbf57a54160cef756",
 			"9691429ecec748e792173dd277901ee0", "6dd0db759f9a4f6680f298105676d203",
@@ -23412,7 +23389,7 @@ script PlayerAttack extends AttackComponent
 		if not self:IsClient() then return end
 		local mapEntity = self.Entity.CurrentMap
 		if not isvalid(mapEntity) then return end
-		_SoundService:PlaySound("6d345fda6041465680c0238ff8a1f12d", 1.0)
+		_GameAudio:PlaySound("6d345fda6041465680c0238ff8a1f12d", 1.0)
 		local elapsed = 0
 		local spawnTimer
 		spawnTimer = _TimerService:SetTimerRepeat(function()
@@ -23795,7 +23772,7 @@ script PlayerAttack extends AttackComponent
 		local offsetY = ((hitIndex or 1) - (total + 1) / 2) * 0.3
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
-			{ dmg }, DamageSkinTweenType.Default, isCrit,
+			{ dmg > 0 and dmg or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCrit,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
 	end
@@ -25239,7 +25216,7 @@ script PlayerAttack extends AttackComponent
 		-- 어두워짐 규격은 블리자드와 같다(페이드 1.5초 / 최대 알파 0.2 / 순수 검정) - "블리자드 때처럼"이라는 요청.
 		_BlizzardScreenDim:StartHoldDim(1.5, 0.2, 0, 0, 0)
 		_BlizzardBgmDucker:StartHoldDuck(1.5, 0.1)
-		_SoundService:PlayLoopSound("732c8aeac0624d21bdcfc89bc6244105", 1.0)
+		_GameAudio:PlayLoopSound("732c8aeac0624d21bdcfc89bc6244105", 1.0)
 		log("[DarkSight] 화면 어두워짐 + 전용 BGM 시작")
 	end
 
@@ -25253,7 +25230,7 @@ script PlayerAttack extends AttackComponent
 			log("[DarkSight] 해제 - 각성이 아직 켜져 있어 화면/BGM은 그대로 둔다")
 			return
 		end
-		_SoundService:StopSound("732c8aeac0624d21bdcfc89bc6244105")
+		_GameAudio:StopSound("732c8aeac0624d21bdcfc89bc6244105")
 		-- (버그 수정) 맵 BGM 복귀는 **연막 여부와 무관하게 항상** 먼저 한다. 연막은 화면 오버레이만
 		-- 쓰고 BGM 덕킹은 전혀 건드리지 않는데, 예전에는 아래 연막 분기에서 그대로 return 해버려
 		-- EndHoldDuck을 건너뛰었다 - 연막 안에서 다크사이트를 켰다 끄면 맵 BGM이 10%에 영구히 묶였다.
@@ -25358,7 +25335,7 @@ script PlayerAttack extends AttackComponent
 		-- 연막(0.55, 회색빛)보다 어둡지만 색이 없어 몬스터/이펙트 식별에는 지장이 없는 선.
 		_BlizzardScreenDim:StartHoldDim(1.5, 0.5, 0, 0, 0)
 		_BlizzardBgmDucker:StartHoldDuck(1.5, 0.1)
-		_SoundService:PlayLoopSound("732c8aeac0624d21bdcfc89bc6244105", 1.0)
+		_GameAudio:PlayLoopSound("732c8aeac0624d21bdcfc89bc6244105", 1.0)
 		log("[Awakening] 화면 어두워짐 + 전용 BGM 시작")
 	end
 
@@ -25375,7 +25352,7 @@ script PlayerAttack extends AttackComponent
 			log("[Awakening] 해제 - 다크사이트가 아직 켜져 있어 화면/BGM은 그대로 둔다")
 			return
 		end
-		_SoundService:StopSound("732c8aeac0624d21bdcfc89bc6244105")
+		_GameAudio:StopSound("732c8aeac0624d21bdcfc89bc6244105")
 		-- 맵 BGM 복귀는 연막 여부와 무관하게 항상 먼저 한다(다크사이트에서 겪은 "BGM이 10%에 묶임" 버그와 동일 원인).
 		_BlizzardBgmDucker:EndHoldDuck(2.5)
 		if self:IsSmokeScreenActive() then
@@ -25871,13 +25848,13 @@ script PlayerAttack extends AttackComponent
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		self:EchoShadowSkillEffectAttached("47286e5fd6eb4a989792415aacf07f73", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
 		self:EchoShadowSkillEffectAttached("2eb15c8e49f8492f948c5292cd31171f", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
-		_SoundService:PlaySound("d906d21dc9bd4c8cb66861d423044a65", 1.0)
+		_GameAudio:PlaySound("d906d21dc9bd4c8cb66861d423044a65", 1.0)
 		-- (요청) 블리자드의 배경 루프 사운드(c50b1e30, 20초)와 같은 방식으로 메테오 전용 사운드를 20초간 재생한다
 		-- (클립이 20초보다 짧을 수 있어 반복 재생 후 20초에 정지 - 블리자드와 동일한 볼륨).
 		-- (피드백 이력) 사운드 교체: 89da231b → af3acec8 → de5f1d1c. 볼륨 1.5배: 0.8 → 1.2.
-		_SoundService:PlayLoopSound("de5f1d1c7ed644b9a31a31d5c078ed31", 1.2)
+		_GameAudio:PlayLoopSound("de5f1d1c7ed644b9a31a31d5c078ed31", 1.2)
 		_TimerService:SetTimerOnce(function()
-			_SoundService:StopSound("de5f1d1c7ed644b9a31a31d5c078ed31")
+			_GameAudio:StopSound("de5f1d1c7ed644b9a31a31d5c078ed31")
 		end, 20.0)
 	end
 
@@ -26032,7 +26009,7 @@ script PlayerAttack extends AttackComponent
 	method void PlayMeteorHitSound(number px, number py)
 		-- 운석 착지음(_audio/Hit). 착지 지점 기준 3D 재생.
 		if not self:IsClient() then return end
-		_SoundService:PlaySoundAtPos("0500714fee8645bb9a4894535ea723b1", Vector3(px, py, 0), self.Entity, 0.8)
+		_GameAudio:PlaySoundAtPos("0500714fee8645bb9a4894535ea723b1", Vector3(px, py, 0), self.Entity, 0.8)
 	end
 
 	-- ── 제네시스 (4차) ────────────────────────────────────────────────────
@@ -26170,11 +26147,11 @@ script PlayerAttack extends AttackComponent
 		-- 쉐도우 파트너: 같은 시전 이펙트를 x축 뒤쪽에서 투명도 70%로 복제 재생(그림자 몫 - 데미지 없음)
 		self:EchoShadowSkillEffectAttached("f0035d3b88da4c9a91689b9db9c6bf7a", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
 		self:EchoShadowSkillEffectAttached("1c434f7cecf94e1cb16b68ee0079b01d", attacker, castOffset, 0, Vector3(1, 1, 1), backOption, 0)
-		_SoundService:PlaySound("d07011d88da0400e8018379396e564b9", 1.0)
+		_GameAudio:PlaySound("d07011d88da0400e8018379396e564b9", 1.0)
 		-- 전용 BGM을 블리자드/메테오와 같은 방식(루프, 볼륨 1.2, 20초 뒤 정지)으로 재생한다.
-		_SoundService:PlayLoopSound("f0f6d14dc2ab41e48289b9b08838c2e5", 1.2)
+		_GameAudio:PlayLoopSound("f0f6d14dc2ab41e48289b9b08838c2e5", 1.2)
 		_TimerService:SetTimerOnce(function()
-			_SoundService:StopSound("f0f6d14dc2ab41e48289b9b08838c2e5")
+			_GameAudio:StopSound("f0f6d14dc2ab41e48289b9b08838c2e5")
 		end, 20.0)
 	end
 
@@ -26308,7 +26285,7 @@ script PlayerAttack extends AttackComponent
 	method void PlayGenesisHitSound(number px, number py)
 		-- 판정음(_audio/Hit). 판정 지점 기준 3D 재생.
 		if not self:IsClient() then return end
-		_SoundService:PlaySoundAtPos("039d09d0013640b182a7588ac2d34553", Vector3(px, py, 0), self.Entity, 0.8)
+		_GameAudio:PlaySoundAtPos("039d09d0013640b182a7588ac2d34553", Vector3(px, py, 0), self.Entity, 0.8)
 	end
 
 	-- ── 버프 아이콘 우클릭 취소 (서버측 정리) ─────────────────────────────
@@ -26612,7 +26589,7 @@ script PlayerAttack extends AttackComponent
 				end, 0.6 * mult)
 			end
 		end
-		_SoundService:PlaySound("ad63f4c64f304b6c876fb68511addb87", 1.0)
+		_GameAudio:PlaySound("ad63f4c64f304b6c876fb68511addb87", 1.0)
 		log("[SmokeScreen] 시전 모션(swingOF) + 사용음")
 	end
 
@@ -26901,7 +26878,7 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(mapEnt) then return end
 		local wp = defender.TransformComponent.WorldPosition
 		_EffectService:PlayEffect("898b5bfa0c5644cf8dc81b4c8603a9d0", mapEnt, Vector3(wp.x, wp.y, wp.z), 0, Vector3(1, 1, 1), false)
-		_SoundService:PlaySound("f5a0e04558144bd583bf7a2b7e7c72fc", 1.0)
+		_GameAudio:PlaySound("f5a0e04558144bd583bf7a2b7e7c72fc", 1.0)
 	end
 
 	method void NotifySmokeScreenMiss(Entity target)
@@ -27355,7 +27332,7 @@ script PlayerAttack extends AttackComponent
 	method void PlayAssassinateSound()
 		-- 시전음: 체인 라이트닝과 같은 팩 사운드 규격이 없어 기존 암행 계열 표창 사용음을 재사용한다.
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
+		_GameAudio:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
 	end
 
 	@ExecSpace("Server")
@@ -27402,7 +27379,7 @@ script PlayerAttack extends AttackComponent
 
 		-- 기모으기 이펙트는 (피드백) 위치 이동+페이드가 필요해서 PlayEffect 대신 서버가
 		-- SpearBurstFadingEffect 엔티티로 스폰한다(SpawnChainLightningChargeFx). 여기서는 사운드만.
-		_SoundService:PlaySound("3c837a89f39e4e038b0a3a378de9a377", 1.0)
+		_GameAudio:PlaySound("3c837a89f39e4e038b0a3a378de9a377", 1.0)
 
 		_TimerService:SetTimerOnce(function()
 			-- 홀드 종료: 원래 속도로 2~3프레임 재생.
@@ -27714,7 +27691,78 @@ script PlayerAttack extends AttackComponent
 	method void PlayChainLightningHitSound()
 		-- 명중음(_audio/Hit). 연쇄가 한 번에 최대 6명이라 1회만 재생한다.
 		if not self:IsClient() then return end
-		_SoundService:PlaySound("36187759ab2f4bc293aeb035e4ea8d73", 1.0)
+		_GameAudio:PlaySound("36187759ab2f4bc293aeb035e4ea8d73", 1.0)
 	end
 
+    @ExecSpace("ServerOnly")
+    method void RecordAutoHuntContact(Entity target, integer life)
+        -- Relay confirmed server contact, including zero damage, only to the attacking player.
+        if self._T.autoHuntActive ~= true or not isvalid(self.Entity.PlayerComponent) then return end
+        local now = _UtilLogic.ServerElapsedSeconds
+        if self._T.autoContactTarget == target and (self._T.autoContactNext or 0) > now then return end
+        self._T.autoContactTarget = target
+        self._T.autoContactNext = now + 0.15
+        self:ShowAutoHuntContact(target, life, self.Entity.PlayerComponent.UserId)
+    end
+
+    @ExecSpace("Client")
+    method void ShowAutoHuntContact(Entity target, integer life)
+        -- Keep feedback local; other players' damage cannot confirm this player's attack.
+        if self.Entity ~= _UserService.LocalPlayer then return end
+        _AutoHuntManager:ConfirmAttackContact(target, life)
+    end
+    @ExecSpace("ClientOnly")
+    method string GetPlayerOverlayLayer()
+        -- Use the same foreground map layer as monster labels, with a higher order.
+        local map = self.Entity.CurrentMap
+        if self._T.playerOverlayMap == map then return self._T.playerOverlayLayer or "MapLayer0" end
+        local name = "MapLayer0"
+        local order = -2147483648
+        if isvalid(map) then
+            for _, layer in ipairs(map:GetChildComponentsByTypeName("MOD.Core.MapLayerComponent", true)) do
+                if layer.LayerSortOrder > order then name = layer.MapLayerName order = layer.LayerSortOrder end
+            end
+        end
+        self._T.playerOverlayMap = map
+        self._T.playerOverlayLayer = name
+        return name
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePlayerNameOverlay()
+        -- Native NameTag exposes no sort order; render its text above monster overlays.
+        if not isvalid(self.Entity.PlayerComponent) then return end
+        local native = self.Entity.NameTagComponent
+        local map = self.Entity.CurrentMap
+        if not isvalid(native) or not isvalid(map) then return end
+        local overlay = self._T.playerNameOverlay
+        if isvalid(overlay) and overlay.CurrentMap ~= map then overlay:Destroy() overlay = nil end
+        if not isvalid(overlay) then
+            if (self._T.playerNameRetry or 0) > _UtilLogic.ElapsedSeconds then return end
+            self._T.playerNameRetry = _UtilLogic.ElapsedSeconds + 1
+            overlay = _SpawnService:SpawnByModelId("monsternametag", "PlayerName_" .. self.Entity.Id, Vector3.zero, map)
+            if not isvalid(overlay) then return end
+            self._T.playerNameOverlay = overlay
+            local text = overlay.TextRendererComponent
+            text.IsRichText = true
+            text.BestFit = false
+            text.Wrapping = false
+            text.SizeFit = true
+            text.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+            text.VerticalAlignment = TextVerticalAlignmentOption.Middle
+            text.SortingLayer = self:GetPlayerOverlayLayer()
+            text.OrderInLayer = 32768
+            log("[PlayerName] foreground name tag created")
+        end
+        native.Enable = false
+        overlay.Enable = self.Entity.VisibleInHierarchy and native.FontColor.a > 0
+        local text = overlay.TextRendererComponent
+        local name = (string.gsub(native.Name or "", "<", ""))
+        name = (string.gsub(name, ">", ""))
+        text.Text = "<mark=#00000080> " .. name .. " </mark>"
+        text.FontSize = native.FontSize
+        text.FontColor = native.FontColor
+        local p = self.Entity.TransformComponent.WorldPosition
+        overlay.TransformComponent.WorldPosition = Vector3(p.x + native.FontOffset.x, p.y + native.OffsetY + native.FontOffset.y, p.z - 0.02)
+    end
 end

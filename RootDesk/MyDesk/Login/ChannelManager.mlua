@@ -1,0 +1,124 @@
+@Logic
+script ChannelManager extends Logic
+    method string BaseName(string name)
+        return string.match(name or "", "^(.-)__channel_%d+$") or name
+    end
+
+    @ExecSpace("ServerOnly")
+    method integer UserChannel(string userId)
+        local s = _LoginFlow._T.sessions[userId]
+        return s ~= nil and math.max(1, math.min(10, s.channelNumber or 1)) or 1
+    end
+
+    @ExecSpace("ServerOnly")
+    method string EnsureMap(string mapId, string userId)
+        local base = self:BaseName(mapId)
+        if base == "login" then return "login" end
+        local number = self:UserChannel(userId)
+        if number == 1 then return base end
+        local name = base .. "__channel_" .. tostring(number)
+        if self._T.created == nil then self._T.created = {} end
+        if not self._T.created[name] then
+            local result = _DynamicMapService:CreateDynamicMap(base, name)
+            if result ~= DynamicMapResultCode.Success and result ~= DynamicMapResultCode.DuplicateMapName then
+                log_warning("[Channel] map creation failed " .. name .. " " .. tostring(result))
+                return ""
+            end
+            self._T.created[name] = true
+            log("[Channel] map ready " .. name)
+        end
+        return name
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Counts()
+        -- Count connected sessions so the in-game and login channel limits agree.
+        local counts = {}
+        for i = 1, 10 do counts[i] = 0 end
+        for uid, session in pairs(_LoginFlow._T.sessions or {}) do
+            if session.channel and isvalid(_UserService:GetUserEntityByUserId(uid)) then
+                local ch = session.channelNumber or 1
+                counts[ch] = (counts[ch] or 0) + 1
+            end
+        end
+        return counts
+    end
+
+    @ExecSpace("Server")
+    method void RequestInGameList()
+        -- Only the logged-in player may open an in-game channel picker.
+        local s = _LoginFlow._T.sessions[senderUserId]
+        if s == nil or not s.entered then return end
+        _GameSystemMenu:ReceiveChannels(self:UserChannel(senderUserId), self:Counts(), senderUserId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestSwitch(integer channel)
+        -- Authenticate the RPC before reserving a destination channel.
+        self:SwitchUser(senderUserId, channel)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SwitchUser(string userId, integer channel)
+        -- Keep the same player entity and position; no logout or character reload.
+        local s = _LoginFlow._T.sessions[userId]
+        local p = _UserService:GetUserEntityByUserId(userId)
+        if s == nil or not s.entered or not isvalid(p) or not isvalid(p.CurrentMap) then
+            _GameSystemMenu:ChannelResult(false, 0, "게임 입장 후 이용해주세요.", userId) return
+        end
+        if self._T.pending == nil then self._T.pending = {} end
+        if self._T.pending[userId] ~= nil then return end
+        local old = self:UserChannel(userId)
+        if channel < 1 or channel > 10 or channel == old then
+            _GameSystemMenu:ChannelResult(false, old, "이동할 다른 채널을 선택해주세요.", userId) return
+        end
+        if (self:Counts()[channel] or 0) >= 5 then
+            _GameSystemMenu:ChannelResult(false, old, "해당 채널이 가득 찼습니다.", userId) return
+        end
+        local origin = p.CurrentMap.Name
+        if self:BaseName(origin) == "login" then
+            _GameSystemMenu:ChannelResult(false, old, "현재 지역에서는 이동할 수 없습니다.", userId) return
+        end
+        local position = p.TransformComponent.WorldPosition
+        s.channelNumber = channel
+        local target = self:EnsureMap(origin, userId)
+        if target == "" then
+            s.channelNumber = old
+            _GameSystemMenu:ChannelResult(false, old, "채널을 준비하지 못했습니다. 다시 시도해주세요.", userId) return
+        end
+        local entry = {old=old, channel=channel, origin=origin, target=target, position=position, remaining=5}
+        self._T.pending[userId] = entry
+        _TeleportService:TeleportToMapPosition(p, position, target)
+        log("[Channel] switch requested " .. tostring(old) .. " -> " .. tostring(channel) .. " map=" .. target)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        -- Confirm arrival before releasing the UI; roll back a failed transfer.
+        for uid, entry in pairs(self._T.pending or {}) do
+            local p = _UserService:GetUserEntityByUserId(uid)
+            local s = _LoginFlow._T.sessions[uid]
+            if not isvalid(p) or s == nil then self._T.pending[uid] = nil
+            elseif isvalid(p.CurrentMap) and p.CurrentMap.Name == entry.target then
+                self._T.pending[uid] = nil
+                _GameSystemMenu:ChannelResult(true, entry.channel, "", uid)
+                log("[Channel] switch arrived channel=" .. tostring(entry.channel) .. " map=" .. entry.target)
+            else
+                entry.remaining = entry.remaining - delta
+                if entry.remaining <= 0 then
+                    s.channelNumber = entry.old
+                    self._T.pending[uid] = nil
+                    _TeleportService:TeleportToMapPosition(p, entry.position, entry.origin)
+                    _GameSystemMenu:ChannelResult(false, entry.old, "이동하지 못했습니다. 다시 시도해주세요.", uid)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- Pending transfers belong to this play session.
+        self._T.pending = nil
+        self._T.created = nil
+    end
+end

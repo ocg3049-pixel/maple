@@ -1,0 +1,181 @@
+@Logic
+script MapleIslandTutorial extends Logic
+
+    property integer step = 11
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.links = {}
+        self._T.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        for _, name in ipairs({"Skip", "Action", "Back", "Next"}) do
+            local entity = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/" .. name)
+            if isvalid(entity) then
+                local action = name
+                local listener = entity:ConnectEvent(ButtonClickEvent, function() self:OnAction(action) end)
+                table.insert(self._T.links, {entity = entity, listener = listener})
+            end
+        end
+        local title = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Title")
+        if isvalid(title) then
+            self._T.dragTitle = title
+            self._T.dragListener = title:ConnectEvent(UITouchDragEvent, function(event)
+                local guide = title.Parent
+                local current = _UILogic:ScreenToLocalUIPosition(event.TouchPoint, guide.Parent.UITransformComponent)
+                local previous = _UILogic:ScreenToLocalUIPosition(event.TouchPoint - event.TouchDelta, guide.Parent.UITransformComponent)
+                guide.UITransformComponent.anchoredPosition = guide.UITransformComponent.anchoredPosition + current - previous
+            end)
+        end
+        log("[Tutorial] ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        if isvalid(self._T.dragTitle) and self._T.dragListener then self._T.dragTitle:DisconnectEvent(UITouchDragEvent, self._T.dragListener) end
+        if self._T.keyHandler then _InputService:DisconnectEvent(KeyDownEvent, self._T.keyHandler) end
+        for _, link in ipairs(self._T.links or {}) do
+            if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent, link.listener) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string raw)
+        local saved = tonumber(string.match("\n" .. raw, "\nQ\t(%d+)"))
+        local version = tonumber(string.match("\n" .. raw, "\nQ\t%d+\t(%d+)")) or 1
+        if saved ~= nil and version < 2 and saved >= 7 then saved = saved + 1 end
+        self.step = raw == "" and 1 or math.max(1, math.min(11, math.floor(saved or 11)))
+        self._T.leftPressed = false
+        self._T.rightPressed = false
+        self._T.viewStep = self.step
+        self._T.startX = nil
+        self._T.jumpY = nil
+        self._T.drawnStep = nil
+        self._T.practiceResult = ""
+        log("[Tutorial] restore step=" .. tostring(self.step))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Active()
+        return self.step < 11 and _LoginFlow.phase == "ingame"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Advance(integer expected)
+        if not self:Active() or self.step ~= expected then return end
+        local following = (self._T.viewStep or self.step) == self.step
+        self.step = self.step + 1
+        _GameAudio:PlayCue("Quest")
+        if following then self._T.viewStep = self.step end
+        self._T.drawnStep = nil
+        _CharacterPersistence:MarkDirty("tutorial")
+        _CharacterPersistence:FlushToServer()
+        log("[Tutorial] completed=" .. tostring(expected) .. " next=" .. tostring(self.step))
+        if self.step == 11 then _UIToast:ShowMessage("튜토리얼 완료! 새로운 모험을 시작하세요.") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Notify(string action)
+        if action == "snail" then self:Advance(5)
+        elseif action == "enhance" then self:Advance(6)
+        elseif action == "autohunt" then self:Advance(8)
+        elseif action == "worldmap" then self:Advance(9) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        if not self:Active() or _KeySettingManager:IsCapturingKey() then return end
+        local action = _KeySettingManager:GetFuncForKeyEnum(event.key)
+        if self.step == 1 then
+            if event.key == KeyboardKey.LeftArrow then self._T.leftPressed = true end
+            if event.key == KeyboardKey.RightArrow then self._T.rightPressed = true end
+            if self._T.leftPressed and self._T.rightPressed then self:Advance(1) end
+        elseif self.step == 2 and action == "jump" then
+            local p = _UserService.LocalPlayer
+            if isvalid(p) then self._T.jumpY = p.TransformComponent.WorldPosition.y end
+        elseif self.step == 3 and action == "attack" then self:Advance(3) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnAction(string action)
+        if not self:Active() then return end
+        if action == "Back" or action == "Next" then
+            local direction = action == "Back" and -1 or 1
+            self._T.viewStep = math.max(1, math.min(self.step, (self._T.viewStep or self.step) + direction))
+            self._T.drawnStep = nil
+            log("[Tutorial] review=" .. tostring(self._T.viewStep) .. " progress=" .. tostring(self.step))
+            return
+        end
+        if action == "Skip" then
+            self.step = 9
+            self._T.viewStep = 9
+            self._T.drawnStep = nil
+            _CharacterPersistence:MarkDirty("tutorial_skip")
+            _CharacterPersistence:FlushToServer()
+            return
+        end
+        if (self._T.viewStep or self.step) ~= self.step then return end
+        if self.step == 6 or self.step == 7 then
+            -- 성장 안내를 읽고 확인하면 완료한다.
+            log("[Tutorial] enhancement guide acknowledged")
+            self:Advance(self.step)
+        elseif self.step >= 9 then
+            _WorldMapManager:ShowMapPage("victoria")
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        local guide = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide")
+        if not isvalid(guide) then return end
+        local active = self:Active()
+        local worldMap = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        guide.Enable = active and not (isvalid(worldMap) and worldMap.Enable)
+        if not active then return end
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or not isvalid(player.CurrentMap) then return end
+        local pos = player.TransformComponent.WorldPosition
+        if self.step == 2 and self._T.jumpY ~= nil and pos.y > self._T.jumpY + 0.2 then
+            self:Advance(2)
+        elseif self.step == 4 then
+            for key, slot in pairs(_SkillManager:ExportHotkeys()) do
+                if slot.name == "달팽이 세마리" and _SkillManager:GetBarPosForKey(key) ~= "" then
+                    self._T.snailKey = key
+                    self:Advance(4)
+                    break
+                end
+            end
+        elseif self.step == 10 and _ChannelManager:BaseName(player.CurrentMap.Name) ~= "001010000" and player.CurrentMap.Name ~= "login" then
+            self:Advance(10)
+        end
+        if self._T.drawnStep ~= (self._T.viewStep or self.step) then self:Draw() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        local shown = math.min(self._T.viewStep or self.step, 10)
+        self._T.drawnStep = shown
+        local key = function(id) return _KeySettingManager:GetKeyForFunc(id) end
+        local texts = {
+            "<color=#CE3030>왼쪽과 오른쪽 방향키를 각각 한 번씩</color> 눌러보세요.",
+            "[" .. key("jump") .. "] 키로 점프해 보세요.\n아래 방향키와 함께 누르면 아래로 내려갑니다.",
+            "[" .. key("attack") .. "] 키로 기본 공격을 해보세요.",
+            "[" .. key("skill") .. "] 스킬창의 기본(0) 탭을 여세요.\n달팽이 세마리를 화면 아래 퀵슬롯으로 드래그하세요.",
+            "퀵슬롯에 표시된 키 [" .. tostring(self._T.snailKey or "등록한 키") .. "] 를 눌러\n달팽이 세마리를 사용해보세요.",
+            "[" .. key("enhance") .. "] 키로 강화창을 열 수 있습니다.\n장비를 올리고 스타포스를 강화하세요.\n<color=#CE3030>강화에는 메소가 들며 실패할 수 있습니다.</color>\n처음 받은 장비는 3성까지 반드시 성공합니다.\n읽었다면 확인을 눌러주세요.",
+            "<color=#CE3030>레벨은 장비의 전투력으로 결정됩니다.</color>\n착용한 아이템을 강화하면 전투력이 오르고,\n<color=#CE3030>전투력 기준을 넘으면 레벨도 올라갑니다.</color>\n몬스터 사냥으로 메소를 모아 장비를 강화하세요.\n읽었다면 확인을 눌러주세요.",
+            "[" .. key("autohunt") .. "] 키로 자동사냥을 켜보세요.\n살아 있는 몬스터가 있어야 시작됩니다.\n같은 키를 다시 누르면 중지합니다.",
+            "[" .. key("worldmap") .. "] 키 또는 아래 버튼으로 월드맵을 여세요.\n내 레벨에 맞는 몬스터가 있는 지역을 찾아보세요.",
+            "노란점에 마우스를 올려 몬스터와 레벨을 확인하세요.\n내 레벨에 맞는 몬스터가 있는 지역을 고른 뒤\n노란점이나 오른쪽 목록을 두 번 클릭해 이동하세요.\n수련장을 떠나면 튜토리얼이 완료됩니다."
+        }
+        local title = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Title")
+        local body = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Body")
+        local action = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Action")
+        local skip = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Skip")
+        title.TextGUIRendererComponent.Text = "메이플 아일랜드 · " .. tostring(shown) .. " / 10"
+        body.TextGUIRendererComponent.Text = texts[shown] or "모험을 시작하세요!"
+        action.Enable = shown == self.step and (self.step == 6 or self.step == 7 or self.step == 9 or self.step == 10)
+        _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Back").Enable = shown > 1
+        _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Next").Enable = shown < self.step
+        action.TextGUIRendererComponent.Text = (self.step == 6 or self.step == 7) and "확인" or "월드맵 열기"
+        skip.Enable = self.step < 9
+    end
+end

@@ -1,0 +1,362 @@
+@Logic
+script GameSystemMenu extends Logic
+    property boolean opened = false
+    property integer selected = 1
+    property string page = "menu"
+    property number chatSize = 20
+    property integer chatColor = 1
+    property number chatOpacity = 45
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        return _EntityService:GetEntityByPath("/ui/GameSystem/" .. path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        return self.opened or self._T.busy == true or _UtilLogic.ElapsedSeconds < (self._T.inputUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.links = {}
+        for i, name in ipairs({"Paper", "Header", "PreviewFrame"}) do
+            local e = self:UI("Overlay/ChatSettings/" .. name)
+            _UILogic:SetSiblingIndex(e.UITransformComponent, i)
+        end
+        self._T.key = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        for i = 1, 4 do
+            local index = i
+            self:Bind("Overlay/Menu/Choice" .. tostring(i), function() self.selected = index self:Activate() end)
+        end
+        for i = 1, 10 do
+            local channel = i
+            self:Bind("Overlay/Channels/Channel" .. tostring(i), function()
+                if self._T.busy then return end
+                self._T.channelSelected = channel
+                self:DrawChannels()
+            end)
+        end
+        self:Bind("Overlay/Channels/Confirm", function() self:ChangeChannel() end)
+        self:Bind("Overlay/Channels/Back", function() if not self._T.busy then self:ShowPage("menu") end end)
+        self:Bind("Overlay/Menu/Close", function() if not self._T.busy then self:Close() end end)
+        self:Bind("Overlay/ChatSettings/Close", function() self:Close() end)
+        self:Bind("Overlay/Settings/Back", function() self:ShowPage("menu") end)
+        self:Bind("Overlay/ChatSettings/Back", function() self:Close() end)
+        for _, name in ipairs({"Bgm", "Sfx"}) do
+            local key = name
+            local e = self:UI("Overlay/Settings/" .. name)
+            local link = e:ConnectEvent(SliderValueChangedEvent, function(event)
+                if self._T.drawing then return end
+                local bgm = key == "Bgm" and event.Value / 100 or _GameAudio.bgmVolume
+                local sfx = key == "Sfx" and event.Value / 100 or _GameAudio.sfxVolume
+                _GameAudio:SetVolumes(bgm, sfx)
+                self:DrawSettings()
+                self:SavePreferences()
+            end)
+            table.insert(self._T.links, {entity=e, listener=link, eventType=SliderValueChangedEvent})
+        end
+        for _, name in ipairs({"Size", "Opacity"}) do
+            local key = name
+            local e = self:UI("Overlay/ChatSettings/" .. name)
+            local link = e:ConnectEvent(SliderValueChangedEvent, function(event)
+                if self._T.drawing then return end
+                if key == "Size" then self.chatSize = event.Value else self.chatOpacity = event.Value end
+                self:ApplyChat()
+                self:DrawSettings()
+                self:SavePreferences()
+            end)
+            table.insert(self._T.links, {entity=e, listener=link, eventType=SliderValueChangedEvent})
+        end
+        for i = 1, 5 do
+            local index = i
+            self:Bind("Overlay/ChatSettings/Color" .. tostring(i), function()
+                self.chatColor = index self:ApplyChat() self:DrawSettings() self:SavePreferences()
+            end)
+        end
+        local chatButton = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/ChatBox/BtnSettings")
+        if isvalid(chatButton) then
+            local listener = chatButton:ConnectEvent(ButtonClickEvent, function() self:Open("chat") end)
+            table.insert(self._T.links, {entity=chatButton, listener=listener})
+        end
+        log("[GameMenu] ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        local e = self:UI(path)
+        if not isvalid(e) then return end
+        local listener = e:ConnectEvent(ButtonClickEvent, callback)
+        table.insert(self._T.links, {entity=e, listener=listener})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open(string page)
+        if _LoginFlow.phase ~= "ingame" or self._T.busy then return end
+        self.opened = true
+        self.selected = 1
+        local p = _UserService.LocalPlayer
+        if isvalid(p) then
+            self._T.controllerEnabled = p.PlayerControllerComponent.Enable
+            p.PlayerControllerComponent.Enable = false
+            p.MovementComponent:Stop()
+        end
+        self:UI("Overlay").Enable = true
+        self:ShowPage(page)
+        log("[GameMenu] open=" .. page)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowPage(string page)
+        self.page = page
+        self:UI("Overlay/Menu").Enable = page == "menu"
+        self:UI("Overlay/Settings").Enable = page == "settings"
+        self:UI("Overlay/ChatSettings").Enable = page == "chat"
+        self:UI("Overlay/Channels").Enable = page == "channels"
+        if page == "channels" then
+            self._T.channelSelected = _LoginFlow.selectedChannel
+            self._T.channelCurrent = _LoginFlow.selectedChannel
+            self._T.channelCounts = nil
+            self:DrawChannels()
+            _ChannelManager:RequestInGameList()
+        end
+        self:DrawSelection()
+        self:DrawSettings()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        self.opened = false
+        self:UI("Overlay").Enable = false
+        self._T.inputUntil = _UtilLogic.ElapsedSeconds + 0.15
+        local p = _UserService.LocalPlayer
+        if isvalid(p) and self._T.controllerEnabled ~= nil and _LoginFlow.phase == "ingame" then
+            p.PlayerControllerComponent.Enable = self._T.controllerEnabled
+        end
+        self._T.controllerEnabled = nil
+        log("[GameMenu] close")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        if _LoginFlow.phase ~= "ingame" or self._T.busy then return end
+        local key = event.key
+        if not self.opened then
+            if key ~= KeyboardKey.Escape then return end
+            if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return end
+            if _KeySettingManager._T.dialogOpen or (_KeySettingManager._T.remapPos or "") ~= "" then return end
+            local map = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
+            if isvalid(map) and map.Enable then return end
+            if self._T.hadOtherWindow or self:HasOtherWindow() then return end
+            self:Open("menu")
+            return
+        end
+        if key == KeyboardKey.Escape then
+            if self.page == "settings" or self.page == "channels" then self:ShowPage("menu") else self:Close() end
+            return
+        end
+        if self.page == "channels" then
+            local n = self._T.channelSelected or 1
+            if key == KeyboardKey.LeftArrow then n = (n + 8) % 10 + 1
+            elseif key == KeyboardKey.RightArrow then n = n % 10 + 1
+            elseif key == KeyboardKey.UpArrow or key == KeyboardKey.DownArrow then n = (n + 4) % 10 + 1
+            elseif key == KeyboardKey.Return or key == KeyboardKey.KeypadEnter then self:ChangeChannel() return
+            else return end
+            self._T.channelSelected = n self:DrawChannels() return
+        end
+        if self.page ~= "menu" then return end
+        if key == KeyboardKey.UpArrow then self.selected = (self.selected + 2) % 4 + 1 self:DrawSelection()
+        elseif key == KeyboardKey.DownArrow then self.selected = self.selected % 4 + 1 self:DrawSelection()
+        elseif key == KeyboardKey.Return or key == KeyboardKey.KeypadEnter then self:Activate() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean HasOtherWindow()
+        -- Include dialogs outside the inventory window stack.
+        if _UIClickArbiter:GetKeyboardWindow() ~= "" or _InformationBook:IsOpen() then return true end
+        if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return true end
+        for _, path in ipairs({"/ui/WorldMapGroup", "/ui/PopupGroup/PopupBack", "/ui/DefaultGroup/QuickSlotDialog"}) do
+            local w = _EntityService:GetEntityByPath(path)
+            if isvalid(w) and w.EnabledInHierarchy then return true end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Keep the pre-Esc state even if another key listener closes its window first.
+        self._T.hadOtherWindow = self:HasOtherWindow()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSelection()
+        for i = 1, 4 do
+            local b = self:UI("Overlay/Menu/Choice" .. tostring(i))
+            b.SpriteGUIRendererComponent.Color = Color.white
+            b.TextGUIRendererComponent.Text = ({"채널 이동", "캐릭터 변경", "게임 설정", "게임 끝내기"})[i]
+            self:UI("Overlay/Menu/Choice" .. tostring(i) .. "/SelectionArrow").Enable = i == self.selected
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Activate()
+        if self.selected == 1 then self:ShowPage("channels") return end
+        if self.selected == 3 then self:ShowPage("settings") return end
+        local mode = self.selected == 1 and "channel" or (self.selected == 2 and "character" or "quit")
+        if _AutoHuntManager.autoOn then _AutoHuntManager:Toggle() end
+        self._T.busy = true
+        self:UI("Overlay/Menu/Hint").TextGUIRendererComponent.Text = "캐릭터를 저장하고 있습니다..."
+        local snapshot = ""
+        if _CharacterPersistence._T.cl.entered then snapshot = _CharacterPersistence:BuildSaveString() end
+        _CharacterPersistence:RequestSessionExit(mode, snapshot)
+        log("[GameMenu] request=" .. mode)
+    end
+
+    @ExecSpace("Client")
+    method void ExitResult(boolean ok, string mode, string reason)
+        self._T.busy = false
+        self:UI("Overlay/Menu/Hint").TextGUIRendererComponent.Text = "↑ ↓ 선택   Enter 실행   Esc 게임 재개"
+        if not ok then _UIToast:ShowMessage(reason) return end
+        self:Close()
+        _CharacterPersistence._T.cl.entered = false
+        _CharacterPersistence._T.cl.dirty = false
+        _CharacterPersistence._T.cl.lastSentStr = ""
+        if mode == "quit" then return end
+        _LoginFlow.busy = false
+        _LoginFlow._T.entryApproved = false
+        _LoginFlow._T.entryFadeElapsed = nil
+        _LoginFlow._T.restored = false
+        local root = _EntityService:GetEntityByPath("/ui/LoginScene")
+        root.Enable = true
+        _LoginFlow:EnableUI("EntryFade", false)
+        if mode == "channel" then
+            _LoginFlow:ShowPhase("channel", false)
+            _LoginFlow:RequestChannels()
+        else
+            _LoginFlow:ShowCharacters()
+        end
+    end
+
+
+    @ExecSpace("Client")
+    method void ReceiveChannels(integer current, table counts)
+        -- Ignore late list responses after closing the picker.
+        if not self.opened or self.page ~= "channels" then return end
+        self._T.channelCurrent = current
+        self._T.channelCounts = counts
+        self:DrawChannels()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawChannels()
+        -- Keep current, selected and full channels visibly distinct.
+        local current = self._T.channelCurrent or _LoginFlow.selectedChannel
+        local selected = self._T.channelSelected or current
+        self:UI("Overlay/Channels/Current").TextGUIRendererComponent.Text = "현재 채널  CH." .. tostring(current)
+        for i = 1, 10 do
+            local b = self:UI("Overlay/Channels/Channel" .. tostring(i))
+            local count = self._T.channelCounts and (self._T.channelCounts[i] or 0) or nil
+            local status = i == current and "접속 중" or (count == nil and "확인 중" or (count >= 5 and "혼잡" or "이동 가능"))
+            b.TextGUIRendererComponent.Text = "CH." .. tostring(i) .. "\n" .. status
+            b.SpriteGUIRendererComponent.Color = i == selected and Color(1,0.85,0.53,1) or (i == current and Color(0.7,0.87,0.86,1) or Color.white)
+        end
+        local canMove = self._T.channelCounts ~= nil and selected ~= current and (self._T.channelCounts[selected] or 0) < 5 and not self._T.busy
+        self:UI("Overlay/Channels/Confirm").ButtonComponent.Enable = canMove
+        self:UI("Overlay/Channels/Hint").TextGUIRendererComponent.Text = self._T.busy and "채널로 이동하고 있습니다..." or "방향키로 선택 · Enter 이동 · Esc 뒤로"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ChangeChannel()
+        -- A single in-game request preserves the loaded character and map position.
+        if self._T.busy or self.page ~= "channels" or self._T.channelCounts == nil then return end
+        local selected = self._T.channelSelected or 1
+        if selected == self._T.channelCurrent then return end
+        if (self._T.channelCounts[selected] or 0) >= 5 then _UIToast:ShowMessage("해당 채널이 가득 찼습니다.") return end
+        if _AutoHuntManager.autoOn then _AutoHuntManager:Toggle() end
+        self._T.busy = true
+        self:DrawChannels()
+        _ChannelManager:RequestSwitch(selected)
+    end
+
+    @ExecSpace("Client")
+    method void ChannelResult(boolean ok, integer channel, string reason)
+        -- Server confirms the destination map before input is restored.
+        self._T.busy = false
+        if not ok then
+            _UIToast:ShowMessage(reason)
+            if self.opened and self.page == "channels" then
+                self:DrawChannels()
+                _ChannelManager:RequestInGameList()
+            end
+            return
+        end
+        _LoginFlow.selectedChannel = channel
+        self:Close()
+        _GameAudio:PlayCue("Portal")
+        _UIToast:ShowMessage("CH." .. tostring(channel) .. "로 이동했습니다.")
+        log("[GameMenu] channel changed=" .. tostring(channel))
+    end
+
+    @ExecSpace("ClientOnly")
+    method Color GetChatColor()
+        local colors = {Color(1,1,1,1), Color(1,0.88,0.48,1), Color(0.6,0.9,1,1), Color(0.69,0.95,0.67,1), Color(1,0.72,0.87,1)}
+        return colors[self.chatColor] or Color.white
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyChat()
+        _MapleHUDManager:RenderSimpleChatMessages()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSettings()
+        self._T.drawing = true
+        self:UI("Overlay/Settings/Resolution").TextGUIRendererComponent.Text = "현재 해상도  " .. tostring(_UILogic.ScreenWidth) .. " × " .. tostring(_UILogic.ScreenHeight)
+        for _, name in ipairs({"Bgm", "Sfx"}) do
+            local value = math.floor((name == "Bgm" and _GameAudio.bgmVolume or _GameAudio.sfxVolume) * 100 + 0.5)
+            self:UI("Overlay/Settings/" .. name).SliderComponent.Value = value
+            self:UI("Overlay/Settings/" .. name .. "Value").TextGUIRendererComponent.Text = tostring(value) .. "%"
+        end
+        self:UI("Overlay/ChatSettings/Size").SliderComponent.Value = self.chatSize
+        self:UI("Overlay/ChatSettings/SizeValue").TextGUIRendererComponent.Text = tostring(math.floor(self.chatSize))
+        self:UI("Overlay/ChatSettings/Opacity").SliderComponent.Value = self.chatOpacity
+        self:UI("Overlay/ChatSettings/OpacityValue").TextGUIRendererComponent.Text = tostring(math.floor(self.chatOpacity)) .. "%"
+        for i = 1, 5 do
+            self:UI("Overlay/ChatSettings/Color" .. tostring(i) .. "/Selected").Enable = i == self.chatColor
+        end
+        local preview = self:UI("Overlay/ChatSettings/Preview")
+        preview.TextGUIRendererComponent.FontSize = self.chatSize
+        preview.TextGUIRendererComponent.FontColor = self:GetChatColor()
+        preview.SpriteGUIRendererComponent.Color = Color(0,0,0,self.chatOpacity / 100)
+        self._T.drawing = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SavePreferences()
+        _CharacterPersistence:MarkDirty("preferences")
+        _CharacterPersistence:FlushToServer()
+    end
+
+    @ExecSpace("ClientOnly")
+    method string ExportPreferences()
+        return "PREF\t" .. tostring(self.chatSize) .. "\t" .. tostring(self.chatColor) .. "\t" .. tostring(self.chatOpacity) .. "\t" .. tostring(_GameAudio.bgmVolume) .. "\t" .. tostring(_GameAudio.sfxVolume)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestorePreferences(string raw)
+        local size, color, opacity, bgm, sfx = string.match("\n" .. raw, "\nPREF\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\n]+)")
+        self.chatSize = math.max(14, math.min(32, tonumber(size) or 20))
+        self.chatColor = math.max(1, math.min(5, math.floor(tonumber(color) or 1)))
+        self.chatOpacity = math.max(0, math.min(100, tonumber(opacity) or 45))
+        _GameAudio:SetVolumes(tonumber(bgm) or 0.6, tonumber(sfx) or 0.8)
+        self:ApplyChat()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent, self._T.key) end
+        for _, link in ipairs(self._T.links or {}) do
+            if isvalid(link.entity) then link.entity:DisconnectEvent(link.eventType or ButtonClickEvent, link.listener) end
+        end
+    end
+end
