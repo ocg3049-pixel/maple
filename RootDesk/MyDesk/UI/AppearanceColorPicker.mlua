@@ -1,0 +1,292 @@
+@Logic
+script AppearanceColorPicker extends Logic
+    property boolean opened = false
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string child)
+        -- The popup has its own canvas above inventory windows.
+        return _EntityService:GetEntityByPath("/ui/AppearanceColorGroup/Modal/Panel/" .. child)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        -- Keep the closing ESC from reaching another window in the same frame.
+        return self.opened or _UtilLogic.ElapsedSeconds < (self._T.closedUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Subscribe once per session and keep every connection for cleanup.
+        self._T.links = {}
+        self._T.key = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        for i = 1, 12 do
+            local index = i
+            self:Bind("Color" .. tostring(i), function() self:SelectColor(index) end)
+        end
+        self:Bind("Confirm", function() self:Confirm() end)
+        self:Bind("Advanced/Reset",function() self:SetHSV("FFFFFF") self:DrawAdvanced() end)
+        self._T.sliderLinks={}
+        for _,key in ipairs({"Hue","Saturation","Value"}) do
+            local field=key
+            local e=self:UI("Advanced/"..field)
+            local h=e:ConnectEvent(SliderValueChangedEvent,function(event)
+                if self.opened and self._T.dye and not self._T.settingHSV then self:DrawAdvanced() end
+            end)
+            table.insert(self._T.sliderLinks,{e=e,h=h})
+        end
+        self:Bind("Cancel", function() self:Close() end)
+        self:Bind("Previous", function() self:ChangePage(-1) end)
+        self:Bind("Next", function() self:ChangePage(1) end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string child, any callback)
+        -- Button ownership belongs to this modal.
+        local e = self:UI(child)
+        if not isvalid(e) then return end
+        local h = e:ConnectEvent(ButtonClickEvent, callback)
+        table.insert(self._T.links, {entity=e, listener=h})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Do not leave UI callbacks alive between play sessions.
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent, self._T.key) end
+        for _, link in ipairs(self._T.links or {}) do
+            if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent, link.listener) end
+        end
+        for _,link in ipairs(self._T.sliderLinks or {}) do if isvalid(link.e) then link.e:DisconnectEvent(SliderValueChangedEvent,link.h) end end
+        self._T.links = nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        -- Right mouse is Mouse1 on PC; TouchId is not a mouse button.
+        if self.opened then
+            if event.key == KeyboardKey.Escape then self:Close() end
+            return
+        end
+        if event.key ~= KeyboardKey.Mouse1 or _LoginFlow.phase ~= "ingame" then return end
+        if self:BlocksInput() or _GameSystemMenu:BlocksInput() or _UIItemDiscardManager:BlocksInput() then return end
+        local target = _UICursorManager:TargetAt(_InputService:GetCursorPosition())
+        if target == nil then return end
+        if target.kind == "deco" then self:Open("deco",target.index,"")
+        elseif target.kind == "equip" then self:Open("equip", target.index, "")
+        elseif target.kind == "inven" then
+            self:Open("inven", _UIEquipInventoryManager:VisualToDataIdx(target.index), _UIEquipInventoryManager._T.activeTab)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string GetSourceItem()
+        -- Keep the original tab/index so changing the active tab cannot recolor another item.
+        if self._T.source == "deco" then return _DecoWindowManager:GetDecoItem(_DecoWindowManager:SlotUIKeys()[self._T.index]) end
+        if self._T.source == "equip" then return _UIEquipInventoryManager:GetEquip(self._T.index) end
+        return _UIEquipInventoryManager:GetTabItem(self._T.tab, self._T.index)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open(string source, integer index, string tab)
+        -- Hair/face use native variants; other cosmetics use continuous HSV tint.
+        if index < 1 or index > 128 or self.opened then return end
+        if _EnhancementManager:RequireCubeChoice() then return end
+        self._T.source, self._T.index, self._T.tab = source, index, tab
+        local item = self:GetSourceItem()
+        self._T.dye = _UIEquipInventoryManager:GetField(item,3) == "deco"
+        if not self._T.dye and not _UIEquipInventoryManager:IsHairOrFaceItem(item) then return end
+        self._T.original = item
+        self._T.dyePreviewFinals=nil
+        self._T.colors = self._T.dye and {} or _AppearanceColorCatalog:GetColors(_UIEquipInventoryManager:ParseRUID(item))
+        if #self._T.colors == 1 and self._T.colors[1][1] == "기본 색상" then
+            self._T.colors = {{_UIEquipInventoryManager:ParseName(item), _UIEquipInventoryManager:ParseRUID(item), "기본", true}}
+        end
+        
+        if self._T.dye then
+            self._T.colors = {}
+            for _,color in ipairs({{"원본","FFFFFF"},{"빨강","FF7777"},{"주황","FFB16E"},{"노랑","FFF078"},{"초록","95D889"},{"청록","7EDACB"},{"파랑","829EFF"},{"보라","C48CFF"},{"분홍","FF9BD5"},{"갈색","BD9778"},{"회색","B0B0B0"},{"검정","656565"}}) do
+                table.insert(self._T.colors,{_UIEquipInventoryManager:ParseName(item),_UIEquipInventoryManager:ParseRUID(item),color[1],true,color[2]})
+            end
+        end
+        self._T.selected, self._T.page = 1, 1
+        for i, row in ipairs(self._T.colors) do
+            if self._T.dye then
+                if row[5] == (string.match(item,"|dye:(%x%x%x%x%x%x)") or "FFFFFF") then self._T.selected=i end
+            elseif row[2] == _UIEquipInventoryManager:ParseRUID(item) then self._T.selected = i end
+        end
+        self._T.page = math.floor((self._T.selected - 1) / 12) + 1
+        _UIEquipInventoryManager:CancelEquipDrag()
+        _UIEquipInventoryManager:ConsumeEnhancePick()
+        _UIEquipInventoryManager:HideTooltip()
+        self.opened = true
+        _EntityService:GetEntityByPath("/ui/AppearanceColorGroup/Modal").Enable = true
+        if self._T.dye then self:SetHSV(string.match(item,"|dye:(%x%x%x%x%x%x)") or "FFFFFF") end
+        self:Draw()
+        _UIAudio:Play("MenuUp")
+        log("[AppearanceColor] open=" .. source .. ":" .. tostring(index) .. " colors=" .. tostring(#self._T.colors))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectColor(integer visualIndex)
+        -- Selecting is a preview; the item is changed only on Confirm.
+        local index = (self._T.page - 1) * 12 + visualIndex
+        if not self.opened or self._T.colors[index] == nil then return end
+        self._T.selected = index
+        self:Draw()
+        _UIAudio:Play("BtMouseClick")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ChangePage(integer delta)
+        -- Wrap pages for styles with more than twelve registered variants.
+        if not self.opened then return end
+        local pages = math.ceil(#self._T.colors / 12)
+        self._T.page = ((self._T.page - 1 + delta) % pages) + 1
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Switch between native hair/face variants and a continuous tint editor.
+        self:LayoutColorMode()
+        if self._T.dye then self:DrawAdvanced() return end
+        local colors = self._T.colors
+        local row = colors[self._T.selected]
+        self:UI("Name").TextGUIRendererComponent.Text = row[1]
+        self:UI("Preview").SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. row[2]
+        self:UI("Preview").SpriteGUIRendererComponent.Color = Color.FromHexCode("#"..(row[5] or "FFFFFF"))
+        self:UI("Hint").TextGUIRendererComponent.Text = #colors > 1 and "색상을 고른 뒤 확인을 누르면 적용됩니다." or "이 스타일에 등록된 색상은 한 가지입니다."
+        if self._T.dye then self:UI("Hint").TextGUIRendererComponent.Text="치장의 원래 색에 선택한 색을 입힙니다. 원본으로 되돌릴 수 있습니다." end
+        for i = 1, 12 do
+            local index = (self._T.page - 1) * 12 + i
+            local choice = colors[index]
+            local button = self:UI("Color" .. tostring(i))
+            button.Enable = choice ~= nil
+            if choice ~= nil then
+                local icon = self:UI("Color" .. tostring(i) .. "/Icon")
+                icon.SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. choice[2]
+                icon.SpriteGUIRendererComponent.Color = Color.FromHexCode("#"..(choice[5] or "FFFFFF"))
+                self:UI("Color" .. tostring(i) .. "/Label").TextGUIRendererComponent.Text = choice[3]
+                button.SpriteGUIRendererComponent.Outline = index == self._T.selected
+                button.SpriteGUIRendererComponent.OutlineColor = Color(0.92, 0.55, 0.16, 1)
+            end
+        end
+        local pages = math.ceil(#colors / 12)
+        self:UI("Previous").Enable = pages > 1
+        self:UI("Next").Enable = pages > 1
+        self:UI("Page").Enable = pages > 1
+        self:UI("Page").TextGUIRendererComponent.Text = tostring(self._T.page) .. " / " .. tostring(pages)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Confirm()
+        -- Reject stale targets and preserve every field except display name and appearance RUID.
+        if not self.opened then return end
+        if self:GetSourceItem() ~= self._T.original then self:Close() return end
+        local row = self._T.colors[self._T.selected]
+        local suffix = string.match(self._T.original, "^[^|]*|[^|]*(|.*)$")
+        if suffix == nil then self:Close() return end
+        local updated = row[1] .. "|" .. row[2] .. suffix
+        
+        if self._T.dye then
+            updated=string.gsub(self._T.original,"|dye:%x%x%x%x%x%x","")
+            local hex=self._T.dyeHex or "FFFFFF"
+            if hex~="FFFFFF" then updated=updated.."|dye:"..hex end
+        end
+        if self._T.source == "deco" then
+            local data=_DecoWindowManager:ExportDeco()
+            data[_DecoWindowManager:SlotUIKeys()[self._T.index]]=updated
+            _DecoWindowManager:ImportDeco(data)
+        elseif self._T.source == "equip" then _UIEquipInventoryManager:SetEquipStr(self._T.index, updated)
+        else _UIEquipInventoryManager:SetTabItem(self._T.tab, self._T.index, updated) end
+        _UIEquipInventoryManager:RefreshUI()
+        _DecoWindowManager:ApplyAppearance()
+        _CharacterPersistence:MarkDirty("appearance_color")
+        _CharacterPersistence:FlushToServer()
+        log("[AppearanceColor] applied=" .. row[2])
+        self:Close()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        -- Cancel discards the preview and leaves the original item intact.
+        if not self.opened then return end
+        self.opened = false
+        self._T.closedUntil = _UtilLogic.ElapsedSeconds + 0.2
+        _EntityService:GetEntityByPath("/ui/AppearanceColorGroup/Modal").Enable = false
+        _UIEquipInventoryManager:HideTooltip()
+        _UIAudio:Play("MenuDown")
+    end
+    @ExecSpace("ClientOnly")
+    method void LayoutColorMode()
+        -- Preserve the existing hair/face selector layout.
+        local dye=self._T.dye
+        local panel=_EntityService:GetEntityByPath("/ui/AppearanceColorGroup/Modal/Panel")
+        panel.UITransformComponent.RectSize=dye and Vector2(660,660) or Vector2(560,470)
+        self:UI("Advanced").Enable=dye
+        for i=1,12 do self:UI("Color"..tostring(i)).Enable=not dye end
+        self:UI("Title").UITransformComponent.anchoredPosition=dye and Vector2(-55,299) or Vector2(-55,202)
+        self:UI("Title").TextGUIRendererComponent.Text=dye and "치장 색상 조절" or "헤어 / 성형 색상"
+        self:UI("Name").UITransformComponent.anchoredPosition=dye and Vector2(49,248) or Vector2(49,149)
+        self:UI("Preview").UITransformComponent.anchoredPosition=dye and Vector2(-240,247) or Vector2(-200,132)
+        self:UI("Hint").Enable=not dye
+        self:UI("Confirm").UITransformComponent.anchoredPosition=dye and Vector2(90,-289) or Vector2(78,-195)
+        self:UI("Cancel").UITransformComponent.anchoredPosition=dye and Vector2(222,-289) or Vector2(202,-195)
+        if dye then self:UI("Previous").Enable=false self:UI("Next").Enable=false self:UI("Page").Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetHSV(string hex)
+        -- RGB serialization stays compatible with existing dyed items.
+        local h,s,v=Color.RGBToHSV(Color.FromHexCode("#"..hex))
+        self._T.settingHSV=true
+        self:UI("Advanced/Hue").SliderComponent.Value=math.floor(h*359+0.5)
+        self:UI("Advanced/Saturation").SliderComponent.Value=math.floor(s*100+0.5)
+        self:UI("Advanced/Value").SliderComponent.Value=math.floor(v*100+0.5)
+        self._T.settingHSV=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawAdvanced()
+        -- Live preview only; Confirm commits to the original item.
+        local h=self:UI("Advanced/Hue").SliderComponent.Value
+        local s=self:UI("Advanced/Saturation").SliderComponent.Value
+        local v=self:UI("Advanced/Value").SliderComponent.Value
+        local tint=Color.HSVToRGB(h/360,s/100,v/100)
+        local hex=string.format("%02X%02X%02X",math.floor(tint.r*255+0.5),math.floor(tint.g*255+0.5),math.floor(tint.b*255+0.5))
+        self._T.dyeHex=hex
+        self:UI("Advanced/HueValue").TextGUIRendererComponent.Text=tostring(math.floor(h)).."°"
+        self:UI("Advanced/SaturationValue").TextGUIRendererComponent.Text=tostring(math.floor(s)).."%"
+        self:UI("Advanced/ValueValue").TextGUIRendererComponent.Text=tostring(math.floor(v)).."%"
+        -- 선택한 색조를 기준으로 채도/명도 막대의 예상 색을 표시한다.
+        for i=0,47 do
+            local ratio=i/47
+            self:UI("Advanced/Saturation/Spectrum/Band"..tostring(i)).SpriteGUIRendererComponent.Color=Color.HSVToRGB(h/360,ratio,1)
+            self:UI("Advanced/Value/Spectrum/Band"..tostring(i)).SpriteGUIRendererComponent.Color=Color.HSVToRGB(h/360,s/100,ratio)
+        end
+        local item=string.gsub(self._T.original,"|dye:%x%x%x%x%x%x","").."|dye:"..hex
+        self:UI("Name").TextGUIRendererComponent.Text=_UIEquipInventoryManager:ParseName(item)
+        self:UI("Preview").SpriteGUIRendererComponent.ImageRUID="thumbnail://".._UIEquipInventoryManager:ParseRUID(item)
+        self:UI("Preview").SpriteGUIRendererComponent.Color=tint
+        local cached=self._T.dyePreviewFinals
+        if cached~=nil then
+            local ruid=_UIEquipInventoryManager:ParseRUID(item)
+            for _,entry in ipairs(cached) do if entry[2]==ruid then entry[3]=hex end end
+            _DecoWindowManager:ApplyDyes(self:UI("Advanced/Avatar").CostumeManagerComponent,cached)
+            return
+        end
+        local equips={}
+        for i=1,27 do
+            local e=_UIEquipInventoryManager:GetEquip(i)
+            equips[i]={name=_UIEquipInventoryManager:ParseName(e),ruid=_UIEquipInventoryManager:ParseRUID(e)}
+        end
+        local deco={}
+        for key,value in pairs(_DecoWindowManager:ExportDeco()) do deco[key]=value end
+        local key=_DecoWindowManager:SlotKeyForCat(_UIEquipInventoryManager:GetField(item,4))
+        deco[key]=item
+        if _UIEquipInventoryManager:GetField(item,4)=="longcoat" then deco.pants="" end
+        local finals=_DecoWindowManager:ComposeAppearance(equips,deco,_UIMyInfoManager:GetSelectedCharacterJobIdx())
+        table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"})
+        self._T.dyePreviewFinals=finals
+        _DecoWindowManager:ApplyCostumeSnapshot(self:UI("Advanced/Avatar").CostumeManagerComponent,finals)
+    end
+end

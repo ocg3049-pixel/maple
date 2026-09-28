@@ -51,6 +51,13 @@ script MapleHUDManager extends Logic
             self:ConnectMenuButton(keys.ButtonComponent, function() _KeySettingManager:ToggleWindow() end)
         end
 
+        local shop = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnShop")
+        if isvalid(shop) then
+            self:ConnectMenuButton(shop.ButtonComponent, function()
+                _CosmeticExchange:Open()
+            end)
+        end
+
         self:WireChatWindow()
         self:WireSimpleChatMessages()
         self:SendLevelFadeBehindText()
@@ -277,7 +284,8 @@ script MapleHUDManager extends Logic
 		if isvalid(input) then
 			-- 포커스 해제 중에도 입력란 배경은 계속 남겨 깜빡이지 않게 한다.
 			input.Enable = true
-			input.UITransformComponent.RectSize = Vector2(size.x - 20, 26)
+			input.UITransformComponent.RectSize = Vector2(size.x - 134, 26)
+            input.UITransformComponent.anchoredPosition = Vector2(124, 3)
 		end
 		local view = box:GetChildByName("Messages", false)
 		if isvalid(view) then
@@ -345,19 +353,40 @@ script MapleHUDManager extends Logic
         local label = view:GetChildByName("Log", false)
         if not isvalid(label) then return end
         local messages = self._T.chatMessages or {}
-        local text = table.concat(messages, "\n")
-        if self._T.chatCollapsed then text = messages[#messages] or "" end
+        local rendered = {}
+        local labels = {map="모두",party="파티",friend="친구",whisper="귓속말"}
+        for _, message in ipairs(messages) do
+            local body = self:FormatChatMessage(message)
+            body = string.gsub(body, "<", "＜")
+            body = string.gsub(body, ">", "＞")
+            body = string.gsub(body, "＜＜", "<<")
+            body = string.gsub(body, "＞＞", ">>")
+            local mode = type(message) == "table" and message.mode or "map"
+            table.insert(rendered, "<color=" .. _GameSystemMenu:GetChatHex(mode) .. ">" .. body .. "</color>")
+        end
+        local text = table.concat(rendered, "\n")
+        if self._T.chatCollapsed then text = rendered[#rendered] or "" end
         local width = view.UITransformComponent.RectSize.x
         local tc = label.TextGUIRendererComponent
         tc.FontSize = _GameSystemMenu.chatSize
         tc.BestFit = false
-        tc.FontColor = _GameSystemMenu:GetChatColor()
+        tc.FontColor = Color.white
+        tc.IsRichText = true
         local bg = self.chatBox:GetChildByName("SimpleChatBG", false)
         if isvalid(bg) then bg.SpriteGUIRendererComponent.Color = Color(0.08,0.09,0.11,_GameSystemMenu.chatOpacity / 100) end
         tc.Text = text
         local height = 32
         if not self._T.chatCollapsed and text ~= "" then height = math.max(32, math.ceil(tc:GetPreferredHeight(text, width)) + 2) end
         label.UITransformComponent.RectSize = Vector2(width, height)
+    end
+
+    method string FormatChatMessage(any message)
+        -- Direction is stamped by the server; only the counterpart's name is shown.
+        if type(message)~="table" then return tostring(message) end
+        if message.mode=="whisper" then
+            return (message.sent and message.target or message.name)..(message.sent and " << " or " >> ")..message.text
+        end
+        return message.name.." : "..message.text
     end
 
     @ExecSpace("ClientOnly")
@@ -373,7 +402,7 @@ script MapleHUDManager extends Logic
         if not _LoginFlow:IsInGame() or _UIItemDiscardManager:BlocksInput() then return true end
         for _, path in ipairs(_UIClickArbiter:GetWindowPaths()) do
             local win = _EntityService:GetEntityByPath(path)
-            if isvalid(win) and win.EnabledInHierarchy then return true end
+            if path ~= "/ui/DefaultGroup/Board" and isvalid(win) and win.EnabledInHierarchy and win.Visible then return true end
         end
         for _, path in ipairs({"/ui/DefaultGroup/CommandInputBar", "/ui/DefaultGroup/QuickSlotDialog", "/ui/DefaultGroup/MapSelectGroup", "/ui/WorldMapGroup", "/ui/ShopGroup/ShopPopup", "/ui/PopupGroup/PopupBack"}) do
             local win = _EntityService:GetEntityByPath(path)
@@ -431,11 +460,11 @@ script MapleHUDManager extends Logic
         self:FinishChatInput()
         text = (string.gsub(text or "", "[%c]", " "))
         text = string.match(text, "^%s*(.-)%s*$") or ""
-        if text ~= "" then self:RequestChat(text) end
+        if text ~= "" then self:RequestChat(text, _SocialManager.chatMode, _SocialManager.whisperName) end
     end
 
     @ExecSpace("Server")
-    method void RequestChat(string text)
+    method void RequestChat(string text, string mode, string target)
         -- 이름을 클라이언트에서 받지 않는다. 접속 중인 요청자만 인스턴스 채팅에 참여할 수 있다.
         local player = _UserService:GetUserEntityByUserId(senderUserId)
         if not isvalid(player) or not isvalid(player.PlayerComponent) then return end
@@ -447,23 +476,16 @@ script MapleHUDManager extends Logic
         local now = _UtilLogic.ElapsedSeconds
         if now - (self._T.chatSendTimes[senderUserId] or -10) < 0.7 then return end
         self._T.chatSendTimes[senderUserId] = now
-        local name = player.PlayerComponent.Nickname
-        if name == nil or name == "" then name = player.Name end
-        name = (string.gsub(name, "[%c]", " "))
-        for _, recipient in ipairs(_UserService.UserEntities.Values) do
-            if isvalid(recipient) and isvalid(recipient.PlayerComponent)
-                and _ChannelManager:UserChannel(recipient.PlayerComponent.UserId) == _ChannelManager:UserChannel(senderUserId) then
-                self:ReceiveChat(name, text, recipient.PlayerComponent.UserId)
-            end
-        end
-        log("[MapleHUD] chat accepted and delivered")
+        if _RecoveryManager:HandleCommand(senderUserId, text) then return end
+        _SocialManager:RouteChat(senderUserId, mode, target, text)
     end
 
     @ExecSpace("Client")
-    method void ReceiveChat(string nickname, string text)
+    method void ReceiveChat(string nickname, string text, string mode, string target, boolean sent)
         -- TextGUIRendererComponent의 Maker 금칙어 필터를 거쳐 표시하고 리치 텍스트는 해석하지 않는다.
         self._T.chatMessages = self._T.chatMessages or {}
-        table.insert(self._T.chatMessages, nickname .. " : " .. text)
+        table.insert(self._T.chatMessages, {name=nickname, text=text, mode=mode or "map", target=target or "",sent=sent})
+        if mode=="whisper" and not sent then _SocialManager.lastWhisperName=nickname end
         if #self._T.chatMessages > 80 then table.remove(self._T.chatMessages, 1) end
         self:RenderSimpleChatMessages()
         log("[MapleHUD] chat line rendered count=" .. tostring(#self._T.chatMessages))
@@ -521,6 +543,8 @@ script MapleHUDManager extends Logic
         if not isvalid(self.hudRoot) then return end
 
         local inMenu = not _LoginFlow:IsInGame()
+        local countdown = _EntityService:GetEntityByPath("/ui/RespawnGroup/Window")
+        if isvalid(countdown) then countdown.Enable = false end
 
         local playerEntity = self:FindLocalPlayerEntity()
 
@@ -542,6 +566,13 @@ script MapleHUDManager extends Logic
 
         -- HP
         local pc = playerEntity.PlayerComponent
+        if pc:IsDead() and isvalid(countdown) then
+            local remaining = math.max(0, math.ceil(pc.RespawnTime - _UtilLogic.ServerElapsedSeconds))
+            countdown.Enable = true
+            countdown:GetChildByName("Time").TextGUIRendererComponent.Text = "부활까지 " .. tostring(remaining) .. "초"
+        elseif not pc:IsDead() then
+            pc.RespawnDuration = math.max(1, _CharInfoManager:GetDisplayLevel())
+        end
         local hp = math.floor(pc.Hp or 0)
         local maxHp = math.floor(pc.MaxHp or 0)
         if isvalid(self.hpFill) then

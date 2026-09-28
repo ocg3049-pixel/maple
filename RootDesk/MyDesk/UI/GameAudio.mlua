@@ -2,35 +2,36 @@
 script GameAudio extends Logic
     property number bgmVolume = 0.6
     property number sfxVolume = 0.8
+    property boolean muted = false
 
     @ExecSpace("ClientOnly")
     method void OnBeginPlay()
         self._T.loops = {}
-        for name, id in pairs({Portal="952bafe2e6ca4c3e8522d1ca839bd234", Quest="9ac61b9e20934031a749e240174041a2"}) do
+        for name, id in pairs({Portal="952bafe2e6ca4c3e8522d1ca839bd234", Quest="2eb4855233f041b19aaac1bcd4fd82e9"}) do
             local e = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/" .. name)
             if isvalid(e) then e.SoundComponent.AudioClipRUID = "" e.SoundComponent.AudioClipRUID = id end
         end
         self._T.duck = 1
-        _ResourceService:PreloadAsync({"952bafe2e6ca4c3e8522d1ca839bd234", "9ac61b9e20934031a749e240174041a2"}, function(results)
+        _ResourceService:PreloadAsync({"952bafe2e6ca4c3e8522d1ca839bd234", "2eb4855233f041b19aaac1bcd4fd82e9"}, function(results)
             for i, result in ipairs(results) do log("[GameAudio] preload " .. tostring(i) .. "=" .. tostring(result)) end
         end)
     end
 
     @ExecSpace("Client")
     method void PlaySound(string id, number volume)
-        if self.sfxVolume > 0 then _SoundService:PlaySound(id, volume * self.sfxVolume) end
+        if not self.muted and self.sfxVolume > 0 then self:TrackSound(id) _SoundService:PlaySound(id, volume * self.sfxVolume) end
     end
 
     @ExecSpace("Client")
     method void PlaySoundAtPos(string id, Vector3 pos, Entity listener, number volume)
-        if self.sfxVolume > 0 then _SoundService:PlaySoundAtPos(id, pos, listener, volume * self.sfxVolume) end
+        if not self.muted and self.sfxVolume > 0 then self:TrackSound(id) _SoundService:PlaySoundAtPos(id, pos, listener, volume * self.sfxVolume) end
     end
 
     @ExecSpace("Client")
     method void PlayLoopSound(string id, number volume)
         self._T.loops = self._T.loops or {}
         self._T.loops[id] = volume
-        if self.sfxVolume > 0 then _SoundService:PlayLoopSound(id, volume * self.sfxVolume) end
+        if not self.muted and self.sfxVolume > 0 then _SoundService:PlayLoopSound(id, volume * self.sfxVolume) end
     end
 
     @ExecSpace("Client")
@@ -42,34 +43,64 @@ script GameAudio extends Logic
     @ExecSpace("ClientOnly")
     method void SetBGMVolume(number volume)
         self._T.duck = volume
-        _SoundService:SetBGMVolume(volume * self.bgmVolume * (_UIAudio._T.mapGain or 1))
+        _SoundService:SetBGMVolume(volume * self:GetBgmGain() * (_UIAudio._T.mapGain or 1))
     end
 
     @ExecSpace("ClientOnly")
     method void SetVolumes(number bgm, number sfx)
         self.bgmVolume = math.max(0, math.min(1, bgm))
         self.sfxVolume = math.max(0, math.min(1, sfx))
-        _SoundService:SetBGMVolume(self.bgmVolume * (self._T.duck or 1) * (_UIAudio._T.mapGain or 1))
+        self:ApplyNativeMute(self.muted or self.sfxVolume <= 0)
+        _SoundService:SetBGMVolume(self:GetBgmGain() * (self._T.duck or 1) * (_UIAudio._T.mapGain or 1))
         for id, volume in pairs(self._T.loops or {}) do
             _SoundService:StopSound(id)
-            if self.sfxVolume > 0 then _SoundService:PlayLoopSound(id, volume * self.sfxVolume) end
+            if not self.muted and self.sfxVolume > 0 then _SoundService:PlayLoopSound(id, volume * self.sfxVolume) end
         end
         for _, name in ipairs({"Portal", "Quest"}) do
             local entity = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/" .. name)
-            if isvalid(entity) then entity.SoundComponent.Volume = self.sfxVolume end
+            if isvalid(entity) then entity.SoundComponent.Volume = self.muted and 0 or self.sfxVolume end
         end
     end
 
     @ExecSpace("ClientOnly")
     method void PlayCue(string name)
         local entity = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/" .. name)
-        if not isvalid(entity) or self.sfxVolume <= 0 then return end
+        if not isvalid(entity) or self.muted or self.sfxVolume <= 0 then return end
         local sound = entity.SoundComponent
         sound.Volume = self.sfxVolume
         sound.Mute = false
         sound:Stop()
         sound:Play()
         log("[GameAudio] cue=" .. name .. " loaded=" .. tostring(sound:IsAudioClipLoaded()))
+    end
+
+    @ExecSpace("ClientOnly")
+    method number GetBgmGain()
+        return self.muted and 0 or self.bgmVolume
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TrackSound(string id)
+        self._T.playedSounds = self._T.playedSounds or {}
+        self._T.playedSounds[id] = true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetMuted(boolean value)
+        self.muted = value
+        if value then
+            for id, _ in pairs(self._T.playedSounds or {}) do _SoundService:StopSound(id) end
+            self._T.playedSounds = {}
+            _UIAudio._T.pending = {}
+        end
+        local audioRoot = _EntityService:GetEntityByPath("/ui/GameSystem/Audio")
+        if isvalid(audioRoot) then
+            for _, sound in ipairs(audioRoot:GetChildComponentsByTypeName("MOD.Core.SoundComponent", true)) do
+                sound.Mute = value
+            end
+        end
+        self:SetVolumes(self.bgmVolume, self.sfxVolume)
+        log("[GameAudio] mute=" .. tostring(value) .. " bgm=" .. tostring(self.bgmVolume) .. " sfx=" .. tostring(self.sfxVolume))
     end
 
     @ExecSpace("ClientOnly")
@@ -91,7 +122,7 @@ script GameAudio extends Logic
         if self._T.restoreBgm ~= nil then
             self._T.restoreBgm = self._T.restoreBgm - delta
             if self._T.restoreBgm <= 0 then
-                _SoundService:SetBGMVolume(self.bgmVolume * (self._T.duck or 1) * (_UIAudio._T.mapGain or 1))
+                _SoundService:SetBGMVolume(self:GetBgmGain() * (self._T.duck or 1) * (_UIAudio._T.mapGain or 1))
                 self._T.restoreBgm = nil
             end
         end
@@ -104,4 +135,27 @@ script GameAudio extends Logic
             elseif self._T.travelAge > 10 then self._T.travelDestination = nil end
         end
     end
+    @ExecSpace("ClientOnly")
+    method void ApplyNativeMute(boolean silent)
+        -- Engine jump/melee audio bypasses PlaySound; override only this client's native preferences.
+        self._T.nativeSounds = self._T.nativeSounds or {}
+        for _, key in ipairs({"DeathSound","JumpSound","WeaponBowSound","WeaponCaneSound","WeaponCannonSound","WeaponCrossBowSound","WeaponDualBowSound","WeaponGunSound","WeaponKnuckleSound","WeaponMaceSound","WeaponPoleArmSound","WeaponSpearSound","WeaponSwordBSound","WeaponSwordKSound","WeaponSwordLSound","WeaponSwordSSound","WeaponSwordZBSound","WeaponSwordZLSound","WeaponTGloveSound"}) do
+            if silent then
+                if self._T.nativeSounds[key] == nil then self._T.nativeSounds[key] = _MaplePreferencesLogic[key] end
+                local original = self._T.nativeSounds[key]
+                if original ~= "" and original ~= "UNSET" then _SoundService:StopSound(original) end
+                _MaplePreferencesLogic[key] = ""
+            elseif self._T.nativeSounds[key] ~= nil then
+                _MaplePreferencesLogic[key] = self._T.nativeSounds[key]
+                self._T.nativeSounds[key] = nil
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Restore engine preferences when this play session ends.
+        self:ApplyNativeMute(false)
+    end
+
 end

@@ -5,10 +5,11 @@ script CharInfoManager extends Logic
 
 	-- 공격속도 단계 (전투력 개편 2026-08-08: 기본 4단계 = "공격속도 100%"). 사용자에게는 단계 대신
 	-- 퍼센트로 표기한다 - 1단계 오를 때마다 +10%p (부스터 +1단계 = "+10%", +2단계 = "+20%").
-	-- "공격 속도의 비약" 사용 시 1단계씩 증가한다.
+	-- 비약의 임시 단계는 남은 시간이 있을 때만 조회값에 더한다.
 	-- 인벤토리와 마찬가지로 클라이언트 전용 상태 - 서버에는 대응 데이터가 없어(코스튬/인벤과 동일한 이유) 사용 시
 	-- 스킬 발동 RPC 인자로 배율을 계산해 넘겨준다 (SkillManager:UseSkillInSlot 참고).
 	property integer atkSpeedStage = 4
+	property number attackSpeedPotionRemaining = 0
 
 	-- "레벨 70 물약" 사용 시 누적되는 보너스. 이 스탯 시스템은 공격력/마력을 하나의 flatATK로 합쳐서 계산하므로
 	-- (CalcCombatPower/UpdateStats의 "공격력" 또는 "마력" 옵션 분기 참고), 공격력 +1000·마력 +1000을 합쳐 2000으로 반영한다.
@@ -92,6 +93,7 @@ script CharInfoManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		self.attackSpeedPotionRemaining = 0
 		local detailBtn = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow/DetailToggleBtn")
 		if isvalid(detailBtn) then
 			detailBtn:ConnectEvent(ButtonClickEvent, self.OnToggleDetail)
@@ -105,6 +107,7 @@ script CharInfoManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		self.attackSpeedPotionRemaining = 0
 		-- 콤보 감시 타이머 해제(OnBeginPlay와 짝).
 		if self.comboWatchTimerId ~= 0 then
 			_TimerService:ClearTimer(self.comboWatchTimerId)
@@ -239,10 +242,11 @@ script CharInfoManager extends Logic
 
 		ac.UseCustomEquipOnly = true
 		local finals = {}
-		for _, c in ipairs({ 1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18 }) do
+		for _, c in ipairs({ 1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19 }) do
 			table.insert(finals, { c, _DecoWindowManager:SafeEquip(pc, _DecoWindowManager:CatEnum(c)) })
 		end
 		_DecoWindowManager:ApplyCostumeSnapshot(ac, finals)
+		_AvatarTicketManager:UpdateOwnInfo()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -283,7 +287,7 @@ script CharInfoManager extends Logic
 		local critDmgAdd        = 0
 		local cdReduceAdd       = 0   -- (Phase 3) 스킬 쿨타임 감소 초 합산 (표시용)
 
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
 
@@ -468,7 +472,10 @@ script CharInfoManager extends Logic
 		local base = "/ui/DefaultGroup/CharInfoWindow/DetailPanel/"
 		local function sv(name, text)
 			local e = _EntityService:GetEntityByPath(base .. "StatVal_" .. name)
-			if isvalid(e) then e.TextComponent.Text = text end
+			if isvalid(e) then
+                if isvalid(e.TextGUIRendererComponent) then e.TextGUIRendererComponent.Text = text
+                elseif isvalid(e.TextComponent) then e.TextComponent.Text = text end
+            end
 		end
 
 		sv("Combat",    tostring(math.floor(combat)))
@@ -498,9 +505,11 @@ script CharInfoManager extends Logic
 		-- (요청 2026-08-15: 분배당 +0.5%, 마스터 200 = +100%). 종전엔 두 줄 모두 "0%" 하드코딩이었다.
 		-- ⚠ 0.5 단위라 tostring을 그대로 쓰면 "+12.5%"가 "+12.5%"로는 나와도 정수 구간에서 "+13.0%"처럼
 		--   보이는 표기 흔들림이 생긴다 - 소수 첫째 자리로 고정한다.
-		local itemSensePct = _SkillManager:GetBeginnerDropRatePct() + _CashShopManager:GetEquippedRewardBonus()
-		sv("Meso",      "+" .. string.format("%.1f", itemSensePct) .. "%")
-		sv("Drop",      "+" .. string.format("%.1f", itemSensePct) .. "%")
+        local rewardBonus = _SpecialEquipment:RewardBonuses()
+        sv("Meso", "+" .. string.format("%.1f", rewardBonus.meso) .. "%")
+        sv("Drop", "+" .. string.format("%.1f", rewardBonus.drop) .. "%")
+        sv("HpRegen", string.format("%.1f%% /초", _SkillManager:GetBeginnerHpRegenPct()))
+        sv("MpRegen", string.format("%.1f%% /초", _SkillManager:GetBeginnerMpRegenPct()))
 		-- (요청 2026-08-12) "추가 경험치 획득" 줄은 삭제됐다(.ui Label/StatVal_ExpBonus 엔티티 제거).
 	end
 
@@ -524,6 +533,7 @@ script CharInfoManager extends Logic
 	method integer GetAttackSpeedStage()
 		-- (표창+ 개편) 고른 표창의 공속 단계(8·9번 +1)도 함께 얹는다.
 		return self.atkSpeedStage + self:GetWeaponAttackSpeedBonus() + self.shurikenAtkSpeedStage
+			+ (self.attackSpeedPotionRemaining > 0 and 1 or 0)
 	end
 
 	-- (전투력 개편 2026-08-08) 사용자 표기용 공격속도 퍼센트. 기본 4단계 = 100%, 1단계당 +10%p.
@@ -543,7 +553,7 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method table CollectPotentialExtras()
 		local hpFlat, hpPct, mpFlat, mpPct, atkSpdPct = 0, 0, 0, 0, 0
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
 			for _, fi in ipairs({10, 11, 12, 14, 15, 16}) do
@@ -597,12 +607,54 @@ script CharInfoManager extends Logic
 	-- "공격 속도의 비약" 사용 시 호출 - 공격속도 1단계(+10%) 증가
 	@ExecSpace("ClientOnly")
 	method void IncreaseAttackSpeedStage()
-		self.atkSpeedStage = self.atkSpeedStage + 1
-		log("[CharInfo] 공격속도 증가: " .. tostring(self:GetAttackSpeedPercent()) .. "%")
+		-- 비약은 5분간 +10%. 재사용은 중첩하지 않고 남은 시간만 갱신한다.
+		self.attackSpeedPotionRemaining = 300
+		self:UpdateAttackSpeedPotionUI()
+		log("[CharInfo] 공격속도 비약 300초 적용: " .. tostring(self:GetAttackSpeedPercent()) .. "%")
 		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
 		if isvalid(cw) and cw.Enable then
 			self:UpdateStats()
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- 실제 효과와 버프바가 동일한 남은 시간을 사용한다.
+		if self.attackSpeedPotionRemaining <= 0 then return end
+		self.attackSpeedPotionRemaining = math.max(0, self.attackSpeedPotionRemaining - delta)
+		self._T.potionUiTick = (self._T.potionUiTick or 0) + delta
+		if self.attackSpeedPotionRemaining <= 0 then
+			self:CancelAttackSpeedPotion()
+		elseif self._T.potionUiTick >= 0.1 then
+			self._T.potionUiTick = 0
+			self:UpdateAttackSpeedPotionUI()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelAttackSpeedPotion()
+		-- 비약만 제거하며 부스터 등 다른 공격속도 버프는 유지한다.
+		self.attackSpeedPotionRemaining = 0
+		self:UpdateAttackSpeedPotionUI()
+		local cw = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+		if isvalid(cw) and cw.Enable then self:UpdateStats() end
+		log("[CharInfo] 공격속도 비약 종료")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateAttackSpeedPotionUI()
+		-- 기존 우측 상단 버프바 규격의 아이콘/남은 시간/소진 오버레이를 갱신한다.
+		local path = "/ui/DefaultGroup/BuffBar/AttackSpeedPotionIcon"
+		local icon = _EntityService:GetEntityByPath(path)
+		if not isvalid(icon) then return end
+		local remaining = self.attackSpeedPotionRemaining
+		icon.Enable = remaining > 0
+		local label = _EntityService:GetEntityByPath(path .. "/Text")
+		if isvalid(label) then
+			label.TextGUIRendererComponent.Text = tostring(math.floor(math.ceil(remaining) / 60)) .. ":" .. string.format("%02d", math.ceil(remaining) % 60)
+		end
+		local overlay = _EntityService:GetEntityByPath(path .. "/GrayOverlay")
+		if isvalid(overlay) then overlay.SpriteGUIRendererComponent.FillAmount = 1 - remaining / 300 end
 	end
 
 	-- "부스터" 스킬 사용 시 호출 - 공격속도를 지속시간 동안 상승시킨다(재사용 시 중첩되지 않고 지속시간만 갱신 -
@@ -1308,7 +1360,7 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method number CalcCritRate()
 		local critAdd = 0
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
 			for _, fi in ipairs({10, 11, 12, 14, 15, 16}) do
@@ -1335,7 +1387,7 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method number GetCooldownReduction()
 		local cdAdd = 0
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
 			for _, fi in ipairs({10, 11, 12, 14, 15, 16}) do
@@ -1356,7 +1408,7 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method number CalcCritDamage()
 		local critDmgAdd = 0
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if s == "" then continue end
 			for _, fi in ipairs({10, 11, 12, 14, 15, 16}) do
@@ -1461,7 +1513,7 @@ script CharInfoManager extends Logic
 		local critAdd, critDmgAdd = 0, 0
 		local atkSpdPct = 0
 
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if slot == swapSlot then s = swapStr end
 			if swapSlot == 3 and slot == 4 and _UIEquipInventoryManager:IsLongcoatItem(swapStr) then s = "" end
@@ -1705,7 +1757,7 @@ script CharInfoManager extends Logic
 	@ExecSpace("ClientOnly")
 	method number CollectBonusCombatPowerPct(number swapSlot, string swapStr)
 		local pct = 0
-		for slot = 1, 25 do
+		for slot = 1, 27 do
 			local s = _UIEquipInventoryManager:GetEquip(slot)
 			if slot == swapSlot then s = swapStr end
 			if swapSlot == 3 and slot == 4 and _UIEquipInventoryManager:IsLongcoatItem(swapStr) then s = "" end

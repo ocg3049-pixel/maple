@@ -1,0 +1,134 @@
+@Logic
+script CashItemAudit extends Logic
+    method table Items(string snapshot)
+        -- Inventory location is retained with the complete item string for forensic comparison.
+        local result={}
+        for line in string.gmatch(snapshot or "","[^\n]+") do
+            local slot,item=string.match(line,"^E\t([^\t]+)\t(.+)$")
+            if slot~=nil then result["equip:"..slot]=item end
+            local tab,index,value=string.match(line,"^I\t([^\t]+)\t([^\t]+)\t(.+)$")
+            if tab~=nil then
+                -- Track all inventory domains, including unopened cash boxes and consumed protection.
+                result["inventory:"..tab..":"..index]=value
+            end
+            local deco,appearance=string.match(line,"^D\t([^\t]+)\t(.+)$")
+            if deco~=nil then result["costume:"..deco]=appearance end
+        end
+        return result
+    end
+
+    method table Changes(string before, string after)
+        -- A move is not a disappearance; before/after strings retain stars, potential and count.
+        local old=self:Items(before)
+        local new=self:Items(after)
+        local keys={}
+        for k,_ in pairs(old) do keys[k]=true end
+        for k,_ in pairs(new) do keys[k]=true end
+        local ordered={}
+        for k,_ in pairs(keys) do table.insert(ordered,k) end
+        table.sort(ordered)
+        local changes={}
+        for _,k in ipairs(ordered) do
+            local a,b=old[k] or "",new[k] or ""
+            if a~=b then
+                local kind=a=="" and "acquired" or (b=="" and "removed" or "changed")
+                if b=="" then for destination,value in pairs(new) do if value==a then kind="moved_from" break end end
+                elseif a=="" then for origin,value in pairs(old) do if value==b then kind="moved_to" break end end end
+                table.insert(changes,{location=k,before=a,after=b,change=kind})
+            end
+        end
+        return changes
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Queue(table sv, string characterId, string before, string after, string reason)
+        -- Server timestamps observed save changes; client-reported reasons are retained as evidence.
+        local changes=self:Changes(before,after)
+        if #changes==0 and not string.find(reason,"enhance",1,true) and not string.find(reason,"cashshop",1,true) then
+            local oldMeso = _RecoveryManager:Meso(before)
+            local newMeso = _RecoveryManager:Meso(after)
+            if oldMeso ~= newMeso then
+                sv.mesoAudit = sv.mesoAudit or {}
+                local r = sv.mesoAudit[characterId]
+                if r == nil then r={before=oldMeso,after=newMeso,firstUtc=DateTime.UtcNow.Elapsed,count=0,reasons={}} sv.mesoAudit[characterId]=r end
+                r.after=newMeso r.lastUtc=DateTime.UtcNow.Elapsed r.count=r.count+1
+                r.reasons[string.sub(reason,1,100)]=true
+            end
+            return false
+        end
+        -- Retain the full pre-change state when an item is consumed, destroyed or replaced.
+        -- Pure moves do not need another checkpoint.
+        for _, change in ipairs(changes) do
+            if change.before ~= "" and _RecoveryManager:Owned(before,change.before) > _RecoveryManager:Owned(after,change.before) then
+                _RecoveryManager:Checkpoint(sv,characterId,before,true)
+                break
+            end
+        end
+        sv.cashAuditPending=sv.cashAuditPending or {}
+        self._T.sequence=(self._T.sequence or 0)+1
+        if self._T.nonce==nil then self._T.nonce=tostring(DateTime.UtcNow.Elapsed).."_"..tostring(_UtilLogic:RandomIntegerRange(100000,999999)) end
+        local eventId=self._T.nonce.."_"..tostring(self._T.sequence)
+        local header={version=1,eventId=eventId,characterId=characterId,characterName=sv.lastName or "",timeUtc=DateTime.UtcNow.Elapsed,reason=string.sub(reason,1,300),source="server_observed_client_snapshot",mesoBefore=tonumber(string.match(before or "","^M\t(%-?%d+)")) or 0,mesoAfter=tonumber(string.match(after or "","^M\t(%-?%d+)")) or 0}
+        local chunks={}
+        local rows={}
+        for _,change in ipairs(changes) do
+            table.insert(rows,change)
+            if #_HttpService:JSONEncode(rows)>3000 and #rows>1 then
+                table.remove(rows,#rows)
+                table.insert(chunks,rows)
+                rows={change}
+            end
+        end
+        if #rows>0 or #chunks==0 then table.insert(chunks,rows) end
+        for index,chunk in ipairs(chunks) do
+            local record={header=header,part=index,parts=#chunks}
+            if #chunk>0 then record.changes=chunk end
+            local key="cashAudit_"..characterId.."_"..eventId.."_"..tostring(index)
+            sv.cashAuditPending[key]={tag="cashAudit_"..characterId,value=_HttpService:JSONEncode(record)}
+        end
+        log("[CashAudit] queued character="..characterId.." event="..eventId.." changes="..tostring(#changes).." reason="..reason)
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Flush(table sv, boolean synchronous)
+        -- Immutable batch records are retried; failed writes never clear the pending entries.
+        sv.cashAuditPending = sv.cashAuditPending or {}
+        for id, r in pairs(sv.mesoAudit or {}) do
+            local reasons={} for reason,_ in pairs(r.reasons) do table.insert(reasons,reason) end
+            local eventId=_RecoveryManager:NewId()
+            local record={header={version=1,eventId=eventId,characterId=id,characterName=sv.lastName or "",timeUtc=r.lastUtc,firstUtc=r.firstUtc,reason=table.concat(reasons,","),source="server_observed_client_snapshot",mesoBefore=r.before,mesoAfter=r.after,operations=r.count},part=1,parts=1}
+            sv.cashAuditPending["cashAudit_"..id.."_"..eventId.."_1"]={tag="cashAudit_"..id,value=_HttpService:JSONEncode(record)}
+        end
+        sv.mesoAudit={}
+        if next(sv.cashAuditPending)==nil then return end
+        if sv.cashAuditBusy and not synchronous then return end
+        local batch={}
+        local sent={}
+        for key,record in pairs(sv.cashAuditPending) do
+            batch[DataStorageKeyInfo(key,"",record.tag)]=record.value
+            sent[key]=record.value
+        end
+        local function finish(code,success)
+            if success~=nil then
+                for _,info in ipairs(success) do
+                    local current=sv.cashAuditPending[info.Key]
+                    if current~=nil and current.value==sent[info.Key] then sv.cashAuditPending[info.Key]=nil end
+                end
+            end
+            sv.cashAuditBusy=false
+            if code~=0 then log_warning("[CashAudit] storage failed ec="..tostring(code).."; pending records retained for retry")
+            else log("[CashAudit] durable batch saved") end
+        end
+        sv.cashAuditBusy=true
+        if synchronous then
+            local code,success=sv.storage:BatchSetByInfoAndWait(batch)
+            finish(code,success)
+            if code~=0 then
+                local retry={}
+                for key,record in pairs(sv.cashAuditPending) do retry[DataStorageKeyInfo(key,"",record.tag)]=record.value end
+                if next(retry)~=nil then local retryCode,retrySuccess=sv.storage:BatchSetByInfoAndWait(retry) finish(retryCode,retrySuccess) end
+            end
+        else sv.storage:BatchSetByInfoAsync(batch,finish) end
+    end
+end

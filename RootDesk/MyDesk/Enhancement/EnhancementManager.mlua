@@ -452,6 +452,12 @@ script EnhancementManager extends Logic
 	-- ─── 키보드 / 버튼 이벤트 ────────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method void OnKeyDown(KeyDownEvent event)
+        if event.key == KeyboardKey.Mouse1 then
+            self:OnEquipmentRightClick(_InputService:GetCursorPosition())
+            return
+        end
+        local autoInput = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/AutoPanel/Goal")
+        if isvalid(autoInput) and autoInput.EnabledInHierarchy and autoInput.TextGUIRendererInputComponent.IsFocused then return end
 		-- 채팅 중의 Space/P/Tab 입력을 강화 조작으로 처리하지 않는다.
 		if _MapleHUDManager:IsChatTyping() then return end
 		if _UIItemDiscardManager:BlocksInput() then return end
@@ -731,6 +737,39 @@ script EnhancementManager extends Logic
 		return
 	end
 
+    @ExecSpace("ClientOnly")
+    method void OnEquipmentRightClick(Vector2 point)
+        -- Resolve only the frontmost item under the pointer, using inventory page mapping.
+        if _LoginFlow.phase ~= "ingame" or _GameSystemMenu:BlocksInput() or _UIItemDiscardManager:BlocksInput() or _AppearanceColorPicker:BlocksInput() or _CosmeticExchange:BlocksInput() or _SocialManager:BlocksInput() or _KeySettingManager:IsWindowOpen() then return end
+        local target = _UICursorManager:TargetAt(point)
+        if target == nil then return end
+        if target.kind == "inven" then
+            self:OpenEquipmentFromRightClick("inven", _UIEquipInventoryManager:VisualToDataIdx(target.index))
+        elseif target.kind == "equip" then
+            self:OpenEquipmentFromRightClick("equip", target.index)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenEquipmentFromRightClick(string source, number index)
+        -- Register the exact equipment source without starting a paid attempt.
+        local m = _UIEquipInventoryManager
+        if source ~= "inven" and source ~= "equip" then return end
+        local item = source == "equip" and m:GetEquip(index) or m:GetInven(index)
+        if item == "" or not self:IsEnhanceableSlot(m:ParseSlotIdx(item)) or _AvatarTicketManager:IsTicket(item) then return end
+        if m:IsItemLocked(item) then _UIToast:ShowMessage("잠금 설정된 장비는 강화할 수 없습니다.") return end
+        if _StarforcePresentation.busy or _AutoStarforce.running then return end
+        if self:RequireCubeChoice() then return end
+        m:CancelEquipDrag() m:CancelInvenDrag() m:ConsumeEnhancePick() m:HideTooltip()
+        self:HideEnhanceConfirm()
+        self:OpenWindowWithTab(1)
+        if not self:IsWindowOpen() then return end
+        if source == "equip" then self:SetEnhanceTargetFromEquip(index)
+        else self:SetEnhanceTarget(m:ParseName(item), m:ParseRUID(item), index) end
+        self:FocusEnhanceWindow()
+        log("[Enhance] right-click target=" .. source .. ":" .. tostring(index))
+    end
+
 	-- ─── 창 열기 / 닫기 / 토글 ───────────────────────────────────────────
 	@ExecSpace("ClientOnly")
 	method boolean IsWindowOpen()
@@ -754,7 +793,7 @@ script EnhancementManager extends Logic
 			local isUnset = math.abs(cur.x) < 5 and math.abs(cur.y) < 5
 			local isOffScreen = math.abs(cur.x) > 1000 or math.abs(cur.y) > 1000
 			if isUnset or isOffScreen then
-				w.UITransformComponent.anchoredPosition = Vector2(550, 0)
+				w.UITransformComponent.anchoredPosition = Vector2(-170, 0)
 			end
 		end
 		-- 이미 대상 아이템이 올라가 있고, 그 아이템이 해당 잠재능력을 아직 개방하지 않았다면
@@ -775,6 +814,7 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void ToggleWindow()
+        if _AutoStarforce.running and self:IsWindowOpen() then self:CloseWindow() return end
 		-- Do not switch targets/tabs or repeat actions during the Starforce sequence.
 		if _StarforcePresentation.busy then return end
 		if self:IsWindowOpen() then self:CloseWindow(); return end
@@ -793,8 +833,8 @@ script EnhancementManager extends Logic
 			local isUnset = math.abs(cur.x) < 5 and math.abs(cur.y) < 5
 			local isOffScreen = math.abs(cur.x) > 1000 or math.abs(cur.y) > 1000
 			if isUnset or isOffScreen then
-				w.UITransformComponent.anchoredPosition = Vector2(550, 0)
-				log("[Enhance] 위치 550으로 설정")
+				w.UITransformComponent.anchoredPosition = Vector2(-170, 0)
+				log("[Enhance] 초기 위치 -170으로 설정")
 			end
 			self:SelectTab(1)
 			if self.enhanceTargetRUID == "" then self:ClearTarget() end
@@ -808,8 +848,11 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void CloseWindow()
-		-- Do not switch targets/tabs or repeat actions during the Starforce sequence.
-		if _StarforcePresentation.busy then return end
+        _AutoStarforce:Stop("강화창을 닫아 중지되었습니다.", true)
+        -- A destroyed result is already committed; ESC may dismiss its remaining animation.
+        if _StarforcePresentation.busy then
+            if _StarforcePresentation._T.destroyed then _StarforcePresentation:Cancel() else return end
+        end
 		-- 중간 영역에서 옵션 선택을 마친 뒤 창을 닫는다.
 		if self:RequireCubeChoice() then return end
 		local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
@@ -824,13 +867,14 @@ script EnhancementManager extends Logic
 	-- 얼굴(1)·머리(2)·하의(4)와 잠금 칸(10~25 - 개방 시 이 표에 추가)은 강화 불가.
 	@ExecSpace("ClientOnly")
 	method boolean IsEnhanceableSlot(number slotIdx)
-		return slotIdx == 14 or slotIdx == 3 or slotIdx == 5 or slotIdx == 6
+		return slotIdx == 10 or slotIdx == 15 or slotIdx == 26 or slotIdx == 27 or slotIdx == 14 or slotIdx == 3 or slotIdx == 5 or slotIdx == 6
 			or slotIdx == 7 or slotIdx == 8 or slotIdx == 9
 	end
 
 	-- ─── 강화 대상 설정 (더블클릭 / 드래그 드롭 공통) ────────────────────
 	@ExecSpace("ClientOnly")
 	method void SetEnhanceTarget(string name, string ruid, number invenIdx)
+        if _AvatarTicketManager:IsTicket(name .. "|" .. ruid) then _UIToast:ShowMessage("코디 이용권은 강화할 수 없습니다.") return end
 		-- Do not switch targets/tabs or repeat actions during the Starforce sequence.
 		if _StarforcePresentation.busy then return end
 		-- 비교 도중 장비가 바뀌면 결과가 다른 아이템에 적용될 수 있으므로 차단한다.
@@ -838,6 +882,7 @@ script EnhancementManager extends Logic
 		-- (Phase 1) 강화 대상 6부위 제한: 아이템 문자열 3번째 필드(slotIdx)로 판정하고,
 		-- 허용 외 부위는 기존 "사용 불가 아이템" 안내 다이얼로그를 띄운 뒤 등록하지 않는다.
 		local candidate = _UIEquipInventoryManager:GetInven(invenIdx)
+        if _UIEquipInventoryManager:IsItemLocked(candidate) then _UIToast:ShowMessage("잠금 설정된 장비는 강화할 수 없습니다.") return end
 		if candidate ~= "" then
 			local slotIdx = 0
 			local fcount = 0
@@ -942,11 +987,13 @@ script EnhancementManager extends Logic
 	-- 강화/주문서/큐브 결과와 파괴가 장비창 문자열(SetEquipStr)에 직접 반영된다.
 	@ExecSpace("ClientOnly")
 	method void SetEnhanceTargetFromEquip(number equipSlot)
+        if equipSlot == 28 then _UIToast:ShowMessage("코디 이용권은 강화할 수 없습니다.") return end
 		-- Do not switch targets/tabs or repeat actions during the Starforce sequence.
 		if _StarforcePresentation.busy then return end
 		-- 현재 장비의 큐브 비교가 완료되어야 다른 장비를 올릴 수 있다.
 		if self:RequireCubeChoice() then return end
 		local s = _UIEquipInventoryManager:GetEquip(equipSlot)
+        if _UIEquipInventoryManager:IsItemLocked(s) then _UIToast:ShowMessage("잠금 설정된 장비는 강화할 수 없습니다.") return end
 		if s == "" then return end
 		if not self:IsEnhanceableSlot(equipSlot) then
 			self:ShowEnhanceBlockedDialog()
@@ -1056,6 +1103,7 @@ script EnhancementManager extends Logic
 	method boolean CheckCurrentTarget()
 		-- 대상 이동/교환 후 오래된 캐시로 다른 장비를 강화하지 않도록 다시 등록하게 한다.
 		if self.enhanceTargetItemStr == "" then return false end
+        if _UIEquipInventoryManager:IsItemLocked(self:ReadCurrentTarget()) then _UIToast:ShowMessage("잠금 설정된 장비는 강화할 수 없습니다.") return false end
 		if self:ReadCurrentTarget() ~= self.enhanceTargetItemStr then
 			self:ClearTarget()
 			self:AppendLog("장비 상태가 변경되었습니다. 대상을 다시 등록하세요.")
@@ -1143,9 +1191,9 @@ script EnhancementManager extends Logic
 			_StarforcePresentation:Cancel()
 			return
 		end
-		local result = "keep"
+		local result = "fail"
 		local rebuySlot = 0
-		local protected = self:ConsumeTargetProtection()
+		local protected = _UIEquipInventoryManager:HasStarforceProtection(self.enhanceTargetItemStr)
 		_UIEquipInventoryManager:AddMeso(-cost)
 		-- 사이드바 보유 메소 표시 갱신 (원작 개편)
 		self:UpdateMesoDisplay()
@@ -1153,6 +1201,10 @@ script EnhancementManager extends Logic
 		-- (Phase 2) 구간표 기반 4분기 판정: 성공 / 유지 / 하락(-1성) / 파괴 (GDD §4.2)
 		local band = self:GetStarforceBand(self.enhanceLevel)
 		local roll = _UtilLogic:RandomDouble() * 100
+		-- Fail은 메소만 소모하므로 적용 중인 프로텍트도 유지한다.
+		if protected and not (roll >= band.success and roll < band.success + band.keep) then
+			self:ConsumeTargetProtection()
+		end
 		log("[Enhance] roll=" .. tostring(roll) .. " band s/k/d/x=" .. tostring(band.success) .. "/" .. tostring(band.keep) .. "/" .. tostring(band.drop) .. "/" .. tostring(band.destroy))
 
 		local starEnt = _EntityService:GetEntityByPath(self.pathSlotArea .. "/TargetSlotBG/StarLabel")
@@ -1169,9 +1221,9 @@ script EnhancementManager extends Logic
 			self:AppendLog("성공! +" .. tostring(self.enhanceLevel) .. "강")
 			log("[Enhance] 강화 성공: " .. self.enhanceTargetName .. " +" .. tostring(self.enhanceLevel) .. "강")
 		elseif roll < band.success + band.keep then
-			-- 유지: 수치 변화 없음
-			self:AppendLog("실패. 수치 유지.")
-			log("[Enhance] 강화 실패 - 유지")
+			-- Fail: 장비와 성수는 그대로 두고 이미 차감한 메소만 소모한다.
+			self:AppendLog("Fail · 장비와 별 유지 / 메소 " .. tostring(cost) .. " 소모")
+			log("[Enhance] Fail: stars=" .. tostring(self.enhanceLevel) .. " mesoCost=" .. tostring(cost))
 		elseif roll < band.success + band.keep + band.drop then
 			-- (신규) 하락: -1성 (하한 0)
 			result = "drop"
@@ -1184,12 +1236,13 @@ script EnhancementManager extends Logic
 			self:AppendLog("실패! 1단계 하락 → +" .. tostring(self.enhanceLevel) .. "강")
 			log("[Enhance] 강화 실패 - 하락 → +" .. tostring(self.enhanceLevel) .. "강")
 		elseif protected then
-			-- 파괴 결과만 유지로 바꾼다. 성공/유지/하락에서도 보호는 이미 소모되었다.
+			-- 파괴를 막으면 보호를 소모한다. 일반 Fail에서는 보호도 유지한다.
 			self:AppendLog("프로텍트가 장비 파괴를 막았습니다. 별 수 유지. (보호 소모)")
 			log("[Protect] 스타포스 파괴 방지: " .. self.enhanceTargetName)
 		else
-			-- 파괴: 아이템 소멸 후 기본 장비 재구매 제안 (Phase 2 재구매 루프)
+			-- 파괴 후 인벤토리의 낮은 별 장비 등록을 제안한다.
 			local destroyedSlot = self:GetTargetFieldNum(3)
+            self._T.destroyedStars = self.enhanceLevel
 			result = "destroy"
 			rebuySlot = destroyedSlot
 			self:DestroyTarget()
@@ -1204,48 +1257,53 @@ script EnhancementManager extends Logic
 		_StarforcePresentation:ShowResult(result, self.enhanceLevel, rebuySlot)
 	end
 
-	-- (Phase 2) 파괴 직후 기본 장비 재구매 제안 다이얼로그. 방어구 10,000 / 무기 50,000 메소 -
-	-- "파괴의 아픔은 재구매비가 아니라 쌓은 성·잠재의 소멸"이라는 설계라 값은 싸게 유지한다 (GDD §4.2).
+	-- 파괴 직후 소유 중인 대체 장비 등록 제안. 같은 부위를 우선한다.
 	@ExecSpace("ClientOnly")
 	method void ShowRebuyDialog(number slotIdx)
-		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
-		if not isvalid(dlg) then return end
-		local cost = (slotIdx == 6) and self:GetBalancePrice("rebuy_weapon", 50000) or self:GetBalancePrice("rebuy_armor", 10000)
-		local partName = _UIEquipInventoryManager:GetEquipTypeBySlot(slotIdx)
-		local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
-		if isvalid(txt) then
-			txt.TextComponent.Text = partName .. " 파괴!\n기본 장비 재구매: " .. tostring(cost) .. " 메소\n구매하시겠습니까?"
-		end
-		self._T.confirmInfoOnly = false
-		self._T.pendingRebuySlot = slotIdx
-		dlg.Enable = true
-	end
+        -- Offer an existing lower-star item, preferring the destroyed equipment slot.
+        local inv = _UIEquipInventoryManager
+        local candidate, fallback = nil, nil
+        local limit = self._T.destroyedStars or 0
+        for i = 1, 128 do
+            local item = inv:GetTabItem("equip", i)
+            local part = tonumber(inv:GetField(item, 3)) or 0
+            local stars = inv:ParseStars(item)
+            if item ~= "" and self:IsEnhanceableSlot(part) and stars < limit and not inv:IsItemLocked(item) then
+                local row = {index=i, item=item, stars=stars}
+                if part == slotIdx then
+                    if candidate == nil or stars < candidate.stars then candidate = row end
+                elseif fallback == nil or stars < fallback.stars then fallback = row end
+            end
+        end
+        candidate = candidate or fallback
+        self._T.replacement = candidate
+        if candidate == nil then self:AppendLog("대신 등록할 낮은 별의 장비가 없습니다.") return end
+        local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
+        local txt = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog/DlgText")
+        if not isvalid(dlg) or not isvalid(txt) then return end
+        txt.TextComponent.Text = "장비가 파괴되었습니다.\n인벤토리의 " .. inv:ParseName(candidate.item) .. " (" .. tostring(candidate.stars) .. "성)을\n강화창에 등록하시겠습니까?"
+        self._T.confirmInfoOnly = false
+        self._T.confirmMode = "replacement"
+        self._T.pendingRebuySlot = slotIdx
+        dlg.Enable = true
+        log("[Enhance] replacement offered index=" .. tostring(candidate.index))
+    end
 
-	-- (Phase 2) 재구매 실행: 메소 차감 + 부위별 기본(0성·무잠재) 장비를 장비 탭에 지급.
-	@ExecSpace("ClientOnly")
-	method void DoRebuy(number slotIdx)
-		local cost = (slotIdx == 6) and self:GetBalancePrice("rebuy_weapon", 50000) or self:GetBalancePrice("rebuy_armor", 10000)
-		if _UIEquipInventoryManager.meso < cost then
-			self:AppendLog("메소 부족! (" .. tostring(cost) .. "원 필요)")
-			log("[Enhance] 재구매 실패 - 메소 부족")
-			return
-		end
-		local grantedIdx = _UIEquipInventoryManager:GrantBasicEquipBySlot(slotIdx)
-		if grantedIdx <= 0 then
-			self:AppendLog("인벤토리(장비 탭)가 가득 찼습니다.")
-			log("[Enhance] 재구매 실패 - 인벤 가득")
-			return
-		end
-		_UIEquipInventoryManager:AddMeso(-cost)
-		self:UpdateMesoDisplay()
-		self:AppendLog("기본 장비 재구매 완료 (" .. tostring(cost) .. " 메소)")
-		-- (요청) 재구매한 장비를 강화 대상 슬롯에 바로 올린다 - 파괴 → 재구매 → 즉시 재강화 루프
-		self:SetEnhanceTargetFromRebuy(grantedIdx)
-		log("[Enhance] 재구매 완료 slotIdx=" .. tostring(slotIdx) .. " cost=" .. tostring(cost) .. " → 강화 대상 자동 등록 (인벤 " .. tostring(grantedIdx) .. ")")
-	end
+    @ExecSpace("ClientOnly")
+    method void DoRebuy(number slotIdx)
+        -- Registration never creates equipment or spends meso; reject stale inventory slots.
+        local candidate = self._T.replacement
+        self._T.replacement = nil
+        if candidate == nil then return end
+        local inv = _UIEquipInventoryManager
+        if inv:GetTabItem("equip", candidate.index) ~= candidate.item or inv:IsItemLocked(candidate.item) then
+            self:AppendLog("장비가 변경되어 등록을 취소했습니다.") return
+        end
+        self:SetEnhanceTargetFromRebuy(candidate.index)
+        log("[Enhance] existing equipment registered index=" .. tostring(candidate.index))
+    end
 
-	-- (신규) 재구매 직후 자동 등록: 방금 장비 탭 invenIdx에 지급된 기본 장비를 강화 대상으로 올린다.
-	-- SetEnhanceTarget과 달리 탭을 "equip"으로 고정해 읽는다 - 재구매 시점의 활성 탭과 무관하게 동작.
+	-- 인벤토리에 있는 대체 장비를 등록한다. 활성 인벤 탭과 무관하게 장비 탭에서 읽는다.
 	@ExecSpace("ClientOnly")
 	method void SetEnhanceTargetFromRebuy(number invenIdx)
 		-- Do not switch targets/tabs or repeat actions during the Starforce sequence.
@@ -1261,7 +1319,7 @@ script EnhancementManager extends Logic
 		self.enhanceTargetSrcTab = "equip"
 		self.enhanceLevel = _UIEquipInventoryManager:ParseStars(s)
 		self:ApplyEnhanceTargetUI()
-		self:AppendLog("대상: " .. self.enhanceTargetName .. " (재구매 자동 등록)")
+		self:AppendLog("대상: " .. self.enhanceTargetName .. " (인벤토리 장비 등록)")
 	end
 
 	-- ─── 인벤 업데이트 ────────────────────────────────────────────────────
@@ -1543,11 +1601,11 @@ script EnhancementManager extends Logic
 			local upgrade = self:GetTargetFieldNum(6)
 			infoEnt.TextComponent.Text = "성공 시 주문서 강화 +1 (현재 +" .. tostring(scrolls) .. ")\n남은 업그레이드 가능 횟수 : " .. tostring(upgrade) .. "회"
 			if sel and sel.ruid == "bb6c1532d7364170a11abd2d8835bc81" then
-				infoEnt.TextComponent.Text = "성공: 스타포스 +1~5성 (각 20%, 최대 100성)\n실패: 장비 파괴 / 프로텍트 적용 시 1회 방지"
+				infoEnt.TextComponent.Text = "성공: 스타포스 +1~5성 (각 20%, 최대 50성)\n실패: 장비 파괴 / 프로텍트 적용 시 1회 방지"
 			elseif sel and sel.ruid == "a6c6ff42196548dd874b83332ad5b336" then
 				local blocked = _UIEquipInventoryManager:SpecialScrollBlockedReason(sel.ruid, self.enhanceTargetItemStr)
 				local state = blocked ~= "" and blocked or "사용 가능 (중복 적용 불가)"
-				infoEnt.TextComponent.Text = "스타포스 30성 이하 장비 전용\n다음 스타포스 1회 파괴 방지 / 성공·실패 후 소모\n" .. state
+				infoEnt.TextComponent.Text = "스타포스 30성 이하 장비 전용\n다음 스타포스 파괴 방지 / Fail 시 보호 유지\n" .. state
 			elseif sel and (sel.ruid == "14267ae8e168458480697c148ddfdcab" or sel.ruid == "0f134eebddee4b368062790b46afc26a") then
 				local additional = sel.ruid == "0f134eebddee4b368062790b46afc26a"
 				local label = additional and "에디셔널 잠재능력" or "잠재능력"
@@ -1750,10 +1808,18 @@ script EnhancementManager extends Logic
 			level = _StarforcePresentation.displayedLevel
 		end
 		local sfPath = self.pathContent .. "/StarforceContent"
+		local maxStars = _CashShopManager:GetMaxStars(self.enhanceTargetItemStr)
+		self._T.starOriginalPositions = self._T.starOriginalPositions or {}
 		for i = 1, 100 do
 			local star = _EntityService:GetEntityByPath(sfPath .. "/Star_" .. tostring(i))
 			if isvalid(star) then
-				star.Enable = i <= _CashShopManager:GetMaxStars(self.enhanceTargetItemStr)
+				star.Enable = i <= maxStars
+				local original = self._T.starOriginalPositions[i]
+				if original == nil then
+					original = star.UITransformComponent.anchoredPosition
+					self._T.starOriginalPositions[i] = original
+				end
+				star.UITransformComponent.anchoredPosition = maxStars <= 5 and Vector2((i - (maxStars + 1) / 2) * 22, original.y) or original
 				local achieved = i <= level
 				star.SpriteGUIRendererComponent.Enable = false
 				star.SpriteGUIRendererComponent.Color = Color(1, 0.84, 0.24, 1)
@@ -1783,10 +1849,10 @@ script EnhancementManager extends Logic
 				band.keep = band.keep + band.destroy
 				band.destroy = 0
 			end
-			rateEnt.TextComponent.Text = "성공 " .. tostring(band.success) .. "% | 유지 " .. tostring(band.keep)
-				.. "% | 하락 " .. tostring(band.drop) .. "% | 파괴 " .. tostring(band.destroy) .. "%"
+			rateEnt.TextComponent.Text = "성공 " .. tostring(band.success) .. "% | Fail " .. tostring(band.keep)
+				.. "% | 파괴 " .. tostring(band.destroy) .. "%"
 			if _UIEquipInventoryManager:HasStarforceProtection(self.enhanceTargetItemStr) then
-				rateEnt.TextComponent.Text = rateEnt.TextComponent.Text .. "\n프로텍트 적용: 이번 강화 후 소모"
+				rateEnt.TextComponent.Text = rateEnt.TextComponent.Text .. "\n프로텍트 적용: Fail 시 유지, 그 외 소모"
 			end
 		end
 
@@ -1809,7 +1875,7 @@ script EnhancementManager extends Logic
 			label.TextGUIRendererComponent.Text = ""
 			return
 		end
-		local current = math.max(0, math.min(100, level))
+		local current = math.max(0, level)
 		local text = "★ " .. tostring(current) .. "성"
 		if current >= _CashShopManager:GetMaxStars(self.enhanceTargetItemStr) then
 			text = text .. " (최대)"
@@ -1822,14 +1888,19 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method string GetStarforceStatText(integer level)
-		if _CashShopManager:IsHalfEarring(self.enhanceTargetItemStr) then
+		-- 실제 적용 규칙과 같은 장신구 종류/다음 별 기준으로 상승분만 표시한다.
+		local item = self.enhanceTargetItemStr
+		if level >= _CashShopManager:GetMaxStars(item) then return "최대 강화 단계입니다." end
+		if _CashShopManager:IsHalfEarring(item) then
 			return "아이템 드롭률  +2%\n메소 획득량  +2%\n공격력  +3"
 		end
-		-- (전투력 개편 2026-08-08) 구간표 폐지 - 1성당 "직업 주스탯 +4, 공격력 +3" 균일.
-		-- CharInfoManager.CalcStarforceStats(실제 적용)와 반드시 같은 값을 표시해야 한다.
-		-- (마력 분리 2026-08-12) 스타포스 공격력은 마력에도 같은 값으로 들어간다(무기 기본옵션과 동일 규칙) -
-		-- 마법 직업도 스타포스로 전투력이 오르도록. 표기도 "공격력/마력"으로 맞춘다.
-		return _CharInfoManager:GetMainStatName() .. "  +4\n공격력/마력  +3"
+		local text = _CharInfoManager:GetMainStatName() .. "  +4\n공격력/마력  +3"
+		local kind = _SpecialEquipment:Kind(item)
+		if level == 4 then
+			if kind == "necklace" or kind == "pendant" then text ..= "\n아이템 드롭률  +10%"
+			elseif kind == "receiver" or kind == "icebar" or kind == "glasses" then text ..= "\n메소 획득량  +10%" end
+		end
+		return text
 	end
 
 	-- (Phase 2) 스타포스 구간표 (GDD §4.2) - 현재 성 수 기준 성공/유지/하락/파괴 %와 회당 비용(메소).
@@ -1837,15 +1908,32 @@ script EnhancementManager extends Logic
 	-- (Phase 5) Balance/StarforceTable.csv가 진실의 원천 - 없거나 손상이면 아래 하드코딩 폴백.
 	@ExecSpace("ClientOnly")
 	method table GetStarforceBand(integer level)
-		-- 표시와 실제 판정이 동일한 테스트 확률을 사용한다. 원본 구간표/비용은 수정하지 않는다.
-		local band = self:GetBaseStarforceBand(level)
-		if self._T.testGuaranteedStarforce == true or (level < 3 and _UIEquipInventoryManager:IsStarterEquipment(self.enhanceTargetItemStr)) then
-			band.success = 100
-			band.keep = 0
-			band.drop = 0
-			band.destroy = 0
+		-- 실제 강화의 테스트 모드는 판매가 계산에 영향을 주지 않는다.
+		local band = self:GetItemStarforceBand(self.enhanceTargetItemStr, level)
+		if self._T.testGuaranteedStarforce == true then
+			band.success, band.keep, band.drop, band.destroy = 100, 0, 0, 0
 		end
 		return band
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetItemStarforceBand(string item, integer level)
+		-- 아이템별 기본 확률과 비용을 강화·제작 기댓값 계산에서 공유한다.
+		local band = self:GetBaseStarforceBand(level)
+		local slot = tonumber(_UIEquipInventoryManager:GetField(item, 3)) or 0
+		if (slot >= 10 and slot <= 15) or slot == 26 or slot == 27 then
+			band = self:GetAccessoryStarforceBand()
+		end
+		if level >= 0 and level < 3 and _UIEquipInventoryManager:IsStarterEquipment(item) then
+			band.success, band.keep, band.drop, band.destroy = 100, 0, 0, 0
+		end
+		return band
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetAccessoryStarforceBand()
+		-- 장신구 전 성수의 확률·비용을 수동/자동 강화와 정보창에서 공유한다.
+		return {success=10, keep=80, drop=0, destroy=10, cost=10000}
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1863,6 +1951,17 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method table GetBaseStarforceBand(integer level)
+		-- 현재 성수 기준 성공률. 비용만 기존 데이터에서 가져와 표시와 실제 판정을 일치시킨다.
+		local band = self:GetStarforceCostBand(level)
+		local previousSuccess = level < 5 and 90 or (level < 10 and 80 or 70)
+		band.success = previousSuccess / 2
+		band.destroy = (100 - previousSuccess) / 2
+		band.keep, band.drop = 50, 0
+		return band
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetStarforceCostBand(integer level)
 		-- CSV 로드 (최초 1회 캐싱): minStar 오름차순 밴드 목록
 		if self._T.sfBands == nil then
 			local bands = nil
@@ -2611,9 +2710,9 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnResetBtnTouch(integer tabIdx)
-		-- Button and Space both open a confirmation; opening/cancelling never spends.
+		-- Reroll the preview while retaining the original equipment until selection.
 		if _StarforcePresentation.busy or self:IsConfirmDialogOpen() then return end
-		if self:RequireCubeChoice() then return end
+        if (self._T.pendingCubeTab or 0) ~= 0 and self._T.pendingCubeTab ~= tabIdx then return end
 		local request = self:PrepareCubeUse(tabIdx)
 		if request == nil then return end
 		local dlg = _EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow/RightPanel/ConfirmDialog")
@@ -2636,7 +2735,7 @@ script EnhancementManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method table PrepareCubeUse(integer tabIdx)
-		if _CashShopManager:IsHalfEarring(self:ReadCurrentTarget()) then
+		if _SpecialEquipment:FixedPotential(self:ReadCurrentTarget()) then
 			self:AppendLog("하프 이어링은 잠재능력과 에디셔널 잠재능력을 재설정할 수 없습니다.")
 			return nil
 		end
@@ -2750,6 +2849,10 @@ script EnhancementManager extends Logic
 		local opt3Idx  = tabIdx == 4 and 12 or 16
 
 		local curGrade = tonumber(fields[gradeIdx]) or 1
+        if self._T.pendingCubeTab == tabIdx and self._T.pendingCubeNewItem ~= "" then
+            local preview = self:SplitItemFieldsPreserve(self._T.pendingCubeNewItem)
+            curGrade = math.max(curGrade, tonumber(preview[gradeIdx]) or curGrade)
+        end
 		if curGrade < 1 then curGrade = 1 end
 		if curGrade > 4 then curGrade = 4 end
 
@@ -2778,7 +2881,7 @@ script EnhancementManager extends Logic
 		fields[opt3Idx]  = opt3
 
 		local newItemStr = table.concat(fields, "|")
-		-- Ordinary rolls keep the current item; mandatory grade-ups are committed before saving.
+		-- Every roll keeps the original item until the player selects an option.
 
 		-- 재화 소모: 메소 재설정이면 메소 차감, 큐브 재설정이면 큐브 1개 소비
 		if usingMeso then
@@ -2805,8 +2908,7 @@ script EnhancementManager extends Logic
 			end
 		end
 
-		self:ShowCubeCompare(tabIdx, s, newItemStr, newGrade > curGrade)
-		if newGrade > curGrade then self:CommitPendingCubeGradeUp() end
+		self:ShowCubeCompare(tabIdx, s, newItemStr, false)
 		self:PlayCubeResultFeedback(tabIdx)
 		_UIEquipInventoryManager:RefreshUI()
 		_CharacterPersistence:MarkDirty("enhance_cube_use")
@@ -2927,7 +3029,7 @@ script EnhancementManager extends Logic
         w.Enable = true
         local pos = w.UITransformComponent.anchoredPosition
         if math.abs(pos.x) > 1000 or math.abs(pos.y) > 1000 or (math.abs(pos.x) < 5 and math.abs(pos.y) < 5) then
-            w.UITransformComponent.anchoredPosition = Vector2(550, 0)
+            w.UITransformComponent.anchoredPosition = Vector2(-170, 0)
         end
         self:SelectTab(tab)
         self:FocusEnhanceWindow()

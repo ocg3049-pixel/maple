@@ -1,0 +1,180 @@
+@Logic
+script AutoStarforce extends Logic
+    property boolean running = false
+    property boolean opened = false
+    property boolean useBoxes = false
+    property integer goalStars = 10
+    property integer equipKind = 0
+    property string panelPath = "/ui/DefaultGroup/EnhanceWindow/AutoPanel"
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string child)
+        -- Resolve the side panel and its children in the existing enhancement window.
+        return _EntityService:GetEntityByPath(self.panelPath..(child=="" and "" or "/"..child))
+    end
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        -- Store every subscription for session cleanup.
+        local entity=_EntityService:GetEntityByPath(path)
+        if not isvalid(entity) then log_error("[AutoStarforce] missing "..path) return end
+        local listener=entity:ConnectEvent(ButtonClickEvent,function() _UIAudio:Play("BtMouseClick") callback() end)
+        table.insert(self._T.links,{entity=entity,listener=listener})
+    end
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Bind the side-panel controls without adding another enhancement transaction.
+        self.running=false self.opened=false self._T.links={} self._T.slide=0
+        self:Bind("/ui/DefaultGroup/EnhanceWindow/RightPanel/ContentArea/StarforceContent/AutoButton",function() self:Toggle() end)
+        self:Bind(self.panelPath.."/Start",function() self:ToggleRunning() end)
+        self:UpdateRunButton()
+        self:Bind(self.panelPath.."/Close",function() self:Stop("자동강화 패널을 닫았습니다.",true) self.opened=false end)
+        self:Bind(self.panelPath.."/UseBoxes",function()
+            if self.running then return end
+            self.useBoxes=not self.useBoxes
+            self:UI("UseBoxes/Check/Mark").Enable=self.useBoxes
+        end)
+        self:UI("UseBoxes/Check/Mark").Enable=self.useBoxes
+        local check=self:UI("UseBoxes")
+        self._T.hoverEntity=check
+        self._T.hoverListener=check:ConnectEvent(ButtonStateChangeEvent,function(event)
+            self:UI("BoxTooltip").Enable=self.opened and event.state==ButtonState.Hover
+        end)
+    end
+    @ExecSpace("ClientOnly")
+    method void Toggle()
+        -- Slide the panel beside the window; closing also cancels automatic work.
+        self.opened=not self.opened
+        self:UI("BoxTooltip").Enable=false
+        if self.opened then
+            self:UI("").Enable=true
+        else self:Stop("자동강화 패널을 닫았습니다.",true) end
+    end
+    @ExecSpace("ClientOnly")
+    method void ToggleRunning()
+        -- One button starts while idle and cancels the loop while running.
+        if self.running then self:Stop("사용자가 중지했습니다.",true) else self:Start() end
+    end
+    @ExecSpace("ClientOnly")
+    method void UpdateRunButton()
+        -- Keep the action label in sync for success, cancellation and all stop reasons.
+        local button = self:UI("Start")
+        if isvalid(button) then button.TextGUIRendererComponent.Text = self.running and "중지" or "강화 시작" end
+    end
+    @ExecSpace("ClientOnly")
+    method void Start()
+        -- One explicit start authorizes repeated standard attempts up to this target.
+        if self.running or _StarforcePresentation.busy then return end
+        local e=_EnhancementManager
+        if not e:IsWindowOpen() or e.currentTab~=1 or not e:CheckCurrentTarget() then return end
+        local target=tonumber(self:UI("Goal").TextGUIRendererInputComponent.Text)
+        local limit=_CashShopManager:GetMaxStars(e.enhanceTargetItemStr)
+        if target==nil or target~=math.floor(target) or target<1 or target>limit then
+            _UIToast:ShowMessage("목표 강화는 1~"..tostring(limit).."성의 정수로 입력해주세요.") return
+        end
+        self.goalStars=target self.equipKind=_UIEquipInventoryManager:ParseSlotIdx(e.enhanceTargetItemStr)
+        if e.enhanceLevel>=self.goalStars then self:Stop("이미 목표 강화에 도달했습니다.",false) return end
+        self.running=true self._T.nextAt=0 self._T.stalled=0 self._T.needsReplacement=false
+        self:RememberTarget()
+        self:UpdateRunButton()
+        self:UI("Status").TextGUIRendererComponent.Text="자동강화 진행 중"
+        log("[AutoStarforce] start target="..tostring(target).." kind="..tostring(self.equipKind))
+    end
+    @ExecSpace("ClientOnly")
+    method void RememberTarget()
+        -- Track the original inventory/equipment location so manual swaps stop automation.
+        local e=_EnhancementManager
+        self._T.targetIndex=e.enhanceTargetInvenIdx self._T.targetEquip=e.enhanceTargetEquipSlot self._T.targetTab=e.enhanceTargetSrcTab
+    end
+    @ExecSpace("ClientOnly")
+    method void Stop(string reason, boolean cancelAttempt)
+        -- Invalidate the loop first; an unresolved animation must never charge later.
+        local wasRunning=self.running
+        self.running=false self._T.nextAt=nil
+        self:UpdateRunButton()
+        if wasRunning and cancelAttempt and _StarforcePresentation.busy then
+            _StarforcePresentation._T.rebuySlot=0
+            _StarforcePresentation:Cancel()
+        end
+        local status=self:UI("Status")
+        if isvalid(status) then status.TextGUIRendererComponent.Text=reason end
+        if wasRunning then log("[AutoStarforce] stopped: "..reason) end
+    end
+    @ExecSpace("ClientOnly")
+    method boolean ReplaceDestroyed()
+        -- Only the original equipment category is eligible; never consume locked items.
+        local m=_UIEquipInventoryManager
+        local chosen,best=0,100000
+        for i=1,128 do
+            local item=m:GetTabItem("equip",i)
+            if item~="" and not m:IsItemLocked(item) and m:ParseSlotIdx(item)==self.equipKind and _CashShopManager:GetMaxStars(item)>=self.goalStars then
+                local stars=m:ParseStars(item)
+                if stars<best then chosen=i best=stars end
+            end
+        end
+        if chosen==0 and self.useBoxes then chosen=m:OpenAutoEquipmentBox(self.equipKind) end
+        if chosen==0 then return false end
+        _EnhancementManager:SetEnhanceTargetFromRebuy(chosen)
+        self:RememberTarget()
+        return _EnhancementManager.enhanceTargetItemStr~=""
+    end
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Detect forced window closure even when no CloseWindow handler ran.
+        local panel=self:UI("") if not isvalid(panel) then return end
+        local e=_EnhancementManager
+        local window=_EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+        if not isvalid(window) or not window.EnabledInHierarchy or e.currentTab~=1 or _LoginFlow.phase~="ingame" then
+            self:Stop("강화창이 닫혀 중지되었습니다.",true)
+            self.opened=false self._T.slide=0 panel.Enable=false
+            self:UI("BoxTooltip").Enable=false
+            return
+        end
+        local goal=self.opened and 1 or 0
+        local slide=self._T.slide or 0
+        slide=slide+math.max(-delta*5,math.min(delta*5,goal-slide)) self._T.slide=slide
+        panel.Enable=slide>0
+        panel.UITransformComponent.anchoredPosition=Vector2(390+180*(1-(1-slide)^3),0)
+        panel.CanvasGroupComponent.GroupAlpha=slide
+        if not self.running or self._T.ticking or _StarforcePresentation.busy then return end
+        self._T.ticking=true
+        local ok,err=pcall(function() self:Tick() end)
+        self._T.ticking=false
+        if not ok then log_error("[AutoStarforce] "..tostring(err)) self:Stop("자동강화 처리 오류로 중지되었습니다.",true) end
+    end
+    @ExecSpace("ClientOnly")
+    method void Tick()
+        -- Wait for each real result and presentation before starting another paid attempt.
+        local e=_EnhancementManager
+        if e.enhanceTargetItemStr=="" then
+            if not self._T.needsReplacement then self:Stop("강화 대상이 해제되었습니다.",false) return end
+            if not self:ReplaceDestroyed() then self:Stop("같은 부위 장비 또는 사용 가능한 상자가 없습니다.",false) return end
+        end
+        self._T.needsReplacement=false
+        if not self.running then return end
+        if e.enhanceTargetInvenIdx~=self._T.targetIndex or e.enhanceTargetEquipSlot~=self._T.targetEquip or e.enhanceTargetSrcTab~=self._T.targetTab or _UIEquipInventoryManager:ParseSlotIdx(e.enhanceTargetItemStr)~=self.equipKind then
+            self:Stop("강화 대상이 변경되었습니다.",false) return
+        end
+        if not e:CheckCurrentTarget() then self:Stop("장비 상태 또는 잠금 설정을 확인해주세요.",false) return end
+        if self.goalStars>_CashShopManager:GetMaxStars(e.enhanceTargetItemStr) then self:Stop("대체 장비의 최대 강화가 목표보다 낮습니다.",false) return end
+        if e.enhanceLevel>=self.goalStars then self:Stop("목표 "..tostring(self.goalStars).."성 달성!",false) return end
+        if _UIEquipInventoryManager.meso<e:GetStarforceCost(e.enhanceLevel) then self:Stop("메소가 부족합니다.",false) return end
+        if _UtilLogic.ElapsedSeconds<(self._T.nextAt or 0) then return end
+        self._T.nextAt=_UtilLogic.ElapsedSeconds+0.5
+        e:DoEnhance()
+        if not self.running then
+            if _StarforcePresentation.busy then _StarforcePresentation._T.rebuySlot=0 _StarforcePresentation:Cancel() end
+            return
+        end
+        if _StarforcePresentation.busy then self._T.stalled=0 else self._T.stalled=(self._T.stalled or 0)+1 end
+        if self._T.stalled>30 then self:Stop("강화 준비가 지연되어 중지되었습니다.",false) end
+    end
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Stop the loop and release input subscriptions on session teardown.
+        self.running=false self.opened=false
+        if isvalid(self._T.hoverEntity) and self._T.hoverListener~=nil then self._T.hoverEntity:DisconnectEvent(ButtonStateChangeEvent,self._T.hoverListener) end
+        self._T.hoverListener=nil
+        for _,link in ipairs(self._T.links or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent,link.listener) end end
+        self._T.links={}
+    end
+end

@@ -3,19 +3,54 @@ script MonsterDropRules extends Logic
 
     method table GetItems()
             return {
+                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", name = "부위별 코디 상자", rate = 0.0002 / 3, type = "cosmetic_roll" },
                 { ruid = "9d6404b526184e85aeddfd6728e39fdb", name = "공격 속도의 비약", rate = 0.0003, fixedRate = true },
-                -- (재보정) 드롭 아이템 박스: 파괴가 5성부터로 잦아진 만큼 공급도 늘림 (0.05% → 1.5%)
-                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", name = "드롭 아이템", rate = 0.015 },
-                { ruid = "b2300eda46f3445e9b1c6e774a2ee95a", name = "레드큐브", rate = 0.005 },
-                { ruid = "b8f0af90c30b462f859f45bdc1878d8b", name = "블랙큐브", rate = 0.002 },
-                { ruid = "af5404f4c8fc4ec78ccc1a57446f69db", name = "에디셔널큐브", rate = 0.004 },
-                { ruid = "9c2a12b9a92f44d4b6dd95c7fb182ac9", name = "화이트 에디셔널큐브", rate = 0.0015 },
-                { ruid = "0f134eebddee4b368062790b46afc26a", name = "에디셔널 잠재능력 부여주문서", rate = 0.0005 },
-                { ruid = "a6c6ff42196548dd874b83332ad5b336", name = "프로텍트 주문서", rate = 0.0002 },
-                { ruid = "14267ae8e168458480697c148ddfdcab", name = "잠재능력 부여주문서", rate = 0.0005 },
+                -- 현재 사냥 드롭 기준: 장비상자·큐브 1/2, 부여 주문서 1/4, 프로텍트 1/5, 코디 1/3.
+                { ruid = "47841bc4d3554cf0a68bd05f19de1f18", name = "장비 상자", rate = 0.00525 },
+                { ruid = "b2300eda46f3445e9b1c6e774a2ee95a", name = "레드큐브", rate = 0.0005 },
+                { ruid = "b8f0af90c30b462f859f45bdc1878d8b", name = "블랙큐브", rate = 0.0002 },
+                { ruid = "af5404f4c8fc4ec78ccc1a57446f69db", name = "에디셔널큐브", rate = 0.0004 },
+                { ruid = "9c2a12b9a92f44d4b6dd95c7fb182ac9", name = "화이트 에디셔널큐브", rate = 0.00015 },
+                { ruid = "0f134eebddee4b368062790b46afc26a", name = "에디셔널 잠재능력 부여주문서", rate = 0.000125 },
+                { ruid = "a6c6ff42196548dd874b83332ad5b336", name = "프로텍트 주문서", rate = 0.00004 },
+                { ruid = "14267ae8e168458480697c148ddfdcab", name = "잠재능력 부여주문서", rate = 0.000125 },
                 -- (요청) 아바타 장비(상의/하의/망토/장갑/신발)는 몬스터가 드롭하지 않는다 -
                 -- 소비 탭의 "드롭 아이템" 박스로만 뽑을 수 있다(UIEquipInventoryManager 박스 지급 경로).
             }
+    end
+
+    method number GetCosmeticDropChance()
+        -- Tooltips share the exact aggregate costume-box chance with monster drops.
+        for _,item in ipairs(self:GetItems()) do if item.type=="cosmetic_roll" then return item.rate end end
+        return 0
+    end
+
+    method number GetMesoDropChance(number levelRate)
+        return math.max(0, math.min(1, 0.6 * levelRate))
+    end
+
+    method integer CalculateMeso(integer baseAmount, number bonusMultiplier, number levelRate)
+        -- 모든 몬스터의 최종 메소 금액을 50%로 적용한다. 드롭 확률은 유지한다.
+        return math.max(0, math.floor(baseAmount * bonusMultiplier * levelRate * 0.5 + 0.0000001))
+    end
+
+    method number CalculateItemChance(number baseRate, boolean fixedRate, number bonusMultiplier, number levelRate)
+        return math.max(0, math.min(1, baseRate * (fixedRate and 1 or bonusMultiplier) * levelRate))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ApplyEquipmentBoxVisual(Entity dropEnt)
+        if not isvalid(dropEnt) then return end
+        local sr = dropEnt.SpriteRendererComponent
+        if not isvalid(sr) then return end
+        -- Uploaded box is 1254px at 100 PPU; red cube is 36px.
+        -- Scale the whole sprite: Sliced/TiledSize does not reliably shrink this world sprite.
+        local scale = 36 / 1254
+        dropEnt.TransformComponent.Scale = Vector3(scale, scale, 1)
+        -- Center-pivot 36px box: keep its lower edge above the foothold.
+        dropEnt.DroppedItemComponent.GroundOffset = 0.18
+        sr.DrawMode = SpriteDrawMode.Simple
+        sr.SpriteRUID = "90d3412612004466b328850446cb1d68"
     end
 
     @ExecSpace("ServerOnly")
@@ -27,27 +62,29 @@ script MonsterDropRules extends Logic
             -- (요청 2026-08-12) 초보자 패시브 "아이템 감각" - 마지막 공격자의 보너스(%)를 **메소 획득량과
             -- 모든 확률 아이템 드랍**에 함께 곱한다(분배당 +1%, 마스터 100 = 2배). 킬러를 못 찾으면 1.0.
             -- 메소·아이템 두 블록이 같은 값을 쓰므로 여기서 한 번만 구한다.
-            local dropMult = 1.0
-            local killerEnt = killer
+            local dropMult, mesoMult = 1.0, 1.0
+            local killerEnt = _BattleStatsManager:ResolveOwner(killer)
             if isvalid(killerEnt) then
                 ---@type PlayerAttack
                 local killerPa = killerEnt:GetComponent("script.PlayerAttack")
                 if isvalid(killerPa) then
                     dropMult = 1.0 + killerPa:GetDropRateBonusPct() / 100
+                    mesoMult = 1.0 + killerPa:GetMesoRateBonusPct() / 100
                 end
             end
 
-            -- 메소와 아이템 모두 같은 레벨 차이 패널티를 한 번만 적용한다.
+            -- 메소 드롭 확률과 금액, 아이템 확률에 각각 레벨 차이 배율을 적용한다.
             local levelRate = 1.0
-            if isvalid(killer) then
-                local killerLevel = _RegionTierLogic:GetServerLevelOf(killer)
+            if isvalid(killerEnt) then
+                local killerLevel = _RegionTierLogic:GetServerLevelOf(killerEnt)
                 if killerLevel > 0 then levelRate = _RegionTierLogic:GetLevelDropRate(monsterLevel, killerLevel) end
             end
-            if _UtilLogic:RandomDouble() < levelRate then
-            local mesoAmount = math.floor(_RegionTierLogic:RollMesoForLevel(monsterLevel) * dropMult)
+            local mesoAmount = self:CalculateMeso(_RegionTierLogic:RollMesoForLevel(monsterLevel), mesoMult, levelRate)
+            if mesoAmount > 0 and _UtilLogic:RandomDouble() < self:GetMesoDropChance(levelRate) then
             local mesoEnt = _SpawnService:SpawnByModelId("droppedmeso", monster.Name .. "_meso", deathPos, dropMap)
             if isvalid(mesoEnt) then
                 mesoEnt.DroppedItemComponent.ItemName = tostring(mesoAmount)
+                if isvalid(killerEnt) and isvalid(killerEnt.PlayerComponent) then mesoEnt.DroppedItemComponent.KillerUserId = killerEnt.PlayerComponent.UserId end
                 local sr = mesoEnt.SpriteRendererComponent
                 if isvalid(sr) then
                     if mesoAmount < 50 then
@@ -72,7 +109,7 @@ script MonsterDropRules extends Logic
 
             -- dropMult는 위 메소 블록에서 이미 구했다(아이템 감각 보너스 - 메소·아이템 공용).
             for i, drop in ipairs(itemDrops) do
-                local chance = math.min(1, (drop.fixedRate and drop.rate or drop.rate * dropMult) * levelRate)
+                local chance = self:CalculateItemChance(drop.rate, drop.fixedRate == true, dropMult, levelRate)
                 if _UtilLogic:RandomDouble() < chance then
                     local dropEnt = _SpawnService:SpawnByModelId("droppedshell", monster.Name .. "_item" .. tostring(i), deathPos, dropMap)
                     if isvalid(dropEnt) then
@@ -82,11 +119,23 @@ script MonsterDropRules extends Logic
                             dic.ItemName = drop.name
                             dic.ItemRUID = drop.ruid
                             local itype = drop.type or "sprite"
+                            if itype == "cosmetic_roll" then
+                                local categories = _CosmeticBoxCatalog:DropCategories()
+                                local category = categories[_UtilLogic:RandomIntegerRange(1,#categories)]
+                                itype = "cosmetic:" .. category.key
+                                dic.ItemName = _CosmeticBoxCatalog:Box(itype).name
+                            end
                             dic.ItemType = itype
                             local sr = dropEnt.SpriteRendererComponent
                             if isvalid(sr) then
                                 -- 아바타 아이템은 RUID를 스프라이트에 그대로 넣으면 안 보인다 - thumbnail://로 아이콘 렌더.
                                 sr.SpriteRUID = (itype == "avataritem") and ("thumbnail://" .. drop.ruid) or drop.ruid
+                                if drop.name == "장비 상자" then
+                                    self:ApplyEquipmentBoxVisual(dropEnt)
+                                elseif string.sub(itype,1,9)=="cosmetic:" or string.find(itype,"box",1,true) then
+                                    sr.DrawMode = SpriteDrawMode.Sliced
+                                    sr.TiledSize = Vector2(0.32,0.32)
+                                end
                             end
                         end
                         log("[Monster] 아이템 드랍: " .. drop.ruid)

@@ -1,7 +1,7 @@
 @Component
 script PlayerHit extends HitComponent
 
-    property number ImmuneCooldown = 1.0
+    property number ImmuneCooldown = 1.5
 
     -- MonsterAttack.IsAttackTarget이 공격자 쪽에서 참조하는 무적 플래그.
     -- IsHitTarget(방어자 쪽 훅)은 이 프로젝트의 몬스터 근접공격 경로에서 전혀 호출되지 않고,
@@ -71,6 +71,9 @@ script PlayerHit extends HitComponent
     end
 
     method void OnEndPlay()
+        if isvalid(self._T.hatBody) and self._T.hatListener then
+            self._T.hatBody:DisconnectEvent(ActionStateChangedEvent, self._T.hatListener)
+        end
         -- 플레이 종료 시 이 컴포넌트가 만든 반복 타이머를 해제한다.
         if self._T.serverWatchdogId then
             _TimerService:ClearTimer(self._T.serverWatchdogId)
@@ -207,11 +210,59 @@ script PlayerHit extends HitComponent
     end
 
     @ExecSpace("ClientOnly")
+    method void KeepSoccerHatVisible()
+        -- This cap has no visible stand1/stand2 frames; alert is its verified idle fallback.
+        local avatar = self.Entity.AvatarRendererComponent
+        local costume = self.Entity.CostumeManagerComponent
+        if not isvalid(avatar) or not isvalid(costume) then return end
+        local body = avatar:GetBodyEntity()
+        if not isvalid(body) then return end
+        if self._T.hatBody ~= body then
+            if isvalid(self._T.hatBody) and self._T.hatListener then
+                self._T.hatBody:DisconnectEvent(ActionStateChangedEvent, self._T.hatListener)
+            end
+            self._T.hatBody = body
+            self._T.hatListener = body:ConnectEvent(ActionStateChangedEvent, function(event)
+                self._T.hatActionRevision = (self._T.hatActionRevision or 0) + 1
+                local revision = self._T.hatActionRevision
+                if costume.CustomCapEquip ~= "aeb1286a232949c98b4dc07ab8d2c14e" then return end
+                if event.CoreActionName ~= "stand1" and event.CoreActionName ~= "stand2" then return end
+                -- Defer until the original event has finished dispatching.
+                _TimerService:SetTimerOnce(function()
+                    if not isvalid(self.Entity) or not isvalid(body) then return end
+                    if self._T.hatActionRevision ~= revision then return end
+                    if costume.CustomCapEquip ~= "aeb1286a232949c98b4dc07ab8d2c14e" then return end
+                    if self.Entity.StateComponent.CurrentStateName ~= "IDLE" then return end
+                    body:SendEvent(ActionStateChangedEvent("alert", "alert", 1, SpriteAnimClipPlayType.Loop))
+                end, 0.01)
+            end)
+            self._T.hatCap = nil
+        end
+        local cap = costume.CustomCapEquip
+        if self._T.hatCap ~= cap then
+            local previous = self._T.hatCap
+            self._T.hatCap = cap
+            if self.Entity.StateComponent.CurrentStateName == "IDLE" then
+                if cap == "aeb1286a232949c98b4dc07ab8d2c14e" then
+                    body:SendEvent(ActionStateChangedEvent("alert", "alert", 1, SpriteAnimClipPlayType.Loop))
+                    log("[HatIdle] soccer cap fallback applied")
+                elseif previous == "aeb1286a232949c98b4dc07ab8d2c14e" then
+                    local reset = BodyActionStateChangeEvent()
+                    reset.ActionState = MapleAvatarBodyActionState.Stand
+                    reset.needResetAction = true
+                    self.Entity:SendEvent(reset)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
     method void ClientWatchdogTick()
         -- 내 캐릭터에 대해서만 동작해야 한다 - 다른 플레이어의 상태를 내 클라이언트에서 바꾸려 하면
         -- 권한이 없어 [LEA-3022]가 다시 발생한다.
         if not isvalid(self.Entity) then return end
         self:KeepAvatarAboveTerrain()
+        self:KeepSoccerHatVisible()
         local localPlayer = _UserService.LocalPlayer
         if not isvalid(localPlayer) or localPlayer ~= self.Entity then return end
         local sc = self.Entity.StateComponent
@@ -567,7 +618,7 @@ script PlayerHit extends HitComponent
             -- 사망하면 즉시 원색으로 복구하고 멈춘다(사망 연출을 회색으로 덮지 않기 위해).
             local sc = self.Entity.StateComponent
             if isvalid(sc) and sc.CurrentStateName == "DEAD" then
-                arT:SetColor(1.0, 1.0, 1.0, 1.0, nil)
+                _AvatarTicketManager:ApplyPlayerTint(self.Entity,1)
                 if self._T.blinkTimerId ~= nil then
                     _TimerService:ClearTimer(self._T.blinkTimerId)
                     self._T.blinkTimerId = nil
@@ -577,9 +628,9 @@ script PlayerHit extends HitComponent
             isGray = not isGray
             if isGray then
                 -- (피드백 2026-08-10) 회색을 더 연하게: 0.45 → 0.65
-                arT:SetColor(0.65, 0.65, 0.65, 1.0, nil)
+                _AvatarTicketManager:ApplyPlayerTint(self.Entity,0.65)
             else
-                arT:SetColor(1.0, 1.0, 1.0, 1.0, nil)
+                _AvatarTicketManager:ApplyPlayerTint(self.Entity,1)
             end
         end, 0.08)   -- (피드백 2026-08-10) 깜빡임 더 빠르게: 0.12초 → 0.08초
 
@@ -592,7 +643,7 @@ script PlayerHit extends HitComponent
             end
             if isvalid(self.Entity) then
                 local arE = self.Entity.AvatarRendererComponent
-                if isvalid(arE) then arE:SetColor(1.0, 1.0, 1.0, 1.0, nil) end
+                if isvalid(arE) then _AvatarTicketManager:ApplyPlayerTint(self.Entity,1) end
             end
         end, duration)
     end

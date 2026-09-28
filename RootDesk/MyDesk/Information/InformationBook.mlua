@@ -5,6 +5,8 @@ script InformationBook extends Logic
     property integer grade = 1
     property integer equipType = 1
     property boolean additional = false
+    property integer hallBoard = 1
+    property integer hallJob = 1
     property integer selectedRank = 1
     property table ranks = {}
     property table pages = {}
@@ -14,18 +16,22 @@ script InformationBook extends Logic
 
     @ExecSpace("ClientOnly")
     method Entity UI(string name)
-        return _EntityService:GetEntityByPath("/ui/InformationBook/Book" .. (name == "" and "" or "/" .. name))
+        return _EntityService:GetEntityByPath((self._T.windowPath or "/ui/InformationBook/Book") .. (name == "" and "" or "/" .. name))
     end
 
     @ExecSpace("ClientOnly")
     method void OnBeginPlay()
+        -- Share sibling ordering with inventory windows.
+        local book = _EntityService:GetEntityByPath("/ui/InformationBook/Book")
+        local windows = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+        if isvalid(book) and isvalid(windows) then book:AttachTo(windows) self._T.windowPath="/ui/DefaultGroup/Book" end
         self:Close()
         self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
         self:Bind("Close", function() self:Close() end)
         self:Bind("Prev", function() self:Turn(-1) end)
         self:Bind("Next", function() self:Turn(1) end)
         self:Bind("Refresh", function() self:RefreshRanks() end)
-        for i = 1, 5 do
+        for i = 1, 7 do
             local index = i
             self:Bind("Tab" .. tostring(i), function()
                 self:SelectTab(index)
@@ -46,11 +52,45 @@ script InformationBook extends Logic
         for i = 1, 10 do
             local index = i
             self:Bind("Rank" .. tostring(i), function()
-                self.selectedRank = (self.page - 1) * 10 + index
-                self:Render()
+                self:ChooseRank((self.page - 1) * 10 + index)
             end)
         end
-        log("[InformationBook] ready key=1")
+
+        for i=1,3 do
+            local n=i
+            self:Bind("Hall/Board"..tostring(i),function() self:SelectHall(n,self.hallJob) end)
+        end
+        for i=1,10 do
+            local n=i
+            self:Bind("Hall/Job"..tostring(i),function() self:SelectHall(3,n) end)
+        end
+        for i=1,28 do
+            local slot=i
+            self:Bind("Hall/Profile/Equipment/Slot"..tostring(i),function()
+                local d=self._T.hallOwner
+                self:ShowHallItem(d and (d.equips or {})[tostring(slot)] or "")
+            end)
+        end
+        self:Bind("Hall/Profile/RankedItem",function()
+            local row=self.ranks[self.selectedRank]
+            self:ShowHallItem(row and row.item or "")
+        end)
+        self:Bind("Hall/Profile/ItemDetails/Back",function() self:Show("Hall/Profile/ItemDetails",false) end)
+        self:Bind("Hall/Profile/Ticket",function()
+            self._T.hallOriginal=not self._T.hallOriginal self:DrawHallOwner() _UIAudio:Play("Tab")
+        end)
+        for i=1,12 do local n=i self:Bind("Cosmetics/Results/Card"..tostring(i),function() self:TryCosmetic(n) end) end
+        self:Bind("Cosmetics/Fitting/Reset",function() self:ResetFitting() end)
+        self:Bind("Cosmetics/Fitting/Zoom",function() self._T.fittingZoom=not self._T.fittingZoom self:UpdateFittingView() end)
+        self:Bind("Cosmetics/Fitting/Pose",function() self._T.fittingPose=((self._T.fittingPose or 1)%5)+1 self:UpdateFittingView() end)
+        self:Bind("Cosmetics/SearchButton", function() self:SearchCosmetics() end)
+        for i = 0, 14 do
+            local n = i
+            self:Bind("Cosmetics/Cat" .. tostring(i), function() self._T.cosCategory = n self:SearchCosmetics() _UIAudio:Play("Tab") end)
+        end
+        local input = self:UI("Cosmetics/Search")
+        self._T.cosSubmit = input:ConnectEvent(TextInputSubmitEvent, function() self:SearchCosmetics() end)
+        log("[InformationBook] ready key=1, cosmetic catalogue tab=6")
     end
 
     @ExecSpace("ClientOnly")
@@ -59,6 +99,9 @@ script InformationBook extends Logic
         for _, h in ipairs(self.handlers) do
             if isvalid(h.e) then h.e:DisconnectEvent(ButtonClickEvent, h.h) end
         end
+        local input = self:UI("Cosmetics/Search")
+        if isvalid(input) and self._T.cosSubmit then input:DisconnectEvent(TextInputSubmitEvent, self._T.cosSubmit) end
+        self._T.cosScan = nil
         self.handlers = {}
     end
 
@@ -66,7 +109,7 @@ script InformationBook extends Logic
     method void Bind(string name, any action)
         local e = self:UI(name)
         if not isvalid(e) then log_warning("[InformationBook] missing " .. name) return end
-        table.insert(self.handlers, {e = e, h = e:ConnectEvent(ButtonClickEvent, action)})
+        table.insert(self.handlers, {e = e, h = e:ConnectEvent(ButtonClickEvent, function() if _UIClickArbiter:AcceptClickAt(self._T.windowPath,_InputService:GetCursorPosition()) then action() end end)})
     end
 
     @ExecSpace("ClientOnly")
@@ -87,14 +130,17 @@ script InformationBook extends Logic
         local e = self:UI("")
         if not isvalid(e) then return end
         e.Enable = true
+        _UIEquipInventoryManager:BringWindowToFront(self._T.windowPath)
         self:Render()
         if self.tab == 5 then self:RefreshRanks() end
     end
 
     @ExecSpace("ClientOnly")
     method void OnKey(KeyDownEvent event)
+        local search = self:UI("Cosmetics/Search")
+        if self:IsOpen() and self.tab == 6 and isvalid(search) and search.TextGUIRendererInputComponent.IsFocused then return end
         if not _LoginFlow:IsInGame() or _KeySettingManager:IsCapturingKey() or _MapleHUDManager:IsChatTyping() or _GameSystemMenu:BlocksInput() then return end
-        if event.key == KeyboardKey.Tab and self:IsOpen() then self:SelectTab(self.tab % 5 + 1) return end
+        if event.key == KeyboardKey.Tab and self:IsOpen() and _UIClickArbiter:GetKeyboardWindow()==self._T.windowPath then self:SelectTab(self.tab % 7 + 1) return end
         if _KeySettingManager:GetFuncForKeyEnum(event.key) == "information" then self:Toggle() end
     end
 
@@ -102,7 +148,7 @@ script InformationBook extends Logic
     method void SelectTab(integer index)
         -- Mouse and Tab share the same per-tab page memory.
         self.pages[self.tab] = self.page
-        self.tab = math.max(1, math.min(5, index))
+        self.tab = math.max(1, math.min(7, index))
         self.page = self.pages[self.tab] or 1
         self:Render()
         _UIAudio:Play("Tab")
@@ -124,6 +170,7 @@ script InformationBook extends Logic
 
     @ExecSpace("ClientOnly")
     method void Turn(integer direction)
+        if self.tab == 6 and self._T.cosScan ~= nil then return end
         self.page = math.max(1, math.min(self._T.maxPage or 1, self.page + direction))
         self.pages[self.tab] = self.page
         self:Render()
@@ -131,6 +178,7 @@ script InformationBook extends Logic
 
     @ExecSpace("ClientOnly")
     method table GuideLines()
+        if self.tab == 7 then return _SpecialEquipment:GuideLines() end
         if self.tab == 4 and self._T.dropLines ~= nil then return self._T.dropLines end
         local lines = {}
         if self.tab == 1 then
@@ -175,15 +223,27 @@ script InformationBook extends Logic
             table.insert(lines, "에디 계열 2·3줄: 에픽 4.7619%, 그 위 1.9608%")
             table.insert(lines, "나머지는 한 단계 낮은 등급 / 레어는 레어 100%")
             table.insert(lines, "")
-            table.insert(lines, "스타포스 · 현재 성수 → 다음 성수")
+            table.insert(lines, "일반 장비 스타포스 · 현재 성수 → 다음 성수")
+            table.insert(lines, "0~4성: 성공 45% / Fail 50% / 파괴 5%")
+            table.insert(lines, "5~9성: 성공 40% / Fail 50% / 파괴 10%")
+            table.insert(lines, "10성 이상: 성공 35% / Fail 50% / 파괴 15%")
+            table.insert(lines, "Fail: 장비·별 유지, 강화 비용만 소모")
+            table.insert(lines, "일반 장비 최대 50성 / 시작 무기 3성 / 하프 이어링 5성")
             for _, level in ipairs({0, 5, 10, 12, 15, 17, 20, 22, 25, 30, 40}) do
-                local b = _EnhancementManager:GetStarforceBand(level)
-                table.insert(lines, tostring(level) .. "성: 성공 " .. tostring(b.success) .. "% / 파괴 " .. tostring(b.destroy) .. "%")
-                table.insert(lines, "  유지 " .. tostring(b.keep) .. "% · 하락 " .. tostring(b.drop) .. "% · " .. tostring(b.cost) .. " 메소")
+                local b = _EnhancementManager:GetBaseStarforceBand(level)
+                table.insert(lines, tostring(level) .. "성: 성공 " .. tostring(b.success) .. "% / Fail " .. tostring(b.keep) .. "% / 파괴 " .. tostring(b.destroy) .. "%")
+                table.insert(lines, "  비용 " .. tostring(b.cost) .. " 메소")
             end
             table.insert(lines, "")
-            table.insert(lines, "드롭 아이템 상자 · 0성 70%")
-            table.insert(lines, "1~29성: 30% ÷ 2^성수 / 30성: 30% ÷ 2^29")
+            local accessory = _EnhancementManager:GetAccessoryStarforceBand()
+            table.insert(lines, "장신구 스타포스 · 모든 성수 공통")
+            table.insert(lines, "성공 " .. tostring(accessory.success) .. "% / Fail " .. tostring(accessory.keep) .. "% / 파괴 " .. tostring(accessory.destroy) .. "%")
+            table.insert(lines, "1회 비용 " .. tostring(accessory.cost) .. " 메소")
+            table.insert(lines, "")
+            table.insert(lines, "장비 상자 · 0성 40% / 강화 장비 총 60%")
+            table.insert(lines, "1~29성: 60% ÷ 2^성수 / 30성: 60% ÷ 2^29")
+            table.insert(lines, "고급 상자: 각 5성 이상 확률 10배 / 0성 6.25%")
+            table.insert(lines, "성수별 상세 확률은 장비·장신구 상자 탭에 공개합니다.")
             table.insert(lines, "장비 종류는 상자 사용 시 직접 선택합니다.")
             table.insert(lines, "각 시도는 독립 추첨이며 이전 실패 횟수와 무관합니다.")
             table.insert(lines, "")
@@ -191,7 +251,7 @@ script InformationBook extends Logic
             table.insert(lines, "잠재·에디셔널 부여: 성공 70% / 파괴 30%")
             table.insert(lines, "장비 강화 주문서: 성공 90% / 파괴 10%")
             table.insert(lines, "성공 시 +1~5성 각각 20% (최대 성수 제한)")
-            table.insert(lines, "프로텍트: 다음 스타포스 1회 파괴 방지")
+            table.insert(lines, "프로텍트: 파괴 방지 / Fail 시 보호 유지")
             table.insert(lines, "일반 60% 주문서: 성공 여부와 무관하게 횟수 소모")
         elseif self.tab == 3 then
             lines = {
@@ -200,34 +260,48 @@ script InformationBook extends Logic
                 "양수 전투력은 최소 1을 보장합니다.", "마법 직업은 마력·INT, 나머지는 공격력·주스탯.", "버프·스킬 공마와 최종 전투력 보너스는 별도 반영.", "",
                 "실제 공격 피해", "스킬별 전투력 배율 / 고정 피해를 먼저 계산합니다.", "무기·스킬별 난수, 치명타, 추가타가 적용됩니다.",
                 "몬스터가 높은 레벨이면 1레벨당 피해 2% 감소.", "배율 = 최대(0, 1 − 최대(0, 몬스터Lv−내Lv)×0.02)", "최종 피해는 정수 내림합니다.",
-                "달팽이 세 마리: 고정 40 × 레벨 보정 / MP 10.", "공격속도·크리티컬은 기본 전투력에 중복 합산 안 함.", "",
+                "달팽이 세 마리: 고정 40 × 레벨 보정 / MP 5.", "공격속도·크리티컬은 기본 전투력에 중복 합산 안 함.", "",
                 "장비와 성장", "스타포스 1성: 직업 주스탯 +4, 공마 +3.", "표시 레벨은 순수 장비 성능으로 계산합니다.", "버프는 장비 레벨을 올리지 않습니다.", "",
                 "명예의 전당 점수", "장비 하나의 T² 중 가장 적합한 직업 조합을 사용.", "착용자 레벨·다른 장비·버프는 제외합니다.", "HP·MP·공격속도·크리티컬은 점수에 포함 안 함.", "같은 점수의 장비도 각각 별도 아이템으로 표시.", "세부 스킬 배율은 스킬창 설명을 참고해주세요."
             }
         else
+            table.insert(lines, "레벨 차이 페널티 · 드롭 확률과 메소 금액")
+            table.insert(lines, "처치한 플레이어와 몬스터의 레벨 차이로 계산합니다.")
+            table.insert(lines, "몬스터가 높거나 낮은 경우 모두 적용됩니다.")
+            for _, band in ipairs({{0, "0~10"}, {11, "11~20"}, {21, "21~30"}, {31, "31~40"}, {41, "41 이상"}}) do
+                local rate = _RegionTierLogic:GetLevelDropRate(1, 1 + band[1])
+                table.insert(lines, band[2] .. " 차이: " .. tostring(math.floor(rate * 100 + 0.5)) .. "% 적용")
+            end
+            table.insert(lines, "메소 기본 드롭 확률: " .. string.format("%.0f%%", _MonsterDropRules:GetMesoDropChance(1) * 100))
+            table.insert(lines, "확률과 금액 모두 위 레벨 차이 배율을 적용합니다.")
+            table.insert(lines, "메소 확률: 60% / 48% / 36% / 24% / 12%")
+            table.insert(lines, "예: 25레벨 차이 → 36% 확률로 기본 금액의 60%")
+            table.insert(lines, "드롭률 1%도 같은 조건에서는 0.6%가 됩니다.")
+            table.insert(lines, "")
             table.insert(lines, "전 몬스터 공통 드롭 테이블 · 기본 확률")
             for _, item in ipairs(_MonsterDropRules:GetItems()) do
-                table.insert(lines, item.name .. "   " .. string.format("%.3f%%", item.rate * 100) .. (item.fixedRate and " (고정)" or ""))
+                table.insert(lines, item.name .. "   " .. string.format("%.5f%%", item.rate * 100) .. (item.fixedRate and " (고정)" or ""))
             end
             table.insert(lines, "")
             table.insert(lines, "각 아이템을 독립 추첨하므로 여러 개가 함께 나옵니다.")
             table.insert(lines, "아이템 감각: 메소량·비고정 아이템 확률에 적용.")
-            table.insert(lines, "메소·아이템 확률: 레벨 차이 0~10 / 11~20 / 21~30 / 31~40 / 41+")
-            table.insert(lines, "동일 레벨: 100% / 50레벨 이상 차이: 0%")
-            table.insert(lines, "메소량 = 몬스터 레벨 구간 기본값의 80~120%")
-            table.insert(lines, "각각 100% / 80% / 60% / 40% / 20% 배율 적용")
-            table.insert(lines, "공격 속도의 비약도 레벨 패널티 적용 · 아이템 감각 제외")
-            table.insert(lines, "아바타 장비는 드롭 아이템 상자로 획득합니다.")
+            table.insert(lines, "아이템 감각은 메소 드롭 확률을 높이지 않습니다.")
+            table.insert(lines, "메소량 = 레벨 구간 원래 기본값의 80~120% × 50%")
+            table.insert(lines, "이 금액에 아이템 감각과 레벨 차이 배율을 곱합니다.")
+            table.insert(lines, "공격 속도의 비약: 기본 0.03% × 레벨 차이 배율")
+            table.insert(lines, "비약에는 아이템 감각 보너스를 적용하지 않습니다.")
+            table.insert(lines, "아바타 장비는 장비 상자로 획득합니다.")
             table.insert(lines, "")
             table.insert(lines, "메소 기본값 · 아이템 감각 적용 전")
             local tiers = {}
             for i = 1, 11 do
                 local info = _RegionTierLogic:GetTierInfo(i)
                 table.insert(tiers, info)
-                table.insert(lines, "Lv." .. tostring(info.openLevel) .. "부터: " .. tostring(info.meso) .. " 메소 (±20%)")
+                table.insert(lines, "Lv." .. tostring(info.openLevel) .. "부터: " .. tostring(_MonsterDropRules:CalculateMeso(info.meso, 1, 1)) .. " 메소 (±20%)")
             end
             table.insert(lines, "")
             table.insert(lines, "몬스터 도감 · 모든 몬스터는 위 공통 드롭을 사용")
+            table.insert(lines, "Lv.30 이하: HP·공격력 기존의 50% (정수 내림, 최소 1)")
             _WorldMapManager:GetMapMonsters("")
             local seen, catalog = {}, {}
             for _, monsters in pairs(_WorldMapManager._T.mapMonsterCatalog or {}) do
@@ -240,7 +314,9 @@ script InformationBook extends Logic
             for _, monster in ipairs(catalog) do
                 local info = tiers[1]
                 for _, tier in ipairs(tiers) do if monster.level >= tier.openLevel then info = tier end end
-                table.insert(lines, "Lv." .. tostring(monster.level) .. " " .. monster.name .. "  ·  " .. tostring(math.floor(info.meso * 0.8)) .. "~" .. tostring(math.floor(info.meso * 1.2)) .. " 메소")
+                table.insert(lines, "Lv." .. tostring(monster.level) .. " " .. monster.name .. "  ·  " .. tostring(_MonsterDropRules:CalculateMeso(math.floor(info.meso * 0.8), 1, 1)) .. "~" .. tostring(_MonsterDropRules:CalculateMeso(math.floor(info.meso * 1.2), 1, 1)) .. " 메소")
+                local damage = _RegionTierLogic:GetMonsterDamageRange(monster.level)
+                table.insert(lines, "HP " .. tostring(_HeroMonsterBalance:GetMonsterHP(monster.level)) .. " · 공격력 " .. tostring(damage.min) .. "~" .. tostring(damage.max))
             end
         end
         if self.tab == 4 then self._T.dropLines = lines end
@@ -249,9 +325,9 @@ script InformationBook extends Logic
 
     @ExecSpace("ClientOnly")
     method void Render()
-        local titles = {"큐브 등장 옵션", "각종 확률", "데미지 공식", "몬스터 드롭", "명예의 전당"}
+        local titles = {"큐브 등장 옵션", "각종 확률", "데미지 공식", "몬스터 드롭", "명예의 전당", "치장 상자 도감", "장비·장신구 상자"}
         self:Text("Title", titles[self.tab])
-        for i = 1, 5 do
+        for i = 1, 7 do
             local e = self:UI("Tab" .. tostring(i))
             if isvalid(e) then
                 e.SpriteGUIRendererComponent.Color = i == self.tab and Color(0.23,0.29,0.30,1) or Color(0.89,0.85,0.76,1)
@@ -273,41 +349,23 @@ script InformationBook extends Logic
             tr.anchoredPosition = Vector2(name == "BodyLeft" and -325 or 325, self.tab == 1 and -68 or -44)
             tr.RectSize = Vector2(565, self.tab == 1 and 520 or 590)
         end
+        self:Show("TabHint", self.tab ~= 6)
+        self:UI("Page").UITransformComponent.anchoredPosition = Vector2(0, self.tab == 6 and -369 or -330)
+        self:Show("Cosmetics", self.tab == 6)
         self:Show("Refresh", self.tab == 5)
-        self:Show("BodyLeft", self.tab ~= 5)
-        self:Show("BodyRight", self.tab ~= 5)
-        self:Show("Details", self.tab == 5)
-        self:Show("ItemIcon", self.tab == 5)
+        self:Show("BodyLeft", self.tab < 5 or self.tab == 7)
+        self:Show("BodyRight", self.tab < 5 or self.tab == 7)
+        self:Show("Details", false)
+        self:Show("Hall", self.tab == 5)
+        self:Show("ItemIcon", false)
         self:Show("HallNote", self.tab == 5)
-        if self.tab == 5 then
-            self._T.maxPage = 10
-            for i = 1, 10 do
-                local index = (self.page - 1) * 10 + i
-                local row = self.ranks[index]
-                self:Show("Rank" .. tostring(i), true)
-                self:Text("Rank" .. tostring(i) .. "/RankNumber", tostring(index) .. "위" .. (row == nil and "  —" or ""))
-                self:Text("Rank" .. tostring(i) .. "/Name", row ~= nil and _UIEquipInventoryManager:ParseName(row.item) or "등록 장비 없음")
-                local icon = self:UI("Rank" .. tostring(i) .. "/Icon")
-                if isvalid(icon) then
-                    icon.Enable = row ~= nil
-                    if row ~= nil then icon.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. _UIEquipInventoryManager:ParseRUID(row.item)) end
-                end
-            end
-            local selected = self.ranks[self.selectedRank]
-            if selected ~= nil then
-                local s = selected.item
-                local name = _UIEquipInventoryManager:ParseName(s)
-                local text = tostring(self.selectedRank) .. "위  " .. name .. "\n소유자: " .. selected.owner
-                    .. "\n장비 점수: " .. tostring(selected.score) .. "\n스타포스: " .. tostring(_UIEquipInventoryManager:ParseStars(s)) .. "성\n\n"
-                    .. _UIEquipInventoryManager:BuildTooltipStatsText(name, _UIEquipInventoryManager:ParseStars(s), _UIEquipInventoryManager:ParseUpgrade(s))
-                    .. _UIEquipInventoryManager:BuildPotentialText(s)
-                self:Text("Details", text)
-                self:UI("ItemIcon").SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. _UIEquipInventoryManager:ParseRUID(s))
-            else
-                self:Show("ItemIcon", false)
-                self:Text("Details", self.rankMessage ~= "" and self.rankMessage or "장비를 선택하면\n상세 능력치를 볼 수 있습니다.")
-            end
-            self:Text("HallNote", self.rankMessage ~= "" and self.rankMessage or "월드 전체 장비 순위 · 접속·저장 시 반영\n조회 후 30초 동안 같은 순위가 표시될 수 있습니다.")
+        if self.tab == 6 then
+            for i = 1, 10 do self:Show("Rank" .. tostring(i), false) end
+            if self._T.cosRows == nil or self._T.cosJob ~= _UIMyInfoManager:GetSelectedCharacterJobIdx() then self:SearchCosmetics() else self:RenderCosmetics() end
+            return
+        elseif self.tab == 5 then
+            self:RenderHall()
+
         else
             for i = 1, 10 do self:Show("Rank" .. tostring(i), false) end
             local lines = self:GuideLines()
@@ -335,11 +393,303 @@ script InformationBook extends Logic
         end
         if self:IsOpen() then self:Render() end
     end
+
     @ExecSpace("ClientOnly")
     method void RefreshRanks()
-        self.rankMessage = "월드 장비 순위를 불러오는 중…"
+        self._T.hallRequest=(self._T.hallRequest or 0)+1
+        self.rankMessage="순위를 불러오는 중…"
         self:Render()
-        _ItemHallOfFame:Request()
+        _ItemHallOfFame:RequestBoard(self.hallBoard,self.hallJob,self._T.hallRequest)
     end
 
+    @ExecSpace("ClientOnly")
+    method void SearchCosmetics()
+        -- Search the same ordered pools as box rolls; filtering never changes reward odds.
+        self._T.cosRows = {}
+        self.page = 1 self.pages[6] = 1
+        self._T.cosJob = _UIMyInfoManager:GetSelectedCharacterJobIdx()
+        self._T.cosQuery = _CosmeticExchange:Normalize(self:UI("Cosmetics/Search").TextGUIRendererInputComponent.Text or "")
+        local cats = _CosmeticBoxCatalog:NewCategories()
+        local selected = cats[self._T.cosCategory or 0]
+        self._T.cosScan = {cats = selected and {selected} or cats, cat = 1, part = 1, index = 0, job = self._T.cosJob, query = self._T.cosQuery}
+        self:RenderCosmetics()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Limit catalogue parsing to one 100-item chunk per frame and pause while hidden.
+        if not self:IsOpen() or self.tab ~= 6 or self._T.cosDrawing then return end
+        local s = self._T.cosScan
+        if s == nil then return end
+        local c = s.cats[s.cat]
+        if c == nil then
+            self._T.cosScan = nil
+            self:RenderCosmetics()
+            log("[InformationBook] cosmetic search results=" .. tostring(#self._T.cosRows))
+            return
+        end
+        local raw = _CosmeticBoxCatalog:ReadData(c.key, s.part)
+        for line in string.gmatch(raw, "[^\r\n]+") do
+            if self._T.cosScan ~= s then return end
+            s.index = s.index + 1
+            local name = string.match(line, "^[^\t]+\t([^\t]+)") or ""
+            if string.find(_CosmeticExchange:Normalize(name), s.query, 1, true) then
+                local row = _CosmeticBoxCatalog:ParseRow(line)
+                if row ~= nil and _CosmeticBoxCatalog:Allowed(row, s.job) then
+                    row.key = c.key row.index = s.index
+                    table.insert(self._T.cosRows, row)
+                end
+            end
+        end
+        if self._T.cosScan ~= s then return end
+        s.part = s.part + 1
+        if s.part > c.parts then s.cat = s.cat + 1 s.part = 1 s.index = 0 end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderCosmetics()
+        if self._T.fittingEquips == nil then self:ResetFitting() end
+        -- Reuse twelve visible cards, keeping large catalogues out of the UI hierarchy.
+        if self._T.cosDrawing then self._T.cosDrawAgain = true return end
+        self._T.cosDrawing = true
+        local rows = self._T.cosRows or {}
+        local scanning = self._T.cosScan ~= nil
+        local cats = _CosmeticBoxCatalog:NewCategories()
+        local chosen = cats[self._T.cosCategory or 0]
+        self._T.maxPage = math.max(1, math.ceil(#rows / 12))
+        self.page = math.max(1, math.min(self.page, self._T.maxPage))
+        for i = 0, 14 do
+            local e = self:UI("Cosmetics/Cat" .. tostring(i))
+            local selected = i == (self._T.cosCategory or 0)
+            e.SpriteGUIRendererComponent.Color = selected and Color(0.16,0.38,0.40,1) or Color(0.94,0.92,0.85,1)
+            e.TextGUIRendererComponent.FontColor = selected and Color.white or Color(0.18,0.20,0.20,1)
+        end
+        self:Text("Cosmetics/Status", scanning and "코디 목록을 검색하고 있습니다…" or (#rows == 0 and "검색 결과가 없습니다. 이름이나 부위를 바꿔주세요." or ((chosen and chosen.name .. " 상자" or "전체 상자") .. " · 검색 결과 " .. tostring(#rows) .. "종")))
+        for i = 1, 12 do
+            local path = "Cosmetics/Results/Card" .. tostring(i)
+            local row = rows[(self.page - 1) * 12 + i]
+            self:Show(path, not scanning and row ~= nil)
+            if row ~= nil and not scanning then
+                local c = _CosmeticBoxCatalog:Category(row.key)
+                local pool = c.count
+                if row.key == "weapon" then pool = #_CosmeticBoxCatalog:WeaponIndices(self._T.cosJob) end
+                self:UI(path .. "/Icon").SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. row.ruid)
+                self:Text(path .. "/Name", row.name)
+                self:Text(path .. "/Odds", c.name .. " 상자 · " .. string.format("%.4f%%", 100 / math.max(1,pool)))
+            end
+        end
+        self:Text("Page", scanning and "검색 중" or tostring(self.page) .. " / " .. tostring(self._T.maxPage))
+        self._T.cosDrawing = false
+        if self._T.cosDrawAgain then self._T.cosDrawAgain = false self:RenderCosmetics() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectHall(integer board, integer job)
+        self._T.hallPages=self._T.hallPages or {}
+        self._T.hallPages[tostring(self.hallBoard)..":"..tostring(self.hallJob)]=self.page
+        self.hallBoard=board self.hallJob=job
+        self.page=self._T.hallPages[tostring(board)..":"..tostring(job)] or 1
+        self.selectedRank=(self.page-1)*10+1
+        self.ranks={} self._T.hallOwner=nil self._T.ownerKey=nil
+        self:Show("Hall/Profile/ItemDetails",false)
+        self:RefreshRanks() _UIAudio:Play("Tab")
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveBoard(integer board, integer job, integer requestId, string raw, string message)
+        if board~=self.hallBoard or job~=self.hallJob or requestId~=self._T.hallRequest then return end
+        self.rankMessage=message
+        if raw~="" then
+            local ok,rows=pcall(function() return _HttpService:JSONDecode(raw) end)
+            if ok and rows~=nil then self.ranks=rows end
+        end
+        if self:IsOpen() and self.tab==5 then
+            self:Render()
+            self:ChooseRank(self.selectedRank)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ChooseRank(integer index)
+        self.selectedRank=index
+        self._T.hallOwner=nil self._T.hallOriginal=false
+        self._T.ownerRequest=(self._T.ownerRequest or 0)+1
+        self:Show("Hall/Profile/ItemDetails",false)
+        local row=self.ranks[index]
+        self._T.ownerKey=row and (row.ownerKey or string.match(row.key,"^(.*)_[EI]%d+$")) or nil
+        self._T.ownerMessage=row and "캐릭터 정보 불러오는 중…" or "왼쪽에서 순위를 선택해주세요."
+        self:Render()
+        if self._T.ownerKey~=nil then _ItemHallOfFame:RequestOwner(self._T.ownerKey,self._T.ownerRequest) end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveOwner(string key, integer requestId, string raw, string message)
+        if key~=self._T.ownerKey or requestId~=self._T.ownerRequest then return end
+        local ok,d=pcall(function() return raw~="" and _HttpService:JSONDecode(raw) or nil end)
+        self._T.hallOwner=ok and d~=nil and not d.deleted and d or nil
+        self._T.ownerMessage=message~="" and message or "삭제되었거나 등록되지 않은 캐릭터입니다."
+        if self:IsOpen() and self.tab==5 then self:DrawHallOwner() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderHall()
+        self._T.maxPage=10
+        self.page=math.max(1,math.min(10,self.page))
+        for i=1,3 do
+            local e=self:UI("Hall/Board"..tostring(i))
+            e.SpriteGUIRendererComponent.Color=i==self.hallBoard and Color(0.16,0.38,0.40,1) or Color(0.94,0.92,0.85,1)
+            e.TextGUIRendererComponent.FontColor=i==self.hallBoard and Color.white or Color(0.18,0.2,0.2,1)
+        end
+        for i=1,10 do
+            local e=self:UI("Hall/Job"..tostring(i))
+            e.Enable=self.hallBoard==3
+            e.SpriteGUIRendererComponent.Color=i==self.hallJob and Color(0.16,0.38,0.40,1) or Color(0.94,0.92,0.85,1)
+            e.TextGUIRendererComponent.FontColor=i==self.hallJob and Color.white or Color(0.18,0.2,0.2,1)
+            local index=(self.page-1)*10+i
+            local row=self.ranks[index]
+            self:Show("Rank"..tostring(i),true)
+            self:UI("Rank"..tostring(i)).SpriteGUIRendererComponent.Color=index==self.selectedRank and Color(0.77,0.87,0.83,1) or Color(0.96,0.93,0.86,1)
+            self:Text("Rank"..tostring(i).."/RankNumber",tostring(index).."위")
+            local label="등록된 기록 없음"
+            if row~=nil then
+                if self.hallBoard==1 then label=_UIEquipInventoryManager:ParseName(row.item).."\n"..row.owner.." · 점수 "..tostring(row.score)
+                else label=row.owner.." · Lv."..tostring(row.level).."\n".._UIMyInfoManager:GetClassNameForLevel(row.job,row.level).." · 전투력 "..tostring(row.score) end
+            end
+            self:Text("Rank"..tostring(i).."/Name",label)
+            local icon=self:UI("Rank"..tostring(i).."/Icon")
+            icon.Enable=row~=nil and self.hallBoard==1
+            if icon.Enable then icon.SpriteGUIRendererComponent.ImageRUID=DataRef(_UIEquipInventoryManager:ItemIconRUID(row.item)) end
+        end
+        self:Text("HallNote",self.rankMessage~="" and self.rankMessage or "월드 전체 · 저장 시 반영 · 최대 100위\n장비는 개별 점수 / 캐릭터는 저장된 전투력 기준")
+        self:DrawHallOwner()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawHallOwner()
+        local d=self._T.hallOwner
+        self:Show("Hall/Profile/Avatar",d~=nil)
+        self:Show("Hall/Profile/Equipment",d~=nil)
+        self:Show("Hall/Profile/Ticket",false)
+        self:Show("Hall/Profile/RankedItem",false)
+        if d==nil then
+            self:Text("Hall/Profile/Info",self._T.ownerMessage or "왼쪽에서 순위를 선택해주세요.")
+            return
+        end
+        self:Text("Hall/Profile/Info",d.name.."\nLv."..tostring(d.level).."  ".._UIMyInfoManager:GetClassNameForLevel(d.job,d.level).."\n전투력 "..tostring(d.power))
+        local equips=d.equips or {}
+        local eq={}
+        for i=1,27 do
+            local item=equips[tostring(i)] or ""
+            eq[i]={ruid=_UIEquipInventoryManager:ParseRUID(item),name=_UIEquipInventoryManager:ParseName(item)}
+            if i<=7 and eq[i].ruid=="" then
+                local field=i==7 and 9 or i+1
+                local r=_ItemHallOfFame:Field(d.appearance or "",field)
+                if #r==32 then eq[i].ruid=r end
+            end
+        end
+        local finals=_DecoWindowManager:ComposeAppearance(eq,d.deco or {},d.job)
+        local ticket=equips["28"] or ""
+        local enabled=_AvatarTicketManager:IsTicket(ticket) and not _AvatarTicketManager:IsExpired(ticket)
+        local avatar=self:UI("Hall/Profile/Avatar")
+        if (self._T.fittingDeco.skin or "")=="" then table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"}) end
+        _AvatarTicketManager:Apply(avatar.CostumeManagerComponent,d.uid,finals,_AvatarTicketManager:ShouldShowWorld(d.uid,enabled,self._T.hallOriginal==true))
+        self:Show("Hall/Profile/Ticket",enabled)
+        self:Text("Hall/Profile/Ticket",self._T.hallOriginal and "게임 코디" or "MSW 코디")
+        for i=1,28 do
+            local slot=self:UI("Hall/Profile/Equipment/Slot"..tostring(i))
+            local item=equips[tostring(i)] or ""
+            local icon=slot:GetChildByName("Icon")
+            icon.Enable=item~=""
+            if item~="" then icon.SpriteGUIRendererComponent.ImageRUID=DataRef(_UIEquipInventoryManager:ItemIconRUID(item)) end
+        end
+        local row=self.ranks[self.selectedRank]
+        self:Show("Hall/Profile/RankedItem",row~=nil and row.item~=nil)
+        if row~=nil and row.item~=nil then self:Text("Hall/Profile/RankedItem","순위 장비 상세: ".._UIEquipInventoryManager:ParseName(row.item)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowHallItem(string item)
+        if item==nil or item=="" then return end
+        local name=_UIEquipInventoryManager:ParseName(item)
+        local stars=_UIEquipInventoryManager:ParseStars(item)
+        local text=name.."\n"
+        if _AvatarTicketManager:IsTicket(item) then text=text.._AvatarTicketManager:ExpiryText(item)
+        elseif tonumber(_ItemHallOfFame:Field(item,3))==1 or tonumber(_ItemHallOfFame:Field(item,3))==2 then
+            text=text.."헤어·성형 아이템\n색상 변경은 소유자의 장비창에서 가능합니다."
+        else
+            text=text.."스타포스 "..tostring(stars).."성\n"
+            text=text.._UIEquipInventoryManager:BuildTooltipStatsText(name,stars,_UIEquipInventoryManager:ParseUpgrade(item))
+            text=text.._UIEquipInventoryManager:BuildPotentialText(item)
+        end
+        self:Text("Hall/Profile/ItemDetails/Text",text)
+        self:UI("Hall/Profile/ItemDetails/Icon").SpriteGUIRendererComponent.ImageRUID=DataRef(_UIEquipInventoryManager:ItemIconRUID(item))
+        self:Show("Hall/Profile/ItemDetails",true)
+        _UIAudio:Play("BtMouseClick")
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void ResetFitting()
+        -- Start with the current world outfit; never mutate the real inventory.
+        self._T.fittingEquips = {}
+        self._T.fittingDeco = {}
+        for i=1,27 do
+            local item = _UIEquipInventoryManager:GetEquip(i)
+            self._T.fittingEquips[i] = {name=_UIEquipInventoryManager:ParseName(item),ruid=_UIEquipInventoryManager:ParseRUID(item)}
+        end
+        for key,item in pairs(_DecoWindowManager:ExportDeco()) do self._T.fittingDeco[key]=item end
+        self:DrawFitting()
+        self:Text("Cosmetics/Fitting/Name","목록의 아이템을 눌러 입어보세요.")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TryCosmetic(integer visual)
+        -- Mix different categories, replacing only the selected body part.
+        if self.tab ~= 6 or self._T.cosScan then return end
+        local row = (self._T.cosRows or {})[(self.page-1)*12+visual]
+        if row == nil then return end
+        if self._T.fittingEquips == nil then self:ResetFitting() end
+        local item = _CosmeticBoxCatalog:RewardItem(row)
+        if row.category=="hair" then self._T.fittingEquips[2]={name=row.name,ruid=row.ruid}
+        elseif row.category=="face" then self._T.fittingEquips[1]={name=row.name,ruid=row.ruid}
+        else
+            local key = _DecoWindowManager:SlotKeyForCat(_UIEquipInventoryManager:GetField(item,4))
+            if key == "" then return end
+            self._T.fittingDeco[key]=item
+            if row.category=="longcoat" then self._T.fittingDeco.pants="" end
+        end
+        self:DrawFitting()
+        self:Text("Cosmetics/Fitting/Name",row.name.."\n미리보기 착용 중")
+        _UIAudio:Play("BtMouseClick")
+        log("[Fitting] try="..row.ruid)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawFitting()
+        -- Independent avatar, without account outfit or item ownership changes.
+        local avatar=self:UI("Cosmetics/Fitting/Avatar")
+        if not isvalid(avatar) then return end
+        local finals=_DecoWindowManager:ComposeAppearance(self._T.fittingEquips,self._T.fittingDeco,_UIMyInfoManager:GetSelectedCharacterJobIdx())
+        table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"})
+        avatar.CostumeManagerComponent.UseCustomEquipOnly=true
+        _DecoWindowManager:ApplyCostumeSnapshot(avatar.CostumeManagerComponent,finals)
+        self:UpdateFittingView()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateFittingView()
+        -- Change only the independent fitting avatar.
+        local avatar=self:UI("Cosmetics/Fitting/Avatar")
+        local scale=self._T.fittingZoom and 1 or 0.5
+        avatar.UITransformComponent.UIScale=Vector3(scale,scale,1)
+        self:UI("Cosmetics/Fitting/Zoom").TextGUIRendererComponent.Text=self._T.fittingZoom and "x1" or "x2"
+        local poses={{"서기","stand1"},{"걷기","walk1"},{"앉기","sit"},{"점프","jump"},{"엎드리기","prone"}}
+        local pose=poses[self._T.fittingPose or 1]
+        self:UI("Cosmetics/Fitting/Pose").TextGUIRendererComponent.Text=pose[1].." >"
+        local body=avatar.AvatarGUIRendererComponent:GetBodyEntity()
+        local action=pose[2]
+        if action=="stand1" and avatar.CostumeManagerComponent.CustomCapEquip=="aeb1286a232949c98b4dc07ab8d2c14e" then action="alert" end
+        if isvalid(body) then body:SendEvent(ActionStateChangedEvent(action,action,1,SpriteAnimClipPlayType.Loop)) end
+        log("[Fitting] zoom="..tostring(scale).." pose="..pose[2])
+    end
 end

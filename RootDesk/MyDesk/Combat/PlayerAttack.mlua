@@ -2,12 +2,14 @@
 script PlayerAttack extends AttackComponent
 
 	@Sync property integer CombatLevel = 1
+	@Sync property integer MonsterKillCount = 0
 
 	@ExecSpace("Server")
 	method void SyncCombatLevel(integer level)
 		-- 장비 기반 표시 레벨을 해당 플레이어의 서버 전투·드롭 판정에 전달한다.
 		if senderUserId ~= self.Entity.PlayerComponent.UserId then return end
 		self.CombatLevel = math.max(1, math.min(200, level))
+        if not self.Entity.PlayerComponent:IsDead() then self.Entity.PlayerComponent.RespawnDuration = self.CombatLevel end
 	end
 
 	-- 콤보 어택 버프로 쌓인 콤보 구슬 수(0~5). 서버가 갱신하고 모든 클라이언트에 동기화돼
@@ -2741,6 +2743,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ClientOnly")
 	method boolean ShouldEnforceDirectionLock()
+		-- Only the owning client may force a player state transition.
+		if self.Entity ~= _UserService.LocalPlayer then return false end
 		-- 방향 잠금(매 프레임 LookDirectionX 고정 + MOVE 강제 IDLE 되돌림)은 **조작이 잠겨 있는 동안**만
 		-- 유효하다. 스킬들의 조작 복구(0.60×공속)가 방향 잠금 해제(0.80×공속)보다 먼저 와서, 그 사이
 		-- 0.1~0.2초 동안 이동키를 잡고 있으면 MOVE↔IDLE이 프레임 단위로 튕기며 모션이 끊기고 조작이
@@ -7386,15 +7390,18 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void AttackTeleport(string direction)
+	method boolean AttackTeleport(string direction)
 		        -- 텔레포트: 즉시 순간이동 스킬 - 판정/데미지가 없고 모션 재생 딜레이도 없어 다른 스킬처럼 컨트롤러를 잠그지 않는다.
-		        if not isvalid(self.Entity) then return end
-		        local rb = self.Entity.RigidbodyComponent
-		        if not isvalid(rb) then return end
+		        if not isvalid(self.Entity) then return false end
+		        local state = self.Entity.StateComponent
+				if isvalid(state) and (state.CurrentStateName == "DEAD" or state.CurrentStateName == "CLIMB" or state.CurrentStateName == "LADDER") then return false end
+				if direction ~= "up" and direction ~= "down" and direction ~= "left" and direction ~= "right" then return false end
+				local rb = self.Entity.RigidbodyComponent
+		        if not isvalid(rb) then return false end
 		        local map = self.Entity.CurrentMap
-		        if not isvalid(map) then return end
+		        if not isvalid(map) then return false end
 		        local fh = map.FootholdComponent
-		        if not isvalid(fh) then return end
+		        if not isvalid(fh) then return false end
 
 		        -- "짧은 거리를 순간이동한다"는 스킬 설명에 맞춰 다른 스킬 사거리(2.0~5.0)와 비슷한 수준으로 고정.
 		        -- 기존 3.0 → 30% 감소로 2.1 → 사용자 요청으로 다시 10% 증가해 2.31로 조정.
@@ -7424,7 +7431,7 @@ script PlayerAttack extends AttackComponent
 		            local farthestDist = -1
 		            for _, h in ipairs(hits) do
 		                local d = math.abs(h:GetYByX(curPos.x) - curPos.y)
-		                if d > farthestDist then
+		                if not h:IsVertical() and d > 0.15 and d > farthestDist then
 		                    farthestDist = d
 		                    hit = h
 		                end
@@ -7435,7 +7442,7 @@ script PlayerAttack extends AttackComponent
 		            -- 조건3: 거리 안에 발판이 없으면 사용 자체가 무효 - 사운드/이펙트도 재생하지 않는다.
 		            if landing == nil then
 		                log("[PlayerAttack] AttackTeleport 실패: " .. direction .. " 방향 " .. tostring(TELEPORT_DISTANCE) .. " 이내에 발판 없음")
-		                return
+		                return false
 		            end
 		        else
 		            local dirX = (direction == "left") and -1 or 1
@@ -7491,11 +7498,12 @@ script PlayerAttack extends AttackComponent
 
 		            if landing == nil then
 		                log("[PlayerAttack] AttackTeleport 실패: " .. direction .. " 방향에 착지 가능한 발판 없음")
-		                return
+		                return false
 		            end
 		        end
 
-		        if isvalid(self.Entity.MovementComponent) then
+		        if math.abs(landing.x - curPos.x) < 0.1 and math.abs(landing.y - curPos.y) < 0.15 then return false end
+				if isvalid(self.Entity.MovementComponent) then
 		            self.Entity.MovementComponent:Stop()
 		        end
 		        -- 실측 결과: SetWorldPosition을 짧은 시간 동안 여러 프레임에 걸쳐 나눠 호출하는 "대시" 방식을 시도했으나,
@@ -7511,6 +7519,7 @@ script PlayerAttack extends AttackComponent
 		        rb:PositionReset()
 		        self:PlayTeleportEffects(self.Entity, curPos)
 		        log("[PlayerAttack] AttackTeleport 성공! direction=" .. direction .. " from=(" .. tostring(curPos.x) .. "," .. tostring(curPos.y) .. ") to=(" .. tostring(landing.x) .. "," .. tostring(landing.y) .. ")")
+		return true
 	end
 
 	method Foothold FindNearbyFootholdAtX(FootholdComponent fh, number x, number y, number tolerance)
@@ -9460,7 +9469,7 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(body) then return end
 
 		local playerCtrl = attacker.PlayerControllerComponent
-		if isvalid(attacker.MovementComponent) then
+		if attacker == _UserService.LocalPlayer and isvalid(attacker.MovementComponent) then
 			attacker.MovementComponent:Stop()
 		end
 		if isvalid(playerCtrl) then
@@ -9474,8 +9483,9 @@ script PlayerAttack extends AttackComponent
 		log("[ComboAttack] PlayComboAttackMotion sent " .. tostring(motionName) .. " playRate=" .. tostring(playRate))
 
 		_TimerService:SetTimerOnce(function()
+			if not isvalid(attacker) then return end
 			local sc = attacker.StateComponent
-			if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
+			if attacker == _UserService.LocalPlayer and isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
 				sc:ChangeState("IDLE")
 				sc:ChangeState("MOVE")
 				sc:ChangeState("IDLE")
@@ -10982,6 +10992,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void OnMonsterKilled()
+        self.MonsterKillCount = self.MonsterKillCount + 1
 		-- (표창 재고) 이 플레이어가 몬스터를 처치했다 - 주인 클라에 통보해 표창을 보충한다.
 		-- 호출자는 Monster.Dead()(모든 처치가 지나는 유일한 길목)다.
 		local pc = self.Entity.PlayerComponent
@@ -18530,8 +18541,7 @@ script PlayerAttack extends AttackComponent
 		local ar = caster.AvatarRendererComponent
 		if not isvalid(ar) then return end
 		local a = visible and 1.0 or 0.0
-		ar:SetAvatarPartColor(MapleAvatarItemCategory.TwoHandedWeapon, 1, 1, 1, a)
-		ar:SetAvatarPartColor(MapleAvatarItemCategory.OneHandedWeapon, 1, 1, 1, a)
+		_AvatarTicketManager:SetWeaponAlpha(caster,a)
 	end
 
 	@ExecSpace("Multicast")
@@ -19955,6 +19965,8 @@ script PlayerAttack extends AttackComponent
 		local body = avatarRenderer:GetBodyEntity()
 		if not isvalid(body) then return end
 
+		if self._T.breatherToken ~= myToken then return end
+		self._T.isBreatherArmed = false
 		self._T.isBreatherPlaying = true
 
 		local breatherEvent = ActionStateChangedEvent("alert", "alert", 1.0, SpriteAnimClipPlayType.Loop)
@@ -19965,18 +19977,7 @@ script PlayerAttack extends AttackComponent
 			if self._T.breatherToken ~= myToken then return end
 			if not self._T.isBreatherPlaying then return end
 			self._T.isBreatherPlaying = false
-			-- (버그 수정) "스피어 버스터 사용 후 숨고르기가 계속 지속된다"는 신고 - 원인은 여기서
-			-- ChangeState("IDLE") 한 번만 불렀던 것. 컨트롤 복구 시점(RestoreSpearBurstControl 등)에서
-			-- 이미 IDLE→MOVE→IDLE 토글을 거쳐 CurrentStateName이 이미 "IDLE"인 상태였기 때문에, 같은
-			-- 상태로 다시 ChangeState("IDLE")를 부르면 실제 상태 전이가 없어 StateChangeEvent가 발생하지
-			-- 않고, body에 직접 보낸 "alert" Loop 애니메이션을 덮어쓸 계기가 전혀 생기지 않아 화면에서
-			-- 영원히 반복 재생되는 상태로 남았다. 이 파일의 다른 곳(PlayAttackMotion 등)에서 이미
-			-- 검증된 것과 동일하게 IDLE→MOVE→IDLE 강제 토글로 반드시 새 StateChangeEvent를 일으켜야
-			-- AvatarStateAnimationComponent가 기본 stand/walk 클립을 다시 내보내 alert를 확실히 덮어쓴다.
-			-- 타이머는 클라이언트에서 실행되므로 상태 전이는 서버 RPC에 위임한다.
-			if self.Entity == _UserService.LocalPlayer then
-				self:RequestRefreshIdleState("Breather", 0)
-			end
+			self:RestoreBreatherPose()
 			log("[Breather] 숨고르기 자동 종료(3초 경과)")
 		end, 3.0)
 	end
@@ -27742,6 +27743,11 @@ script PlayerAttack extends AttackComponent
             self._T.playerNameRetry = _UtilLogic.ElapsedSeconds + 1
             overlay = _SpawnService:SpawnByModelId("monsternametag", "PlayerName_" .. self.Entity.Id, Vector3.zero, map)
             if not isvalid(overlay) then return end
+            if not overlay:AttachTo(self.Entity) then
+                overlay:Destroy()
+                log_warning("[PlayerName] could not attach name tag")
+                return
+            end
             self._T.playerNameOverlay = overlay
             local text = overlay.TextRendererComponent
             text.IsRichText = true
@@ -27762,7 +27768,37 @@ script PlayerAttack extends AttackComponent
         text.Text = "<mark=#00000080> " .. name .. " </mark>"
         text.FontSize = native.FontSize
         text.FontColor = native.FontColor
-        local p = self.Entity.TransformComponent.WorldPosition
-        overlay.TransformComponent.WorldPosition = Vector3(p.x + native.FontOffset.x, p.y + native.OffsetY + native.FontOffset.y, p.z - 0.02)
+        -- Follow through the transform hierarchy, without a frame-late world-position copy.
+        text.SortingLayer = self:GetPlayerOverlayLayer()
+        overlay.TransformComponent.Position = Vector3(native.FontOffset.x, native.OffsetY + native.FontOffset.y - 0.12, -0.02)
     end
+    @ExecSpace("ServerOnly")
+    method void SetMesoRateBonusPct(number amount)
+        -- Meso bonuses do not change item probabilities.
+        self._T.mesoRateBonusPct=math.max(0,amount or 0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method number GetMesoRateBonusPct()
+        -- Preserve the old common bonus until the first equipment sync arrives.
+        return self._T.mesoRateBonusPct or self:GetDropRateBonusPct()
+    end
+
+
+	@ExecSpace("ClientOnly")
+	method void RestoreBreatherPose()
+		if not isvalid(self.Entity) then return end
+		if self._T.isBreatherPlaying or self._T.isBreatherArmed then return end
+		if _UtilLogic.ElapsedSeconds < (self._T.hitStanceUntil or 0) then return end
+		if self:IsRidingSitLocked() then return end
+		local sc = self.Entity.StateComponent
+		local animation = self.Entity.AvatarStateAnimationComponent
+		if not isvalid(sc) or not isvalid(animation) then return end
+		if sc.CurrentStateName ~= "IDLE" then return end
+		-- 서버의 IDLE→MOVE→IDLE은 같은 프레임에 합쳐져 클라이언트에
+		-- 새 전이가 전달되지 않을 수 있다. 각 화면에서 현재 자세를 직접 다시 적용한다.
+		self.Entity:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Stand))
+		log("[Breather] client idle animation restored")
+	end
+
 end

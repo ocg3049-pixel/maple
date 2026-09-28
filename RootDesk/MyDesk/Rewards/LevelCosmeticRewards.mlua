@@ -1,0 +1,172 @@
+
+@Logic
+script LevelCosmeticRewards extends Logic
+    property integer highest = 0
+    property string claimed = ""
+
+    method table ReadState(string snapshot)
+        -- One record per character, stored atomically with its inventory.
+        local high,flags=string.match("\n"..(snapshot or ""),"\nCRWD\t(%d+)\t([%d,]*)")
+        return {highest=tonumber(high) or 0,claimed=flags or ""}
+    end
+
+    method string MergeState(string previous, string incoming)
+        -- Never forget an achieved level or a confirmed claim when a stale save arrives.
+        local old=self:ReadState(previous)
+        local new=self:ReadState(incoming)
+        local level=tonumber(string.match("\n"..incoming,"\nLV\t(%d+)")) or 0
+        local high=math.max(old.highest,new.highest,level)
+        local flags=""
+        for _,lv in ipairs({10,20,30}) do
+            local tag=","..tostring(lv)..","
+            if string.find(","..old.claimed..",",tag,1,true) or (high>=lv and string.find(","..new.claimed..",",tag,1,true)) then
+                flags=flags..tostring(lv)..","
+            end
+        end
+        local lines={}
+        for line in string.gmatch(incoming,"[^\r\n]+") do
+            if string.sub(line,1,5)~="CRWD\t" then table.insert(lines,line) end
+        end
+        table.insert(lines,"CRWD\t"..tostring(high).."\t"..flags)
+        return table.concat(lines,"\n")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string snapshot)
+        -- Reset when switching characters; a previous character's claims must not leak.
+        local state=self:ReadState(snapshot)
+        self.highest=state.highest
+        self.claimed=state.claimed
+        self._T.granting=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Export()
+        -- Persist the highest observed level even if equipment removal lowers it.
+        return "CRWD\t"..tostring(self.highest).."\t"..self.claimed
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer NextReward()
+        -- Each milestone remains claimable after dropping below its required level.
+        for _,lv in ipairs({10,20,30}) do
+            if self.highest>=lv and not string.find(","..self.claimed..",",","..tostring(lv)..",",1,true) then return lv end
+        end
+        return 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- A persistent left-side notification becomes visible only when a reward is available.
+        self._T.button=_EntityService:GetEntityByPath("/ui/LevelRewardGroup/Bulb")
+        if isvalid(self._T.button) then
+            self._T.listener=self._T.button:ConnectEvent(ButtonClickEvent,function() self:Claim() end)
+            self._T.button.Enable=false
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- No storage calls here; only dirty the existing save cache when a new level is reached.
+        if (self._T.noticeTime or 0)>0 then
+            self._T.noticeTime=self._T.noticeTime-delta
+            if self._T.noticeTime<=0 then _EntityService:GetEntityByPath("/ui/LevelRewardGroup/Notice").Enable=false end
+        end
+        self._T.tick=(self._T.tick or 0)+delta
+        if self._T.tick<0.25 then return end
+        self._T.tick=0
+        local cl=_CharacterPersistence._T.cl
+        local ingame=_LoginFlow.phase=="ingame" and cl~=nil and cl.entered
+        if ingame then
+            local lv=_CharInfoManager:GetDisplayLevel()
+            if lv>self.highest then self.highest=lv _CharacterPersistence:MarkDirty("level_milestone") end
+        end
+        local button=self._T.button
+        if isvalid(button) then
+            local nextLevel=self:NextReward()
+            button.Enable=ingame and nextLevel>0
+            if button.Enable then
+                button:GetChildByName("Label").TextGUIRendererComponent.Text="Lv."..tostring(nextLevel).."\n코디 선물"
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method table PlanGrant(table slots, integer level)
+        -- Keep zero-shard milestone boxes separate from ordinary reward-bearing boxes.
+        local result={}
+        for i=1,128 do result[i]=slots[i] or "" end
+        local keys={"hair","face","cap","longcoat","weapon"}
+        if level==10 then table.insert(keys,"skin") end
+        for _,key in ipairs(keys) do
+            local id="cosmetic:"..key
+            local gift=_CosmeticBoxCatalog:LevelRewardBoxItem(id,1)
+            local stackKey=_UIEquipInventoryManager:ConsumableStackKey(gift)
+            local left=key=="skin" and 1 or 2
+            for i=1,128 do
+                local item=result[i]
+                if _UIEquipInventoryManager:ConsumableStackKey(item)==stackKey and not _UIEquipInventoryManager:IsItemLocked(item) then
+                    local count=_UIEquipInventoryManager:ParseCount(item)
+                    local add=math.min(left,math.max(0,999-count))
+                    if add>0 then result[i]=_UIEquipInventoryManager:WithStackCount(item,count+add) left=left-add end
+                    if left==0 then break end
+                end
+            end
+            if left>0 then
+                for i=1,128 do
+                    if result[i]=="" then result[i]=_CosmeticBoxCatalog:LevelRewardBoxItem(id,left) left=0 break end
+                end
+            end
+            if left>0 then return {} end
+        end
+        return result
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Claim()
+        -- Item additions and the one-time receipt are changed before any UI call can yield.
+        local cl=_CharacterPersistence._T.cl
+        if _LoginFlow.phase~="ingame" or cl==nil or not cl.entered or self._T.granting then return end
+        if cl.flushing then _UIToast:ShowMessage("저장 중입니다. 잠시 후 전구를 다시 눌러주세요.") return end
+        local lv=self:NextReward()
+        if lv==0 then return end
+        self._T.granting=true
+        local inv=_UIEquipInventoryManager
+        local before={}
+        for i=1,128 do before[i]=inv:GetTabItem("consume",i) end
+        local plan=self:PlanGrant(before,lv)
+        if #plan==0 then
+            self._T.granting=false
+            _UIToast:ShowMessage("소비 인벤토리 공간이 부족합니다. 공간을 비운 뒤 전구를 다시 눌러주세요.")
+            return
+        end
+        for i=1,128 do if inv:GetTabItem("consume",i)~=before[i] then self._T.granting=false return end end
+        for i=1,128 do inv:SetTabItem("consume",i,plan[i]) end
+        self.claimed=self.claimed..tostring(lv)..","
+        _CharacterPersistence:MarkDirty("level_reward")
+        self._T.granting=false
+        inv:RefreshUI()
+        _CharacterPersistence:FlushToServer()
+        self:ShowRewardNotice(lv)
+        _GameAudio:PlayCue("Quest")
+        log("[LevelReward] claimed milestone="..tostring(lv).." boxes="..tostring(lv==10 and 11 or 10))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Release the notification event between Maker sessions.
+        if isvalid(self._T.button) and self._T.listener then self._T.button:DisconnectEvent(ButtonClickEvent,self._T.listener) end
+    end
+    @ExecSpace("ClientOnly")
+    method void ShowRewardNotice(integer level)
+        -- Dedicated multiline bounds prevent reward text from escaping the toast.
+        local notice=_EntityService:GetEntityByPath("/ui/LevelRewardGroup/Notice")
+        notice:GetChildByName("Title").TextGUIRendererComponent.Text="최초 "..tostring(level).."레벨 달성 보상"
+        notice:GetChildByName("Body").TextGUIRendererComponent.Text="헤어 · 성형 · 모자 · 한벌옷 · 무기\n코디 상자를 각각 2개 지급했습니다.\n<color=#FF6A6A>획득 코디 분해 시 조각을 얻을 수 없습니다.</color>"
+        if level==10 then
+            notice:GetChildByName("Body").TextGUIRendererComponent.Text="헤어 · 성형 · 모자 · 한벌옷 · 무기 각 2개\n피부 코디 상자 1개를 추가 지급했습니다.\n<color=#FF6A6A>획득 코디 분해 시 조각을 얻을 수 없습니다.</color>"
+        end
+        notice.Enable=true
+        self._T.noticeTime=5
+    end
+end

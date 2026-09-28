@@ -1,0 +1,726 @@
+@Logic
+script SocialManager extends Logic
+    property string tab = "party"
+    property string chatMode = "map"
+    property string whisperName = ""
+    property table rows = {}
+    property string selectedName = ""
+    property string lastWhisperName = ""
+    property table partyRows = {}
+
+    @ExecSpace("ServerOnly")
+    method table Record(string uid)
+        self._T.records = self._T.records or {}
+        local sv = _CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        local player = _UserService:GetUserEntityByUserId(uid)
+        if sv == nil or sv.activeId == "" or not isvalid(player) then return nil end
+        local data = nil
+        for _, ch in ipairs(sv.list) do if ch.id == sv.activeId then data = ch.data break end end
+        if data == nil then return nil end
+        local rec = self._T.records[uid]
+        if rec == nil or rec.id ~= sv.activeId or rec.player ~= player then
+            self._T.partyLoadRetry=self._T.partyLoadRetry or {}
+            if _UtilLogic.ElapsedSeconds < (self._T.partyLoadRetry[sv.activeId] or 0) then return nil end
+            local ec, raw = sv.storage:GetAndWait("social_" .. sv.activeId)
+            if ec ~= 0 and ec ~= 1000002 then return nil end
+            rec = {uid=uid, id=sv.activeId, friends={}, storage=sv.storage}
+            for name in string.gmatch(raw or "", "[^\n]+") do rec.friends[name] = true end
+            rec.player = player
+            rec.partyLoading = true
+            self._T.records[uid] = rec
+            rec.party = self:LoadParty(rec)
+            rec.partyLoading = false
+            if rec.partyLoadFailed then self._T.partyLoadRetry[rec.id]=_UtilLogic.ElapsedSeconds+15 self._T.records[uid]=nil return nil end
+        end
+        if rec.partyLoading then return nil end
+        rec.name = string.match(data, "^[^|]+") or ""
+        local parts = {}
+        for part in string.gmatch(data, "[^|]+") do table.insert(parts, part) end
+        rec.job = tonumber(parts[8]) or 1
+        rec.level = _RegionTierLogic:GetServerLevelOf(player)
+        rec.power = tonumber(string.match("\n" .. (sv.saves[sv.activeId] or ""), "\nCP\t(%d+)")) or 0
+        rec.player = player
+        return rec
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Find(string name)
+        for _, player in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(player.PlayerComponent) then
+                local rec = self:Record(player.PlayerComponent.UserId)
+                if rec ~= nil and rec.name == name then return rec end
+            end
+        end
+        return nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean SameMap(table a, table b)
+        return a ~= nil and b ~= nil and isvalid(a.player) and isvalid(b.player) and a.player.CurrentMap == b.player.CurrentMap and _ChannelManager:UserChannel(a.uid) == _ChannelManager:UserChannel(b.uid)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Leave(string uid)
+        -- Explicit leave only; a disconnected character keeps their durable slot.
+        local rec = self._T.records and self._T.records[uid]
+        if rec ~= nil then self:ChangeParty("leave", rec, nil) end
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method table LoadParty(table rec)
+        -- Membership snapshots are read once on character entry, never per HP update.
+        self._T.partyStorage = self._T.partyStorage or _DataStorageService:GetGlobalDataStorage("MapleEasyPartyV1")
+        local ec, raw = self._T.partyStorage:GetAndWait("member_" .. rec.id)
+        if ec == 1000002 or (ec == 0 and (raw == nil or raw == "")) then return nil end
+        if ec ~= 0 then rec.partyLoadFailed=true log_warning("[Party] load failed=" .. tostring(ec)) return nil end
+        local ok, saved = pcall(function() return _HttpService:JSONDecode(raw) end)
+        if not ok or saved.id == nil or saved.members == nil or saved.profiles == nil then rec.partyLoadFailed=true return nil end
+        local profile = saved.profiles[rec.uid]
+        if profile == nil or profile.id ~= rec.id then return nil end
+        self._T.parties = self._T.parties or {}
+        local party = self._T.parties[saved.id]
+        if party == nil then party=saved self._T.parties[saved.id]=party
+        elseif not party.busy and (saved.revision or 0)>(party.revision or 0) then
+            party.members=saved.members party.profiles=saved.profiles party.leader=saved.leader party.revision=saved.revision
+        end
+        local current = party.profiles[rec.uid]
+        if current == nil or current.id ~= rec.id then return nil end
+        log("[Party] restored character=" .. rec.id .. " members=" .. tostring(#party.members))
+        return party
+    end
+
+    method table PartyProfile(table rec)
+        -- Keep only public scalar identity in durable party snapshots.
+        return {uid=rec.uid,id=rec.id,name=rec.name,job=rec.job,level=rec.level,power=rec.power or 0}
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean ChangeParty(string action, table me, table other)
+        -- Commit all membership snapshots atomically before changing live membership.
+        local party = action=="join" and other.party or me.party
+        if action=="create" then
+            if party~=nil then return true end
+            party={id=me.id.."_"..tostring(math.floor(DateTime.UtcNow.Elapsed)),leader=me.uid,members={},profiles={}}
+        end
+        if party==nil or party.busy then return false end
+        party.busy=true
+        local nextParty={id=party.id,leader=party.leader,members={},profiles={},revision=(party.revision or 0)+1}
+        for _, uid in ipairs(party.members) do
+            table.insert(nextParty.members,uid)
+            local p=party.profiles[uid]
+            nextParty.profiles[uid]={uid=p.uid,id=p.id,name=p.name,job=p.job,level=p.level,power=p.power or 0}
+        end
+        local removed=nil
+        local disbanded=false
+        if action=="create" or action=="join" then
+            if #nextParty.members>=6 or (action=="join" and (me.party~=nil or other.uid~=party.leader)) then party.busy=false return false end
+            if nextParty.profiles[me.uid]~=nil then party.busy=false return false end
+            table.insert(nextParty.members,me.uid) nextParty.profiles[me.uid]=self:PartyProfile(me)
+        elseif action=="leave" or action=="kick" then
+            local uid=action=="leave" and me.uid or (other and other.uid or "")
+            if action=="kick" and (party.leader~=me.uid or uid==me.uid) then party.busy=false return false end
+            removed=nextParty.profiles[uid]
+            if removed==nil then party.busy=false return false end
+            for i=#nextParty.members,1,-1 do if nextParty.members[i]==uid then table.remove(nextParty.members,i) end end
+            nextParty.profiles[uid]=nil
+            if nextParty.leader==uid then nextParty.leader=nextParty.members[1] or "" end
+        elseif action=="presence" or action=="disband" then
+            local best=action=="presence" and self:OnlinePartyLeader(party) or nil
+            if best==nil then
+                disbanded=true nextParty.members={} nextParty.profiles={} nextParty.leader=""
+            elseif best.uid==party.leader then party.busy=false return true
+            else nextParty.leader=best.uid end
+        else party.busy=false return false end
+        local raw=""
+        if #nextParty.members==0 then
+            disbanded=true
+        else
+            local ok, encoded=pcall(function() return _HttpService:JSONEncode(nextParty) end)
+            if not ok then party.busy=false party.retryAt=_UtilLogic.ElapsedSeconds+15 log_warning("[Party] encode failed") return false end
+            raw=encoded
+        end
+        local writes={}
+        for _, uid in ipairs(nextParty.members) do writes["member_"..nextParty.profiles[uid].id]=raw end
+        if removed~=nil then writes["member_"..removed.id]="" end
+        if disbanded then for _, p in pairs(party.profiles) do writes["member_"..p.id]="" end end
+        if next(writes)==nil then party.busy=false return true end
+        self._T.partyStorage=self._T.partyStorage or _DataStorageService:GetGlobalDataStorage("MapleEasyPartyV1")
+        local ec=self._T.partyStorage:TransactSetAndWait(writes)
+        party.busy=false
+        if ec~=0 then
+            party.retryAt=_UtilLogic.ElapsedSeconds+15
+            if action~="presence" and action~="disband" then self:Notice("파티 정보를 저장하지 못했습니다. 다시 시도해주세요.",me.uid) end
+            log_warning("[Party] save failed="..tostring(ec)) return false
+        end
+        party.retryAt=nil
+        party.members=nextParty.members party.profiles=nextParty.profiles party.leader=nextParty.leader party.revision=nextParty.revision
+        self._T.parties=self._T.parties or {} self._T.parties[party.id]=party
+        if disbanded then self._T.parties[party.id]=nil end
+        for _, rec in pairs(self._T.records or {}) do
+            local p=party.profiles[rec.uid]
+            if p~=nil and p.id==rec.id then rec.party=party
+            elseif (removed~=nil and rec.id==removed.id) or (disbanded and rec.party==party) then rec.party=nil end
+        end
+        log("[Party] committed action="..action.." members="..tostring(#party.members).." leader="..tostring(party.leader))
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method table OnlinePartyLeader(table party)
+        -- Keep an online leader; otherwise choose the strongest active character, with a stable tie break.
+        local candidates={}
+        for _, uid in ipairs(party.members) do
+            local p=party.profiles[uid]
+            local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+            local player=_UserService:GetUserEntityByUserId(uid)
+            local left=self._T.disconnected and self._T.disconnected[uid]
+            if p~=nil and not left and sv~=nil and sv.activeId==p.id and isvalid(player) then
+                local power=tonumber(string.match("\n"..(sv.saves[p.id] or ""),"\nCP\t(%d+)")) or p.power or 0
+                local candidate={uid=uid,id=p.id,power=power}
+                table.insert(candidates,candidate)
+            end
+        end
+        return self:ChoosePartyLeader(party.leader,candidates)
+    end
+
+    method table ChoosePartyLeader(string leaderUid, table candidates)
+        -- Deterministic election: an online leader stays; ties among successors use character ID.
+        local best=nil
+        for _, candidate in ipairs(candidates) do
+            if candidate.uid==leaderUid then return candidate end
+            if best==nil or candidate.power>best.power or (candidate.power==best.power and candidate.id<best.id) then best=candidate end
+        end
+        return best
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReconcileParties()
+        -- Sweep cached membership only; storage is written only for a leader change or dissolution.
+        local parties={}
+        for _, party in pairs(self._T.parties or {}) do table.insert(parties,party) end
+        for _, party in ipairs(parties) do
+            if not party.busy and #party.members>0 and _UtilLogic.ElapsedSeconds>=(party.retryAt or 0) then
+                local best=self:OnlinePartyLeader(party)
+                if best==nil or best.uid~=party.leader then
+                    self:ChangeParty("presence",{party=party,uid=party.leader},nil)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnPartyUserLeave(UserLeaveEvent event)
+        -- Mark the departure before the engine removes its entity or persistence cache.
+        self._T.disconnected=self._T.disconnected or {}
+        self._T.disconnected[tostring(event.UserId)]=true
+        self:ReconcileParties()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnPartyUserEnter(UserEnterEvent event)
+        -- A fresh connection can restore a slot only while the saved party still exists.
+        self._T.disconnected=self._T.disconnected or {}
+        self._T.disconnected[tostring(event.UserId)]=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SaveFriends(table rec)
+        local names = {}
+        for name, enabled in pairs(rec.friends) do if enabled then table.insert(names, name) end end
+        table.sort(names)
+        local ec = rec.storage:SetAndWait("social_" .. rec.id, table.concat(names, "\n"))
+        if ec ~= 0 then log_warning("[Social] friend save failed=" .. tostring(ec)) end
+    end
+
+    method integer FriendCount(table rec)
+        -- Count only registered friends; enforce capacity again when accepting.
+        local count = 0
+        for _, enabled in pairs(rec.friends) do if enabled then count = count + 1 end end
+        return count
+    end
+
+    method boolean CanAddFriend(table a, table b)
+        -- Existing reciprocal entries do not consume another slot.
+        return (a.friends[b.name] == true or self:FriendCount(a) < 200) and (b.friends[a.name] == true or self:FriendCount(b) < 200)
+    end
+
+    @ExecSpace("Server")
+    method void Request(string action, string target)
+        local me = self:Record(senderUserId)
+        if me == nil then return end
+        self._T.invites = self._T.invites or {}
+        if action == "refresh" then self:SendState(me) return end
+        if action == "leave" then self:Leave(me.uid)
+        elseif action == "create" then
+            if me.party == nil then self:ChangeParty("create",me,nil) end
+        elseif action == "kick" then
+            if me.party~=nil then
+                for _, profile in pairs(me.party.profiles) do if profile.name==target then self:ChangeParty("kick",me,profile) break end end
+            end
+        elseif action == "removeFriend" then
+            me.friends[target] = nil self:SaveFriends(me)
+            local other = self:Find(target)
+            if other ~= nil then other.friends[me.name] = nil self:SaveFriends(other) end
+        elseif action == "accept" or action == "decline" then
+            local invite = self._T.invites[me.uid]
+            self._T.invites[me.uid] = nil
+            if invite == nil or invite.untilTime < _UtilLogic.ElapsedSeconds or invite.toId ~= me.id then return end
+            local from = self:Record(invite.from)
+            if from == nil or from.id ~= invite.fromId then return end
+            if action == "accept" then
+                if invite.kind == "friend" then
+                    if not self:CanAddFriend(me, from) then self:Notice("친구는 최대 200명까지 등록할 수 있습니다.", me.uid) return end
+                    me.friends[from.name] = true from.friends[me.name] = true
+                    self:SaveFriends(me) self:SaveFriends(from)
+                elseif me.party == nil and from.party ~= nil and from.party == invite.party and from.party.leader == from.uid and #from.party.members < 6 then
+                    self:ChangeParty("join",me,from)
+                else self:Notice("파티에 참여할 수 없습니다. 초대를 다시 요청해주세요.", me.uid) end
+            end
+            self:SendState(from)
+        elseif action == "inviteParty" or action == "inviteFriend" then
+            local other = self:Find(target)
+            if other == nil or other.uid == me.uid then self:Notice("접속 중인 다른 캐릭터 이름을 입력해주세요.", me.uid) return end
+            if action == "inviteParty" then
+                if me.party == nil then self:ChangeParty("create",me,nil) end
+                if me.party == nil then return end
+                if me.party.leader ~= me.uid or #me.party.members >= 6 or other.party ~= nil then self:Notice("파티장만 초대할 수 있으며 파티는 최대 6명입니다.", me.uid) return end
+            elseif me.friends[other.name] then self:Notice("이미 등록된 친구입니다.", me.uid) return end
+            if action == "inviteFriend" and not self:CanAddFriend(me, other) then self:Notice("본인 또는 상대의 친구 목록이 가득 찼습니다. (최대 200명)", me.uid) return end
+            local pending = self._T.invites[other.uid]
+            if pending ~= nil and pending.untilTime > _UtilLogic.ElapsedSeconds then self:Notice("상대가 다른 초대에 응답 중입니다.", me.uid) return end
+            self._T.invites[other.uid] = {from=me.uid, fromId=me.id, toId=other.id, kind=action == "inviteParty" and "party" or "friend", party=me.party, untilTime=_UtilLogic.ElapsedSeconds+30}
+            self:Invitation(me.name, action == "inviteParty" and "파티" or "친구", other.uid)
+            self:Notice("초대를 보냈습니다.", me.uid)
+        end
+        self:SendState(me)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendState(table me)
+        -- Disconnected members stay in the roster; only live HP is transient.
+        local rows={}
+        local function append(kind, rec, profile)
+            local same=self:SameMap(me,rec)
+            local pc=rec and rec.player.PlayerComponent or nil
+            table.insert(rows,{kind=kind,uid=profile.uid or "",id=profile.id or profile.name,name=profile.name,
+                job=rec and rec.job or profile.job or 0,level=rec and rec.level or profile.level or 0,
+                power=rec and rec.power or profile.power or 0,same=same,online=rec~=nil,hp=pc and pc.Hp or 0,maxHp=pc and pc.MaxHp or 1})
+        end
+        if me.party~=nil then
+            for _, uid in ipairs(me.party.members) do
+                local profile=me.party.profiles[uid]
+                local rec=self:Record(uid)
+                if rec~=nil and (rec.id~=profile.id or rec.party~=me.party) then rec=nil end
+                if rec~=nil then me.party.profiles[uid]=self:PartyProfile(rec) profile=me.party.profiles[uid] end
+                append(uid==me.party.leader and "L" or "P",rec,profile)
+            end
+        end
+        local names={}
+        for name in pairs(me.friends) do table.insert(names,name) end
+        table.sort(names)
+        for _, name in ipairs(names) do
+            local rec=self:Find(name)
+            append("F",rec,rec or {name=name})
+        end
+        self:ReceiveRoster(rows,me.uid)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveRoster(table rows)
+        -- A stable tie-break prevents equal-power members from jumping between rows.
+        self.rows=rows
+        self.partyRows=self:SortPartyRows(rows)
+        self:Draw()
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveState(string raw)
+        self.rows = {}
+        for line in string.gmatch(raw, "[^\n]+") do
+            local kind, name, job, level, same = string.match(line, "([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)")
+            if name ~= nil then table.insert(self.rows, {kind=kind,name=name,job=tonumber(job),level=tonumber(level),same=same == "1"}) end
+        end
+        self:Draw()
+    end
+
+    @ExecSpace("Client")
+    method void Notice(string message)
+        _UIToast:ShowMessage(message)
+    end
+
+    @ExecSpace("Client")
+    method void Invitation(string name, string kind)
+        self:UI("Invite").Enable = true
+        self:UI("Invite/Message").TextGUIRendererComponent.Text = name .. "님의 " .. kind .. " 초대입니다."
+        self._T.inviteUntil = _UtilLogic.ElapsedSeconds + 30
+        _UIAudio:Play("DlgNotice")
+    end
+
+    method table SplitMeso(integer amount, integer count, integer killerIndex)
+        count = math.max(1, math.min(6, count))
+        killerIndex = math.max(1, math.min(count, killerIndex))
+        if count == 1 then return {amount} end
+        local total = math.floor(amount * (1 + count * 0.05) + 0.000001)
+        local shares, fractions = {}, {}
+        local allocated = 0
+        for i = 1, count do
+            local exact = amount * (1 + count * 0.05) * (0.8 / count + (i == killerIndex and 0.2 or 0))
+            shares[i] = math.floor(exact + 0.000001)
+            fractions[i] = exact - shares[i]
+            allocated = allocated + shares[i]
+        end
+        while allocated < total do
+            local best = killerIndex
+            for i = 1, count do if fractions[i] > fractions[best] then best = i end end
+            shares[best] = shares[best] + 1 fractions[best] = -1 allocated = allocated + 1
+        end
+        return shares
+    end
+
+    @ExecSpace("ServerOnly")
+    method void DeliverMeso(integer amount, string pickerUid, string killerUid)
+        local picker = self:Record(pickerUid)
+        local killer = self:Record(killerUid)
+        if picker == nil then return end
+        local party = picker.party
+        if party == nil or killer == nil or killer.party ~= party or not self:SameMap(picker, killer) then
+            _ItemPickupLogic:DeliverItem(tostring(amount), "", "meso", pickerUid) return
+        end
+        local recipients = {}
+        local killerIndex = 1
+        for _, uid in ipairs(party.members) do
+            local rec = self:Record(uid)
+            if rec ~= nil and rec.party == party and self:SameMap(picker, rec) then
+                table.insert(recipients, uid)
+                if uid == killerUid then killerIndex = #recipients end
+            end
+        end
+        local shares = self:SplitMeso(amount, #recipients, killerIndex)
+        for i, uid in ipairs(recipients) do
+            if shares[i] > 0 then _ItemPickupLogic:DeliverItem(tostring(shares[i]), "", "meso", uid) end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void RouteChat(string uid, string mode, string target, string text)
+        local me = self:Record(uid)
+        if me == nil then return end
+        if mode ~= "map" and mode ~= "party" and mode ~= "friend" and mode ~= "whisper" then return end
+        local recipient = mode == "whisper" and self:Find(target) or nil
+        if mode == "whisper" and recipient == nil then self:Notice("귓속말 대상이 접속 중이 아닙니다.", uid) return end
+        if mode == "party" and me.party == nil then self:Notice("파티에 가입되어 있지 않습니다.", uid) return end
+        for _, player in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(player.PlayerComponent) then
+                local other = self:Record(player.PlayerComponent.UserId)
+                local allowed = other ~= nil and (other.uid == uid or (mode == "map" and self:SameMap(me,other)) or (mode == "party" and me.party ~= nil and other.party == me.party) or (mode == "friend" and me.friends[other.name] == true) or (mode == "whisper" and other == recipient))
+                if allowed then _MapleHUDManager:ReceiveChat(me.name, text, mode, mode == "whisper" and target or "", other.uid == uid, other.uid) end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        if string.sub(path,1,5)=="Above" then
+            local moved=_EntityService:GetEntityByPath("/ui/DefaultGroup/"..path)
+            if isvalid(moved) then return moved end
+        end
+        return _EntityService:GetEntityByPath("/ui/SocialWindow/" .. path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any action)
+        local e = _EntityService:GetEntityByPath(path)
+        if not isvalid(e) then return end
+        local connection = e:ConnectEvent(ButtonClickEvent, function() _UIAudio:Play("BtMouseClick") action() end)
+        table.insert(self._T.links, {entity=e, connection=connection})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open(string tab)
+        local window = self:UI("Window")
+        if window.Enable and self.tab == tab then window.Enable = false return end
+        self.tab = tab self._T.resetScroll = true window.Enable = true self:Request("refresh", "") self:Draw()
+        _UIAudio:Play("MenuUp")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Refresh visible grid rows without resetting the current scroll position.
+        local window = self:UI("Window")
+        if not isvalid(window) then return end
+        local filtered = {}
+        for _, row in ipairs(self.rows) do
+            if (self.tab == "friend") == (row.kind == "F") then table.insert(filtered, row) end
+        end
+        if self.tab=="party" then filtered=self.partyRows end
+        self._T.visibleRows = filtered
+        local party = self.tab == "party"
+        self:UI("Window/Status").TextGUIRendererComponent.Text = (party and "내 파티  " or "내 친구  ") .. tostring(#filtered) .. (party and "/6" or "/200")
+        for _, name in ipairs({"Friend", "Party"}) do
+            local active = (name == "Party") == party
+            local button = self:UI("Window/" .. name)
+            button.SpriteGUIRendererComponent.Color = active and Color(1,0.73,0.27,1) or Color(0.76,0.78,0.8,1)
+            button.TextGUIRendererComponent.FontColor = active and Color(0.24,0.14,0.04,1) or Color(0.36,0.38,0.4,1)
+            button:GetChildByName("ActiveLine").Enable = active
+        end
+        local grid = self:UI("Window/List").GridViewComponent
+        grid.TotalCount = #filtered
+        if self._T.gridReady then grid:Refresh(self._T.resetScroll == true, true) end
+        self._T.resetScroll = false
+        self:UI("Window/Create").Enable = party
+        self:UI("Window/Kick").Enable = party
+        self:UI("Window/NameInput").UITransformComponent.RectSize=Vector2(party and 354 or 478,32)
+        self:UI("Window/NameInput").UITransformComponent.anchoredPosition=Vector2(party and -62 or 0,-190)
+        self:UI("Window/InviteButton").UITransformComponent.anchoredPosition = Vector2(party and 0 or -164, -236)
+        self:UI("Window/InviteButton").TextGUIRendererComponent.Text = party and "파티 초대" or "친구 추가"
+        self:UI("Window/Leave").TextGUIRendererComponent.Text = party and "파티 탈퇴" or "친구 삭제"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectChat(string mode)
+        if mode == "whisper" then
+            self:UI("Whisper").Enable=true
+            local input=self:UI("Whisper/Name").TextGUIRendererInputComponent
+            input.Text=self.lastWhisperName~="" and self.lastWhisperName or self.whisperName
+            if self._T.whisperFocusTimer~=nil then _TimerService:ClearTimer(self._T.whisperFocusTimer) end
+            self._T.whisperFocusTimer=_TimerService:SetTimerOnce(function()
+                self._T.whisperFocusTimer=nil
+                if self:UI("Whisper").EnabledInHierarchy then input:ActivateInputField() end
+            end,0.05)
+            return
+        end
+        self.chatMode = mode self:DrawChatMode()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ConfirmWhisper()
+        -- Text submit and the confirmation button use the same path.
+        if not self:UI("Whisper").EnabledInHierarchy then return end
+        local name=self:UI("Whisper/Name").TextGUIRendererInputComponent.Text
+        name=string.match(name,"^%s*(.-)%s*$") or ""
+        if name=="" then return end
+        self.whisperName=name self.chatMode="whisper" self:UI("Whisper").Enable=false
+        self:DrawChatMode() _MapleHUDManager:FocusChat()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePartyHUD()
+        -- Persistent party membership is independent of this transient HP display.
+        local rows=self.partyRows or {}
+        local ingame=_LoginFlow:IsInGame()
+        local panel=self:UI("PartyHUD")
+        panel.Enable=ingame and #rows>0
+        local height=34+29*math.max(1,#rows)
+        panel.UITransformComponent.RectSize=Vector2(320,height)
+        self:UI("PartyHUD/Header").UITransformComponent.anchoredPosition=Vector2(0,height/2-16)
+        local me=_UserService.LocalPlayer
+        for i=1,6 do
+            local row=rows[i]
+            local e=self:UI("PartyHUD/Row"..tostring(i))
+            local above=self:UI("Above"..tostring(i))
+            e.Enable=ingame and row~=nil
+            e.UITransformComponent.anchoredPosition=Vector2(0,height/2-48-(i-1)*29)
+            above.Enable=false
+            if ingame and row~=nil then
+                local player=_UserService:GetUserEntityByUserId(row.uid or "")
+                local hp,maxHp=row.hp or 0,math.max(1,row.maxHp or 1)
+                local same=isvalid(player) and isvalid(me) and player.CurrentMap==me.CurrentMap and row.same
+                if same then hp=player.PlayerComponent.Hp maxHp=math.max(1,player.PlayerComponent.MaxHp) end
+                local ratio=math.max(0,math.min(1,hp/maxHp))
+                e:GetChildByName("Name").TextGUIRendererComponent.Text=row.name..(row.online==false and " (오프라인)" or "")
+                e:GetChildByName("Name").TextGUIRendererComponent.FontColor=row.same and Color(0.1,0.1,0.1,1) or Color(0.45,0.45,0.45,1)
+                e:GetChildByName("Bar"):GetChildByName("Fill").UITransformComponent.RectSize=Vector2(98*ratio,8)
+                if same then
+                    local p=player.TransformComponent.WorldPosition
+                    local screen=_UILogic:WorldToScreenPosition(Vector2(p.x,p.y+1.1))
+                    if screen.x>=0 and screen.x<=_UILogic.ScreenWidth and screen.y>=0 and screen.y<=_UILogic.ScreenHeight then
+                        above.Enable=true
+                        above.UITransformComponent.anchoredPosition=_UILogic:ScreenToLocalUIPosition(screen,above.Parent.UITransformComponent)
+                        above:GetChildByName("Fill").UITransformComponent.RectSize=Vector2(70*ratio,5)
+                    end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawChatMode()
+        local b = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/ChatBox/Recipient")
+        if not isvalid(b) then return end
+        local names = {map="모두에게",friend="친구에게",party="파티에게",whisper=self.whisperName}
+        b.TextGUIRendererComponent.Text = names[self.chatMode] or "모두에게"
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        -- Hidden dialogs never retain keyboard ownership.
+        for _, path in ipairs({"Whisper","Invite"}) do
+            local e = self:UI(path)
+            if isvalid(e) and e.EnabledInHierarchy then return true end
+        end
+        local input = self:UI("Window/NameInput")
+        return isvalid(input) and input.EnabledInHierarchy and input.TextGUIRendererInputComponent.IsFocused
+    end
+
+    method void OnBeginPlay()
+        -- Server presence events do not fire for an ordinary map/channel warp.
+        if self:IsServer() then
+            self._T.disconnected={}
+            self._T.partyLeave=_UserService:ConnectEvent(UserLeaveEvent,self.OnPartyUserLeave)
+            self._T.partyEnter=_UserService:ConnectEvent(UserEnterEvent,self.OnPartyUserEnter)
+            self._T.partySweep=_TimerService:SetTimerRepeat(self.ReconcileParties,2)
+            return
+        end
+        self._T.links = {}
+        local windows=_EntityService:GetEntityByPath("/ui/DefaultGroup")
+        for i=1,6 do
+            local above=self:UI("Above"..tostring(i))
+            if isvalid(above) and isvalid(windows) then above:AttachTo(windows) _UILogic:SetSiblingIndex(above.UITransformComponent,0) end
+        end
+        self:UI("Window").Enable = false self:UI("Invite").Enable = false self:UI("Whisper").Enable = false
+        local base = "/ui/SocialWindow/"
+        self:Bind(base .. "Window/Party",function() self.tab="party" self._T.resetScroll=true self:Draw() end)
+        self:Bind(base .. "Window/Friend",function() self.tab="friend" self._T.resetScroll=true self:Draw() end)
+        self:Bind(base .. "Window/Close",function() self:UI("Window").Enable=false end)
+        self:Bind(base .. "Window/Create",function() self:Request("create","") end)
+        self:Bind(base .. "Window/InviteButton",function() self:Request(self.tab=="party" and "inviteParty" or "inviteFriend",self:UI("Window/NameInput").TextGUIRendererInputComponent.Text) end)
+        self:Bind(base .. "Window/Leave",function() self:Request(self.tab=="party" and "leave" or "removeFriend",self.selectedName) end)
+        local grid = self:UI("Window/List").GridViewComponent
+        grid.ItemEntity = self:UI("Window/RowTemplate")
+        self._T.gridRows = {}
+        grid.OnRefresh = function(index, entity)
+            local row = self._T.visibleRows and self._T.visibleRows[index + 1]
+            if row == nil then return end
+            local binding = self._T.gridRows[entity.Id]
+            if binding == nil then
+                binding = {}
+                self._T.gridRows[entity.Id] = binding
+                local connection = entity:ConnectEvent(ButtonClickEvent, function()
+                    local selected = binding.row
+                    if selected ~= nil then
+                        self.selectedName = selected.name self.whisperName = selected.name
+                        self:UI("Window/NameInput").TextGUIRendererInputComponent.Text = selected.name
+                        _UIAudio:Play("BtMouseClick")
+                    end
+                end)
+                table.insert(self._T.links, {entity=entity, connection=connection})
+            end
+            binding.row = row
+            entity:GetChildByName("Name").TextGUIRendererComponent.Text = row.name
+            entity:GetChildByName("LeaderStar").Enable = row.kind=="L"
+            entity:GetChildByName("Job").TextGUIRendererComponent.Text = row.level > 0 and _UIMyInfoManager:GetClassNameForLevel(row.job,row.level) or "오프라인"
+            entity:GetChildByName("Level").TextGUIRendererComponent.Text = row.level > 0 and tostring(row.level) or "-"
+            entity.SpriteGUIRendererComponent.Color = index % 2 == 0 and Color.white or Color(0.92,0.93,0.94,1)
+            for _, name in ipairs({"Name","Job","Level"}) do
+                entity:GetChildByName(name).TextGUIRendererComponent.FontColor = row.same and Color(0.1,0.1,0.1,1) or Color(0.55,0.55,0.55,1)
+            end
+        end
+        grid.OnClear = function(index, entity)
+            local binding = self._T.gridRows[entity.Id]
+            if binding ~= nil then binding.row = nil end
+        end
+        self._T.gridReady = true
+        self:Draw()
+        for _, action in ipairs({"accept","decline"}) do local choice=action self:Bind(base .. "Invite/" .. action,function() self:UI("Invite").Enable=false self:Request(choice,"") end) end
+        self:Bind(base .. "Whisper/Confirm",function() self:ConfirmWhisper() end)
+        self:Bind(base .. "Window/Kick",function() self:Request("kick",self.selectedName) end)
+        local input=self:UI("Whisper/Name")
+        self._T.whisperSubmit=input:ConnectEvent(TextInputSubmitEvent,function() self:ConfirmWhisper() end)
+        self._T.whisperEnd=input:ConnectEvent(TextInputEndEditEvent,function()
+            if _InputService:IsKeyPressed(KeyboardKey.Escape) then
+                self:UI("Whisper").Enable=false
+                _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2
+            end
+        end)
+        local drag=self:UI("PartyHUD/Header")
+        self._T.hudDrag=drag:ConnectEvent(UITouchDragEvent,function(event)
+            local tr=self:UI("PartyHUD").UITransformComponent
+            local p=tr.anchoredPosition+event.TouchDelta
+            tr.anchoredPosition=Vector2(math.max(-795,math.min(795,p.x)),math.max(-425,math.min(425,p.y)))
+        end)
+        self:Bind(base .. "Whisper/Cancel",function() self:UI("Whisper").Enable=false end)
+        self:Bind("/ui/DefaultGroup/MapleHUD/ChatBox/Recipient",function() local menu=self:UI("ChatModes") menu.Enable=not menu.Enable end)
+        for _, mode in ipairs({"map","friend","party","whisper"}) do local selected=mode self:Bind(base .. "ChatModes/" .. mode,function() self:UI("ChatModes").Enable=false self:SelectChat(selected) end) end
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        log("[Social] ready: party 6, friends 200, scroll and tab keys")
+
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen()
+        -- Report all social popups to the shared Escape arbiter.
+        for _, path in ipairs({"Window","Whisper","Invite","ChatModes"}) do
+            local entity = self:UI(path)
+            if isvalid(entity) and entity.EnabledInHierarchy then return true end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        -- Consume Escape before text-focus guards, regardless of listener ordering.
+        if not _LoginFlow:IsInGame() then return end
+        if event.key == KeyboardKey.Escape and self:IsOpen() and not _GameSystemMenu.opened then
+            for _, path in ipairs({"Window","Whisper","Invite","ChatModes"}) do self:UI(path).Enable=false end
+            _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2
+            _UIAudio:Play("MenuDown")
+            return
+        end
+        if (event.key==KeyboardKey.Return or event.key==KeyboardKey.KeypadEnter) and self:UI("Whisper").EnabledInHierarchy then self:ConfirmWhisper() return end
+        if event.key == KeyboardKey.Tab and self:UI("Window").EnabledInHierarchy and not _GameSystemMenu.opened and not self:UI("Whisper").EnabledInHierarchy and not self:UI("Invite").EnabledInHierarchy then
+            self.tab = self.tab == "party" and "friend" or "party"
+            self._T.resetScroll = true self.selectedName = ""
+            self:Draw() _UIAudio:Play("Tab")
+            return
+        end
+        if _KeySettingManager:IsCapturingKey() or _MapleHUDManager:IsChatTyping() or self:BlocksInput() or _GameSystemMenu:BlocksInput() then return end
+        if event.key==KeyboardKey.P then self:Open("party") elseif event.key==KeyboardKey.F then self:Open("friend") elseif event.key==KeyboardKey.H then self:SelectChat("whisper") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        self:UpdatePartyHUD()
+        if not _LoginFlow:IsInGame() then
+            self:UI("Window").Enable=false self:UI("Invite").Enable=false self:UI("Whisper").Enable=false self:UI("ChatModes").Enable=false
+            self.chatMode="map" self.whisperName="" self.lastWhisperName="" self.rows={} self.partyRows={} self:DrawChatMode() return
+        end
+        local now=_UtilLogic.ElapsedSeconds
+        if now >= (self._T.refreshAt or 0) then self._T.refreshAt=now+2 self:Request("refresh","") end
+        if self:UI("Invite").Enable and now > (self._T.inviteUntil or 0) then self:UI("Invite").Enable=false end
+    end
+
+    method void OnEndPlay()
+        -- World shutdown also ends the final online memberships, including Maker Stop.
+        if self:IsServer() then
+            if self._T.partyLeave~=nil then _UserService:DisconnectEvent(UserLeaveEvent,self._T.partyLeave) end
+            if self._T.partyEnter~=nil then _UserService:DisconnectEvent(UserEnterEvent,self._T.partyEnter) end
+            if self._T.partySweep~=nil then _TimerService:ClearTimer(self._T.partySweep) end
+            local parties={}
+            for _, party in pairs(self._T.parties or {}) do table.insert(parties,party) end
+            for _, party in ipairs(parties) do
+                while party.busy do wait(0.05) end
+                self:ChangeParty("disband",{party=party,uid=party.leader},nil)
+            end
+            return
+        end
+        if self._T.whisperFocusTimer~=nil then _TimerService:ClearTimer(self._T.whisperFocusTimer) end
+        if self._T.whisperSubmit~=nil then self:UI("Whisper/Name"):DisconnectEvent(TextInputSubmitEvent,self._T.whisperSubmit) end
+        if self._T.whisperEnd~=nil then self:UI("Whisper/Name"):DisconnectEvent(TextInputEndEditEvent,self._T.whisperEnd) end
+        if self._T.hudDrag~=nil then self:UI("PartyHUD/Header"):DisconnectEvent(UITouchDragEvent,self._T.hudDrag) end
+        for _, link in ipairs(self._T.links or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent,link.connection) end end
+        if self._T.key ~= nil then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+    end
+    @ExecSpace("ClientOnly")
+    method table SortPartyRows(table rows)
+        local sorted={}
+        for _, row in ipairs(rows) do if row.kind~="F" then table.insert(sorted,row) end end
+        table.sort(sorted,function(a,b)
+            if (a.level or 0)~=(b.level or 0) then return (a.level or 0)>(b.level or 0) end
+            if a.name~=b.name then return a.name<b.name end
+            return (a.id or "")<(b.id or "")
+        end)
+        return sorted
+    end
+
+end

@@ -273,12 +273,13 @@ script CharacterPersistence extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
-	method void FlushUserNow(string userId)
+	method boolean FlushUserNow(string userId)
         _ItemHallOfFame:Flush()
 		-- 해당 유저의 dirty 데이터를 전부 동기 저장 (퇴장 시점 - 블로킹 허용).
 		local sv = self._T.sv[userId]
-		if sv == nil then return end
+		if sv == nil then return true end
 		local storage = sv.storage
+        _CashItemAudit:Flush(sv,true)
 		if sv.charsDirty then
 			storage:SetAndWait("chars", self:EncodeCharsStore(sv))
 			sv.charsDirty = false
@@ -287,21 +288,7 @@ script CharacterPersistence extends Logic
 			storage:SetAndWait("account", self:EncodeAccount(sv))
 			sv.accountDirty = false
 		end
-		for id, _ in pairs(sv.dirtySaves) do
-			local s = sv.saves[id]
-			if s ~= nil and s ~= "" then
-				-- (유실 방지) 퇴장 flush는 마지막 기회라 실패 시 1회 즉시 재시도하고, 그래도
-				-- 실패하면 크게 남긴다 (캐시가 곧 해제되므로 이후 재시도 불가).
-				local ec = storage:SetAndWait("save_" .. id, s)
-				if ec ~= 0 then
-					local ec2 = storage:SetAndWait("save_" .. id, s)
-					if ec2 ~= 0 then
-						log_error("[Persist] 퇴장 최종 저장 실패 ec=" .. tostring(ec2) .. " (id=" .. id .. ", user=" .. userId .. ") - 세션 진행분 유실 위험")
-					end
-				end
-			end
-		end
-		sv.dirtySaves = {}
+		local savesOK = self:WriteCharacterSaves(sv, true)
 		for id, _ in pairs(sv.dirtyLogs) do
 			local lg = sv.logs[id]
 			if lg ~= nil then
@@ -309,6 +296,9 @@ script CharacterPersistence extends Logic
 			end
 		end
 		sv.dirtyLogs = {}
+		local auditOK = (sv.cashAuditPending == nil or next(sv.cashAuditPending) == nil) and (sv.mesoAudit == nil or next(sv.mesoAudit) == nil)
+		if not auditOK then log_warning("[Persist] 복구 기록 저장 미완료 - 캐시를 유지하고 재시도합니다.") end
+		return savesOK and auditOK
 	end
 
 	@ExecSpace("ServerOnly")
@@ -316,6 +306,7 @@ script CharacterPersistence extends Logic
 		-- 10초 주기: dirty인 것만 비동기 저장 (변경 없으면 아무것도 안 씀).
 		for userId, sv in pairs(self._T.sv) do
 			local storage = sv.storage
+            _CashItemAudit:Flush(sv,false)
 			-- (유실 방지) 실패 콜백에서 dirty를 복원해 다음 틱이 재시도하게 한다 - 기존에는 발행과
 			-- 동시에 dirty를 내려버려, 쓰기 실패 + 이후 변경 없음이면 세션 진행분이 통째로 증발했다.
 			if sv.charsDirty then
@@ -336,19 +327,7 @@ script CharacterPersistence extends Logic
 					end
 				end)
 			end
-			for id, _ in pairs(sv.dirtySaves) do
-				local s = sv.saves[id]
-				if s ~= nil and s ~= "" then
-					local savedId = id
-					storage:SetAsync("save_" .. id, s, function(ec, key)
-						if ec ~= 0 then
-							log_warning("[Persist] save 저장 실패 ec=" .. tostring(ec) .. " - 재시도 예약")
-							sv.dirtySaves[savedId] = true
-						end
-					end)
-				end
-			end
-			sv.dirtySaves = {}
+			self:WriteCharacterSaves(sv, false)
 			for id, _ in pairs(sv.dirtyLogs) do
 				local lg = sv.logs[id]
 				if lg ~= nil then
@@ -365,8 +344,7 @@ script CharacterPersistence extends Logic
 		local userId = tostring(event.UserId)
 		log("[Persist] 유저 퇴장 - 최종 저장: " .. userId)
 		self:CaptureLocation(userId)
-		self:FlushUserNow(userId)
-		self._T.sv[userId] = nil
+		if self:FlushUserNow(userId) then self._T.sv[userId] = nil end
 	end
 
 	-- ══════════════════════════ 서버: 클라이언트 요청 처리 ══════════════════════════
@@ -379,8 +357,34 @@ script CharacterPersistence extends Logic
 			self:OnPersistLoadError("서버에서 캐릭터 목록을 불러오지 못했습니다.\n잠시 후 다시 로그인해주세요.", senderUserId)
 			return
 		end
+		self:UpgradeSelectionAppearance(sv)
 		self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, senderUserId)
 	end
+
+
+    method boolean IsValidNickname(string name)
+        -- 한글 완성형 1자=2, 영문/숫자 1자=1로 계산해 최대 12까지 허용한다.
+        if name == nil or name == "" or #name > 18 then return false end
+        local weight, index = 0, 1
+        while index <= #name do
+            local first = string.byte(name, index)
+            if (first >= 48 and first <= 57) or (first >= 65 and first <= 90) or (first >= 97 and first <= 122) then
+                weight = weight + 1
+                index = index + 1
+            elseif first >= 234 and first <= 237 and index + 2 <= #name then
+                local second, third = string.byte(name, index + 1), string.byte(name, index + 2)
+                if second < 128 or second > 191 or third < 128 or third > 191 then return false end
+                local codepoint = (first - 224) * 4096 + (second - 128) * 64 + third - 128
+                if codepoint < 44032 or codepoint > 55203 then return false end
+                weight = weight + 2
+                index = index + 3
+            else
+                return false
+            end
+            if weight > 12 then return false end
+        end
+        return weight > 0
+    end
 
 	@ExecSpace("Server")
 	method void RequestCreateCharacter(string dataStr)
@@ -390,9 +394,9 @@ script CharacterPersistence extends Logic
 			self:OnCreateResult(false, "서버 오류로 생성에 실패했습니다. 잠시 후 다시 시도해주세요.", "", senderUserId)
 			return
 		end
-		local name = string.match(dataStr, "([^|]+)") or ""
-		if name == "" or string.find(dataStr, "\t") ~= nil or string.find(dataStr, "\n") ~= nil then
-			self:OnCreateResult(false, "잘못된 캐릭터 데이터입니다.", "", senderUserId)
+		local name = string.match(dataStr, "^([^|]+)|") or ""
+		if not self:IsValidNickname(name) or string.find(dataStr, "\t") ~= nil or string.find(dataStr, "\n") ~= nil then
+			self:OnCreateResult(false, "한글·영문·숫자만 사용할 수 있습니다. 한글 1자, 영문·숫자 0.5자로 최대 6자입니다.", "", senderUserId)
 			return
 		end
 		-- (유실 방지) 이름에 "|"가 섞이면 파이프 구분 캐릭터 data의 필드가 밀려 외형/직업 파싱이
@@ -496,6 +500,28 @@ script CharacterPersistence extends Logic
 			end
 			sv.saves[id] = saveStr
 		end
+        -- Recovery is delivered before entry, never into an active client's stale inventory.
+        if sv.recoveryApplying then return end
+        sv.recoveryApplying = true
+        if not self:WriteCharacterSaves(sv, true) then
+            sv.recoveryApplying = false
+            self:OnPersistLoadError("저장 완료를 기다린 후 다시 접속해주세요.", senderUserId)
+            return
+        end
+        local readCode, durable = sv.storage:GetAndWait("save_"..id)
+        if readCode == 0 then saveStr = durable or ""
+        elseif readCode ~= 1000002 then
+            sv.recoveryApplying = false
+            self:OnPersistLoadError("최신 저장 상태를 확인하지 못했습니다.", senderUserId)
+            return
+        end
+        local recovery = _RecoveryManager:ApplyPending(sv.storage, senderUserId, id, saveStr)
+        sv.recoveryApplying = false
+        if recovery.error then self:OnPersistLoadError(recovery.error, senderUserId) return end
+        saveStr = recovery.snapshot
+        sv.saves[id] = saveStr
+        _RecoveryManager:Checkpoint(sv, id, saveStr, true)
+        _CashItemAudit:Flush(sv, false)
 		-- 입장 확정 이후에만 활성/최근접속 기록을 갱신한다 (로드 실패 시 activeId가 남아
 		-- 떠돌이 스냅샷을 받는 일이 없도록).
 		sv.lastId = id
@@ -522,7 +548,10 @@ script CharacterPersistence extends Logic
 		if sv == nil or sv.activeId == "" then return end
 		local id = sv.activeId
 		saveStr = self:WithLocation(saveStr, sv.location or "")
+        saveStr = _RecoveryManager:PreserveReceipts(sv.saves[id] or "", saveStr)
+        saveStr = _LevelCosmeticRewards:MergeState(sv.saves[id] or "",saveStr)
 		if sv.saves[id] == saveStr then return end
+        local cashAuditChanged = _CashItemAudit:Queue(sv,id,sv.saves[id] or "",saveStr,reason)
 
 		local meso = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
 		local prev = sv.lastMeso[id] or 0
@@ -542,18 +571,12 @@ script CharacterPersistence extends Logic
 		sv.lastMeso[id] = meso
 		sv.saves[id] = saveStr
 		sv.dirtySaves[id] = true
+        if cashAuditChanged then _CashItemAudit:Flush(sv,false) end
 		-- (유실 방지) 강화 계열 스냅샷은 10초 주기 flush를 기다리지 않고 즉시 비동기 기록한다 -
 		-- 그 사이 서버가 내려가도 파괴/성공이 롤백되지 않도록. 성공 시에만 dirty를 내리고(그 사이
 		-- 새 스냅샷이 왔으면 유지), 실패하면 dirty가 남아 다음 틱이 재시도한다.
-		if string.find(reason, "enhance", 1, true) ~= nil or string.find(reason, "preferences", 1, true) ~= nil then
-			local writtenStr = saveStr
-			sv.storage:SetAsync("save_" .. id, writtenStr, function(ec, key)
-				if ec == 0 then
-					if sv.saves[id] == writtenStr then sv.dirtySaves[id] = nil end
-				else
-					log_warning("[Persist] 강화 즉시 저장 실패 ec=" .. tostring(ec) .. " - 주기 flush가 재시도")
-				end
-			end)
+		if string.find(reason,"level_reward",1,true) or string.find(reason,"level_milestone",1,true) or cashAuditChanged or string.find(reason, "enhance", 1, true) ~= nil or string.find(reason, "preferences", 1, true) ~= nil then
+			self:WriteCharacterSaves(sv, false)
 		end
 		-- 캐릭터 목록의 외형 필드도 최신 장비로 맞춘다 (선택창 슬롯 아바타가 지금 입은 장비를 보여주도록)
 		self:SyncCharDataFromSave(sv, id, saveStr)
@@ -562,6 +585,7 @@ script CharacterPersistence extends Logic
 
 	@ExecSpace("ServerOnly")
 	method void SyncCharDataFromSave(table sv, string id, string saveStr)
+        if saveStr == "" then return end
 		-- 세이브의 장비 슬롯(E 라인: "E\t<슬롯>\t<아이템문자열>")에서 RUID를 뽑아 캐릭터 목록 data를 갱신한다.
 		-- data 포맷: 이름|얼굴|머리|상의|하의|신발|무기|직업|모자 (미착용은 "NONE", 9번째는 구버전에 없을 수 있음)
 		local ch = nil
@@ -592,7 +616,7 @@ script CharacterPersistence extends Logic
 				end
 			end
 		end
-		if found == 0 then return end   -- 장비 정보가 없는 스냅샷이면 건드리지 않는다
+
 
 		local newData = parts[1]
 		for i = 1, 6 do
@@ -606,12 +630,80 @@ script CharacterPersistence extends Logic
         local power = string.match("\n" .. saveStr, "\nCP\t(%d+)") or parts[10]
         newData = newData .. "|" .. (power or "-1")
         local level = string.match("\n" .. saveStr, "\nLV\t(%d+)") or parts[11]
-        if level ~= nil then newData = newData .. "|" .. level end
+        newData = newData .. "|" .. (level or "-1") .. "|" .. self:SelectionAppearance(saveStr)
 		if newData ~= ch.data then
 			ch.data = newData
 			sv.charsDirty = true
 		end
 	end
+
+
+    method string SelectionAppearance(string saveStr)
+        -- A compact, delimiter-safe visual snapshot; no inventory or stat data.
+        local entries = {"look1"}
+        for _, line in ipairs(self:SplitLines(saveStr)) do
+            local f = self:SplitTabs(line)
+            if #f >= 3 and (f[1] == "E" or f[1] == "D") then
+                local allowed = f[1] == "D" or (tonumber(f[2]) ~= nil and tonumber(f[2]) >= 1 and tonumber(f[2]) <= 9)
+                local fields = {}
+                for v in string.gmatch(f[3], "([^|]+)") do table.insert(fields, v) end
+                local ruid = fields[2] or ""
+                if allowed and #ruid == 32 and string.match(ruid, "^%x+$") then
+                    local cat = fields[4] or "-"
+                    local jobs = f[1] == "D" and (fields[5] or "-") or "-"
+                    if not string.match(cat, "^[%w_-]+$") then cat = "-" end
+                    if not string.match(jobs, "^[%d,%-]+$") then jobs = "-" end
+                    table.insert(entries, f[1] .. f[2] .. "=" .. ruid .. "=" .. cat .. "=" .. jobs)
+                end
+            end
+        end
+        return table.concat(entries, ";") .. ";"
+    end
+
+    @ExecSpace("ServerOnly")
+    method void UpgradeSelectionAppearance(table sv)
+        -- Older character summaries omitted cosmetics. Read their saves once in a batch.
+        if sv.selectionAppearanceLoaded or sv.selectionAppearanceLoading then return end
+        sv.selectionAppearanceLoading = true
+        local keys, ids = {}, {}
+        for _, ch in ipairs(sv.list) do
+            if not string.find(ch.data, "|look1;", 1, true) then
+                if sv.saves[ch.id] ~= nil then
+                    self:SyncCharDataFromSave(sv, ch.id, sv.saves[ch.id])
+                else
+                    local key = "save_" .. ch.id
+                    table.insert(keys, key)
+                    ids[key] = ch.id
+                end
+            end
+        end
+        if #keys > 0 then
+            local ec, pages = sv.storage:BatchGetAndWait(keys)
+            if ec ~= 0 or pages == nil then
+                sv.selectionAppearanceLoading = false
+                log_warning("[SelectAppearance] existing save lookup failed ec=" .. tostring(ec))
+                return
+            end
+            while true do
+                for _, entry in ipairs(pages:GetCurrentPageDatas() or {}) do
+                    local id = ids[entry.KeyInfo.Key]
+                    if id ~= nil then
+                        self:SyncCharDataFromSave(sv, id, sv.saves[id] or entry.Value or "")
+                    end
+                end
+                if pages.IsLastPage then break end
+                local pageError = pages:LoadNextPageAndWait()
+                if pageError ~= 0 then
+                    sv.selectionAppearanceLoading = false
+                    log_warning("[SelectAppearance] page lookup failed ec=" .. tostring(pageError))
+                    return
+                end
+                pages:MoveToNextPageAndWait()
+            end
+        end
+        sv.selectionAppearanceLoading = false
+        sv.selectionAppearanceLoaded = true
+    end
 
 	-- ══════════════════════════ 클라이언트: 서버 응답 ══════════════════════════
 
@@ -716,12 +808,16 @@ script CharacterPersistence extends Logic
 		local cl = self._T.cl
 		-- 직전 캐릭터의 보존 라인이 새 캐릭터 세이브에 섞이지 않게 초기화 (RestoreSave가 다시 채움)
 		cl.unknownLines = {}
+        _LevelCosmeticRewards:Restore(saveStr)
+        _InformationBook._T.fittingEquips = nil
+        _InformationBook._T.fittingDeco = nil
 		_MapleIslandTutorial:Restore(saveStr)
         _GameSystemMenu:RestorePreferences(saveStr)
 		if saveStr ~= "" then
 			self:RestoreSave(saveStr)
 		else
 			_DecoWindowManager:ImportDeco({})
+			_CharInfoManager:CancelAttackSpeedPotion()
 			_CharInfoManager.atkSpeedStage = 4
 			_CharInfoManager.potionAttackBonus = 0
 			_SkillManager:ImportSkillLevels({})
@@ -736,6 +832,7 @@ script CharacterPersistence extends Logic
 		cl.lastSentStr = ""
 		self:MarkDirty("init")
 		_LoginFlow:CharacterRestored()
+        _AvatarTicketManager:RequestOwnedTicket()
 	end
 
 	-- ══════════════════════════ 클라이언트: 공개 API ══════════════════════════
@@ -806,7 +903,7 @@ script CharacterPersistence extends Logic
 		if cl == nil or not cl.entered then return end
 		cl.dirty = true
 		cl.dirtyReasons[reason] = true
-		if reason == "discard" or string.find(reason, "enhance", 1, true) == 1 then
+		if string.find(reason,"meso",1,true)==1 or string.find(reason,"ticket_",1,true)==1 or string.find(reason,"cashshop_test_purchase",1,true)==1 or reason == "accessory_box" or reason == "transparent_set" or reason == "equipment_box" or reason == "discard" or reason == "cosmetic_box_open" or reason == "cosmetic_dismantle" or reason == "cosmetic_redeem" or string.find(reason, "enhance", 1, true) == 1 then
 			self:FlushToServer()
 			return
 		end
@@ -817,23 +914,28 @@ script CharacterPersistence extends Logic
 		end, 2.0)
 	end
 
-	@ExecSpace("ClientOnly")
-	method void FlushToServer()
-		-- 현재 상태 스냅샷을 직렬화해 서버로 보낸다 (직전 전송과 같으면 생략).
-		local cl = self._T.cl
-		cl.flushPending = false
-		if not cl.dirty or not cl.entered then return end
-		cl.dirty = false
-		local reasons = {}
-		for r, _ in pairs(cl.dirtyReasons) do table.insert(reasons, r) end
-		cl.dirtyReasons = {}
-		local reason = table.concat(reasons, ",")
-
-		local saveStr = self:BuildSaveString()
-		if saveStr == cl.lastSentStr then return end
-		cl.lastSentStr = saveStr
-		self:PushCharacterSave(saveStr, reason)
-	end
+    @ExecSpace("ClientOnly")
+    method void FlushToServer()
+        -- Serialize sends too: UI/stat reads can yield while another money change arrives.
+        local cl = self._T.cl
+        if cl == nil then return end
+        cl.flushPending = false
+        if cl.flushing or not cl.dirty or not cl.entered then return end
+        cl.flushing = true
+        while cl.dirty and cl.entered do
+            cl.dirty = false
+            local reasons = {}
+            for r, _ in pairs(cl.dirtyReasons) do table.insert(reasons, r) end
+            cl.dirtyReasons = {}
+            local reason = table.concat(reasons, ",")
+            local saveStr = self:BuildSaveString()
+            if cl.entered and self._T.cl == cl and saveStr ~= cl.lastSentStr then
+                cl.lastSentStr = saveStr
+                self:PushCharacterSave(saveStr, reason)
+            end
+        end
+        cl.flushing = false
+    end
 
 	@ExecSpace("ClientOnly")
 	method string BuildSaveString()
@@ -845,6 +947,7 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 세이브 포맷 버전 - 향후 포맷 변경 시 RestoreSave가 이 값으로 마이그레이션
 		-- 분기를 태운다. 서버 감사 로그가 첫 줄 "M\t"를 앵커로 파싱하므로 M 다음 줄에 둔다.
 		table.insert(lines, "V\t1")
+        table.insert(lines, _LevelCosmeticRewards:Export())
 		table.insert(lines, "Q\t" .. tostring(_MapleIslandTutorial.step) .. "\t2")
         -- 선택 화면용 표시 스냅샷. 게임 전투 판정에는 사용하지 않는다.
         table.insert(lines, "CP\t" .. tostring(math.max(0, math.floor(_CharInfoManager:CalcCombatPower()))))
@@ -854,7 +957,7 @@ script CharacterPersistence extends Logic
 		table.insert(lines, "A\t" .. tostring(_CharInfoManager.atkSpeedStage) .. "\t0")
 		-- (Phase 1) 장비 슬롯 25종 선확장 - 잠금 칸(10~25)은 빈 문자열이라 라인이 생기지 않고,
 		-- 복원(RestoreSave)은 "E\t<slot>" 키 기반이라 상한이 없어 그대로 호환된다.
-		for i = 1, 25 do
+		for i = 1, 28 do
 			local s = t.equips[tostring(i)] or ""
 			if s ~= "" then
 				table.insert(lines, "E\t" .. tostring(i) .. "\t" .. s)
@@ -949,7 +1052,7 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 복원 때 이 빌드가 해석하지 못해 보존해 둔 라인들을 그대로 재부착한다 -
 		-- 구버전 빌드가 신버전 세이브를 열어도 모르는 데이터를 지우지 않는다(라운드트립 보존).
 		for _, ln in ipairs(self._T.cl.unknownLines or {}) do
-			if string.sub(ln, 1, 6) ~= "PCUBE\t" and string.sub(ln, 1, 5) ~= "PREF\t" and string.sub(ln, 1, 3) ~= "CP\t" and string.sub(ln, 1, 3) ~= "LV\t" and string.sub(ln, 1, 2) ~= "Q\t" and string.sub(ln, 1, 2) ~= "L\t" then table.insert(lines, ln) end
+			if string.sub(ln,1,5) ~= "CRWD\t" and string.sub(ln, 1, 13) ~= "WORLDCOSTUME\t" and string.sub(ln, 1, 10) ~= "CHATCOLOR\t" and string.sub(ln, 1, 5) ~= "MUTE\t" and string.sub(ln, 1, 6) ~= "PCUBE\t" and string.sub(ln, 1, 5) ~= "PREF\t" and string.sub(ln, 1, 3) ~= "CP\t" and string.sub(ln, 1, 3) ~= "LV\t" and string.sub(ln, 1, 2) ~= "Q\t" and string.sub(ln, 1, 2) ~= "L\t" then table.insert(lines, ln) end
 		end
 		return table.concat(lines, "\n")
 	end
@@ -975,7 +1078,7 @@ script CharacterPersistence extends Logic
 			local kind = string.sub(line, 1, 1)
 			if kind == "Q" or kind == "L" or string.sub(line, 1, 5) == "PREF\t" or string.sub(line, 1, 6) == "PCUBE\t" then
 				-- 튜토리얼은 Restore, 위치는 서버가 복원한다.
-			elseif kind == "M" then
+			elseif string.sub(line, 1, 2) == "M\t" then
 				t.meso = tonumber(string.sub(line, 3)) or 0
 			elseif string.sub(line, 1, 3) == "CP\t" or string.sub(line, 1, 3) == "LV\t" then
                 -- 표시 요약은 장비/스킬 복원 후 다시 계산하므로 게임 상태로 복원하지 않는다.
@@ -1115,6 +1218,7 @@ script CharacterPersistence extends Logic
 		-- 시작한다. (전투력 개편 2026-08-08) 기본값 5단계 → 4단계(= "공격속도 100%" 표기 기준).
 		-- 과거 단계가 저장된 기존 캐릭터도 이 줄로 즉시 기본값으로 정상화된다.
 		-- (비약을 먹어 올라간 단계는 접속을 유지하는 동안에만 유효하다.)
+		_CharInfoManager:CancelAttackSpeedPotion()
 		_CharInfoManager.atkSpeedStage = 4
 		-- (기능 변경) 물약 공격력 보너스는 세션 전용 - 저장본에 남아있는 과거 값(f[3])도 무시하고
 		-- 항상 0에서 시작한다. 이미 2000이 저장된 기존 캐릭터도 이 줄로 즉시 정상화된다.
@@ -1243,18 +1347,11 @@ script CharacterPersistence extends Logic
         if sv ~= nil and sv.activeId ~= "" then
             self:CaptureLocation(uid)
             if snapshot ~= "" then self:PushCharacterSave(snapshot, "session_exit") end
-            local id = sv.activeId
-            local data = sv.saves[id]
-            if data ~= nil and data ~= "" then
-                local ec = sv.storage:SetAndWait("save_" .. id, data)
-                if ec ~= 0 then
-                    session.leaving = false
-                    _GameSystemMenu:ExitResult(false, mode, "저장하지 못했습니다. 잠시 후 다시 시도해주세요.", uid)
-                    return
-                end
-                sv.dirtySaves[id] = nil
+            if not self:FlushUserNow(uid) then
+                session.leaving = false
+                _GameSystemMenu:ExitResult(false, mode, "저장하지 못했습니다. 잠시 후 다시 시도해주세요.", uid)
+                return
             end
-            self:FlushUserNow(uid)
             sv.activeId = ""
             sv.locationReady = false
         end
@@ -1270,8 +1367,65 @@ script CharacterPersistence extends Logic
         end
         local p = _UserService:GetUserEntityByUserId(uid)
         if isvalid(p) then _TeleportService:TeleportToMapPosition(p, Vector3(0,0,0), "login") end
+        -- Refresh the client summary after saving, before showing character selection.
+        if sv ~= nil then self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, uid) end
         _GameSystemMenu:ExitResult(true, mode, "", uid)
         log("[SessionExit] saved mode=" .. mode)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean WriteCharacterSaves(table sv, boolean blocking)
+        -- One writer per user prevents an older async snapshot overwriting the logout save.
+        if sv.saveWriting then
+            if not blocking then return false end
+            local deadline = _UtilLogic.ElapsedSeconds + 15
+            while sv.saveWriting and _UtilLogic.ElapsedSeconds < deadline do wait(0.05) end
+            if sv.saveWriting then log_warning("[Persist] save still in flight; retaining dirty data") return false end
+        end
+        local payload = {}
+        local snapshots = {}
+        for id, _ in pairs(sv.dirtySaves) do
+            local raw = sv.saves[id]
+            if raw ~= nil and raw ~= "" then payload["save_"..id] = raw snapshots[id] = raw end
+        end
+        if next(payload) == nil then return true end
+        sv.saveWriting = true
+        for id, raw in pairs(snapshots) do _RecoveryManager:Checkpoint(sv, id, raw, blocking) end
+        _CashItemAudit:Flush(sv, blocking)
+        local complete = function(ec, successKeys)
+            -- Clear only confirmed keys whose current data still matches THIS batch.
+            local succeeded = {}
+            for _, key in ipairs(successKeys or {}) do succeeded[key] = true end
+            for id, raw in pairs(snapshots) do
+                if (ec == 0 or succeeded["save_"..id]) and sv.saves[id] == raw then sv.dirtySaves[id] = nil end
+            end
+            sv.saveWriting = false
+            if ec ~= 0 then log_warning("[Persist] save failed ec="..tostring(ec).."; dirty data retained") end
+        end
+        if blocking then
+            local ec, keys = sv.storage:BatchSetAndWait(payload)
+            complete(ec, keys)
+            -- Failed or changed snapshots are retried from current data, never an old payload.
+            if next(sv.dirtySaves) ~= nil then
+                local retry = {}
+                local latest = {}
+                for id, _ in pairs(sv.dirtySaves) do
+                    local raw = sv.saves[id]
+                    if raw ~= nil and raw ~= "" then retry["save_"..id] = raw latest[id] = raw end
+                end
+                if next(retry) ~= nil then
+                    sv.saveWriting = true
+                    snapshots = latest
+                    local retryCode, retryKeys = sv.storage:BatchSetAndWait(retry)
+                    complete(retryCode, retryKeys)
+                end
+            end
+            local ok = next(sv.dirtySaves) == nil
+            log("[Persist] final character save="..tostring(ok))
+            return ok
+        end
+        sv.storage:BatchSetAsync(payload, complete)
+        return true
     end
 
 end

@@ -255,20 +255,42 @@ script LoginFlow extends Logic
 
     @ExecSpace("ClientOnly")
     method void RestoreInGameVisibility()
-        -- 승인된 입장 후 맵별 플레이어 표현에 남은 로그인 숨김 상태만 복구한다.
-        local player = _UserService.LocalPlayer
-        if not isvalid(player) or not self:IsInGame() then return end
-        local map = player.CurrentMap
+        -- Each observer must restore newly arrived avatars, including players already in the map.
+        local me = _UserService.LocalPlayer
+        if not isvalid(me) or not self:IsInGame() then return end
+        local map = me.CurrentMap
         if not isvalid(map) or map.Name == "login" then return end
-        if self._T.visiblePlayer ~= player or self._T.visibleMap ~= map then
-            self._T.visiblePlayer = player
-            self._T.visibleMap = map
-            self._T.visibilityRestoreUntil = self.clock + 1.5
+        if self._T.visibilityMap ~= map then
+            self._T.visibilityMap = map
+            self._T.observedPlayers = {}
         end
-        -- 맵 전환 직후의 지연 동기화까지만 처리하며 스킬의 알파/사망 연출은 변경하지 않는다.
-        if self.clock <= self._T.visibilityRestoreUntil and not player.Visible then
-            player:SetVisible(true, true, false)
-            log("[LoginFlow] local player visibility restored map=" .. map.Name)
+        local mini = _EntityService:GetEntityByPath("/ui/MiniMapUI")
+        local controller = isvalid(mini) and mini:GetFirstChildComponentByTypeName("script.MiniMapUIManager", true) or nil
+        local capturing = isvalid(controller) and controller._T.capturing == true
+        local observed = self._T.observedPlayers or {}
+        self._T.observedPlayers = observed
+        for _, player in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(player) and player.CurrentMap == map then
+                local ar = player.AvatarRendererComponent
+                local root = isvalid(ar) and ar:GetAvatarRootEntity() or nil
+                local record = observed[player.Id]
+                if record == nil then
+                    record = {untilTime=self.clock+2, restored=false}
+                    observed[player.Id] = record
+                end
+                -- Capture owns visibility while taking map pictures. Never fight its hide/restore.
+                if capturing or record.root ~= root then record.untilTime=self.clock+2 record.restored=false end
+                record.root = root
+                if self.clock <= record.untilTime and not capturing then
+                    if not player.Visible or (isvalid(root) and not record.restored) then
+                        -- The avatar root is engine-owned; querying its Visible can raise LEA-3046.
+                        -- Restore through the player hierarchy instead of touching that internal entity.
+                        player:SetVisible(true, true, false)
+                        record.restored = isvalid(root)
+                        log("[LoginFlow] observer restored avatar="..player.Name.." map="..map.Name)
+                    end
+                end
+            end
         end
     end
 
@@ -305,13 +327,16 @@ script LoginFlow extends Logic
         -- 단계 전환을 단일 경로로 수행해 HUD 노출과 잘못된 뒤로 가기를 막는다.
         if nextPhase == "intro" and self._T.introPlayed then return end
         self:EnableUI("IntroCover", nextPhase == "intro")
-        if nextPhase == "character" then self._T.infoSelection = nil end
         local previousPhase = self.phase
+        if nextPhase == "character" and previousPhase ~= "character" then
+            self._T.infoSelection = nil
+            self._T.infoTime = 0
+        end
         if previousPhase ~= nextPhase then
             if previousPhase == "channel" then _UIAudio:Play("RollUp") end
             if nextPhase == "channel" then _UIAudio:Play("RollDown") end
             local pair = previousPhase .. ":" .. nextPhase
-            if pair == "login:world" or pair == "world:login" or pair == "channel:character" or pair == "character:channel" or pair == "character:create" or pair == "create:character" or pair == "job:character" then _UIAudio:Play("ScrollUp") end
+            if pair == "login:world" or pair == "world:login" or pair == "channel:character" or pair == "character:channel" or pair == "character:job" or pair == "character:create" or pair == "create:character" or pair == "job:character" then _UIAudio:Play("ScrollUp") end
         end
         if previousPhase == "character" and (nextPhase == "create" or nextPhase == "job") then
             local selection = self:SelectComponent()
@@ -337,6 +362,7 @@ script LoginFlow extends Logic
         self:EnableUI("Stage/CreateCharacter", nextPhase == "create" or nextPhase == "job")
         self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel", nextPhase == "create")
         self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/JobSelectPanel", nextPhase == "job")
+        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName", nextPhase == "create" or nextPhase == "job")
         self:EnableUI("Stage/Navigation", nextPhase ~= "login" and nextPhase ~= "ingame" and nextPhase ~= "intro")
         self:EnableUI("Stage/Navigation/StepCustom", nextPhase == "character" or nextPhase == "create" or nextPhase == "job")
         self:EnableUI("Stage/Navigation/WorldLabel", nextPhase == "character" or nextPhase == "create" or nextPhase == "job")
@@ -396,7 +422,7 @@ script LoginFlow extends Logic
         if self.phase == "intro" then self:UpdateIntro(delta) end
         if self._T.entryFadeElapsed ~= nil then
             self._T.entryFadeElapsed = math.min(1, self._T.entryFadeElapsed + delta)
-            self:UI("EntryFade").SpriteGUIRendererComponent:SetAlpha(self._T.entryFadeElapsed)
+            self:UI("EntryFade").PolygonGUIRendererComponent.Color = Color(0,0,0,self._T.entryFadeElapsed)
         end
         if self:IsInGame() then
             self:RestoreInGameVisibility()
@@ -521,6 +547,7 @@ script LoginFlow extends Logic
         worldShadow.SpriteGUIRendererComponent:SetAlpha(shadowAlpha)
         if (self._T.infoTime or 0) > 0 then
             self._T.infoTime = math.max(0, self._T.infoTime - delta)
+            self:SetCharacterScroll(1 - self._T.infoTime / 0.4)
             if self._T.infoTime == 0 and self.phase == "character" and self._T.infoSelection ~= nil then self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", true) end
         end
         local atmosphere = self:UI("Stage/Scenery/Atmosphere")
@@ -640,8 +667,17 @@ script LoginFlow extends Logic
         elseif string.sub(action, 1, 8) == "channel:" and self.phase == "channel" then
             local idx = (self.channelPage - 1) * 19 + (tonumber(string.sub(action, 9)) or 0)
             if self._T.channels[idx] == nil then return end
+            local now = _UtilLogic.ElapsedSeconds
+            local double = self._T.channelClickIndex == idx and now - (self._T.channelClickAt or -10) <= 0.45
+            self._T.channelClickIndex = idx
             self.selectedChannel = idx
-            self:RefreshChannels()
+            if double then
+                self._T.channelClickIndex = nil
+                self:Action("channelEnter")
+            else
+                self:RefreshChannels()
+                self._T.channelClickAt = _UtilLogic.ElapsedSeconds
+            end
         elseif action == "channelEnter" and self.phase == "channel" then
             local ch = self._T.channels[self.selectedChannel]
             if ch == nil then self:Notice("접속 가능한 서버를 선택해주세요.", "") return end
@@ -653,24 +689,23 @@ script LoginFlow extends Logic
             if not _CharacterPersistence:IsCharacterListReady() then self:Notice("캐릭터 목록을 불러오는 중입니다. 잠시 후 다시 시도해주세요.", "") return end
             local comp = self:SelectComponent()
             if comp == nil or comp:FirstEmptySlot() == 0 then self:Notice("캐릭터 슬롯이 가득 찼습니다.", "") return end
-            self:ShowPhase("create", true)
+            self:ShowPhase("job", true)
             local panel = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
             panel:GetComponent("script.CharacterSettingComponent"):Init()
             self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName").TextGUIRendererInputComponent.Text = ""
-            self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok").ButtonComponent.Enable = true
-        elseif action == "createNext" and self.phase == "create" then
-            local name = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName").TextGUIRendererInputComponent.Text
-            if name == nil or string.match(name, "^%s*$") ~= nil then
-                self:Notice("캐릭터 이름을 입력해주세요.", "")
-                return
-            end
-            self:ShowPhase("job", false)
-            self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok").ButtonComponent.Enable = true
         elseif action == "createNext" and self.phase == "job" then
+            local panel = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
+            local setting = panel:GetComponent("script.CharacterSettingComponent")
+            if setting.jobIdx <= 0 then self:Notice("먼저 직업을 선택해주세요.", "") return end
+            self:ShowPhase("create", false)
+            setting:UpdateAllText()
+            setting:ApplyCostume()
+            setting:UpdateCompleteButtonState()
+        elseif action == "createNext" and self.phase == "create" then
             local e = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok")
             e:GetComponent("script.CreateCharacterok"):Submit()
         elseif action == "cancelCreate" then
-            if self.phase == "job" then self:ShowPhase("create", false) else self:ShowCharacters() end
+            if self.phase == "create" then self:ShowPhase("job", false) else self:ShowCharacters() end
         elseif action == "delete" and self.phase == "character" then
             local comp = self:SelectComponent()
             local data = comp:GetSlotData(comp.selectedSlot)
@@ -680,8 +715,8 @@ script LoginFlow extends Logic
         elseif action == "prevPage" and self.phase == "character" then self:SelectComponent():MovePage(-1)
         elseif action == "nextPage" and self.phase == "character" then self:SelectComponent():MovePage(1)
         elseif action == "previous" then
-            if self.phase == "job" then self:ShowPhase("create", false)
-            elseif self.phase == "create" then self:ShowCharacters()
+            if self.phase == "create" then self:ShowPhase("job", false)
+            elseif self.phase == "job" then self:ShowCharacters()
             elseif self.phase == "character" then self:ShowPhase("channel", true) self:RequestChannels()
             elseif self.phase == "channel" then self:ShowPhase("world", false)
             elseif self.phase == "world" then self:ShowPhase("login", true) end
@@ -718,15 +753,32 @@ script LoginFlow extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method void SetCharacterScroll(number progress)
+        -- Keep the original artwork fixed; reveal paper continuously below its top roller.
+        local t = math.max(0, math.min(1, progress))
+        local eased = 1 - (1 - t) * (1 - t) * (1 - t)
+        local height = 15 + 123 * eased
+        local base = "Stage/CharacterSelectGroup/SelectBackground/InfoScroll/"
+        local reveal = self:UI(base .. "Reveal")
+        if not isvalid(reveal) then return end
+        reveal.UITransformComponent.RectSize = Vector2(129, height)
+        reveal.UITransformComponent.anchoredPosition = Vector2(0, (153 - height) / 2)
+        reveal:GetChildByName("Art").UITransformComponent.anchoredPosition = Vector2(0, (height - 153) / 2)
+        self:UI(base .. "Roller").UITransformComponent.anchoredPosition = Vector2(0, 69 - height)
+    end
+
+    @ExecSpace("ClientOnly")
     method void SelectionChanged()
+        -- Late list updates must not restart the scroll during an approved entry attempt.
+        if self.phase == "character" and self.busy then return end
         -- 선택한 캐릭터의 이름과 직업을 원본 두루마리에 표시한다.
         local comp = self:SelectComponent()
         if comp == nil then return end
         local data = comp:GetSlotData(comp.selectedSlot)
-        self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll", data ~= "")
         local e = self:UI("Stage/CharacterSelectGroup/SelectBackground/EnterButton")
         if isvalid(e) then e.ButtonComponent.Enable = data ~= "" end
         if data == "" then
+            self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll", false)
             self._T.infoSelection = nil
             self._T.infoTime = 0
             self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", false)
@@ -741,18 +793,26 @@ script LoginFlow extends Logic
         self:Text("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", levelText .. "\n\n" .. (level ~= nil and _UIMyInfoManager:GetClassNameForLevel(tonumber(parts[8]) or 1, level) or "접속 후 갱신") .. "\n\n전투력 " .. powerText)
         local slot = _EntityService:GetEntityByPath(comp:UISlotPath(comp:UISlotOfIndex(comp.selectedSlot)))
         local paper = self:UI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll")
+        local info = self:UI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info")
+        if isvalid(info) then _UILogic:SetSiblingIndex(info.UITransformComponent,1000000) end
         if isvalid(slot) and isvalid(paper) then
             paper.UITransformComponent.anchoredPosition = Vector2(slot.UITransformComponent.anchoredPosition.x, 113.5)
-            local stamp = tostring(comp.selectedSlot) .. ":" .. data
+            -- 정보·외형의 늦은 갱신은 같은 캐릭터의 펼치기를 다시 시작하지 않는다.
+            local stamp = tostring(comp.selectedSlot) .. ":" .. tostring(parts[1])
             if self._T.infoSelection ~= stamp then
                 self._T.infoSelection = stamp
                 _UIAudio:Play("CharSelect")
                 _UIAudio:Play("RollDown")
-                self._T.infoTime = 0.32
+                self._T.infoTime = 0.4
                 self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info", false)
-                paper:GetComponent("script.LoginSpriteAnimation"):Replay()
+                self:SetCharacterScroll(0)
                 log("[LoginFlow] character scroll opened slot=" .. tostring(comp.selectedSlot))
+            elseif (self._T.infoTime or 0) <= 0 then
+                self:SetCharacterScroll(1)
+                self:EnableUI("Stage/CharacterSelectGroup/SelectBackground/InfoScroll/Info",true)
             end
+            -- 접힌 상태를 먼저 준비한 뒤 표시해 첫 프레임의 완성된 창 노출을 막는다.
+            paper.Enable = true
         end
     end
 
@@ -927,7 +987,7 @@ script LoginFlow extends Logic
         -- 책 UI도 맵과 같은 1초 동안 검게 덮어 전환 레이어 위에 남지 않게 한다.
         if not self._T.entryTransition then return end
         self._T.entryFadeElapsed = 0
-        self:UI("EntryFade").SpriteGUIRendererComponent:SetAlpha(0)
+        self:UI("EntryFade").PolygonGUIRendererComponent.Color = Color(0,0,0,0)
         self:EnableUI("EntryFade", true)
         log("[LoginFlow] entry fade out started")
     end
@@ -941,7 +1001,7 @@ script LoginFlow extends Logic
         -- 완전히 어두워진 경계에서만 책 화면을 내리고 도착 맵을 드러낸다.
         if not self._T.entryTransition then return end
         self._T.entryFadeElapsed = nil
-        self:UI("EntryFade").SpriteGUIRendererComponent:SetAlpha(1)
+        self:UI("EntryFade").PolygonGUIRendererComponent.Color = Color(0,0,0,1)
         self._T.entryFadeReady = true
         log("[LoginFlow] entry fade in started")
     end
@@ -977,6 +1037,8 @@ script LoginFlow extends Logic
         self._T.entryFadeElapsed = nil
         self._T.entryFadeReady = false
         self:EnableUI("EntryFade", false)
+        local selection = self:SelectComponent()
+        if self.phase == "character" and selection ~= nil then selection:RefreshPage() end
         self:Notice(reason, "")
     end
 
@@ -1000,6 +1062,7 @@ script LoginFlow extends Logic
                 if isvalid(cover) then
                     cover.UITransformComponent.RectSize = size
                     cover.UITransformComponent.anchoredPosition = center
+                    self:FitOpaqueCover(cover,size)
                 end
             end
         end
@@ -1017,7 +1080,10 @@ script LoginFlow extends Logic
         local a = _UILogic:ScreenToLocalUIPosition(Vector2.zero,group.UITransformComponent)
         local b = _UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight),group.UITransformComponent)
         cover.UITransformComponent.anchoredPosition = Vector2((a.x+b.x)/2,(a.y+b.y)/2)
-        cover.UITransformComponent.UIScale = Vector3((math.abs(b.x-a.x)+128)/4096,(math.abs(b.y-a.y)+128)/4096,1)
+        -- Keep the opaque sprite at unit scale; size it from the actual viewport with edge overscan.
+        cover.UITransformComponent.UIScale = Vector3(1,1,1)
+        cover.UITransformComponent.RectSize = Vector2(math.abs(b.x-a.x)+128,math.abs(b.y-a.y)+128)
+        self:FitOpaqueCover(cover,cover.UITransformComponent.RectSize)
     end
 
     @ExecSpace("ClientOnly")
@@ -1028,4 +1094,19 @@ script LoginFlow extends Logic
         self:UpdateFullScreenCover(0)
         log("[ScreenCover] viewport fully covered")
     end
+    @ExecSpace("ClientOnly")
+    method void FitOpaqueCover(Entity cover, Vector2 size)
+        -- Polygon fill has no transparent sprite border and covers every viewport aspect ratio.
+        local renderer=cover.PolygonGUIRendererComponent
+        if not isvalid(renderer) then return end
+        self._T.coverSizes=self._T.coverSizes or {}
+        local signature=tostring(size.x)..":"..tostring(size.y)
+        if self._T.coverSizes[cover.Id]==signature then return end
+        local x,y=size.x/2,size.y/2
+        renderer.Points:Clear()
+        renderer.Points:AddRange({Vector2(-x,-y),Vector2(x,-y),Vector2(x,y),Vector2(-x,y)})
+        self._T.coverSizes[cover.Id]=signature
+        log("[ScreenCover] solid bounds="..signature.." layer="..cover.Name)
+    end
+
 end

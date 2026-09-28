@@ -1,0 +1,674 @@
+@Logic
+script CosmeticExchange extends Logic
+    property boolean opened = false
+    property string shardRuid = "a5f0c36308b84847a8c573e3cf3e849f"
+
+    method string Normalize(string value)
+        local result=string.gsub(value,"%s+","")
+        return string.lower(result)
+    end
+
+    method boolean IsShard(string item)
+        return string.match(item or "","|cosmetic_shard")~=nil
+    end
+
+    method string ShardItem(integer count)
+        if count<1 or count>999 then return "" end
+        return "코디 조각|"..self.shardRuid.."|0|0|0|0|"..tostring(count).."|cosmetic_shard"
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer Shards()
+        local total=0
+        for i=1,128 do local s=_UIEquipInventoryManager:GetTabItem("etc",i) if self:IsShard(s) then total=total+_UIEquipInventoryManager:ParseCount(s) end end
+        return total
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsDismantlable(string item)
+        return item~="" and not _UIEquipInventoryManager:IsItemLocked(item) and (string.find(item,"|deco|",1,true)~=nil or _UIEquipInventoryManager:IsHairOrFaceItem(item))
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer ShardYield(string item)
+        -- Creation/tutorial cosmetics are removable but never generate free shards.
+        return _UIEquipInventoryManager:IsStarterCosmetic(item) and 0 or 1
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Dismantle(table selected)
+        local inv=_UIEquipInventoryManager
+        local count=0
+        local reward=0
+        local seen={}
+        for _,r in ipairs(selected) do
+            local key=r.tab..":"..tostring(r.slot)
+            if seen[key] or (r.tab~="equip" and r.tab~="decorate") or r.slot<1 or r.slot>128 then return false end
+            if inv:GetTabItem(r.tab,r.slot)~=r.item or not self:IsDismantlable(r.item) then return false end
+            seen[key]=true count=count+1 reward=reward+self:ShardYield(r.item)
+        end
+        if count==0 then return false end
+        local room=0
+        for i=1,128 do local s=inv:GetTabItem("etc",i) if s=="" then room=room+999 elseif self:IsShard(s) then room=room+math.max(0,999-inv:ParseCount(s)) end end
+        if room<reward then _UIToast:ShowMessage("기타 인벤토리에 조각을 보관할 공간이 필요합니다.") return false end
+        -- Validation is complete. Consume and credit together before any UI, sound, or save call can yield.
+        for _,r in ipairs(selected) do inv:SetTabItem(r.tab,r.slot,"") end
+        local left=reward
+        for pass=1,2 do
+            for i=1,128 do
+                local s=inv:GetTabItem("etc",i)
+                if (pass==1 and self:IsShard(s)) or (pass==2 and s=="") then
+                    local old=s=="" and 0 or inv:ParseCount(s)
+                    local add=math.min(left,math.max(0,999-old))
+                    if add>0 then inv:SetTabItem("etc",i,s=="" and self:ShardItem(old+add) or inv:WithStackCount(s,old+add)) left=left-add end
+                    if left==0 then break end
+                end
+            end
+            if left==0 then break end
+        end
+        inv:CancelInvenDrag() inv:RefreshUI() inv:HideTooltip()
+        _CharacterPersistence:MarkDirty("cosmetic_dismantle")
+        _AcquisitionLog:Push("코디 조각 +"..tostring(reward),false)
+        log("[CosmeticExchange] dismantled="..tostring(count))
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Redeem(string key, integer index)
+        local row=_CosmeticBoxCatalog:RowAt(key,index)
+        if not _CosmeticBoxCatalog:Allowed(row,_UIMyInfoManager:GetSelectedCharacterJobIdx()) then return false end
+        if self:Shards()<30 then _UIToast:ShowMessage("코디 조각 30개가 필요합니다.") return false end
+        local inv=_UIEquipInventoryManager
+        local tab=(key=="hair" or key=="face") and "equip" or "decorate"
+        local empty=0
+        for i=1,128 do if inv:GetTabItem(tab,i)=="" then empty=i break end end
+        if empty==0 then _UIToast:ShowMessage("받을 아이템을 보관할 인벤토리 빈칸이 필요합니다.") return false end
+        local result=_CosmeticBoxCatalog:RewardItem(row)
+        if result=="" then return false end
+        local left=30
+        for i=1,128 do
+            local s=inv:GetTabItem("etc",i)
+            if self:IsShard(s) then
+                local count=inv:ParseCount(s)
+                local take=math.min(left,count)
+                inv:SetTabItem("etc",i,inv:WithStackCount(s,count-take))
+                left=left-take
+                if left==0 then break end
+            end
+        end
+        inv:SetTabItem(tab,empty,result)
+        inv:CancelInvenDrag() inv:RefreshUI() inv:HideTooltip()
+        _CharacterPersistence:MarkDirty("cosmetic_redeem")
+        _AcquisitionLog:Push(row.name.." +1",false)
+        log("[CosmeticExchange] redeemed="..row.ruid.." cost=30")
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string child)
+        return _EntityService:GetEntityByPath("/ui/CosmeticExchangeGroup/Modal/Panel/"..child)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        return self.opened or _UtilLogic.ElapsedSeconds<(self._T.closedUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        local e=_EntityService:GetEntityByPath(path)
+        if not isvalid(e) then return end
+        local h=e:ConnectEvent(ButtonClickEvent,callback)
+        table.insert(self._T.links,{entity=e,eventType=ButtonClickEvent,listener=h})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self.opened=false self._T.links={}
+        local base="/ui/CosmeticExchangeGroup/Modal/Panel/"
+        self:Bind("/ui/DefaultGroup/InvenWindow/CosmeticExchangeButton",function() self:Open() end)
+        self:Bind("/ui/DefaultGroup/DecoWindow/CosmeticExchangeButton",function() self:Open() end)
+        self:Bind(base.."Close",function() self:Close() end)
+        self:Bind(base.."SearchButton",function() self:Search() end)
+        self:Bind(base.."ShopTab",function() self:SetMode("shop") end)
+        self:Bind(base.."SellTab",function() self:SetMode("sell") end)
+        self:Bind(base.."RedeemTab",function() self:SetMode("redeem") end)
+        self:Bind(base.."DismantleTab",function() self:SetMode("dismantle") end)
+        self:Bind(base.."Previous",function() self:Page(-1) end)
+        self:Bind(base.."Next",function() self:Page(1) end)
+        self:Bind(base.."SelectPage",function() self:SelectPage() end)
+        self:Bind(base.."SellTools/SelectAll",function() self:SelectAllSales() end)
+        self:Bind(base.."SellTools/SellBelow",function() self:AskSellBelow() end)
+        self:Bind(base.."Action",function() self:Ask() end)
+        self:Bind(base.."Confirmation/Yes",function() self:Confirm() end)
+        self:Bind(base.."Confirmation/No",function() self:CancelConfirm() end)
+        for i=0,14 do local n=i self:Bind(base.."Categories/Cat"..tostring(i),function() if self._T.pending then return end if self._T.mode=="sell" then self._T.sellCategory=n else self._T.category=n end self:UI("Search").TextGUIRendererInputComponent.Text="" self:Search() end) end
+        for i=1,12 do
+            local n=i
+            self:Bind(base.."Results/Card"..tostring(i),function() self:Select(n) end)
+            local card=self:UI("Results/Card"..tostring(i))
+            local hover=card:ConnectEvent(ButtonStateChangeEvent,function(event)
+                if event.state==ButtonState.Hover then self:ShowItemTooltip(n)
+                elseif event.state==ButtonState.Normal then self:UI("ItemTooltip").Enable=false end
+            end)
+            table.insert(self._T.links,{entity=card,eventType=ButtonStateChangeEvent,listener=hover})
+        end
+        local quantity=self:UI("Confirmation/Quantity")
+        local quantityChanged=quantity:ConnectEvent(TextInputValueChangeEvent,function() self:UpdatePurchaseConfirmation() end)
+        table.insert(self._T.links,{entity=quantity,eventType=TextInputValueChangeEvent,listener=quantityChanged})
+        local input=self:UI("Search")
+        local h=input:ConnectEvent(TextInputSubmitEvent,function() self:Search() end)
+        table.insert(self._T.links,{entity=input,eventType=TextInputSubmitEvent,listener=h})
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,self.OnKey)
+        log("[CosmeticExchange] ready: shop, dismantle 1:1, redeem 30:1, meso pouch 3:1")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+        for _,l in ipairs(self._T.links or {}) do if isvalid(l.entity) then l.entity:DisconnectEvent(l.eventType,l.listener) end end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open()
+        if self.opened or _LoginFlow.phase~="ingame" or _EnhancementManager:RequireCubeChoice() then return end
+        if _GameSystemMenu:BlocksInput() or _UIItemDiscardManager.pending then return end
+        _UIEquipInventoryManager:CancelEquipDrag() _UIEquipInventoryManager:CancelInvenDrag() _UIEquipInventoryManager:HideTooltip()
+        self.opened=true self._T.category=self._T.category or 0
+        _EntityService:GetEntityByPath("/ui/CosmeticExchangeGroup/Modal").Enable=true
+        local p=_UserService.LocalPlayer
+        if isvalid(p) then self._T.controller=p.PlayerControllerComponent.Enable p.PlayerControllerComponent.Enable=false p.MovementComponent:Stop() end
+        self:CancelConfirm() self:SetMode("shop")
+        _UIAudio:Play("MenuUp")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        if not self.opened then return end
+        self.opened=false self._T.scanning=nil self._T.pending=nil
+        self._T.closedUntil=_UtilLogic.ElapsedSeconds+0.2
+        _EntityService:GetEntityByPath("/ui/CosmeticExchangeGroup/Modal").Enable=false
+        local p=_UserService.LocalPlayer
+        if isvalid(p) and self._T.controller~=nil and _LoginFlow.phase=="ingame" then p.PlayerControllerComponent.Enable=self._T.controller end
+        self._T.controller=nil
+        _UIAudio:Play("MenuDown")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        -- A remappable shop action must not consume typing or key-setting input.
+        if _KeySettingManager:GetFuncForKeyEnum(event.key) == "shop" then
+            if _KeySettingManager:IsWindowOpen() or (not self.opened and _KeySettingManager:IsCapturingKey()) or _MapleHUDManager:IsChatTyping() or _SocialManager:BlocksInput() or _AppearanceColorPicker:BlocksInput() then return end
+            for _, field in ipairs({"Search", "Quantity", "SellTools/MaxStars", "Confirmation/Quantity"}) do
+                local input = self:UI(field)
+                if isvalid(input) and input.EnabledInHierarchy and isvalid(input.TextGUIRendererInputComponent) and input.TextGUIRendererInputComponent.IsFocused then return end
+            end
+            if self._T.pending then return end
+            if self.opened then self:Close() else self:Open() end
+            return
+        end
+        if not self.opened then return end
+        if event.key==KeyboardKey.Tab and not self._T.pending then
+            local modes={shop="sell",sell="redeem",redeem="dismantle",dismantle="shop"}
+            self:SetMode(modes[self._T.mode] or "shop")
+            _UIAudio:Play("Tab")
+        elseif event.key==KeyboardKey.Escape then
+            if self._T.pending then self:CancelConfirm() else self:Close() end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetMode(string mode)
+        if self._T.pending then return end
+        self._T.mode=mode self._T.selected={} self._T.choice=nil
+        self._T.sellCategory=self._T.sellCategory or 0
+        self:UI("Search").TextGUIRendererInputComponent.Text=""
+        self:UI("Quantity").TextGUIRendererInputComponent.Text="1"
+        self._T.lastClickIndex=nil
+        self:UI("ItemTooltip").Enable=false
+        self:Search()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Search()
+        if not self.opened or self._T.pending then return end
+        self._T.rows={} self._T.page=1 self._T.choice=nil self._T.selected={}
+        self._T.lastClickIndex=nil self:UI("ItemTooltip").Enable=false
+        local query=self:Normalize(self:UI("Search").TextGUIRendererInputComponent.Text or "")
+        self._T.query=query
+        local cats=_CosmeticBoxCatalog:NewCategories()
+        local chosen=cats[self._T.category or 0]
+        if self._T.mode=="shop" then
+            self._T.scanning=nil
+            self._T.rows={{key="equipment_box",name="장비 상자 · 20,000 메소",ruid="90d3412612004466b328850446cb1d68"},{key="meso_pouch",name="메소주머니 · 조각 3개",ruid="17ae6a22966f45738bb92fb97ecc3e9d"}}
+        elseif self._T.mode=="sell" then
+            self._T.scanning=nil
+            for i=1,128 do
+                local item=_UIEquipInventoryManager:GetTabItem("equip",i)
+                if self:CanSell(item) and self:MatchesSellCategory(item) and string.find(self:Normalize(_UIEquipInventoryManager:ParseName(item)),query,1,true) then
+                    table.insert(self._T.rows,{item=item,tab="equip",slot=i,name=_UIEquipInventoryManager:ParseName(item),ruid=_UIEquipInventoryManager:ParseRUID(item)})
+                end
+            end
+        elseif self._T.mode=="dismantle" then
+            self._T.scanning=nil
+            for _,tab in ipairs({"equip","decorate"}) do
+                for i=1,128 do
+                    local item=_UIEquipInventoryManager:GetTabItem(tab,i)
+                    local name=_UIEquipInventoryManager:ParseName(item)
+                    if self:IsDismantlable(item) and string.find(self:Normalize(name),query,1,true) then
+                        table.insert(self._T.rows,{item=item,tab=tab,slot=i,name=name,ruid=_UIEquipInventoryManager:ParseRUID(item)})
+                    end
+                end
+            end
+        else
+            self._T.scanning={cats=chosen and {chosen} or cats,cat=1,part=1,index=0,job=_UIMyInfoManager:GetSelectedCharacterJobIdx()}
+        end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        if not self.opened then return end
+        if _LoginFlow.phase~="ingame" then self:Close() return end
+        local s=self._T.scanning
+        if s==nil or self._T.drawing then return end
+        -- Process one data chunk per frame so name searches never freeze the whole wardrobe UI.
+        local c=s.cats[s.cat]
+        if c==nil then self._T.scanning=nil self:Draw() log("[CosmeticExchange] search results="..tostring(#self._T.rows)) return end
+        local raw=_CosmeticBoxCatalog:ReadData(c.key,s.part)
+        for line in string.gmatch(raw,"[^\r\n]+") do
+            if self._T.scanning~=s then return end
+            s.index=s.index+1
+            local name=string.match(line,"^[^\t]+\t([^\t]+)") or ""
+            if string.find(self:Normalize(name),self._T.query,1,true) then
+                local row=_CosmeticBoxCatalog:ParseRow(line)
+                if _CosmeticBoxCatalog:Allowed(row,s.job) then row.key=c.key row.index=s.index table.insert(self._T.rows,row) end
+            end
+        end
+        if self._T.scanning~=s then return end
+        s.part=s.part+1
+        if s.part>c.parts then s.cat=s.cat+1 s.part=1 s.index=0 end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Page(integer delta)
+        if self._T.scanning or self._T.pending then return end
+        local pages=math.max(1,math.ceil(#self._T.rows/12))
+        self._T.page=math.max(1,math.min(pages,self._T.page+delta)) self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Select(integer visual)
+        if self._T.scanning or self._T.pending then return end
+        local index=(self._T.page-1)*12+visual
+        if self._T.rows[index]==nil then return end
+        local multiple=self._T.mode=="dismantle" or self._T.mode=="sell"
+        if multiple then self._T.selected[index]=not self._T.selected[index] else self._T.choice=index end
+        local now=_UtilLogic.ElapsedSeconds
+        local double=self._T.lastClickIndex==index and now-(self._T.lastClickAt or -10)<0.35
+        self._T.lastClickIndex=index self._T.lastClickAt=now
+        self:Draw()
+        self._T.lastClickAt=_UtilLogic.ElapsedSeconds
+        if double and not multiple then self._T.lastClickIndex=nil self:Ask() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        if self._T.drawing then self._T.drawAgain=true return end
+        self._T.drawing=true
+        local rows=self._T.rows or {}
+        local scanning=self._T.scanning~=nil
+        local dismantle=self._T.mode=="dismantle"
+        local buying=self._T.mode=="shop"
+        local selling=self._T.mode=="sell"
+        local multiple=dismantle or selling
+        self:UI("SelectPage").Enable=multiple and not scanning
+        self:UI("SellTools").Enable=selling
+        self:UI("SelectPage").TextGUIRendererComponent.Text="현재 페이지 전체선택"
+        self:UI("Quantity").Enable=buying
+        self:UI("QuantityLabel").Enable=buying
+        self:UI("Header/Balance").TextGUIRendererComponent.Text="조각 "..tostring(self:Shards()).." · ".._UIEquipInventoryManager:FormatMeso(_UIEquipInventoryManager.meso).." 메소"
+        self:UI("ShopTab").SpriteGUIRendererComponent.Color=buying and Color(1,0.83,0.5,1) or Color(0.85,0.86,0.88,1)
+        self:UI("RedeemTab").SpriteGUIRendererComponent.Color=self._T.mode=="redeem" and Color(1,0.83,0.5,1) or Color(0.85,0.86,0.88,1)
+        self:UI("DismantleTab").SpriteGUIRendererComponent.Color=dismantle and Color(1,0.83,0.5,1) or Color(0.85,0.86,0.88,1)
+        self:UI("SellTab").SpriteGUIRendererComponent.Color=selling and Color(1,0.83,0.5,1) or Color(0.85,0.86,0.88,1)
+        self:UI("Categories").Enable=not dismantle and not buying
+        self:UI("Search").Enable=not buying
+        self:UI("SearchButton").Enable=not buying
+        local categories=selling and self:SellCategories() or _CosmeticBoxCatalog:NewCategories()
+        for i=0,14 do
+            local button=self:UI("Categories/Cat"..tostring(i))
+            local category=selling and categories[i+1] or categories[i]
+            button.Enable=not selling or i<#categories
+            button.TextGUIRendererComponent.Text=(not selling and i==0) and "전체" or (category and category.name or "기타")
+            button.SpriteGUIRendererComponent.Color=i==(selling and self._T.sellCategory or self._T.category) and Color(1,0.85,0.58,1) or Color.white
+        end
+        local count=0
+        for _,selected in pairs(self._T.selected or {}) do if selected then count=count+1 end end
+        self:UI("Action").TextGUIRendererComponent.Text=dismantle and (tostring(count).."개 분해") or (buying and "선택한 아이템 구매" or "조각 30개로 교환")
+        self:UI("Hint").TextGUIRendererComponent.Text=dismantle and "분해할 코디를 선택하세요. 착용 중이거나 잠긴 아이템은 표시하지 않습니다.\n기본 지급 코디는 조각 0개, 나머지는 1개 · 확인 후 분해됩니다." or "이름을 검색하고 원하는 코디를 선택하세요.\n공용 무기와 현재 직업에 맞는 무기만 표시합니다."
+        if self._T.mode=="sell" then
+            local total=0
+            for index,value in pairs(self._T.selected) do if value and rows[index] then total=total+self:SellPrice(rows[index].item) end end
+            self:UI("Action").TextGUIRendererComponent.Text=tostring(count).."개 판매 · ".._UIEquipInventoryManager:FormatMeso(total).." 메소"
+            self:UI("Hint").TextGUIRendererComponent.Text="판매가: 0성부터 제작 기댓값의 70% (상자 10,000메소 기준)\n일괄 판매는 현재 분류·검색의 모든 페이지에 적용됩니다."
+        end
+        if buying then self:UI("Hint").TextGUIRendererComponent.Text="장비 상자 1개: 20,000 메소 · 메소주머니 1개: 코디 조각 3개\n메소주머니 사용 시 10,000~100,000 메소를 균등 추첨합니다." end
+        self:UI("Status").TextGUIRendererComponent.Text=scanning and "코디 목록을 검색하고 있습니다…" or (tostring(#rows).."개 · "..tostring(self._T.page or 1).." / "..tostring(math.max(1,math.ceil(#rows/12))))
+        self:UI("Action").ButtonComponent.Enable=not scanning and (multiple and count>0 or not multiple and self._T.choice~=nil)
+        for i=1,12 do
+            local index=((self._T.page or 1)-1)*12+i
+            local row=rows[index]
+            local path="Results/Card"..tostring(i)
+            local e=self:UI(path) e.Enable=not scanning and row~=nil
+            if row~=nil and not scanning then
+                e.SpriteGUIRendererComponent.Color=(multiple and self._T.selected[index] or not multiple and self._T.choice==index) and Color(1,0.86,0.6,1) or Color.white
+                self:UI(path.."/Icon").SpriteGUIRendererComponent.ImageRUID=buying and row.ruid or "thumbnail://"..row.ruid
+                self:UI(path.."/Name").TextGUIRendererComponent.Text=selling and (row.name.." · "..tostring(_UIEquipInventoryManager:ParseStars(row.item)).."성") or row.name
+                self:UI(path.."/Selected").Enable=multiple and self._T.selected[index]==true
+            end
+        end
+        self._T.drawing=false
+        if self._T.drawAgain then self._T.drawAgain=false self:Draw() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Ask()
+        if self._T.scanning or self._T.pending then return end
+        self:UI("Confirmation/Quantity").Enable=self._T.mode=="shop"
+        self:UI("Confirmation/QuantityLabel").Enable=self._T.mode=="shop"
+        local selected={}
+        local message=""
+        if self._T.mode=="dismantle" then
+            for index,value in pairs(self._T.selected) do if value then table.insert(selected,self._T.rows[index]) end end
+            if #selected==0 then return end
+            self._T.pending={mode="dismantle",rows=selected}
+            local reward=0 for _,row in ipairs(selected) do reward=reward+self:ShardYield(row.item) end
+            message=tostring(#selected).."개의 코디를 분해하고 조각 "..tostring(reward).."개를 받을까요?\n분해한 아이템은 되돌릴 수 없습니다."
+        elseif self._T.mode=="sell" then
+            for index,value in pairs(self._T.selected) do if value and self._T.rows[index] then table.insert(selected,self._T.rows[index]) end end
+            self:AskSellRows(selected,"선택한 장비")
+            return
+        elseif self._T.mode=="shop" then
+            local row=self._T.rows[self._T.choice or 0] if row==nil then return end
+            local count=math.floor(tonumber(self:UI("Quantity").TextGUIRendererInputComponent.Text) or 0)
+            if count<1 or count>999 then _UIToast:ShowMessage("구매 수량은 1~999개로 입력해주세요.") return end
+            self._T.pending={mode="shop",key=row.key,count=count,name=row.name}
+            self:UI("Confirmation/Quantity").TextGUIRendererInputComponent.Text=tostring(count)
+            local price=row.key=="equipment_box" and (_UIEquipInventoryManager:FormatMeso(20000*count).." 메소") or (tostring(count*3).." 조각")
+            message=row.name.."\n"..tostring(count).."개를 "..price.."로 구매할까요?"
+        else
+            local row=self._T.rows[self._T.choice or 0] if row==nil then return end
+            self._T.pending={mode="redeem",key=row.key,index=row.index}
+            message=row.name.."\n코디 조각 30개로 교환할까요?"
+        end
+        self:UI("ItemTooltip").Enable=false
+        self:UI("Confirmation/Message").TextGUIRendererComponent.Text=message
+        self:UI("Confirmation").Enable=true _UIAudio:Play("DlgNotice")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePurchaseConfirmation()
+        -- 입력 중 총 비용을 갱신하고 실제 구매 직전에 수량을 다시 검증한다.
+        local p=self._T.pending
+        if p==nil or p.mode~="shop" then return end
+        local raw=self:UI("Confirmation/Quantity").TextGUIRendererInputComponent.Text
+        local count=tonumber(raw)
+        if not string.match(raw,"^%d+$") or count==nil or count<1 or count>999 then
+            self:UI("Confirmation/Message").TextGUIRendererComponent.Text=p.name.."\n구매 수량을 1~999개로 입력해주세요."
+            return
+        end
+        local price=p.key=="equipment_box" and (_UIEquipInventoryManager:FormatMeso(20000*count).." 메소") or (tostring(count*3).." 조각")
+        self:UI("Confirmation/Message").TextGUIRendererComponent.Text=p.name.."\n"..tostring(count).."개를 "..price.."로 구매할까요?"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CancelConfirm()
+        self._T.pending=nil self:UI("Confirmation").Enable=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Confirm()
+        local p=self._T.pending if p==nil then return end
+        if p.mode=="shop" then
+            local raw=self:UI("Confirmation/Quantity").TextGUIRendererInputComponent.Text
+            local count=tonumber(raw)
+            if not string.match(raw,"^%d+$") or count==nil or count<1 or count>999 then
+                _UIToast:ShowMessage("구매 수량은 1~999개로 입력해주세요.") return
+            end
+            p.count=count
+            self:UI("Quantity").TextGUIRendererInputComponent.Text=tostring(count)
+        end
+        self._T.pending=nil self:UI("Confirmation").Enable=false
+        local ok=false
+        if p.mode=="sell" then ok=self:SellMany(p.rows) elseif p.mode=="dismantle" then ok=self:Dismantle(p.rows) elseif p.mode=="shop" then ok=self:Purchase(p.key,p.count) else ok=self:Redeem(p.key,p.index) end
+        if not ok then _UIToast:ShowMessage("보유 아이템과 조각, 인벤토리 공간을 확인해주세요.") end
+        self:Search()
+    end
+    @ExecSpace("ClientOnly")
+    method void ShowItemTooltip(integer visual)
+        -- Keep shop descriptions in this modal group so they remain above its dimmer.
+        if not self.opened or self._T.pending or self._T.scanning then return end
+        local row=(self._T.rows or {})[((self._T.page or 1)-1)*12+visual]
+        if row==nil then return end
+        local desc=""
+        if self._T.mode=="shop" then
+            desc=row.key=="equipment_box" and "원하는 부위를 선택하여 0~30성 장비 획득\n강화된 장비도 등장합니다.\n1개당 20,000 메소" or "사용 시 10,000~100,000 메소 획득\n범위 안의 정수 금액을 균등 추첨합니다.\n1개당 코디 조각 3개"
+        elseif self._T.mode=="sell" then
+            desc="판매 가격: "..tostring(self:SellPrice(row.item)).." 메소\n현재 스타포스 "..tostring(_UIEquipInventoryManager:ParseStars(row.item)).."성\n0성부터 강화·실패·파괴 재제작 비용의 기댓값 × 70%\n계산용 상자 가격: 10,000 메소 (소수점 버림)\n판매 후 복구할 수 없습니다."
+        elseif self._T.mode=="dismantle" then
+            desc="분해 시 코디 조각 "..tostring(self:ShardYield(row.item)).."개\n분해한 아이템은 되돌릴 수 없습니다."
+        else
+            desc="외형을 변경하는 코디 아이템입니다.\n교환 비용: 코디 조각 30개"
+        end
+        local tooltip=self:UI("ItemTooltip")
+        self:UI("ItemTooltip/Title").TextGUIRendererComponent.Text=row.name
+        self:UI("ItemTooltip/Description").TextGUIRendererComponent.Text=desc
+        tooltip.Enable=true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanSell(string item)
+        -- Sell unequipped equipment only; locked/cosmetic items never enter this list.
+        local m=_UIEquipInventoryManager
+        return item~="" and not m:IsItemLocked(item) and not m:IsHairOrFaceItem(item) and not string.find(item,"|deco|",1,true) and m:ParseSlotIdx(item)>=3 and m:ParseSlotIdx(item)<=27
+    end
+    @ExecSpace("ClientOnly")
+    method integer SellPrice(string item)
+        -- 소수 메소는 버리고, 표시·단일·일괄 판매 모두 같은 가격을 사용한다.
+        return math.floor(self:ExpectedCraftCost(item) * 0.7)
+    end
+
+    @ExecSpace("ClientOnly")
+    method number ExpectedCraftCost(string item)
+        -- 0성 장비 1개=10,000. 실패는 재시도, 파괴는 새 장비로 0성부터 재제작한다.
+        -- E[n+1] = E[n] + (회당비용 + 파괴확률*E[n]) / 성공확률.
+        local expected = 10000
+        local stars = math.max(0, math.min(_CashShopManager:GetMaxStars(item), _UIEquipInventoryManager:ParseStars(item)))
+        for level=0,stars-1 do
+            local band = _EnhancementManager:GetItemStarforceBand(item, level)
+            local success = band.success / 100
+            local destroy = band.destroy / 100
+            expected = expected + (band.cost + destroy * expected) / success
+        end
+        return expected
+    end
+    @ExecSpace("ClientOnly")
+    method boolean Sell(table row)
+        -- Keep the single-item entry point on the same validated batch path.
+        if row==nil then return false end
+        return self:SellMany({row})
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean SellMany(table rows)
+        -- Validate every snapshot before removing anything; stale/locked/duplicate targets cancel the whole sale.
+        if rows==nil or #rows==0 then return false end
+        local m=_UIEquipInventoryManager
+        local e=_EnhancementManager
+        local seen={} local price=0
+        for _,row in ipairs(rows) do
+            if row.tab~="equip" or row.slot==nil or row.slot<1 or row.slot>128 or row.slot~=math.floor(row.slot) or seen[row.slot] then return false end
+            if m:GetTabItem("equip",row.slot)~=row.item or not self:CanSell(row.item) then return false end
+            if e.enhanceTargetEquipSlot==0 and (e.enhanceTargetSrcTab=="equip" or e.enhanceTargetSrcTab=="") and e.enhanceTargetInvenIdx==row.slot and e:HasEnhanceTarget() then
+                _UIToast:ShowMessage("강화창의 장비를 먼저 해제해주세요.") return false
+            end
+            seen[row.slot]=true price=price+self:SellPrice(row.item)
+        end
+        for _,row in ipairs(rows) do m:SetTabItem("equip",row.slot,"") end
+        m:AddMeso(price)
+        _CharacterPersistence:MarkDirty("item_sale")
+        m:CancelInvenDrag() m:HideTooltip() m:RefreshUI()
+        _UIToast:ShowMessage("장비 "..tostring(#rows).."개 판매 · "..m:FormatMeso(price).." 메소")
+        log("[EquipmentSale] count="..tostring(#rows).." price="..tostring(price))
+        return true
+    end
+
+    method table SellCategories()
+        -- Inventory equipment slots; the final category also covers legacy accessory slots.
+        return {{name="전체",slot=0},{name="무기",slot=6},{name="모자",slot=7},{name="상의·한벌옷",slot=3},
+            {name="하의",slot=4},{name="신발",slot=5},{name="장갑",slot=9},{name="망토",slot=8},
+            {name="반지",slot=10},{name="귀고리",slot=14},{name="펜던트",slot=15},
+            {name="얼굴장식",slot=26},{name="눈장식",slot=27},{name="기타 장비",slot=-1}}
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean MatchesSellCategory(string item)
+        -- Category filtering is independent from cosmetic exchange filters.
+        local category=self:SellCategories()[(self._T.sellCategory or 0)+1]
+        if category==nil or category.slot==0 then return true end
+        local slot=_UIEquipInventoryManager:ParseSlotIdx(item)
+        if category.slot~=-1 then return slot==category.slot end
+        for _,c in ipairs(self:SellCategories()) do if c.slot==slot then return false end end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectAllSales()
+        -- Toggle every filtered result across pages, without selecting hidden categories.
+        if self._T.mode~="sell" or self._T.pending or self._T.scanning then return end
+        local all=#self._T.rows>0
+        for i=1,#self._T.rows do if not self._T.selected[i] then all=false end end
+        for i=1,#self._T.rows do self._T.selected[i]=not all end
+        self:Draw() _UIAudio:Play("BtMouseClick")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AskSellBelow()
+        -- Build a fresh snapshot from all filtered pages, using an inclusive star limit.
+        if self._T.mode~="sell" or self._T.pending or self._T.scanning then return end
+        local limit=tonumber(self:UI("SellTools/MaxStars").TextGUIRendererInputComponent.Text)
+        if limit==nil or limit<0 or limit>99 or limit~=math.floor(limit) then
+            _UIToast:ShowMessage("별 수는 0~99 사이의 정수로 입력해주세요.") return
+        end
+        local selected={}
+        for _,row in ipairs(self._T.rows or {}) do
+            if _UIEquipInventoryManager:ParseStars(row.item)<=limit then table.insert(selected,row) end
+        end
+        local category=self:SellCategories()[(self._T.sellCategory or 0)+1]
+        self:AskSellRows(selected,(category and category.name or "전체").." · "..tostring(limit).."성 이하 (모든 페이지)")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AskSellRows(table rows, string title)
+        -- Show the exact number and sum before the existing confirmation commits the batch.
+        if self._T.pending or self._T.mode~="sell" then return end
+        if #rows==0 then _UIToast:ShowMessage("판매할 장비가 없습니다.") return end
+        local total=0 for _,row in ipairs(rows) do total=total+self:SellPrice(row.item) end
+        self._T.pending={mode="sell",rows=rows}
+        self:UI("Confirmation/Quantity").Enable=false
+        self:UI("Confirmation/QuantityLabel").Enable=false
+        self:UI("ItemTooltip").Enable=false
+        self:UI("Confirmation/Message").TextGUIRendererComponent.Text=title.."\n장비 "..tostring(#rows).."개 · 합계 ".._UIEquipInventoryManager:FormatMeso(total).." 메소\n판매한 장비는 되돌릴 수 없습니다. 판매할까요?"
+        self:UI("Confirmation").Enable=true _UIAudio:Play("DlgNotice")
+    end
+
+    method string MesoPouch(integer count)
+        -- Consumable identity includes a type marker and uses a native sprite icon.
+        if count < 1 or count > 999 then return "" end
+        return "메소주머니|17ae6a22966f45738bb92fb97ecc3e9d|0|0|0|0|"..tostring(count).."|meso_pouch"
+    end
+
+    method boolean IsMesoPouch(string item)
+        return string.match(item or "", "|meso_pouch") ~= nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Purchase(string product, integer quantity)
+        -- Validate all inputs, capacity and payment before changing either inventory or money.
+        local inv = _UIEquipInventoryManager
+        local item = ""
+        if product == "equipment_box" then item = _SpecialEquipment:BoxItem("normal", 1)
+        elseif product == "meso_pouch" then item = self:MesoPouch(1)
+        else return false end
+        if quantity < 1 or quantity > 999 then return false end
+        if product == "equipment_box" and inv.meso < 20000*quantity then _UIToast:ShowMessage("메소가 부족합니다.") return false end
+        if product == "meso_pouch" and self:Shards() < quantity*3 then _UIToast:ShowMessage("코디 조각이 부족합니다.") return false end
+        local plan, left = {}, quantity
+        for pass=1,2 do
+            for i=1,128 do
+                local current=inv:GetTabItem("consume",i)
+                local matches=current~="" and inv:ConsumableStackKey(current)==inv:ConsumableStackKey(item)
+                if (pass==1 and matches) or (pass==2 and current=="") then
+                    local old=current=="" and 0 or inv:ParseCount(current)
+                    local add=math.min(left,math.max(0,999-old))
+                    if add>0 then table.insert(plan,{slot=i,item=inv:WithStackCount(current=="" and item or current,old+add)}) left=left-add end
+                    if left==0 then break end
+                end
+            end
+            if left==0 then break end
+        end
+        if left>0 then _UIToast:ShowMessage("소비 인벤토리에 공간이 부족합니다. 구매하지 않았습니다.") return false end
+        if product=="equipment_box" then inv.meso=inv.meso-20000*quantity
+        else
+            local cost=quantity*3
+            for i=1,128 do
+                local shard=inv:GetTabItem("etc",i)
+                if self:IsShard(shard) then
+                    local take=math.min(cost,inv:ParseCount(shard))
+                    inv:SetTabItem("etc",i,inv:WithStackCount(shard,inv:ParseCount(shard)-take))
+                    cost=cost-take
+                    if cost==0 then break end
+                end
+            end
+        end
+        for _,row in ipairs(plan) do inv:SetTabItem("consume",row.slot,row.item) end
+        _CharacterPersistence:MarkDirty("meso_shop")
+        inv:CancelInvenDrag() inv:RefreshUI() inv:UpdateMesoUI()
+        _AcquisitionLog:Push(inv:ParseName(item).." +"..tostring(quantity), false)
+        log("[MesoShop] purchase="..product.." quantity="..tostring(quantity))
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean UseMesoPouch(integer slot)
+        -- Consume one and credit its reward before refreshing UI or serializing the combined state.
+        if slot < 1 or slot > 128 then return false end
+        local inv = _UIEquipInventoryManager
+        local item = inv:GetTabItem("consume", slot)
+        if not self:IsMesoPouch(item) or inv:ParseCount(item) < 1 then return false end
+        local reward = _UtilLogic:RandomIntegerRange(10000, 100000)
+        inv:SetTabItem("consume", slot, inv:WithStackCount(item, inv:ParseCount(item)-1))
+        inv.meso = inv.meso + reward
+        _CharacterPersistence:MarkDirty("meso_pouch")
+        inv:CancelInvenDrag() inv:HideTooltip() inv:RefreshUI() inv:UpdateMesoUI()
+        _AcquisitionLog:Push(inv:FormatMeso(reward).." 메소 획득", true)
+        log("[MesoShop] pouch reward="..tostring(reward))
+        return true
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void SelectPage()
+        -- Select only the visible twelve rows, preserving explicit choices on other pages.
+        if (self._T.mode ~= "dismantle" and self._T.mode ~= "sell") or self._T.scanning or self._T.pending then return end
+        local first = ((self._T.page or 1)-1)*12+1
+        local last = math.min(first+11,#self._T.rows)
+        local all = first <= last
+        for i=first,last do if not self._T.selected[i] then all=false end end
+        for i=first,last do self._T.selected[i]=not all end
+        self:Draw()
+        _UIAudio:Play("BtMouseClick")
+    end
+
+end

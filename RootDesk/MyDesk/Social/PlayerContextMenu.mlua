@@ -1,0 +1,288 @@
+@Logic
+script PlayerContextMenu extends Logic
+    property string targetUid = ""
+    property string targetName = ""
+    property string page = "info"
+    property table equips = {}
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- Both panels share the existing equipment/tooltip window layer.
+        return _EntityService:GetEntityByPath("/ui/DefaultGroup/" .. path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen()
+        -- Escape arbitration also includes the temporary context menu.
+        local a, b = self:UI("PlayerContext"), self:UI("PlayerInspect")
+        return (isvalid(a) and a.EnabledInHierarchy) or (isvalid(b) and b.EnabledInHierarchy)
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity PickPlayer(Vector2 point, boolean includeSelf)
+        -- Use avatar-sized world bounds; exclude self and other map instances.
+        local me = _UserService.LocalPlayer
+        if not isvalid(me) then return nil end
+        local world = _UILogic:ScreenToWorldPosition(point)
+        local best, distance = nil, 100000
+        for _, player in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(player) and (includeSelf or player ~= me) and player.CurrentMap == me.CurrentMap and player.EnabledInHierarchy and player.VisibleInHierarchy and isvalid(player.PlayerComponent) then
+                local pos = player.TransformComponent.WorldPosition
+                local dx, dy = world.x - pos.x, world.y - (pos.y + 0.45)
+                if math.abs(dx) <= 0.45 and dy >= -0.6 and dy <= 0.8 then
+                    local score = dx*dx + dy*dy
+                    if score < distance then best=player distance=score end
+                end
+            end
+        end
+        return best
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenAt(Entity player, Vector2 point)
+        -- A response is accepted only for this latest selected player.
+        if not isvalid(player) or not isvalid(player.PlayerComponent) then return end
+        self.targetUid=player.PlayerComponent.UserId self.targetName=""
+        self._T.originalOutfit=false
+        self._T.targetMap=player.CurrentMap
+        self._T.refreshAt=_UtilLogic.ElapsedSeconds+0.35
+        self:UI("PlayerInspect").Enable=false
+        self:UI("PlayerContext").Enable=true
+        self:UI("PlayerContext/Name").TextGUIRendererComponent.Text="정보 불러오는 중..."
+        for i=1,5 do self:UI("PlayerContext/Action"..tostring(i)).ButtonComponent.Enable=false end
+        local p=_UILogic:ScreenToUIPosition(point)
+        self:UI("PlayerContext").UITransformComponent.anchoredPosition=Vector2(math.max(-830,math.min(830,p.x+128)),math.max(-395,math.min(395,p.y-132)))
+        _UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/PlayerContext")
+        self:RequestDetails(self.targetUid)
+    end
+
+    @ExecSpace("Server")
+    method void RequestDetails(string uid)
+        -- Share only public identity and equipped items, never inventory or preferences.
+        self._T.requestAt=self._T.requestAt or {}
+        local now=_UtilLogic.ElapsedSeconds
+        if now < (self._T.requestAt[senderUserId] or 0) then return end
+        self._T.requestAt[senderUserId]=now+0.25
+        local me, other=_SocialManager:Record(senderUserId),_SocialManager:Record(uid)
+        if uid == senderUserId or not _SocialManager:SameMap(me,other) then self:ReceiveDetails(uid,{},senderUserId) return end
+        local sv=_CharacterPersistence._T.sv[uid]
+        local raw=sv.saves[other.id] or ""
+        local result={name=other.name,job=other.job,level=other.level,hp=other.player.PlayerComponent.Hp,maxHp=other.player.PlayerComponent.MaxHp,equips={}}
+        result.power=tonumber(string.match("\n"..raw,"\nCP\t(%d+)")) or 0
+        for line in string.gmatch(raw,"[^\n]+") do
+            local slot,item=string.match(line,"^E\t(%d+)\t(.+)$")
+            if slot ~= nil and tonumber(slot)>=1 and tonumber(slot)<=28 then result.equips[slot]=item end
+        end
+        local outfit = _AvatarTicketManager.outfits[uid]
+        if outfit ~= nil and outfit ~= "" then result.outfit = _HttpService:JSONDecode(outfit) end
+        self:ReceiveDetails(uid,result,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveDetails(string uid, table data)
+        -- Discard late responses after closing, changing maps, or changing target.
+        if uid ~= self.targetUid or not self:IsOpen() then return end
+        if data.name == nil then self:Close() _UIToast:ShowMessage("상대방이 같은 맵에 없습니다.") return end
+        self.targetName=data.name self.equips=data.equips or {}
+        self._T.details=data
+        self:UI("PlayerContext/Name").TextGUIRendererComponent.Text=data.name
+        for i=1,5 do self:UI("PlayerContext/Action"..tostring(i)).ButtonComponent.Enable=true end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Activate(integer action)
+        -- Reuse the existing invitation and whisper paths without asking for a name.
+        if self.targetName == "" then return end
+        local player=_UserService:GetUserEntityByUserId(self.targetUid)
+        local me=_UserService.LocalPlayer
+        if not isvalid(player) or not isvalid(me) or player.CurrentMap ~= me.CurrentMap then self:Close() return end
+        self:UI("PlayerContext").Enable=false
+        if action==1 or action==2 then
+            self.page=action==1 and "info" or "equip"
+            self:UI("PlayerInspect").Enable=true self:Draw()
+            _UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/PlayerInspect")
+            _UIAudio:Play("MenuUp")
+        elseif action==3 then _SocialManager:Request("inviteParty",self.targetName)
+        elseif action==4 then _SocialManager:Request("inviteFriend",self.targetName)
+        elseif action==5 then
+            _SocialManager.whisperName=self.targetName _SocialManager.chatMode="whisper"
+            _SocialManager:DrawChatMode() _MapleHUDManager:FocusChat()
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Render inspection data without changing the viewer's own equipment.
+        local d=self._T.details
+        if d == nil then return end
+        self:UI("PlayerInspect/Title").TextGUIRendererComponent.Text=d.name
+        self:UI("PlayerInspect/Info").Enable=self.page=="info"
+        self:UI("PlayerInspect/Equipment").Enable=self.page=="equip"
+        local values = {"이름   "..d.name, "직업   ".._UIMyInfoManager:GetClassNameForLevel(d.job,d.level), "레벨   "..tostring(d.level), "전투력   "..tostring(d.power), "HP   "..tostring(d.hp).." / "..tostring(d.maxHp)}
+        for i,value in ipairs(values) do self:UI("PlayerInspect/Info/Row"..tostring(i)).TextGUIRendererComponent.Text=value end
+        for _, p in ipairs({"info","equip"}) do
+            self:UI("PlayerInspect/"..p).SpriteGUIRendererComponent.Color=self.page==p and Color(1,0.75,0.35,1) or Color(0.8,0.81,0.82,1)
+        end
+        local outfit = d.outfit or {finals={},ticket=false}
+        local ticket = self:UI("PlayerInspect/AvatarTicket")
+        ticket.Enable = self.page=="info" and outfit.ticket==true
+        ticket.TextGUIRendererComponent.Text = self._T.originalOutfit and "게임 코디" or "MSW 티켓"
+        local avatar = self:UI("PlayerInspect/Avatar")
+        avatar.Enable = self.page=="info"
+        if avatar.Enable then
+            _AvatarTicketManager:Apply(avatar.CostumeManagerComponent, self.targetUid, outfit.finals or {}, _AvatarTicketManager:ShouldShowWorld(self.targetUid, outfit.ticket==true, self._T.originalOutfit==true))
+        end
+        for i=1,28 do
+            local slot=self:UI("PlayerInspect/Equipment/Slot"..tostring(i))
+            local item=self.equips[tostring(i)] or ""
+            local icon=slot:GetChildByName("Icon")
+            local ruid=_UIEquipInventoryManager:ParseInvenRUID(item)
+            icon.Enable=ruid~=""
+            if ruid~="" then icon.SpriteGUIRendererComponent.ImageRUID=DataRef(_UIEquipInventoryManager:ItemIconRUID(item)) end
+            slot:GetChildByName("Stars").TextGUIRendererComponent.Text=item~="" and i>2 and i~=28 and (tostring(_UIEquipInventoryManager:ParseStars(item)).."성") or ""
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean UpdateTooltip(Vector2 point)
+        -- Hand inspection slots to the existing detailed item tooltip renderer.
+        if not self:UI("PlayerInspect").EnabledInHierarchy or self.page~="equip" then
+            if _UIEquipInventoryManager.tooltipSource=="inspect" then _UIEquipInventoryManager:HideTooltip() end
+            return false
+        end
+        for i=1,28 do
+            local slot=self:UI("PlayerInspect/Equipment/Slot"..tostring(i))
+            if _UICursorManager:Hit(slot,point) and _UIClickArbiter:IsTopmostAt("/ui/DefaultGroup/PlayerInspect",point) then
+                local item=self.equips[tostring(i)] or ""
+                if item~="" then
+                    local sig=slot.Path..item
+                    if self._T.tipSignature~=sig or not self:UI("TooltipPanel").Enable then
+                        self._T.tipSignature=sig
+                        _UIEquipInventoryManager.tooltipSource="inspect"
+                        _UIEquipInventoryManager:ShowTooltipFromStr(item,true,slot.Path,"/ui/DefaultGroup/PlayerInspect")
+                    end
+                    _UIEquipInventoryManager:FollowItemTooltip()
+                    return true
+                end
+            end
+        end
+        self._T.tipSignature=""
+        if _UIEquipInventoryManager.tooltipSource=="inspect" then _UIEquipInventoryManager:HideTooltip() end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        -- Cancel late responses and return Escape ownership to the game.
+        self:UI("PlayerContext").Enable=false self:UI("PlayerInspect").Enable=false
+        self.targetUid="" self.targetName="" self.equips={} self._T.details=nil
+        if _UIEquipInventoryManager.tooltipSource=="inspect" then _UIEquipInventoryManager:HideTooltip() end
+        _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        -- PC right-click is Mouse1; prevent clicks through any UI.
+        if not _LoginFlow:IsInGame() then return end
+        if event.key==KeyboardKey.Escape and self:IsOpen() then self:Close() return end
+        if event.key==KeyboardKey.Mouse0 and self:UI("PlayerContext").Enable then
+            if not _UICursorManager:Hit(self:UI("PlayerContext"),_InputService:GetCursorPosition()) then self:UI("PlayerContext").Enable=false end
+        end
+        if event.key~=KeyboardKey.Mouse1 or _GameSystemMenu:BlocksInput() or _MapleHUDManager:IsChatTyping() then return end
+        local point=_InputService:GetCursorPosition()
+        if _UIClickArbiter:BlocksWorldClick(point) then return end
+        local target=self:PickPlayer(point,false)
+        if isvalid(target) then self:OpenAt(target,point) else self:UI("PlayerContext").Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- All client listeners are disconnected when the play session ends.
+        self._T.links={}
+        self:UI("PlayerContext").Enable=false self:UI("PlayerInspect").Enable=false
+        for i=1,5 do
+            local index=i local e=self:UI("PlayerContext/Action"..tostring(i))
+            local conn=e:ConnectEvent(ButtonClickEvent,function() _UIAudio:Play("BtMouseClick") self:Activate(index) end)
+            table.insert(self._T.links,{entity=e,connection=conn})
+        end
+        for _, mode in ipairs({"info","equip"}) do
+            local p=mode local e=self:UI("PlayerInspect/"..mode)
+            local conn=e:ConnectEvent(ButtonClickEvent,function() self.page=p self:Draw() _UIAudio:Play("Tab") end)
+            table.insert(self._T.links,{entity=e,connection=conn})
+        end
+        local ticket=self:UI("PlayerInspect/AvatarTicket")
+        local ticketConn=ticket:ConnectEvent(ButtonClickEvent,function()
+            if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/PlayerInspect",_InputService:GetCursorPosition()) then return end
+            self._T.originalOutfit=not self._T.originalOutfit
+            self:Draw() _UIAudio:Play("Tab")
+        end)
+        table.insert(self._T.links,{entity=ticket,connection=ticketConn})
+        local e=self:UI("PlayerInspect/Close")
+        local conn=e:ConnectEvent(ButtonClickEvent,function() self:Close() end)
+        table.insert(self._T.links,{entity=e,connection=conn})
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,self.OnKey)
+        self._T.pointer=_InputService:ConnectEvent(ScreenTouchEvent,self.OnPointer)
+        log("[PlayerContext] ready: info equipment party friend whisper")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Dismiss stale targets on map change, disconnect, or return to login.
+        if not self:IsOpen() then return end
+        local me=_UserService.LocalPlayer
+        local target=_UserService:GetUserEntityByUserId(self.targetUid)
+        if not _LoginFlow:IsInGame() or not isvalid(me) or not isvalid(target) or target.CurrentMap~=me.CurrentMap or me.CurrentMap~=self._T.targetMap then self:Close() return end
+        local now=_UtilLogic.ElapsedSeconds
+        if (self:UI("PlayerInspect").Enable or self.targetName=="") and now>=(self._T.refreshAt or 0) then self._T.refreshAt=now+2 self:RequestDetails(self.targetUid) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Remove handlers retained by the global logic.
+        for _, link in ipairs(self._T.links or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent,link.connection) end end
+        if self._T.key~=nil then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+        if self._T.pointer~=nil then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.pointer) end
+    end
+    @ExecSpace("ClientOnly")
+    method void OnPointer(ScreenTouchEvent event)
+        if event.TouchId~=1 then return end
+        if not _LoginFlow:IsInGame() or _GameSystemMenu:BlocksInput() or _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then self._T.clickedUid=nil return end
+        local point=event.TouchPoint
+        if _UIClickArbiter:BlocksWorldClick(point) then self._T.clickedUid=nil return end
+        local target=self:PickPlayer(point,true)
+        if not isvalid(target) then self._T.clickedUid=nil return end
+        local uid=target.PlayerComponent.UserId
+        local now=_UtilLogic.ElapsedSeconds
+        local double=self._T.clickedUid==uid and now-(self._T.clickedAt or -10)<=0.45
+        self._T.clickedUid=uid self._T.clickedAt=now
+        if double then self._T.clickedUid=nil self:OpenStatus(target,point) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenStatus(Entity target, Vector2 point)
+        if not isvalid(target) then return end
+        if target==_UserService.LocalPlayer then
+            self:Close()
+            local window=self:UI("CharInfoWindow")
+            window.Enable=true
+            _CharInfoManager:RefreshCharInfo()
+            _UIEquipInventoryManager:PushWin(window.Path)
+            _UIEquipInventoryManager:BringWindowToFront(window.Path)
+        else
+            self:OpenAt(target,point)
+            self._T.details=nil
+            self.page="info"
+            self:UI("PlayerContext").Enable=false
+            self:UI("PlayerInspect").Enable=true
+            self:UI("PlayerInspect/Title").TextGUIRendererComponent.Text="정보 불러오는 중..."
+            self:UI("PlayerInspect/Info").Enable=false
+            self:UI("PlayerInspect/Equipment").Enable=false
+            self:UI("PlayerInspect/Avatar").Enable=false
+            _UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/PlayerInspect")
+        end
+        _UIAudio:Play("MenuUp")
+        log("[PlayerContext] double-click status opened self="..tostring(target==_UserService.LocalPlayer))
+    end
+
+end

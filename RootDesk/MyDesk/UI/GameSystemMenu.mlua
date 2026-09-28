@@ -1,10 +1,13 @@
 @Logic
 script GameSystemMenu extends Logic
+    property boolean hideOtherWorldCostumes = false
     property boolean opened = false
     property integer selected = 1
     property string page = "menu"
     property number chatSize = 20
     property integer chatColor = 1
+    property string chatColorMode = "map"
+    property table chatColors = {map=1,friend=6,party=7,whisper=4}
     property number chatOpacity = 45
 
     @ExecSpace("ClientOnly")
@@ -14,7 +17,7 @@ script GameSystemMenu extends Logic
 
     @ExecSpace("ClientOnly")
     method boolean BlocksInput()
-        return self.opened or self._T.busy == true or _UtilLogic.ElapsedSeconds < (self._T.inputUntil or 0)
+        return _CosmeticExchange:BlocksInput() or _SocialManager:BlocksInput() or _AppearanceColorPicker:BlocksInput() or self.opened or self._T.busy == true or _UtilLogic.ElapsedSeconds < (self._T.inputUntil or 0)
     end
 
     @ExecSpace("ClientOnly")
@@ -41,6 +44,13 @@ script GameSystemMenu extends Logic
         self:Bind("Overlay/Channels/Back", function() if not self._T.busy then self:ShowPage("menu") end end)
         self:Bind("Overlay/Menu/Close", function() if not self._T.busy then self:Close() end end)
         self:Bind("Overlay/ChatSettings/Close", function() self:Close() end)
+        self:Bind("Overlay/Settings/Mute", function() self:ToggleMute() end)
+        self:Bind("Overlay/Settings/HideWorldCostumes", function()
+            self.hideOtherWorldCostumes = not self.hideOtherWorldCostumes
+            _AvatarTicketManager:RefreshViewers()
+            self:DrawSettings()
+            self:SavePreferences()
+        end)
         self:Bind("Overlay/Settings/Back", function() self:ShowPage("menu") end)
         self:Bind("Overlay/ChatSettings/Back", function() self:Close() end)
         for _, name in ipairs({"Bgm", "Sfx"}) do
@@ -68,10 +78,16 @@ script GameSystemMenu extends Logic
             end)
             table.insert(self._T.links, {entity=e, listener=link, eventType=SliderValueChangedEvent})
         end
-        for i = 1, 5 do
+        for i = 1, 8 do
             local index = i
             self:Bind("Overlay/ChatSettings/Color" .. tostring(i), function()
-                self.chatColor = index self:ApplyChat() self:DrawSettings() self:SavePreferences()
+                self.chatColor = index self.chatColors[self.chatColorMode] = index self:ApplyChat() self:DrawSettings() self:SavePreferences()
+            end)
+        end
+        for _, mode in ipairs({"map","friend","party","whisper"}) do
+            local selected = mode
+            self:Bind("Overlay/ChatSettings/Mode_" .. mode,function()
+                self.chatColorMode=selected self.chatColor=self.chatColors[selected] or 1 self:DrawSettings()
             end)
         end
         local chatButton = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/ChatBox/BtnSettings")
@@ -139,8 +155,20 @@ script GameSystemMenu extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnKey(KeyDownEvent event)
+        if _CosmeticExchange:BlocksInput() or _AppearanceColorPicker:BlocksInput() then return end
         if _LoginFlow.phase ~= "ingame" or self._T.busy then return end
         local key = event.key
+        if _KeySettingManager:GetFuncForKeyEnum(key) == "mute" and not _KeySettingManager:IsWindowOpen() and not _SocialManager:BlocksInput() and not _UIItemDiscardManager:BlocksInput() then
+            local uiRoot = _EntityService:GetEntityByPath("/ui")
+            if isvalid(uiRoot) then
+                for _, input in ipairs(uiRoot:GetChildComponentsByTypeName("MOD.Core.TextGUIRendererInputComponent", true)) do
+                    if input.IsFocused then return end
+                end
+            end
+            self:ToggleMute()
+            return
+        end
+        if not self.opened and (_SocialManager:IsOpen() or _UtilLogic.ElapsedSeconds < (self._T.inputUntil or 0)) then return end
         if not self.opened then
             if key ~= KeyboardKey.Escape then return end
             if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return end
@@ -173,6 +201,7 @@ script GameSystemMenu extends Logic
     @ExecSpace("ClientOnly")
     method boolean HasOtherWindow()
         -- Include dialogs outside the inventory window stack.
+        if _SocialManager:IsOpen() then return true end
         if _UIClickArbiter:GetKeyboardWindow() ~= "" or _InformationBook:IsOpen() then return true end
         if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return true end
         for _, path in ipairs({"/ui/WorldMapGroup", "/ui/PopupGroup/PopupBack", "/ui/DefaultGroup/QuickSlotDialog"}) do
@@ -258,7 +287,8 @@ script GameSystemMenu extends Logic
             local count = self._T.channelCounts and (self._T.channelCounts[i] or 0) or nil
             local status = i == current and "접속 중" or (count == nil and "확인 중" or (count >= 5 and "혼잡" or "이동 가능"))
             b.TextGUIRendererComponent.Text = "CH." .. tostring(i) .. "\n" .. status
-            b.SpriteGUIRendererComponent.Color = i == selected and Color(1,0.85,0.53,1) or (i == current and Color(0.7,0.87,0.86,1) or Color.white)
+            b.SpriteGUIRendererComponent.Color = i == selected and Color(0.12,0.12,0.12,1) or (i == current and Color(0.8,0.8,0.8,1) or Color.white)
+            b.TextGUIRendererComponent.FontColor = i == selected and Color.white or Color(0.12,0.12,0.12,1)
         end
         local canMove = self._T.channelCounts ~= nil and selected ~= current and (self._T.channelCounts[selected] or 0) < 5 and not self._T.busy
         self:UI("Overlay/Channels/Confirm").ButtonComponent.Enable = canMove
@@ -299,8 +329,14 @@ script GameSystemMenu extends Logic
 
     @ExecSpace("ClientOnly")
     method Color GetChatColor()
-        local colors = {Color(1,1,1,1), Color(1,0.88,0.48,1), Color(0.6,0.9,1,1), Color(0.69,0.95,0.67,1), Color(1,0.72,0.87,1)}
-        return colors[self.chatColor] or Color.white
+        local colors = {Color(1,1,1,1),Color(1,0.88,0.48,1),Color(0.6,0.9,1,1),Color(0.35,1,0.45,1),Color(1,0.72,0.87,1),Color(1,0.62,0.22,1),Color(0.76,0.5,1,1),Color(1,0.35,0.35,1)}
+        return colors[self.chatColors[self.chatColorMode] or 1] or Color.white
+    end
+
+    @ExecSpace("ClientOnly")
+    method string GetChatHex(string mode)
+        local colors={"#FFFFFF","#FFE07A","#99E6FF","#59FF73","#FFB8DE","#FF9E38","#C280FF","#FF5959"}
+        return colors[self.chatColors[mode] or 1] or "#FFFFFF"
     end
 
     @ExecSpace("ClientOnly")
@@ -310,6 +346,15 @@ script GameSystemMenu extends Logic
 
     @ExecSpace("ClientOnly")
     method void DrawSettings()
+        local costumeCheck = self:UI("Overlay/Settings/HideWorldCostumes/Check")
+        if isvalid(costumeCheck) then costumeCheck.Enable = not self.hideOtherWorldCostumes end
+        local check = self:UI("Overlay/Settings/Mute/Check")
+        if isvalid(check) then check.Enable = _GameAudio.muted end
+        local muteLabel = self:UI("Overlay/Settings/Mute/Label")
+        if isvalid(muteLabel) then
+            local binding = _KeySettingManager:GetKeyForFunc("mute")
+            muteLabel.TextGUIRendererComponent.Text = "전체 음소거" .. (binding ~= "" and ("  (" .. binding .. ")") or "")
+        end
         self._T.drawing = true
         self:UI("Overlay/Settings/Resolution").TextGUIRendererComponent.Text = "현재 해상도  " .. tostring(_UILogic.ScreenWidth) .. " × " .. tostring(_UILogic.ScreenHeight)
         for _, name in ipairs({"Bgm", "Sfx"}) do
@@ -322,13 +367,23 @@ script GameSystemMenu extends Logic
         self:UI("Overlay/ChatSettings/Opacity").SliderComponent.Value = self.chatOpacity
         self:UI("Overlay/ChatSettings/OpacityValue").TextGUIRendererComponent.Text = tostring(math.floor(self.chatOpacity)) .. "%"
         for i = 1, 5 do
-            self:UI("Overlay/ChatSettings/Color" .. tostring(i) .. "/Selected").Enable = i == self.chatColor
+            self:UI("Overlay/ChatSettings/Color" .. tostring(i) .. "/Selected").Enable = i == (self.chatColors[self.chatColorMode] or 1)
+        end
+        for _, mode in ipairs({"map","friend","party","whisper"}) do
+            self:UI("Overlay/ChatSettings/Mode_" .. mode).SpriteGUIRendererComponent.Color = mode == self.chatColorMode and Color(1,0.8,0.4,1) or Color.white
         end
         local preview = self:UI("Overlay/ChatSettings/Preview")
         preview.TextGUIRendererComponent.FontSize = self.chatSize
         preview.TextGUIRendererComponent.FontColor = self:GetChatColor()
         preview.SpriteGUIRendererComponent.Color = Color(0,0,0,self.chatOpacity / 100)
         self._T.drawing = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleMute()
+        _GameAudio:SetMuted(not _GameAudio.muted)
+        self:DrawSettings()
+        self:SavePreferences()
     end
 
     @ExecSpace("ClientOnly")
@@ -339,16 +394,23 @@ script GameSystemMenu extends Logic
 
     @ExecSpace("ClientOnly")
     method string ExportPreferences()
-        return "PREF\t" .. tostring(self.chatSize) .. "\t" .. tostring(self.chatColor) .. "\t" .. tostring(self.chatOpacity) .. "\t" .. tostring(_GameAudio.bgmVolume) .. "\t" .. tostring(_GameAudio.sfxVolume)
+        return "WORLDCOSTUME\t" .. (self.hideOtherWorldCostumes and "1" or "0") .. "\nPREF\t" .. tostring(self.chatSize) .. "\t" .. tostring(self.chatColor) .. "\t" .. tostring(self.chatOpacity) .. "\t" .. tostring(_GameAudio.bgmVolume) .. "\t" .. tostring(_GameAudio.sfxVolume) .. "\nMUTE\t" .. (_GameAudio.muted and "1" or "0") .. "\nCHATCOLOR\t" .. tostring(self.chatColors.map) .. "\t" .. tostring(self.chatColors.friend) .. "\t" .. tostring(self.chatColors.party) .. "\t" .. tostring(self.chatColors.whisper)
     end
 
     @ExecSpace("ClientOnly")
     method void RestorePreferences(string raw)
+        self.hideOtherWorldCostumes = string.match("\n" .. raw, "\nWORLDCOSTUME\t([01])") == "1"
+        _AvatarTicketManager:RefreshViewers()
         local size, color, opacity, bgm, sfx = string.match("\n" .. raw, "\nPREF\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\n]+)")
         self.chatSize = math.max(14, math.min(32, tonumber(size) or 20))
         self.chatColor = math.max(1, math.min(5, math.floor(tonumber(color) or 1)))
         self.chatOpacity = math.max(0, math.min(100, tonumber(opacity) or 45))
         _GameAudio:SetVolumes(tonumber(bgm) or 0.6, tonumber(sfx) or 0.8)
+        _GameAudio:SetMuted(string.match("\n" .. raw, "\nMUTE\t([01])") == "1")
+        local map,friend,party,whisper = string.match("\n" .. raw,"\nCHATCOLOR\t(%d+)\t(%d+)\t(%d+)\t(%d+)")
+        local function valid(value, fallback) return math.max(1,math.min(8,tonumber(value) or fallback)) end
+        self.chatColors={map=valid(map,self.chatColor),friend=valid(friend,6),party=valid(party,7),whisper=valid(whisper,4)}
+        self.chatColorMode="map"
         self:ApplyChat()
     end
 

@@ -24,6 +24,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		self:ReleaseCliffGuard()
 		if self.keyHandler ~= nil then
 			_InputService:DisconnectEvent(KeyDownEvent, self.keyHandler)
 			self.keyHandler = nil
@@ -73,6 +74,8 @@ script AutoHuntManager extends Logic
 		local pa = isvalid(p) and p:GetComponent("script.PlayerAttack") or nil
 		if pa ~= nil then pa._T.basicAirMotion = nil end
 		self.autoOn = not self.autoOn
+        self._T.lastKillAt = _UtilLogic.ElapsedSeconds
+        self._T.lastKillCount = isvalid(pa) and pa.MonsterKillCount or 0
 		local keyName = _KeySettingManager:GetKeyForFunc("autohunt")
 		if keyName == "" then keyName = "F7" end
 		if self.autoOn then
@@ -101,6 +104,8 @@ script AutoHuntManager extends Logic
             _SkillManager:SetChargeAutoHold("sniping", false)
             _SkillManager:SetChargeAutoHold("piercing", false)
             self._T.huntMap = nil
+            self:ReleaseCliffGuard()
+            self._T.intermediateHop = nil
             self._T.target = nil
             self._T.holdMoveUntil = nil
             self._T.noTargetSince = nil
@@ -457,7 +462,7 @@ script AutoHuntManager extends Logic
 			["디바인 스윙 강화"] = "chargemode", ["디바인 스티그마 강화"] = "chargemode",
 			["디바인 저지먼트 강화"] = "chargemode", ["디바인 차지"] = "chargemode",
 			-- 소환수 (주기 재소환 - 재사용 시 교체되는 기존 동작 활용)
-			["용사 소환"] = "summon", ["힐러 소환"] = "summon", ["용 소환"] = "summon",
+			["기사 소환"] = "summon", ["용사 소환"] = "summon", ["힐러 소환"] = "summon", ["용 소환"] = "summon",
 			-- (비숍 개편 2026-08-08) 소환 3종 - 용사 소환과 완전히 같은 규격이라 역할도 같다.
 			["궁수 소환"] = "summon", ["도적 소환"] = "summon",
 			["서먼 다크드래곤"] = "summon", ["바하뮤트"] = "summon", ["프리져"] = "summon",
@@ -614,6 +619,7 @@ script AutoHuntManager extends Logic
 		-- 있다 - 자동사냥이 꺼져 있어도 수동 끼임 탈출 감시는 항상 돌린다(자동사냥 중에는 기존
 		-- CheckStuckAndJump가 담당하므로 중복 방지를 위해 OFF일 때만).
 		if not self.autoOn then
+			self:ReleaseCliffGuard()
 			local mp = _UserService.LocalPlayer
 			if isvalid(mp) then self:ManualStuckTick(mp) end
 			return
@@ -627,6 +633,12 @@ script AutoHuntManager extends Logic
 			return
 		end
 		local now = _UtilLogic.ElapsedSeconds
+        local attack = player:GetComponent("script.PlayerAttack")
+        local count = isvalid(attack) and attack.MonsterKillCount or 0
+        if count ~= (self._T.lastKillCount or 0) then self._T.lastKillCount=count self._T.lastKillAt=now end
+        if now - (self._T.lastKillAt or now) >= 30 then
+            if self:ReturnToSpawn(now,player,"30초 미처치") then self._T.lastKillAt=now return end
+        end
         self:ResolveJumpAttack(now)
         self:UpdateChaseAim(now, player)
 
@@ -783,6 +795,7 @@ script AutoHuntManager extends Logic
 		-- 독안개를 깔아둔다(익스플로젼 유폭 재료). 대상 유무와 무관 - 주변에 적이 있을 때만 소비된다.
 		if self:PoisonCarpetTick(now, player) then return end
 		if target == nil or not isvalid(target) then
+			self:ReleaseCliffGuard()
 			-- (P2) 몬스터가 없어도 버프/소환수 유지는 계속하고, 그 외에는 배회하며 리젠을 기다린다.
 			-- (요청) 맨아래 층에서 잡을 대상이 없으면(남은 적이 위층뿐이거나 전멸) 위로 복귀한다.
 			-- (신고 2026-08-06) 중간 발판 정체: 남은 적이 위층뿐이면(도달 수단 없어 후보 제외) 맨아래가
@@ -820,6 +833,7 @@ script AutoHuntManager extends Logic
 		local mp = target.TransformComponent.WorldPosition
 		local dx = mp.x - pp.x
 		local dy = mp.y - pp.y
+		self:SetCliffGuard(player, dy >= -0.4)
 
 		-- (요청 2026-08-12) **밀린 버프는 접근보다 먼저 - 제자리에서 다 쓰고 이동한다.**
 		-- ⚠ 왜 필요한가: 유틸 시전(TryUtilityCast)이 "사거리 안" 분기에만 걸려 있어서, 자동사냥을 켜면
@@ -1166,7 +1180,11 @@ script AutoHuntManager extends Logic
 			--   (실측: 등반 1초 뒤 낙하 2건 - 다운점프가 아니라 걸어서 떨어진 것).
 			--   사다리로 올라온 직후가 특히 위험하다 - 도착 지점이 대개 발판 가장자리다.
 			--   앞이 막혀 있어도 위로 넘을 턱이면 아래 TryStepUpOverWall이 따로 처리하므로 손해가 없다.
-			local holdEdge = false
+			local holdEdge = dy >= -0.4 and not self:HasSafeGroundAhead(player,pp,dir)
+			if holdEdge then
+				self:StopMoving()
+				if self:TryStepUpOverWall(player,pp,dir,now) then return end
+			end
 			if (self._T.layerHoldUntil or 0) > now then
 				local rbHold = player.RigidbodyComponent
 				if isvalid(rbHold) and rbHold:IsOnGround()
@@ -1947,6 +1965,7 @@ script AutoHuntManager extends Logic
 	--   두 소환수의 규격(데미지·지속시간·MP·무쿨)이 완전히 같아졌으므로 여기 규칙도 하나로 맞춘다.
 	@ExecSpace("ClientOnly")
 	method number GetSummonRecastInterval(string skillName)
+        if skillName == "기사 소환" then return 60.0 end
 		if skillName == "프리져" then
 			local frLv = math.max(1, _SkillManager:GetHeroSkillLevelByName("프리져"))
 			return math.max(10.0, _SkillManager:GetFreezerDuration(frLv) - 5.0)
@@ -1978,7 +1997,9 @@ script AutoHuntManager extends Logic
 		end
 		if self._T.slotSummons ~= nil then
 			for _, s in ipairs(self._T.slotSummons) do
-				if s.name == "서먼 다크드래곤" then
+				if s.name == "기사 소환" then
+                    if _SkillManager:CanAutoSummonKnight() then return true end
+                elseif s.name == "서먼 다크드래곤" then
 					if _SkillManager:CanAutoSummonDarkDragon() then return true end
 				elseif now - (self._T.lastCast[s.name] or -99999) >= self:GetSummonRecastInterval(s.name) then return true end
 			end
@@ -2153,8 +2174,22 @@ script AutoHuntManager extends Logic
 				-- 판단한다: 드래곤이 사라졌는지(소멸 통보로 활성 창이 닫힘) + 쿨 종료(또는 드래곤의
 				-- "쿨타임 초기화" 버프/오로라로 풀림)를 10초마다 조회한다. 구 방식은 드래곤이 일찍 사라지거나
 				-- 시전이 거부돼도 lastCast가 갱신돼 최대 605초를 드래곤 없이 방치했다.
-				if s.name == "서먼 다크드래곤" then
-					if (self._T.nextDarkDragon or 0) <= now then
+                if s.name == "기사 소환" then
+                    if (_SkillManager._T.knightSummonCooldownUntil or 0) <= now and not _SkillManager:CanAffordSkillCost(s.name) then
+                        self._T.mpSaveUntil = now + 3.0
+                    elseif (self._T.nextKnightTry or 0) <= now and _SkillManager:CanAutoSummonKnight() then
+                        self._T.nextKnightTry = now + 1.2
+                        _SkillManager:UseSkillInSlot(s.key)
+                        -- Only a successful cast starts its cooldown. A rejected motion retries shortly.
+                        if (_SkillManager._T.knightSummonCooldownUntil or 0) > now then
+                            self._T.lastCast[s.name] = now
+                            log("[AutoHunt] 기사 소환 유지 시전 (실제 쿨다운 확인)")
+                        end
+                        self:MarkUtilityCast(now)
+                        return true
+                    end
+                elseif s.name == "서먼 다크드래곤" then
+                    if (self._T.nextDarkDragon or 0) <= now then
 						self._T.nextDarkDragon = now + 10.0
 						if _SkillManager:CanAutoSummonDarkDragon() then
 							self:MarkUtilityCast(now)
@@ -3436,6 +3471,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method Entity FindCurrentPlatformTarget(Entity player)
+		-- 높이가 아닌 발판 연결로 같은 길을 판단한다. 경사로 위 목표도 유지한다.
 		local rb = player.RigidbodyComponent
 		if not isvalid(rb) or not rb:IsOnGround() then return nil end
 		local floor = rb:GetCurrentFoothold()
@@ -3457,7 +3493,7 @@ script AutoHuntManager extends Logic
 					local ban = self._T.banned and self._T.banned[e] or 0
 					local mp = e.TransformComponent.WorldPosition
 					local targetFloor = self:GetFootholdIdBelow(player, mp.x, mp.y + 0.1, 0.8)
-					if ban <= now and math.abs(mp.y - pp.y) <= 0.4 and targetFloor > 0
+					if ban <= now and targetFloor > 0
 						and self:AreFootholdIdsConnected(player, floor.Id, targetFloor) then
 						-- 현재 층의 살아 있는 목표는 유지해 왕복 재선정을 막는다.
 						if e == self._T.target and (_ChannelManager:BaseName(player.CurrentMap.Name) ~= "001010000" or math.abs(mp.x-pp.x) <= 3) then retained = e end
@@ -3743,7 +3779,7 @@ script AutoHuntManager extends Logic
 	method boolean ReturnToSpawn(number now, Entity player, string reason)
 		if (self._T.nextBottomReturn or 0) > now then return false end
 		local rb = player.RigidbodyComponent
-		if not isvalid(rb) or not rb:IsOnGround() then return false end
+		if not isvalid(rb) or (reason ~= "30초 미처치" and not rb:IsOnGround()) then return false end
 		local map = player.CurrentMap
 		if not isvalid(map) then return false end
 		local spawnE = map:GetChildByName("SpawnLocation", true)
@@ -4300,65 +4336,28 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean CanReachTargetLayer(Entity player, Vector3 pp, Vector3 mp, number reach)
-		-- (요청 2026-08-10) **대상이 서 있는 그 발판까지 한 번에 올라설 수 있는가**를 본다. 올라설 수 있으면 true.
-		-- ⚠ 기존 HasSeparateFootholdAbove는 "위에 **아무** 발판이라도 있나"만 확인했다. 대상이 두 층 위면
-		--   중간 발판이 잡혀 true가 되어 일단 뛰어오르고, 올라가 봐야 대상 층에는 못 닿아 도로 내려온다.
-		--   그리고 대상이 그대로 남아 있으니 같은 판단을 2~3번 반복한다(사용자 가설 - 실제 관측과 일치).
-		-- 판정 3단계:
-		--   ① 대상 발밑 발판 = 대상이 실제로 서 있는 층
-		--   ② 그 층이 내 발 높이 기준 점프 사거리 안인가
-		--   ③ 위로 쏜 **첫 발판**이 곧 그 층인가(중간 발판이 먼저 걸리면 한 번에 못 올라간다)
+		-- 경사 발판의 대상 X 높이를 사용한다. 일방향 발판은 위로 통과할 수 있다.
 		local map = player.CurrentMap
 		local fh = isvalid(map) and map.FootholdComponent or nil
-		if not isvalid(fh) then return true end   -- 판정 불가면 막지 않는다(기존 동작 유지)
-		-- ① 대상 발밑(살짝 위에서 아래로) - 대상이 딛고 선 발판
-		local under = fh:Raycast(Vector2(mp.x, mp.y + 0.1), Vector2(0, -1), 2.0)
-		if under == nil then return false end
-		local layerY = under.StartPoint.y
-		if under.EndPoint.y > layerY then layerY = under.EndPoint.y end
-		-- ② 사거리 안인가
-		local h = layerY - pp.y
+		if not isvalid(fh) then return false end
+		local under = fh:Raycast(Vector2(mp.x,mp.y+0.1),Vector2(0,-1),2.0)
+		if under == nil or under:IsVertical() then return false end
+		local h = under:GetYByX(mp.x)-pp.y
 		if h <= 0.05 or h > reach then return false end
-		-- ③ 올라가는 길에 더 낮은 발판이 먼저 가로막지 않는가
-		local hit = fh:Raycast(Vector2(mp.x, pp.y + 0.3), Vector2(0, 1), h + 0.5)
-		if hit == nil then return false end
-		if hit.Id ~= under.Id then return false end
-		-- 지금 밟고 있는 발판이 잡히면 경사면이다 - 걸어서 올라갈 수 있으니 뛰지 않는다.
-		local rb = player.RigidbodyComponent
-		if isvalid(rb) then
-			local cur = rb:GetCurrentFoothold()
-			if cur ~= nil and cur.Id == hit.Id then return false end
-		end
-		return true
+		local fromId = self:GetFootholdIdBelow(player,pp.x,pp.y+0.1,0.6)
+		return not self:AreFootholdIdsConnected(player,fromId,under.Id)
 	end
 
 	@ExecSpace("ClientOnly")
 	method boolean IsTargetLayerUnreachable(Entity player, Vector3 pp, Vector3 mp, number reach)
-		-- "이 대상 층은 **확실히** 못 간다"일 때만 true. 대상 제외(ban) 판단 전용이라 보수적으로 본다.
-		-- 확실한 두 경우만 true:
-		--   ① 대상 발판이 점프 사거리보다 높다
-		--   ② 올라가는 길을 **더 낮은 다른 발판**이 먼저 막는다(= 한 번에 못 올라간다)
-		-- 경사면(위로 쏜 발판이 지금 밟은 그 발판)·레이 실패·판정 불가는 전부 false로 둔다 -
-		-- 걸어서 올라가거나 다른 경로가 있을 수 있으므로 멀쩡한 대상을 버리지 않는다.
-		local map = player.CurrentMap
-		local fh = isvalid(map) and map.FootholdComponent or nil
+		-- 한 번에 못 뛰더라도 중간 발판/로프 경로가 있으면 대상을 유지한다.
+		if self:IsWalkConnectedToTarget(player,pp,mp) then return false end
+		if self:FindUsableRope(player,pp,mp.y,mp.x) ~= nil then return false end
+		if self:FindIntermediateStep(player,pp,mp) ~= nil then return false end
+		local fh = player.CurrentMap.FootholdComponent
 		if not isvalid(fh) then return false end
-		local under = fh:Raycast(Vector2(mp.x, mp.y + 0.1), Vector2(0, -1), 2.0)
-		if under == nil then return false end
-		local layerY = under.StartPoint.y
-		if under.EndPoint.y > layerY then layerY = under.EndPoint.y end
-		local h = layerY - pp.y
-		if h > reach then return true end                    -- ① 너무 높다
-		if h <= 0.05 then return false end
-		local hit = fh:Raycast(Vector2(mp.x, pp.y + 0.3), Vector2(0, 1), h + 0.5)
-		if hit == nil then return false end
-		local rb = player.RigidbodyComponent
-		if isvalid(rb) then
-			local cur = rb:GetCurrentFoothold()
-			if cur ~= nil and cur.Id == hit.Id then return false end   -- 경사면 - 걸어서 올라간다
-		end
-		if hit.Id ~= under.Id then return true end            -- ② 중간 발판이 먼저 막는다
-		return false
+		local under = fh:Raycast(Vector2(mp.x,mp.y+0.1),Vector2(0,-1),2.0)
+		return under ~= nil and not under:IsVertical() and under:GetYByX(mp.x)-pp.y > reach
 	end
 
 	@ExecSpace("ClientOnly")
@@ -4616,6 +4615,7 @@ script AutoHuntManager extends Logic
 		local best = nil
 		local bestD = 99
 		local targetFhId = self:GetFootholdIdBelow(player, targetX, targetY + 0.1, 2.0)
+		local fromId = self:GetFootholdIdBelow(player, pp.x, pp.y + 0.15, 0.8)
 		for _, r in ipairs(self:GetRopes(player)) do
 			if r.bot <= pp.y + 0.8 and r.top >= targetY - 0.8 and r.top > pp.y + 0.5 then
 				local d = math.abs(r.x - pp.x)
@@ -4624,7 +4624,9 @@ script AutoHuntManager extends Logic
 					-- 실제 로프 상단의 도착 발판을 검사한다. 중간 높이를 검사하면
 					-- 목표 층을 지나 다른 층까지 올라가는 로프도 잘못 허용된다.
 					local landFhId = self:GetFootholdIdBelow(player, r.x, r.top + 0.3, 0.9)
-					if targetFhId > 0 and landFhId > 0
+					local approachId = self:GetFootholdIdBelow(player, r.x, pp.y + 0.3, 1.0)
+					if targetFhId > 0 and landFhId > 0 and approachId > 0
+						and self:AreFootholdIdsConnected(player, fromId, approachId)
 						and self:AreFootholdIdsConnected(player, landFhId, targetFhId) then
 						best = r
 						bestD = d
@@ -4650,51 +4652,106 @@ script AutoHuntManager extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void SetCliffGuard(Entity player, boolean protect)
+		-- 위/같은 층 추적 중에만 지상 가장자리 낙하를 막는다. 점프와 아래층 이동은 별도 경로다.
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) then return end
+		if protect then
+			if self._T.cliffGuardBody ~= rb then
+				self:ReleaseCliffGuard()
+				self._T.cliffGuardBody = rb
+				self._T.cliffGuardOriginal = rb.IsolatedMove
+			end
+			rb.IsolatedMove = true
+		else self:ReleaseCliffGuard() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReleaseCliffGuard()
+		-- 자동사냥 종료/맵 변경 시 기존 물리 설정을 복원한다.
+		local rb = self._T.cliffGuardBody
+		if isvalid(rb) then rb.IsolatedMove = self._T.cliffGuardOriginal == true end
+		self._T.cliffGuardBody = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasSafeGroundAhead(Entity player, Vector3 from, number dir)
+		-- 엔진의 연결 발판 예측을 먼저 사용한다. 고정 높이의 광선은 오르막 지면 아래에서 시작해 정상 길을 절벽으로 오인한다.
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) or not rb:IsOnGround() then return true end
+		local current = rb:GetCurrentFoothold()
+		if current == nil then return false end
+		local lookAhead = math.max(0.45, math.min(1.0, math.abs(rb.RealMoveVelocity.x) * 0.25))
+		-- true는 해당 거리까지 보행 가능하다는 뜻이며, 경사와 연결된 다음 발판까지 검사한다.
+		if rb:PredictFootholdEnd(lookAhead, dir > 0) then return true end
+		-- 링크 없이 겹쳐 놓은 발판은 기존의 같은 보행 구역 확인을 유지한다.
+		local id = self:GetFootholdIdBelow(player,from.x+dir*lookAhead,from.y+0.25,0.6)
+		return id > 0 and self:AreFootholdIdsConnected(player,current.Id,id)
+	end
+
+	@ExecSpace("ClientOnly")
 	method boolean AreFootholdIdsConnected(Entity player, integer aId, integer bId)
-		-- 두 발판이 NextFootholdId/PreviousFootholdId 체인으로 **걸어서** 이어져 있는가.
-		-- 같은 높이처럼 보여도 끊긴 별개 발판은 체인이 끊겨 있다([[feedback-msw-foothold-raycast]] 3번:
-		-- 겉보기 한 층도 수십 조각 체인이라 단일 조각의 끝점만 봐서는 진짜 가장자리를 모른다 - 그 역이용).
-		-- 수직 연결선(턱/절벽 세그먼트)도 체인에 포함되므로 계단 지형은 "이어짐"으로 본다 -
-		-- 턱을 실제로 넘는 건 TryStepUpOverWall 몫이고, 여기서는 경로 존재 여부만 가른다.
-		-- 판정 불가(Id 0)면 막지 않는다(기존 동작 유지 - 멀쩡한 대상을 버리는 회귀 방지).
-		if aId <= 0 or bId <= 0 then return true end
-		if aId == bId then return true end
+		-- 같은 보행 구역을 맵당 한 번 계산한다. 절벽은 점프/로프로 별도 탐색한다.
+		if aId <= 0 or bId <= 0 then return false end
 		local map = player.CurrentMap
 		local fh = isvalid(map) and map.FootholdComponent or nil
-		if not isvalid(fh) then return true end
-		-- 맵 발판은 정적이라 결과를 캐시한다 (FindTarget이 0.3초마다 후보별로 물어본다).
-		if self._T.fhConnCacheMap ~= map then
-			self._T.fhConnCache = {}
-			self._T.fhConnCacheMap = map
-		end
-		local lo = math.min(aId, bId)
-		local hi = math.max(aId, bId)
-		local key = tostring(lo) .. "|" .. tostring(hi)
-		local cached = self._T.fhConnCache[key]
-		if cached ~= nil then return cached end
-		local start = fh:GetFoothold(aId)
-		if start == nil then return true end
-		-- 오른쪽(Next) 체인 → 실패 시 왼쪽(Previous) 체인. 한 층이 수십~수백 조각이라 상한은 넉넉히
-		-- 400(무한루프 방지용 안전망이지 실제 경로 길이 제한이 아니다).
-		local found = false
-		for pass = 1, 2 do
-			local cur = start
-			for i = 1, 400 do
-				local nid = cur.NextFootholdId
-				if pass == 2 then nid = cur.PreviousFootholdId end
-				if nid == nil or nid <= 0 or nid == aId then break end
-				local nxt = fh:GetFoothold(nid)
-				if nxt == nil then break end
-				if nxt.Id == bId then
-					found = true
-					break
+		if not isvalid(fh) then return false end
+		if self._T.walkGroupsMap ~= map or self._T.walkGroups == nil then
+			local groups = {}
+			local groupId = 0
+			for _, floor in pairs(fh:GetFootholdAll()) do
+				if floor:IsVertical() or groups[floor.Id] ~= nil then continue end
+				groupId = groupId+1
+				local queue = {floor}
+				groups[floor.Id] = groupId
+				local cursor = 1
+				while cursor <= #queue do
+					local cur = queue[cursor]
+					cursor = cursor+1
+					for pass = 1,2 do
+						local nid = pass == 1 and cur.NextFootholdId or cur.PreviousFootholdId
+						if nid == nil or nid <= 0 or groups[nid] ~= nil then continue end
+						local nxt = fh:GetFoothold(nid)
+						if nxt == nil or nxt:IsVertical() then continue end
+						local a = pass == 1 and cur.EndPoint or cur.StartPoint
+						local b = pass == 1 and nxt.StartPoint or nxt.EndPoint
+						if math.abs(a.x-b.x) > 0.12 or math.abs(a.y-b.y) > 0.12 then continue end
+						groups[nid] = groupId
+						table.insert(queue,nxt)
+					end
 				end
-				cur = nxt
 			end
-			if found then break end
+			-- 링크 없이 겹쳐 놓은 지면도 같은 높이에서 실제로 이어지면 보행 가능하다.
+			local surfaces, parents = {}, {}
+			for _, floor in pairs(fh:GetFootholdAll()) do
+				if floor:IsVertical() then continue end
+				local a,b = floor.StartPoint,floor.EndPoint
+				table.insert(surfaces,{id=floor.Id,l=a.x,r=b.x,ly=a.y,ry=b.y})
+			end
+			for i=1,groupId do parents[i]=i end
+			local rootOf = function(id)
+				while parents[id] ~= id do id=parents[id] end
+				return id
+			end
+			for i,a in ipairs(surfaces) do
+				for j=i+1,#surfaces do
+					local b=surfaces[j]
+					local left,right=math.max(a.l,b.l),math.min(a.r,b.r)
+					if right < left-0.03 then continue end
+					local ga,gb=rootOf(groups[a.id]),rootOf(groups[b.id])
+					if ga == gb then continue end
+					local x=(left+right)*0.5
+					local ya=a.ly+(a.ry-a.ly)*(x-a.l)/(a.r-a.l)
+					local yb=b.ly+(b.ry-b.ly)*(x-b.l)/(b.r-b.l)
+					if math.abs(ya-yb) <= 0.06 then parents[gb]=ga end
+				end
+			end
+			for id,group in pairs(groups) do groups[id]=rootOf(group) end
+			self._T.walkGroups = groups
+			self._T.walkGroupsMap = map
 		end
-		self._T.fhConnCache[key] = found
-		return found
+		local groups = self._T.walkGroups
+		return groups[aId] ~= nil and groups[aId] == groups[bId]
 	end
 
 	@ExecSpace("ClientOnly")
@@ -4802,6 +4859,12 @@ script AutoHuntManager extends Logic
 					pccA.LookDirectionX = (ddx > 0) and 1 or -1
 				end
 				local aDir = (ddx > 0) and 1 or -1
+				if math.abs(ddx) > 0.55 and not self:HasSafeGroundAhead(player,pp,aDir) then
+					self:StopMoving()
+					if self:TryStepUpOverWall(player,pp,aDir,now) then return true end
+					self:ClearRopeState(player,"로프까지 보행 경로 단절",true)
+					return false
+				end
 				player.MovementComponent:MoveToDirection(Vector2(aDir, 0), step)
 				self._T.moving = true
 				local scA = player.StateComponent
@@ -4943,18 +5006,23 @@ script AutoHuntManager extends Logic
     method table FindIntermediateStep(Entity player, Vector3 pp, Vector3 target)
         -- Search several intermediate stairs; the left training route is not a single hop.
         local map = player.CurrentMap
-        if not isvalid(map) or _ChannelManager:BaseName(map.Name) ~= "001010000" then return nil end
+        if not isvalid(map) then return nil end
         local fh = map.FootholdComponent
         if not isvalid(fh) then return nil end
         local key = tostring(map.Id) .. "|" .. tostring(math.floor(pp.x*3)) .. "|" .. tostring(math.floor(pp.y*5)) .. "|" .. tostring(math.floor(target.x*2)) .. "|" .. tostring(math.floor(target.y*5))
-        if self._T.stepCacheKey == key and (self._T.stepCacheUntil or 0) > _UtilLogic.ElapsedSeconds then return self._T.stepCacheValue end
-        self._T.stepCacheKey = key
-        self._T.stepCacheUntil = _UtilLogic.ElapsedSeconds + 0.4
-        self._T.stepCacheValue = nil
+        local now = _UtilLogic.ElapsedSeconds
+        if self._T.stepCacheMap ~= map or (self._T.stepCacheResetAt or 0) <= now then
+            self._T.stepRoutes = {} self._T.stepCacheMap = map self._T.stepCacheResetAt = now+2
+        end
+        local cached = self._T.stepRoutes[key]
+        if cached ~= nil and cached.untilTime > now then return cached.value end
+        local entry = {untilTime=now+0.6,value=nil}
+        self._T.stepRoutes[key] = entry
         local reach = self:GetPlainJumpReach(player)
         local initialId = self:GetFootholdIdBelow(player, pp.x, pp.y+0.1, 0.6)
         local targetId = self:GetFootholdIdBelow(player, target.x, target.y+0.1, 0.6)
         if initialId <= 0 or targetId <= 0 then return nil end
+        if self:AreFootholdIdsConnected(player,initialId,targetId) then return nil end
         local queue = {{point=pp, id=initialId, first=nil, depth=0}}
         local visited = {[initialId]=true}
         local footholds = fh:GetFootholdAll()
@@ -4964,15 +5032,29 @@ script AutoHuntManager extends Logic
             cursor = cursor + 1
             local from = node.point
             if node.first ~= nil and (
-                (math.abs(from.y-target.y) < 0.25 and self:AreFootholdIdsConnected(player,node.id,targetId))
+                self:AreFootholdIdsConnected(player,node.id,targetId)
                 or self:FindUsableRope(player,from,target.y,target.x) ~= nil
                 or (math.abs(target.x-from.x) <= 2.0 and self:CanReachTargetLayer(player,from,target,reach))) then
-                local result = {x=node.first.x, y=node.first.y, launchX=node.first.launchX,
+                local result = {x=node.first.x, y=node.first.y, launchX=node.first.launchX, kind=node.first.kind, bot=node.first.bot,
                     routeCost=math.abs(node.first.launchX-pp.x)+math.abs(from.x-node.first.x)+math.abs(target.x-from.x)+math.abs(target.y-pp.y)*1.2}
-                self._T.stepCacheValue = result
+                entry.value = result
                 return result
             end
             if node.depth >= 8 then continue end
+            -- 여러 층의 로프도 경로의 한 구간으로 탐색한다. 아래층으로 내려가는 경로는 제외한다.
+            for _, rope in ipairs(self:GetRopes(player)) do
+                if rope.bot <= from.y+0.8 and rope.top > from.y+0.5 and rope.top <= target.y+0.8 then
+                    local bottomId = self:GetFootholdIdBelow(player,rope.x,from.y+0.3,1.0)
+                    local topId = self:GetFootholdIdBelow(player,rope.x,rope.top+0.3,0.9)
+                    if topId > 0 and not visited[topId] and self:AreFootholdIdsConnected(player,node.id,bottomId) then
+                        local topFloor = fh:GetFoothold(topId)
+                        local topY = topFloor:GetYByX(rope.x)
+                        local first = node.first or {x=rope.x,y=topY,launchX=rope.x,kind="rope",bot=rope.bot}
+                        visited[topId] = true
+                        table.insert(queue,{point=Vector3(rope.x,topY,pp.z),id=topId,first=first,depth=node.depth+1})
+                    end
+                end
+            end
             local launchFloors = {}
             for _, floor in pairs(footholds) do
                 if not floor:IsVertical() and self:AreFootholdIdsConnected(player,node.id,floor.Id) then
@@ -5015,39 +5097,62 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean IntermediateStepTick(Entity player, Vector3 pp, Vector3 target, number now, number delta)
+		-- 먼저 출발 발판의 안전한 위치로 정렬한 뒤, 도약 중에는 착지 발판만 추적한다.
 		if (self._T.ropeState or "") ~= "" then return false end
+		local rb = player.RigidbodyComponent
+		if not isvalid(rb) then return false end
 		local hop = self._T.intermediateHop
-		if self._T.intermediateMap ~= player.CurrentMap then hop = nil self._T.intermediateHop = nil end
-		if hop ~= nil and (self._T.intermediateUntil or 0) <= now then hop = nil self._T.intermediateHop = nil end
+		if self._T.intermediateMap ~= player.CurrentMap or (self._T.intermediateUntil or 0) <= now then
+			hop = nil self._T.intermediateHop = nil
+		end
+		if hop ~= nil and rb:IsOnGround() and math.abs(pp.y-hop.y) < 0.2 then
+			self._T.intermediateHop = nil
+			self._T.noDownJumpUntil = now+1.2
+			self._T.layerHoldUntil = now+2
+			self:StopMoving()
+			return true
+		end
 		if hop == nil then
-			if target.y <= pp.y + 0.15 then return false end
-			if self:FindUsableRope(player, pp, target.y, target.x) ~= nil then return false end
-			hop = self:FindIntermediateStep(player, pp, target)
+			if not rb:IsOnGround() or target.y <= pp.y+0.15 then return false end
+			if self:FindUsableRope(player,pp,target.y,target.x) ~= nil then return false end
+			hop = self:FindIntermediateStep(player,pp,target)
 			if hop == nil then return false end
 		end
-		local rb = player.RigidbodyComponent
+		if hop.kind == "rope" then
+			self._T.ropeState = "approach"
+			self._T.ropeX = hop.x
+			self._T.ropeGoalY = hop.y
+			self._T.ropeUntil = now+6+math.abs(hop.x-pp.x)*1.2+math.abs(hop.y-pp.y)*1.5
+			self._T.intermediateHop = nil
+			log("[AutoHunt] 중간 로프 경로 x="..tostring(hop.x).." y="..tostring(hop.y))
+			return true
+		end
 		local controller = player.PlayerControllerComponent
 		if isvalid(controller) then controller.Enable = false end
-		local airborne = isvalid(rb) and not rb:IsOnGround()
-        local aimX = airborne and hop.x or (hop.launchX or hop.x)
-        local dx = aimX - pp.x
+		local airborne = not rb:IsOnGround()
+		local aimX = airborne and hop.x or (hop.launchX or hop.x)
+		local dx = aimX-pp.x
 		local dir = dx >= 0 and 1 or -1
-		if math.abs(dx) > 0.08 then
-			if isvalid(controller) then controller.LookDirectionX = dir end
-			player.MovementComponent:MoveToDirection(Vector2(dir, 0), delta)
-			self._T.moving = true
-		end
-		if isvalid(rb) and rb:IsOnGround() and math.abs(dx) <= 0.14 and hop.y > pp.y + 0.15 then
+		if not airborne and math.abs(dx) <= 0.22 and hop.y > pp.y+0.15 then
 			self:StopMoving()
-            if isvalid(controller) then controller.Enable = false end
-            local jumpDir = hop.x >= pp.x and 1 or -1
-            if math.abs(hop.x-pp.x) > 0.1 then player.MovementComponent:MoveToDirection(Vector2(jumpDir,0),delta) end
-            player.MovementComponent:Jump()
-            self._T.intermediateHop = hop
+			if isvalid(controller) then controller.Enable = false end
+			local jumpDir = hop.x >= pp.x and 1 or -1
+			if math.abs(hop.x-pp.x) > 0.1 then player.MovementComponent:MoveToDirection(Vector2(jumpDir,0),delta) end
+			player.MovementComponent:Jump()
+			self._T.intermediateHop = hop
 			self._T.intermediateMap = player.CurrentMap
-			self._T.intermediateUntil = now + 0.85
-			log("[AutoHunt] 중간 발판으로 점프 x=" .. tostring(hop.x) .. " y=" .. tostring(hop.y))
-		end
+			self._T.intermediateUntil = now+1.4
+			log("[AutoHunt] 중간 발판 점프 x="..tostring(hop.x).." y="..tostring(hop.y))
+		elseif math.abs(dx) > 0.08 then
+			if not airborne and math.abs(dx) > 0.55 and not self:HasSafeGroundAhead(player,pp,dir) then
+				self:StopMoving()
+				if self:TryStepUpOverWall(player,pp,dir,now) then return true end
+				return false
+			end
+			if isvalid(controller) then controller.LookDirectionX = dir end
+			player.MovementComponent:MoveToDirection(Vector2(dir,0),delta)
+			self._T.moving = true
+		else player.MovementComponent:Stop() end
 		self._T.chaseStart = now
 		return true
 	end

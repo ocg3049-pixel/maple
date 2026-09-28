@@ -48,7 +48,14 @@ script ItemHallOfFame extends Logic
     method void Queue(string userId, string charId, string owner, string save)
         if self._T.pending == nil then self._T.pending = {} end
         local key = userId .. "_" .. charId
+        self._T.characterData = self._T.characterData or {}
+        local sv = _CharacterPersistence._T.sv[userId]
+        if sv ~= nil then
+            for _, ch in ipairs(sv.list) do if ch.id == charId then self._T.characterData[key] = ch.data break end end
+        end
         self._T.pending[key] = {owner = owner, save = save}
+        self._T.boards = {}
+        self._T.cacheUntil = 0
         if self._T.timer == nil then
             self._T.timer = _TimerService:SetTimerOnce(function()
                 self._T.timer = nil
@@ -74,6 +81,8 @@ script ItemHallOfFame extends Logic
 
     @ExecSpace("ServerOnly")
     method boolean Publish(string ownerKey, string owner, string save)
+        save = save or ""
+        if not self:PublishProfile(ownerKey, owner, save) then return false end
         if self._T.published == nil then self._T.published = {} end
         local rows = {}
         for _, line in ipairs(_CharacterPersistence:SplitLines(save)) do
@@ -84,7 +93,7 @@ script ItemHallOfFame extends Logic
             if item ~= "" then table.insert(rows, {key = ownerKey .. "_" .. suffix, item = item}) end
         end
         table.sort(rows, function(a, b) return a.key < b.key end)
-        local fingerprint = owner .. _HttpService:JSONEncode(rows)
+        local fingerprint = owner .. (#rows > 0 and _HttpService:JSONEncode(rows) or "[]")
         if self._T.published[ownerKey] == fingerprint then return true end
         local detail = _DataStorageService:GetGlobalDataStorage(self.DetailName)
         local index = _DataStorageService:GetSortableDataStorage(self.IndexName)
@@ -102,7 +111,7 @@ script ItemHallOfFame extends Logic
             row.score = self:Score(row.item)
             manifest[row.key] = true
             scores[row.key] = row.score
-            values[row.key] = _HttpService:JSONEncode({owner = owner, item = row.item, score = row.score, key = row.key})
+            values[row.key] = _HttpService:JSONEncode({owner = owner, ownerKey = ownerKey, item = row.item, score = row.score, key = row.key})
         end
         local allKeys = {}
         for key, _ in pairs(manifest) do table.insert(allKeys, string.sub(key, #ownerKey + 2)) end
@@ -118,6 +127,7 @@ script ItemHallOfFame extends Logic
             if not self:WriteBatches(index, scores) then return false end
         end
         self._T.published[ownerKey] = fingerprint
+        self._T.boards = {}
         self._T.cacheUntil = 0
         log("[ItemHall] indexed owner=" .. owner .. " items=" .. tostring(#rows))
         return true
@@ -130,7 +140,8 @@ script ItemHallOfFame extends Logic
         if (self._T.requests[user] or 0) > _UtilLogic.ServerElapsedSeconds then return end
         self._T.requests[user] = _UtilLogic.ServerElapsedSeconds + 2
         if self._T.cache ~= nil and (self._T.cacheUntil or 0) > _UtilLogic.ServerElapsedSeconds then
-            _InformationBook:ReceiveRanks(self._T.cache, "", user)
+            local fresh = self:FilterCurrent(self._T.cache)
+            _InformationBook:ReceiveRanks(fresh, fresh == "" and "순위를 불러오지 못했습니다. 새로고침해주세요." or "", user)
             return
         end
         if self._T.reading then
@@ -158,42 +169,120 @@ script ItemHallOfFame extends Logic
         local index = _DataStorageService:GetSortableDataStorage(self.IndexName)
         local detail = _DataStorageService:GetGlobalDataStorage(self.DetailName)
         local ec, pages = index:GetSortedAndWait(SortDirection.Descending, 1, 2147483647)
+        if ec == 1000002 then return "[]" end
         if ec ~= 0 or pages == nil then return "" end
-        local keys, scores = {}, {}
+        local result = {}
         while true do
+            local keys, scores = {}, {}
             for _, row in ipairs(pages:GetCurrentPageDatas()) do
-                if #keys >= 100 then break end
                 table.insert(keys, row.KeyInfo.Key)
                 scores[row.KeyInfo.Key] = row.Value
             end
-            if #keys >= 100 or pages.IsLastPage then break end
+            if #keys > 0 then
+                local code, details = detail:BatchGetAndWait(keys)
+                if code ~= 0 or details == nil then return "" end
+                local records = {}
+                while true do
+                    for _, row in ipairs(details:GetCurrentPageDatas()) do
+                        local ok, value = pcall(function() return _HttpService:JSONDecode(row.Value) end)
+                        if ok and value ~= nil and value.score == scores[row.KeyInfo.Key] then table.insert(records, value) end
+                    end
+                    if details.IsLastPage then break end
+                    if details:LoadNextPageAndWait() ~= 0 then return "" end
+                    details:MoveToNextPageAndWait()
+                end
+                local raw = self:FilterCurrent(#records > 0 and _HttpService:JSONEncode(records) or "[]")
+                if raw == "" then return "" end
+                for _, row in ipairs(_HttpService:JSONDecode(raw)) do table.insert(result, row) end
+            end
+            if #result >= 100 or pages.IsLastPage then break end
             if pages:LoadNextPageAndWait() ~= 0 then return "" end
             pages:MoveToNextPageAndWait()
         end
-        if #keys == 0 then return "[]" end
-        local code, details = detail:BatchGetAndWait(keys)
-        if code ~= 0 or details == nil then return "" end
-        local records = {}
-        while true do
-            for _, row in ipairs(details:GetCurrentPageDatas()) do
-                local ok, value = pcall(function() return _HttpService:JSONDecode(row.Value) end)
-                if ok and value ~= nil and value.score == scores[row.KeyInfo.Key] then records[row.KeyInfo.Key] = value end
-            end
-            if details.IsLastPage then break end
-            if details:LoadNextPageAndWait() ~= 0 then return "" end
-            details:MoveToNextPageAndWait()
-        end
-        local result = {}
-        for _, key in ipairs(keys) do
-            if records[key] ~= nil then table.insert(result, records[key]) end
-        end
-        return _HttpService:JSONEncode(result)
+        table.sort(result, function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end)
+        while #result > 100 do table.remove(result) end
+        return #result > 0 and _HttpService:JSONEncode(result) or "[]"
     end
+
+    @ExecSpace("ServerOnly")
+    method table CurrentOwners(table ownerKeys)
+        -- 요청 단위로 사용자별 목록/세이브를 한 번에 읽는다. 순위 저장본만으로 생존을 판단하지 않는다.
+        local groups, result = {}, {}
+        for ownerKey, _ in pairs(ownerKeys) do
+            local uid, id = string.match(ownerKey, "^([^_]+)_(.+)$")
+            if uid ~= nil and id ~= nil then
+                groups[uid] = groups[uid] or {}
+                groups[uid][id] = ownerKey
+            end
+        end
+        for uid, ids in pairs(groups) do
+            local keys = {"chars"}
+            for id, _ in pairs(ids) do table.insert(keys, "save_" .. id) end
+            local code, pages = _DataStorageService:GetUserDataStorage(uid):BatchGetAndWait(keys)
+            if code ~= 0 or pages == nil then return nil end
+            local loaded = {}
+            while true do
+                for _, row in ipairs(pages:GetCurrentPageDatas()) do loaded[row.KeyInfo.Key] = row.Value end
+                if pages.IsLastPage then break end
+                if pages:LoadNextPageAndWait() ~= 0 then return nil end
+                pages:MoveToNextPageAndWait()
+            end
+            local chars = loaded.chars or ""
+            local current = (_CharacterPersistence._T.sv or {})[uid]
+            -- 접속 중 서버가 받은 최신 스냅샷을 사용한다. 퇴장 후 남은 캐시는 사용하지 않는다.
+            if current ~= nil and not current.loadFailed and isvalid(_UserService:GetUserEntityByUserId(uid)) then
+                chars = _CharacterPersistence:EncodeCharsStore(current)
+                for id, _ in pairs(ids) do
+                    if current.saves[id] ~= nil then loaded["save_" .. id] = current.saves[id] end
+                end
+            end
+            for _, line in ipairs(_CharacterPersistence:SplitLines(chars)) do
+                local f = _CharacterPersistence:SplitTabs(line)
+                if f[1] == "C" and ids[f[2]] ~= nil then
+                    result[ids[f[2]]] = {data=f[4] or "",save=loaded["save_" .. f[2]] or ""}
+                end
+            end
+        end
+        return result
+    end
+
+    method boolean IsCurrentRow(table row, table owners)
+        local ownerKey = row.ownerKey or row.key or ""
+        local owner = owners[ownerKey]
+        if owner == nil then return false end
+        if row.item == nil then return true end
+        -- 아이템은 동일한 저장 슬롯에 실제 남아 있어야 한다 (판매/분해/파괴/삭제 제외).
+        for _, line in ipairs(_CharacterPersistence:SplitLines(owner.save)) do
+            local f = _CharacterPersistence:SplitTabs(line)
+            if f[1] == "E" and row.key == ownerKey .. "_E" .. (f[2] or "") and row.item == f[3] then return true end
+            if f[1] == "I" and f[2] == "equip" and row.key == ownerKey .. "_I" .. (f[3] or "") and row.item == f[4] then return true end
+        end
+        return false
+    end
+
+    @ExecSpace("ServerOnly")
+    method string FilterCurrent(string raw)
+        if raw == "" then return "" end
+        local ok, rows = pcall(function() return _HttpService:JSONDecode(raw) end)
+        if not ok or type(rows) ~= "table" then return "" end
+        local keys = {}
+        for _, row in ipairs(rows) do keys[row.ownerKey or row.key or ""] = true end
+        if next(keys) == nil then return "[]" end
+        local owners = self:CurrentOwners(keys)
+        if owners == nil then return "" end
+        local result = {}
+        for _, row in ipairs(rows) do
+            if self:IsCurrentRow(row, owners) then table.insert(result, row) end
+        end
+        if #result ~= #rows then log("[Hall] removed stale rows=" .. tostring(#rows - #result)) end
+        return #result > 0 and _HttpService:JSONEncode(result) or "[]"
+    end
+
     @ExecSpace("ServerOnly")
     method boolean Backfill()
         if self._T.backfilled then return true end
         local details = _DataStorageService:GetGlobalDataStorage(self.DetailName)
-        local ec, done = details:GetAndWait("backfill_v1")
+        local ec, done = details:GetAndWait("backfill_v2")
         if ec ~= 0 and ec ~= 1000002 then return false end
         if done == "done" then self._T.backfilled = true return true end
         local code, users = _DataStorageService:GetUserDataStoragePagesAndWait()
@@ -209,7 +298,7 @@ script ItemHallOfFame extends Logic
                     if f[1] == "C" and f[2] ~= nil and f[4] ~= nil then
                         local key = "save_" .. f[2]
                         table.insert(keys, key)
-                        names[key] = {id = f[2], name = string.match(f[4], "([^|]+)") or ""}
+                        names[key] = {id = f[2], name = string.match(f[4], "([^|]+)") or "", data = f[4]}
                     end
                 end
                 if #keys > 0 then
@@ -220,6 +309,8 @@ script ItemHallOfFame extends Logic
                             local character = names[row.KeyInfo.Key]
                             if character ~= nil then
                                 local ownerKey = storage.UserId .. "_" .. character.id
+                                self._T.characterData = self._T.characterData or {}
+                                self._T.characterData[ownerKey] = character.data
                                 -- 접속 중 최신 스냅샷이 있으면 DB의 이전 저장본보다 우선한다.
                                 local current = _CharacterPersistence._T.sv[storage.UserId]
                                 local snapshot = current ~= nil and current.saves[character.id] or nil
@@ -237,7 +328,7 @@ script ItemHallOfFame extends Logic
             if users:LoadNextPageAndWait() ~= 0 then return false end
             users:MoveToNextPageAndWait()
         end
-        if details:SetAndWait("backfill_v1", "done") ~= 0 then return false end
+        if details:SetAndWait("backfill_v2", "done") ~= 0 then return false end
         self._T.backfilled = true
         log("[ItemHall] initial world scan complete characters=" .. tostring(count))
         return true
@@ -256,6 +347,151 @@ script ItemHallOfFame extends Logic
         end
         if count > 0 and storage:BatchSetAndWait(batch) ~= 0 then return false end
         return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method table BuildProfile(string ownerKey, string owner, string save)
+        save = save or ""
+        local meta = (self._T.characterData or {})[ownerKey] or ""
+        local uid = string.match(ownerKey, "^([^_]+)_") or ""
+        local power = tonumber(string.match("\n"..save, "\nCP\t(%d+)")) or tonumber(self:Field(meta,10)) or 0
+        local level = tonumber(string.match("\n"..save, "\nLV\t(%d+)")) or tonumber(self:Field(meta,11)) or 1
+        local profile = {key=ownerKey,uid=uid,name=owner,job=math.max(1,math.min(10,tonumber(self:Field(meta,8)) or 1)),level=math.max(1,level),power=math.max(0,math.min(9007199254740990,math.floor(power))),deleted=owner=="",appearance=meta}
+        local equips, deco = {}, {}
+        for _, line in ipairs(_CharacterPersistence:SplitLines(save)) do
+            local f = _CharacterPersistence:SplitTabs(line)
+            if f[1]=="E" and tonumber(f[2])~=nil and tonumber(f[2])>=1 and tonumber(f[2])<=28 then equips[f[2]]=f[3] end
+            if f[1]=="D" then deco[f[2]]=f[3] end
+        end
+        if next(equips)~=nil then profile.equips=equips end
+        if next(deco)~=nil then profile.deco=deco end
+        return profile
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean PublishProfile(string ownerKey, string owner, string save)
+        local p = self:BuildProfile(ownerKey,owner,save)
+        local raw = _HttpService:JSONEncode(p)
+        self._T.profilePublished = self._T.profilePublished or {}
+        if self._T.profilePublished[ownerKey] == raw then return true end
+        local details = _DataStorageService:GetGlobalDataStorage("HallCharactersV1")
+        local code, previous = details:GetAndWait(ownerKey)
+        if code~=0 and code~=1000002 then return false end
+        local oldJob = p.job
+        if previous~=nil and previous~="" then
+            local ok, old=pcall(function() return _HttpService:JSONDecode(previous) end)
+            if ok and old~=nil then oldJob=old.job or p.job end
+        end
+        if details:SetAndWait(ownerKey,raw)~=0 then return false end
+        local score = p.deleted and -1 or p.power
+        if _DataStorageService:GetSortableDataStorage("HallPowerV1"):SetAndWait(ownerKey,score)~=0 then return false end
+        if _DataStorageService:GetSortableDataStorage("HallJobV1_"..tostring(p.job)):SetAndWait(ownerKey,score)~=0 then return false end
+        if oldJob~=p.job and _DataStorageService:GetSortableDataStorage("HallJobV1_"..tostring(oldJob)):SetAndWait(ownerKey,-1)~=0 then return false end
+        self._T.profilePublished[ownerKey]=raw
+        self._T.boards={}
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method string ReadCharacterRanking(integer job)
+        local name = job==0 and "HallPowerV1" or "HallJobV1_"..tostring(job)
+        local index = _DataStorageService:GetSortableDataStorage(name)
+        local code, pages = index:GetSortedAndWait(SortDirection.Descending,0,9007199254740990)
+        if code==1000002 then return "[]" end
+        if code~=0 or pages==nil then return "" end
+        local result={}
+        local details=_DataStorageService:GetGlobalDataStorage("HallCharactersV1")
+        while true do
+            local keys,scores={},{}
+            local candidates={}
+            for _, row in ipairs(pages:GetCurrentPageDatas()) do
+                table.insert(keys,row.KeyInfo.Key) scores[row.KeyInfo.Key]=row.Value
+            end
+            if #keys>0 then
+                local ec, records=details:BatchGetAndWait(keys)
+                if ec~=0 or records==nil then return "" end
+                while true do
+                    for _, row in ipairs(records:GetCurrentPageDatas()) do
+                        local ok,p=pcall(function() return _HttpService:JSONDecode(row.Value) end)
+                        if ok and p~=nil and not p.deleted and p.power==scores[row.KeyInfo.Key] and (job==0 or p.job==job) then
+                            table.insert(candidates,{key=p.key,ownerKey=p.key,owner=p.name,job=p.job,level=p.level,score=p.power})
+                        end
+                    end
+                    if records.IsLastPage then break end
+                    if records:LoadNextPageAndWait()~=0 then return "" end
+                    records:MoveToNextPageAndWait()
+                end
+            end
+            local fresh=self:FilterCurrent(#candidates>0 and _HttpService:JSONEncode(candidates) or "[]")
+            if fresh=="" then return "" end
+            for _,row in ipairs(_HttpService:JSONDecode(fresh)) do table.insert(result,row) end
+            if #result>=100 or pages.IsLastPage then break end
+            if pages:LoadNextPageAndWait()~=0 then return "" end
+            pages:MoveToNextPageAndWait()
+        end
+        table.sort(result,function(a,b) if a.score==b.score then return a.key<b.key end return a.score>b.score end)
+        while #result>100 do table.remove(result) end
+        return #result>0 and _HttpService:JSONEncode(result) or "[]"
+    end
+
+    @ExecSpace("Server")
+    method void RequestBoard(integer board, integer job, integer requestId)
+        local uid=senderUserId
+        if board<1 or board>3 or job<1 or job>10 then return end
+        self._T.boardRequests=self._T.boardRequests or {}
+        if _UtilLogic.ServerElapsedSeconds<(self._T.boardRequests[uid] or 0) then
+            _InformationBook:ReceiveBoard(board,job,requestId,"","잠시 후 새로고침해주세요.",uid) return
+        end
+        self._T.boardRequests[uid]=_UtilLogic.ServerElapsedSeconds+0.3
+        local cacheKey=tostring(board)..":"..tostring(job)
+        self._T.boards=self._T.boards or {}
+        local cached=self._T.boards[cacheKey]
+        if cached~=nil and cached.untilTime>_UtilLogic.ServerElapsedSeconds then
+            local fresh = self:FilterCurrent(cached.raw)
+            _InformationBook:ReceiveBoard(board,job,requestId,fresh,fresh == "" and "순위를 불러오지 못했습니다. 새로고침해주세요." or "",uid) return
+        end
+        if self._T.boardReading then
+            _InformationBook:ReceiveBoard(board,job,requestId,"","순위 갱신 중입니다. 잠시 후 새로고침해주세요.",uid) return
+        end
+        self._T.boardReading=true
+        local ok,raw=pcall(function()
+            if not self:Backfill() then return "" end
+            self:Flush()
+            if board==1 then return self:ReadRanking() end
+            return self:ReadCharacterRanking(board==3 and job or 0)
+        end)
+        self._T.boardReading=false
+        if not ok then log_warning("[Hall] read failed: "..tostring(raw)) end
+        if not ok or raw=="" then
+            _InformationBook:ReceiveBoard(board,job,requestId,"","순위를 불러오지 못했습니다. 새로고침해주세요.",uid) return
+        end
+        self._T.boards[cacheKey]={raw=raw,untilTime=_UtilLogic.ServerElapsedSeconds+30}
+        _InformationBook:ReceiveBoard(board,job,requestId,raw,"",uid)
+        log("[Hall] board="..tostring(board).." job="..tostring(job).." loaded")
+    end
+
+    @ExecSpace("Server")
+    method void RequestOwner(string ownerKey, integer requestId)
+        if #ownerKey>120 or string.match(ownerKey,"^[%w_%-]+$")==nil then return end
+        self._T.ownerRequests=self._T.ownerRequests or {}
+        if _UtilLogic.ServerElapsedSeconds<(self._T.ownerRequests[senderUserId] or 0) then
+            _InformationBook:ReceiveOwner(ownerKey,requestId,"","잠시 후 다시 선택해주세요.",senderUserId) return
+        end
+        self._T.ownerRequests[senderUserId]=_UtilLogic.ServerElapsedSeconds+0.2
+        local owners = self:CurrentOwners({[ownerKey]=true})
+        if owners == nil then
+            _InformationBook:ReceiveOwner(ownerKey,requestId,"","캐릭터 정보를 불러오지 못했습니다.",senderUserId)
+            return
+        end
+        local owner = owners[ownerKey]
+        if owner == nil then
+            _InformationBook:ReceiveOwner(ownerKey,requestId,"","삭제된 캐릭터입니다. 순위를 새로고침해주세요.",senderUserId)
+            return
+        end
+        self._T.characterData = self._T.characterData or {}
+        self._T.characterData[ownerKey] = owner.data
+        local profile = self:BuildProfile(ownerKey, self:Field(owner.data,1), owner.save)
+        _InformationBook:ReceiveOwner(ownerKey,requestId,_HttpService:JSONEncode(profile),"",senderUserId)
     end
 
 end

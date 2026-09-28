@@ -3,13 +3,17 @@ script CashShopManager extends Logic
 
 	property string halfEarringRUID = "837093d12dd344e59956d8f88f1aaf34"
 	property string productId = "G1BADOYWB"
-	property integer expectedPrice = 10
+	property integer expectedPrice = 1600
+	-- 테스트 종료 시 false: 메소 구매 경로와 버튼을 함께 비활성화한다.
+	property boolean temporaryMesoPurchaseEnabled = true
+	property integer temporaryMesoPrice = 10000
 	property string windowPath = "/ui/DefaultGroup/CashShopWindow"
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Reuse nine cards; catalog entries drive category filtering, details and pagination.
 		self._T.handlers = {}
+		self._T.tabKey = _InputService:ConnectEvent(KeyDownEvent, self.OnTabKey)
 		self._T.catalog = self:BuildCatalog()
 		self._T.category = "all"
 		self._T.page = 1
@@ -17,7 +21,8 @@ script CashShopManager extends Logic
 		local bindings = {
 			{path="/ui/DefaultGroup/MapleHUD/BtnCashShop", action=function() self:ToggleWindow() end},
 			{path=self.windowPath .. "/Close", action=function() self:SetOpen(false) end},
-			{path=self.windowPath .. "/Buy", action=function() self:RequestPurchase() end}
+			{path=self.windowPath .. "/Buy", action=function() self:RequestPurchase() end},
+            {path=self.windowPath .. "/BuyMeso", action=function() self:RequestTemporaryPurchase() end}
 			,{path="/ui/DefaultGroup/EquipWindow/SlotEarring", action=function()
 				if _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EquipWindow", _InputService:GetCursorPosition()) then
 					_UIEquipInventoryManager:OnSlotClick("equip", 14)
@@ -46,15 +51,18 @@ script CashShopManager extends Logic
 				table.insert(self._T.handlers, {entity=entity, connection=connection})
 			end
 		end
-		self:SetOpen(false)
+		self:ClosePurchase()
+        self:BindPurchaseDialog()
+        self:SetOpen(false)
 		self:RefreshCatalog()
-		log("[CashShop] catalog ready product=" .. self.productId .. "; paid checkout disabled pending fulfillment verification")
+		log("[CashShop] catalog ready count=" .. tostring(#self._T.catalog) .. "; world-shop items=17 passes=2")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		if self._T.tabKey then _InputService:DisconnectEvent(KeyDownEvent, self._T.tabKey) self._T.tabKey = nil end
 		for _, record in ipairs(self._T.handlers or {}) do
-			if isvalid(record.entity) then record.entity:DisconnectEvent(ButtonClickEvent, record.connection) end
+			if isvalid(record.entity) then record.entity:DisconnectEvent(record.eventType or ButtonClickEvent, record.connection) end
 		end
 	end
 
@@ -69,11 +77,14 @@ script CashShopManager extends Logic
 	method void SetOpen(boolean opened)
 		local window = _EntityService:GetEntityByPath(self.windowPath)
 		if not isvalid(window) then return end
-		window.Enable = opened
+		if not opened then self:ClosePurchase() end
+        window.Enable = opened
 		if opened then
 			_UIEquipInventoryManager:PushWin(self.windowPath)
 			_UIEquipInventoryManager:BringWindowToFront(self.windowPath)
 			self:RefreshCatalog()
+            self:RequestCatalogPrices()
+            _AvatarTicketManager:RequestOwnedTicket()
 		else
 			_UIEquipInventoryManager:RemoveWin(self.windowPath)
 		end
@@ -108,7 +119,7 @@ script CashShopManager extends Logic
 				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Name", product ~= nil and product.name or "")
 				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Price", product ~= nil and tostring(product.price) .. " 월드코인" or "")
 				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Tag", product ~= nil and product.tag or "상품 준비 중")
-				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Hint", product ~= nil and "상세 보기" or "")
+				self:SetLabel("Catalog/Card" .. tostring(i) .. "/Hint", product ~= nil and "더블클릭 구매" or "")
 			end
 		end
 		for _, key in ipairs({"all", "equip", "consume", "decorate", "pet", "package", "etc"}) do
@@ -119,9 +130,10 @@ script CashShopManager extends Logic
 		end
 		self:SetLabel("Page", tostring(self._T.page) .. " / " .. tostring(self._T.pageCount))
 		self:SetLabel("Count", "상품 " .. tostring(#filtered) .. "개  ·  한 페이지 9개")
-		self:SetLabel("Price", selected ~= nil and tostring(selected.price) .. " 월드코인" or "")
+		self:RefreshWalletLabels()
+        self:SetLabel("Price", selected ~= nil and tostring(selected.price) .. " 월드코인" or "")
 		self:SetLabel("Product/Name", selected ~= nil and selected.name or "등록된 상품이 없습니다")
-		self:SetLabel("Product/Details", selected ~= nil and selected.description or "다른 카테고리를 선택해주세요.\n새 상품이 등록되면 이곳에 표시됩니다.")
+		self:SetLabel("Product/Details", selected ~= nil and (selected.description ~= "" and selected.description or "상품 설명 준비 중입니다.") or "다른 카테고리를 선택해주세요.\n새 상품이 등록되면 이곳에 표시됩니다.")
 		local detailIcon = _EntityService:GetEntityByPath(self.windowPath .. "/Product/Icon")
 		if isvalid(detailIcon) then
 			detailIcon.Enable = selected ~= nil
@@ -129,6 +141,10 @@ script CashShopManager extends Logic
 		end
 		local buy = _EntityService:GetEntityByPath(self.windowPath .. "/Buy")
 		if isvalid(buy) then buy.Enable = selected ~= nil end
+        local mesoBuy = _EntityService:GetEntityByPath(self.windowPath .. "/BuyMeso")
+        if isvalid(mesoBuy) then mesoBuy.Enable = selected ~= nil and self.temporaryMesoPurchaseEnabled end
+        self:SetLabel("BuyMeso", _UIEquipInventoryManager:FormatMeso(self.temporaryMesoPrice) .. "메소 구매 (임시)")
+        self:SetLabel("Notice", self.temporaryMesoPurchaseEnabled and ("테스트 한정: 개당 " .. _UIEquipInventoryManager:FormatMeso(self.temporaryMesoPrice) .. "메소 · 정식 서비스에서는 메소 구매 불가") or "메소 임시 구매 종료 · 월드코인 결제는 지급 연동 준비 중")
 		local previous = _EntityService:GetEntityByPath(self.windowPath .. "/Previous")
 		local nextPage = _EntityService:GetEntityByPath(self.windowPath .. "/Next")
 		if isvalid(previous) then previous.ButtonComponent.Enable = self._T.page > 1 end
@@ -136,10 +152,29 @@ script CashShopManager extends Logic
 	end
 
 	method table BuildCatalog()
-		-- Add one entry per product here; id must be unique, category must match a tab key.
-		return {{id=self.productId, category="equip", name="하프이어링", price=self.expectedPrice,
-			icon="thumbnail://" .. self.halfEarringRUID, tag="레전드리 · 최대 5성",
-			description="[고정 잠재능력]\n아이템 드롭률 +20%\n메소 획득량 +20%\n\n[스타포스 · 최대 5성]\n1성마다 드롭률 +2%\n메소 획득량 +2% / 공격력 +3\n\n잠재능력·에디셔널 재설정 불가\n구매 캐릭터에게 1개 지급"}}
+		-- World-shop snapshot: 17 items and 2 passes. Descriptions are authored separately.
+		return {
+			{id="G1BADOYWB", category="consume", name="장신구 상자", price=1600, icon="1ba8494660c64b0a94a4c6bd0d67294c", tag="특수 장신구 6종", description="반지·목걸이 2종·수신기·아이스바·안경 중 각각 1/6 확률로 획득합니다. 최대 5성, 레전드리 고정 잠재능력. 상세 정보는 1번 정보창의 장비·장신구 상자 탭을 확인하세요.", worldItemType="ITEM"},
+			{id="GEPT5CYLT", category="consume", name="고급 장비 상자", price=100, icon="fcaef6c94e144f498bac3c713e7e97e4", tag="5성 이상 확률 10배", description="높은 강화 수치의 장비를 획득할 수 있습니다. 각 5성 이상 등장 확률은 일반 장비 상자의 10배입니다. 상세 확률은 1번 정보창에서 확인하세요.", worldItemType="ITEM"},
+			{id="FS6WBQGE6", category="consume", name="프로텍트 실드", price=800, icon="e4ef0af83c5e49c58f6021853185e176", tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="HNWFXWVP7", category="decorate", name="모자 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("cap"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="LLXVL6RNN", category="decorate", name="헤어 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("hair"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="C6YETMLCT", category="decorate", name="성형 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("face"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="AH1EZJ1MX", category="decorate", name="상의 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("coat"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="UL4L4V1WC", category="decorate", name="하의 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("pants"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="MTIKMWIYT", category="decorate", name="한벌옷 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("longcoat"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="GJZNL9YEC", category="decorate", name="신발 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("shoes"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="HZ45JTJAV", category="decorate", name="장갑 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("glove"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="XMO1J8HF6", category="decorate", name="망토 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("cape"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="ZF9NN16HS", category="decorate", name="무기 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("weapon"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="U1ULRCFJ7", category="decorate", name="얼굴장식 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("faceaccessory"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="GX7BF9I5C", category="decorate", name="눈장식 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("eyeaccessory"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+            {id="cosmetic_skin", category="decorate", name="피부 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("skin"), tag="피부 18종 랜덤", description="피부색을 변경하는 치장 아이템 18종 중 1개를 같은 확률(각 1/18)로 획득합니다. 치장 탭에서 더블클릭하여 피부 슬롯에 장착할 수 있습니다.", worldItemType="ITEM"},
+			{id="CR21MC6Q6", category="decorate", name="귀걸이 아이템 뽑기", price=200, icon=_CosmeticBoxCatalog:BoxIcon("earaccessory"), tag="월드샵 등록 상품", description="", worldItemType="ITEM"},
+			{id="BJIR3RT0O", category="package", name="투명장신구 세트", price=800, icon="483576f627ae4205a02425b1ecd7983f", tag="투명 치장 6종", description="귀장식·눈장식·얼굴장식·신발·망토·장갑의 외형을 숨기는 치장 아이템 6종입니다. 장비 능력치는 유지됩니다. 개봉하려면 치장 인벤토리 빈칸 6개가 필요합니다. <color=#FF6A6A>분해 시 코디 조각을 얻을 수 없습니다(조각 0개).</color>", worldItemType="ITEM"},
+			{id="5THAJEBGH", category="etc", name="MSW 아바타 코디 이용권 (30일)", price=1000, icon="6c5302dc93154d7794435d927c5317ec", tag="이용권", description="장비창 우측 아래 티켓 슬롯에 장착하면 MSW 계정 코디를 표시합니다. 정보창의 티켓 버튼으로 기존 게임 코디를 확인할 수 있습니다. 다른 유저 코디 표시 여부는 게임 설정에서 변경합니다.", worldItemType="PASS"},
+			{id="EFTHGP8UC", category="etc", name="MSW 아바타 코디 이용권 (180일)", price=4800, icon="e16410b7209f44c1970cb6ebdff75604", tag="이용권", description="장비창 우측 아래 티켓 슬롯에 장착하면 MSW 계정 코디를 표시합니다. 정보창의 티켓 버튼으로 기존 게임 코디를 확인할 수 있습니다. 다른 유저 코디 표시 여부는 게임 설정에서 변경합니다.", worldItemType="PASS"}
+		}
 	end
 
 	@ExecSpace("ClientOnly")
@@ -157,6 +192,22 @@ script CashShopManager extends Logic
 		-- Update a text node without introducing a dependency on editor UUIDs.
 		local entity = _EntityService:GetEntityByPath(self.windowPath .. "/" .. relativePath)
 		if isvalid(entity) then entity.TextGUIRendererComponent.Text = value end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnTabKey(KeyDownEvent event)
+		-- 최상단 캐시샵에서만 탭을 순환하며 구매 확인 중에는 전환하지 않는다.
+		if event.key ~= KeyboardKey.Tab then return end
+		local window = _EntityService:GetEntityByPath(self.windowPath)
+		local purchase = _EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase/Overlay")
+		if not isvalid(window) or not window.EnabledInHierarchy then return end
+		if isvalid(purchase) and purchase.EnabledInHierarchy then return end
+		if _KeySettingManager:IsCapturingKey() or _MapleHUDManager:IsChatTyping() or _GameSystemMenu:BlocksInput() then return end
+		if _UIClickArbiter:GetKeyboardWindow() ~= self.windowPath then return end
+		local tabs = {"all", "equip", "consume", "decorate", "pet", "package", "etc"}
+		for i, key in ipairs(tabs) do
+			if key == self._T.category then self:SelectCategory(tabs[i % #tabs + 1]) _UIAudio:Play("Tab") return end
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -179,21 +230,284 @@ script CashShopManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void SelectCard(integer index)
-		-- Resolve the currently visible product, including after page or category changes.
-		local product = (self._T.visibleProducts or {})[index]
-		if product ~= nil then
-			self._T.selectedId = product.id
-			self:RefreshCatalog()
-		end
-	end
+        -- Reuse the quantity/confirmation flow for a double-click.
+        local product=(self._T.visibleProducts or {})[index]
+        if product==nil or self:BlocksInput() then return end
+        local now=_UtilLogic.ElapsedSeconds
+        local double=self._T.lastCardId==product.id and now-(self._T.lastCardTime or -10)<0.4
+        self._T.lastCardId=product.id
+        self._T.lastCardTime=now
+        self._T.selectedId=product.id
+        self:RefreshCatalog()
+        if double then self._T.lastCardId=nil self:RequestPurchase() log("[CashShop] double-click purchase") end
+    end
 
 	@ExecSpace("ClientOnly")
 	method void RequestPurchase()
-		-- Fail closed: no local currency substitute, free grant, or paid prompt before durable server delivery.
-		if self._T.selectedId == nil or self._T.selectedId == "" then return end
-		_UIToast:ShowMessage("안전한 지급 연동 준비 중으로, 아직 결제되지 않습니다.")
-		log("[CashShop] checkout blocked: fulfillment not verified; product=" .. self._T.selectedId)
+        -- Paid checkout uses the same quantity dialog without enabling unverified charging.
+        self:OpenPurchase("world")
 	end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshWalletLabels()
+        -- MSW exposes product prices, but does not expose the account coin balance.
+        self:SetLabel("Currency", "보유 월드코인: 직접 조회 불가")
+        self:SetLabel("MesoBalance", "보유 메소  " .. _UIEquipInventoryManager:FormatMeso(_UIEquipInventoryManager.meso))
+    end
+
+    @ExecSpace("Server")
+    method void RequestCatalogPrices()
+        -- Cache public platform product prices and target only the requesting client.
+        if not isvalid(_UserService:GetUserEntityByUserId(senderUserId)) then return end
+        local now = _UtilLogic.ElapsedSeconds
+        if self._T.priceCache ~= nil and now < (self._T.priceExpires or 0) then
+            self:ReceiveCatalogPrices(self._T.priceCache, senderUserId)
+            return
+        end
+        self._T.priceWaiters = self._T.priceWaiters or {}
+        self._T.priceWaiters[senderUserId] = true
+        if self._T.priceLoading then return end
+        self._T.priceLoading = true
+        local ok, prices = pcall(function()
+            local result = {}
+            local pages = _WorldShopService:GetProductsAndWait(nil, nil)
+            if pages == nil then return result end
+            while true do
+                for _, product in ipairs(pages:GetCurrentPageDatas()) do
+                    result[product.Id] = product.Price
+                end
+                if pages.IsLastPage then break end
+                pages:MoveToNextPageAndWait()
+            end
+            return result
+        end)
+        if not ok then prices = {} end
+        self._T.priceCache = prices
+        self._T.priceExpires = _UtilLogic.ElapsedSeconds + 60
+        self._T.priceLoading = false
+        local waiters = self._T.priceWaiters
+        self._T.priceWaiters = {}
+        for uid, _ in pairs(waiters) do
+            if isvalid(_UserService:GetUserEntityByUserId(uid)) then self:ReceiveCatalogPrices(prices, uid) end
+        end
+        log("[CashShop] platform prices loaded=" .. tostring(ok))
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveCatalogPrices(table prices)
+        -- Keep the last registered price if the platform cannot provide a product.
+        local count = 0
+        for _, product in ipairs(self._T.catalog or {}) do
+            local price = prices[product.id]
+            if type(price) == "number" and price >= 0 then
+                product.price = math.floor(price)
+                count = count + 1
+            end
+        end
+        self:RefreshCatalog()
+        log("[CashShop] refreshed product prices count=" .. tostring(count))
+    end
+
+    @ExecSpace("ClientOnly")
+    method table TemporaryReward(string id)
+        -- Resolve a concrete inventory item; a shop category is not an inventory tab.
+        local product = nil
+        for _, entry in ipairs(self._T.catalog or {}) do if entry.id == id then product = entry break end end
+        if product == nil then return nil end
+        local cosmetics = {cosmetic_skin="skin",HNWFXWVP7="cap",LLXVL6RNN="hair",C6YETMLCT="face",AH1EZJ1MX="coat",UL4L4V1WC="pants",MTIKMWIYT="longcoat",GJZNL9YEC="shoes",HZ45JTJAV="glove",XMO1J8HF6="cape",ZF9NN16HS="weapon",U1ULRCFJ7="faceaccessory",GX7BF9I5C="eyeaccessory",CR21MC6Q6="earaccessory"}
+        local item = ""
+        local tab = "consume"
+        local limit = 1
+        if cosmetics[id] ~= nil then
+            item = _CosmeticBoxCatalog:BoxItem("cosmetic:" .. cosmetics[id], 1)
+            limit = 999
+        elseif id == "G1BADOYWB" then item = _SpecialEquipment:BoxItem("accessory", 1) limit = 999
+        elseif id == "GEPT5CYLT" then item = _SpecialEquipment:BoxItem("premium", 1) limit = 999
+        elseif id == "5THAJEBGH" or id == "EFTHGP8UC" then
+            item = _AvatarTicketManager:BuildItem(id == "EFTHGP8UC" and 180 or 30)
+            tab = "equip"
+        elseif id == "FS6WBQGE6" or id == "BJIR3RT0O" then
+            item = product.name .. "|" .. product.icon .. "|0|0|0|0|1"
+            limit = _UIEquipInventoryManager:GetItemMaxStack(product.icon)
+        end
+        if item == "" then return nil end
+        return {item=item,tab=tab,limit=limit,name=product.name}
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        -- Keep Escape and Enter inside the quantity dialog, including its closing frame.
+        return self._T.purchasePending == true or _UtilLogic.ElapsedSeconds < (self._T.purchaseRelease or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity PurchaseUI(string child)
+        -- The modal has a dedicated root above the cash-shop window.
+        return _EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase/Overlay/Panel/" .. child)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RequestTemporaryPurchase()
+        -- Ask before mutating inventory or spending currency.
+        self:OpenPurchase("meso")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenPurchase(string currency)
+        -- Capture the product so later selection changes cannot purchase a different item.
+        if self._T.purchasePending or not _LoginFlow:IsInGame() then return end
+        if currency=="meso" and not self.temporaryMesoPurchaseEnabled then return end
+        local id=self._T.selectedId or ""
+        local product=nil
+        for _,row in ipairs(self._T.catalog or {}) do if row.id==id then product=row break end end
+        if product==nil then return end
+        if product.worldItemType=="PASS" then
+            local blocked=_AvatarTicketManager:PurchaseBlockReason()
+            if blocked~="" then self:ShowPurchaseNotice(blocked) return end
+        end
+        self._T.purchaseNotice=false
+        self:PurchaseUI("Quantity").Enable=true
+        self:PurchaseUI("Cancel").Enable=true
+        self:PurchaseUI("Confirm").TextGUIRendererComponent.Text="구매"
+        self._T.purchaseMax=product.worldItemType=="PASS" and 1 or 999
+        self._T.purchaseId=id
+        self._T.purchaseCurrency=currency
+        self._T.purchasePrice=currency=="meso" and self.temporaryMesoPrice or product.price
+        self._T.purchasePending=true
+        self:PurchaseUI("Name").TextGUIRendererComponent.Text=product.name
+        self:PurchaseUI("Message").TextGUIRendererComponent.Text=self._T.purchaseMax==1 and "이용권은 1개만 구매할 수 있습니다." or "몇 개를 구매하시겠습니까? (1 ~ 999개)"
+        _EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase/Overlay").Enable=true
+        self:PurchaseUI("Quantity").TextGUIRendererInputComponent.Text="1"
+        local modalRoot=_EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase")
+        _UILogic:SetSiblingIndex(modalRoot.UITransformComponent,9999)
+        self:PurchaseUI("Quantity").TextGUIRendererInputComponent:ActivateInputField()
+        self:UpdatePurchaseTotal()
+        _UIAudio:Play("DlgNotice")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClosePurchase()
+        -- A short release guard prevents the same Escape from opening the game menu.
+        self._T.purchasePending=false
+        self._T.purchaseRelease=_UtilLogic.ElapsedSeconds+0.15
+        local overlay=_EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase/Overlay")
+        if isvalid(overlay) then overlay.Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePurchaseTotal()
+        -- Total always reflects the entered quantity and the captured unit price.
+        if not self._T.purchasePending or self._T.purchaseNotice then return end
+        local raw=self:PurchaseUI("Quantity").TextGUIRendererInputComponent.Text
+        local n=tonumber(raw)
+        local valid=string.match(raw,"^%d+$")~=nil and n~=nil and n>=1 and n<=(self._T.purchaseMax or 999)
+        self:PurchaseUI("Total").TextGUIRendererComponent.Text=valid and ("합계 " .. tostring(n*self._T.purchasePrice) .. (self._T.purchaseCurrency=="meso" and " 메소" or " 월드코인")) or ("1 ~ "..tostring(self._T.purchaseMax or 999).." 사이의 정수를 입력해주세요.")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ConfirmPurchase()
+        -- Revalidate current funds and every destination slot when confirming.
+        if not self._T.purchasePending then return end
+        local raw=self:PurchaseUI("Quantity").TextGUIRendererInputComponent.Text
+        if self._T.purchaseNotice then self:ClosePurchase() return end
+        local qty=tonumber(raw)
+        if not string.match(raw,"^%d+$") or qty==nil or qty<1 or qty>(self._T.purchaseMax or 999) then self:UpdatePurchaseTotal() return end
+        local id=self._T.purchaseId
+        local currency=self._T.purchaseCurrency
+        self:ClosePurchase()
+        if currency~="meso" then
+            _UIToast:ShowMessage("월드코인 결제는 지급 연동 준비 중입니다. 아직 결제되지 않습니다.")
+            return
+        end
+        self:PurchaseTemporaryQuantity(id,qty)
+    end
+
+    @ExecSpace("ClientOnly")
+    method table PlanTemporaryPurchase(string id, number quantity)
+        -- Build all writes before applying any; insufficient capacity never buys a partial amount.
+        if not self.temporaryMesoPurchaseEnabled then return {ok=false,reason="메소 임시 구매가 종료되었습니다."} end
+        local reward=self:TemporaryReward(id)
+        if reward==nil or quantity~=math.floor(quantity) or quantity<1 or quantity>999 then return {ok=false,reason="구매 수량은 1 ~ 999 사이의 정수여야 합니다."} end
+        if reward.tab=="equip" and _AvatarTicketManager:IsTicket(reward.item) then
+            local blocked=_AvatarTicketManager:PurchaseBlockReason()
+            if blocked~="" then return {ok=false,reason=blocked} end
+            if quantity~=1 then return {ok=false,reason="MSW 아바타 코디 이용권은 한 번에 1개만 구매할 수 있습니다."} end
+        end
+        local inv=_UIEquipInventoryManager
+        local cost=quantity*self.temporaryMesoPrice
+        if inv.meso<cost then return {ok=false,reason="메소가 부족하여 구매하지 못했습니다."} end
+        local left=quantity
+        local changes={}
+        for pass=1,2 do
+            for i=1,128 do
+                local item=inv:GetTabItem(reward.tab,i)
+                local old=0
+                local eligible=pass==2 and item==""
+                if pass==1 and reward.limit>1 and item~="" and inv:WithStackCount(item,1)==reward.item then
+                    old=inv:ParseCount(item)
+                    eligible=old<reward.limit
+                end
+                if eligible then
+                    local n=math.min(left,reward.limit-old)
+                    if n>0 then
+                        table.insert(changes,{slot=i,before=item,after=reward.limit>1 and inv:WithStackCount(reward.item,old+n) or reward.item})
+                        left=left-n
+                    end
+                end
+                if left==0 then break end
+            end
+            if left==0 then break end
+        end
+        if left>0 then return {ok=false,reason=(reward.tab=="equip" and "장비" or "소비") .. " 인벤토리 공간이 부족하여 구매하지 못했습니다. 전체 수량을 받을 공간을 확보해주세요."} end
+        return {ok=true,changes=changes,tab=reward.tab,cost=cost,name=reward.name}
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean PurchaseTemporary(string id)
+        -- Compatibility entry point for existing single-item callers.
+        return self:PurchaseTemporaryQuantity(id,1)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean PurchaseTemporaryQuantity(string id, number quantity)
+        -- Commit item changes and meso together, then save the single resulting snapshot.
+        if not self.temporaryMesoPurchaseEnabled or self._T.buying then return false end
+        local plan=self:PlanTemporaryPurchase(id,quantity)
+        if not plan.ok then
+            _UIAudio:Play("DlgNotice")
+            _UIToast:ShowMessage(plan.reason)
+            log("[CashShop] purchase failed product="..id.." quantity="..tostring(quantity).." reason="..plan.reason)
+            return false
+        end
+        self._T.buying=true
+        local inv=_UIEquipInventoryManager
+        for _,change in ipairs(plan.changes) do inv:SetTabItem(plan.tab,change.slot,change.after) end
+        inv.meso=inv.meso-plan.cost
+        _CharacterPersistence:MarkDirty("cashshop_test_purchase:"..id..":"..tostring(quantity)..":cost="..tostring(plan.cost))
+        inv:UpdateMesoUI()
+        inv:RefreshUI()
+        self:RefreshWalletLabels()
+        self._T.buying=false
+        _UIAudio:Play("BtMouseClick")
+        _UIToast:ShowMessage(plan.name.." "..tostring(quantity).."개를 "..tostring(plan.cost).."메소에 구매했습니다."..(plan.tab=="equip" and " 인벤토리의 장비 탭에서 확인해주세요." or ""))
+        log("[CashShop] bulk purchase product="..id.." quantity="..tostring(quantity).." cost="..tostring(plan.cost))
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindPurchaseDialog()
+        -- Track every listener so reopening or ending play cannot duplicate purchases.
+        local function bind(entity,eventType,fn)
+            local connection=entity:ConnectEvent(eventType,fn)
+            table.insert(self._T.handlers,{entity=entity,eventType=eventType,connection=connection})
+        end
+        bind(self:PurchaseUI("Confirm"),ButtonClickEvent,function() self:ConfirmPurchase() end)
+        bind(self:PurchaseUI("Cancel"),ButtonClickEvent,function() self:ClosePurchase() end)
+        bind(self:PurchaseUI("Quantity"),TextInputSubmitEvent,function(e)
+            if self._T.purchasePending then self:PurchaseUI("Quantity").TextGUIRendererInputComponent.Text=e.Text self:ConfirmPurchase() end
+        end)
+        bind(self:PurchaseUI("Quantity"),TextInputValueChangeEvent,function() self:UpdatePurchaseTotal() end)
+    end
 
 	method boolean IsHalfEarring(string item)
 		return string.match(item or "", "^[^|]+|([^|]+)") == self.halfEarringRUID
@@ -205,7 +519,8 @@ script CashShopManager extends Logic
 
 	method integer GetMaxStars(string item)
 		if _UIEquipInventoryManager:IsStarterEquipment(item) and _UIEquipInventoryManager:ParseSlotIdx(item) == 6 then return 3 end
-		return self:IsHalfEarring(item) and 5 or 100
+		if _AvatarTicketManager:IsTicket(item) then return 0 end
+        return _SpecialEquipment:FixedPotential(item) and 5 or 50
 	end
 
 	@ExecSpace("ClientOnly")
@@ -221,16 +536,39 @@ script CashShopManager extends Logic
 		local icon = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/SlotEarring/Icon")
 		if isvalid(icon) then
 			icon.Enable = item ~= ""
-			icon.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. self.halfEarringRUID)
+			local slot = _EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/SlotEarring")
+			if isvalid(slot) then slot.TextGUIRendererComponent.Text = item == "" and "귀고리" or "" end
+			icon.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. _UIEquipInventoryManager:ParseRUID(item))
 		end
-		_SkillManager:RequestSyncDropRatePct(_SkillManager:GetBeginnerDropRatePct() + self:GetEquippedRewardBonus())
+		_SpecialEquipment:RefreshSlots()
 	end
 
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleKeyDownEvent(KeyDownEvent event)
-		if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return end
+		if self._T.purchasePending then
+            if event.key==KeyboardKey.Escape then self:ClosePurchase()
+            elseif (event.key==KeyboardKey.Return or event.key==KeyboardKey.KeypadEnter) and not self:PurchaseUI("Quantity").TextGUIRendererInputComponent.IsFocused then self:ConfirmPurchase() end
+            return
+        end
+        if _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then return end
 		if _KeySettingManager:GetFuncForKeyEnum(event.key) == "cashshop" then self:ToggleWindow() end
 	end
+
+    @ExecSpace("ClientOnly")
+    method void ShowPurchaseNotice(string message)
+        self._T.purchasePending=true
+        self._T.purchaseNotice=true
+        self:PurchaseUI("Name").TextGUIRendererComponent.Text="구매 불가"
+        self:PurchaseUI("Message").TextGUIRendererComponent.Text=message
+        self:PurchaseUI("Quantity").Enable=false
+        self:PurchaseUI("Total").TextGUIRendererComponent.Text=""
+        self:PurchaseUI("Cancel").Enable=false
+        self:PurchaseUI("Confirm").TextGUIRendererComponent.Text="확인"
+        _EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase/Overlay").Enable=true
+        local modal=_EntityService:GetEntityByPath("/ui/DefaultGroup/CashPurchase")
+        _UILogic:SetSiblingIndex(modal.UITransformComponent,9999)
+        _UIAudio:Play("DlgNotice")
+    end
 
 end

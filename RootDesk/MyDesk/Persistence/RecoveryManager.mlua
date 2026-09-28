@@ -1,0 +1,387 @@
+@Logic
+script RecoveryManager extends Logic
+    property string AdminProfileCodes = "WsXCN"
+
+    method string DisplayTime(number value)
+        -- Audit timestamps are stored in UTC and shown to the operator in Korean time.
+        return DateTime(math.floor(value)+32400000):ToFormattedString("yyyy-MM-dd HH:mm:ss").." KST"
+    end
+
+    method table Decode(string raw)
+        -- Corrupt or unknown records fail closed instead of becoming empty player data.
+        local ok, value = pcall(function() return _HttpService:JSONDecode(raw) end)
+        if ok and type(value) == "table" then return value end
+        return nil
+    end
+
+    method string NewId()
+        -- Unique operation keys survive retries and never reuse another case's receipt.
+        self._T.sequence = (self._T.sequence or 0) + 1
+        return tostring(DateTime.UtcNow.Elapsed).."_"..tostring(_UtilLogic:RandomIntegerRange(100000,999999)).."_"..tostring(self._T.sequence)
+    end
+
+    method table Fields(string item)
+        -- Preserve empty extension fields when comparing stack identities.
+        local out = {}
+        for value in string.gmatch((item or "").."|", "(.-)|") do table.insert(out,value) end
+        return out
+    end
+
+    method boolean Stackable(string item)
+        -- Equipment and cosmetics retain their full option string and are single items.
+        local fields = self:Fields(item)
+        return fields[3] ~= "deco" and (tonumber(fields[3]) or 0) == 0
+    end
+
+    method integer Count(string item)
+        -- Empty slots have no item; unstackable gear has one regardless of extension fields.
+        if item == "" then return 0 end
+        if not self:Stackable(item) then return 1 end
+        return math.max(1, math.floor(tonumber(self:Fields(item)[7]) or 1))
+    end
+
+    method string Identity(string item)
+        -- Ignore only stack quantity, never stars, potentials, expiry or cosmetic options.
+        if not self:Stackable(item) then return item end
+        local f = self:Fields(item)
+        while #f < 7 do table.insert(f,"0") end
+        f[7] = "1"
+        return table.concat(f,"|")
+    end
+
+    method integer Owned(string snapshot, string item)
+        -- Count all locations so dragging an item to another tab/slot is not a loss.
+        local total = 0
+        local identity = self:Identity(item)
+        for _,value in pairs(_CashItemAudit:Items(snapshot)) do
+            if self:Identity(value) == identity then total = total + self:Count(value) end
+        end
+        return total
+    end
+
+    method integer Meso(string snapshot)
+        -- The first line is the established persistence currency field.
+        return math.floor(tonumber(string.match(snapshot or "", "^M\t(%-?%d+)")) or 0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Checkpoint(table sv, string id, string snapshot, boolean force)
+        -- Keep an independent full checkpoint at entry/logout and at most once per five minutes.
+        if snapshot == "" then return end
+        sv.recoverySnapshots = sv.recoverySnapshots or {}
+        local previous = sv.recoverySnapshots[id]
+        local now = _UtilLogic.ElapsedSeconds
+        if previous and (previous.raw == snapshot or (not force and now-previous.time < 300)) then return end
+        local key = "rb_"..id.."_"..self:NewId()
+        local record = {version=1,characterId=id,timeUtc=DateTime.UtcNow.Elapsed,source="server_observed_checkpoint",snapshot=snapshot}
+        local encoded = _HttpService:JSONEncode(record)
+        if #encoded > 290000 then log_error("[Recovery] checkpoint too large; character="..id) return end
+        sv.cashAuditPending = sv.cashAuditPending or {}
+        sv.cashAuditPending[key] = {tag="rb_"..id,value=encoded}
+        sv.recoverySnapshots[id] = {raw=snapshot,time=now}
+        log("[Recovery] checkpoint queued "..key)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ReadTagged(any storage, string tag)
+        -- Drain pages with explicit error checks. A missing tag is a valid empty history.
+        local ec,pages = storage:GetPagesAndWait(tag)
+        if ec == 1000002 then return {} end
+        if ec ~= 0 or pages == nil then return nil end
+        local out = {}
+        while true do
+            for _,entry in ipairs(pages:GetCurrentPageDatas() or {}) do table.insert(out,{key=entry.KeyInfo.Key,raw=entry.Value}) end
+            if pages.IsLastPage then break end
+            if pages:LoadNextPageAndWait() ~= 0 then return nil end
+            pages:MoveToNextPageAndWait()
+        end
+        return out
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsAdmin(string uid)
+        -- Only the server-observed MSW account profile is trusted, never a character nickname.
+        local p = _UserService:GetUserEntityByUserId(uid)
+        if not isvalid(p) or not isvalid(p.PlayerComponent) then return false end
+        local profile = p.PlayerComponent.ProfileCode
+        for code in string.gmatch(self.AdminProfileCodes,"[^,%s]+") do if code == profile then return true end end
+        return false
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Target(string nickname)
+        -- Resolve the existing nickname registry and verify the character within its owner's store.
+        local ec,uid = _CharacterPersistence:GetRegistry():GetAndWait(nickname)
+        if ec ~= 0 or uid == nil or uid == "" then return nil end
+        local storage = _DataStorageService:GetUserDataStorage(uid)
+        local code,chars = storage:GetAndWait("chars")
+        if code ~= 0 then return nil end
+        for line in string.gmatch(chars or "","[^\n]+") do
+            local kind,id,data = string.match(line,"^([^\t]+)\t([^\t]+)\t[^\t]+\t(.+)$")
+            if kind == "C" and string.match(data or "","^[^|]+") == nickname then return {uid=uid,id=id,name=nickname,storage=storage} end
+        end
+        return nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method string Current(table target)
+        -- Prefer a loaded live snapshot for review; delivery itself always re-reads durable storage.
+        local sv = _CharacterPersistence._T.sv[target.uid]
+        if sv and sv.saves[target.id] ~= nil then return sv.saves[target.id] end
+        local ec,raw = target.storage:GetAndWait("save_"..target.id)
+        if ec ~= 0 then return nil end
+        return raw
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Evidence(table target, string key)
+        -- Restrict backup reads to this character, then validate the embedded owner.
+        if string.sub(key,1,#("rb_"..target.id.."_")) ~= "rb_"..target.id.."_" then return nil end
+        local ec,raw = target.storage:GetAndWait(key)
+        if ec ~= 0 then return nil end
+        local record = self:Decode(raw)
+        if record == nil or record.characterId ~= target.id or type(record.snapshot) ~= "string" then return nil end
+        return record
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Prepare(table target, string backupKey, string location, integer quantity, string reason, string actor)
+        -- Drafts never grant anything. Source item bytes come only from a stored backup.
+        if quantity < 1 or quantity > 1000000000000 or #reason < 1 then return {error="수량과 사유를 확인해주세요."} end
+        local evidence = self:Evidence(target,backupKey)
+        local current = self:Current(target)
+        if evidence == nil or current == nil then return {error="저장본을 읽지 못했습니다."} end
+        local item,tab = "",""
+        local originalCount,currentCount = self:Meso(evidence.snapshot),self:Meso(current)
+        if location ~= "meso" then
+            item = _CashItemAudit:Items(evidence.snapshot)[location] or ""
+            if item == "" then return {error="백업의 해당 위치에 아이템이 없습니다."} end
+            tab = string.match(location,"^inventory:([^:]+):") or (string.sub(location,1,8)=="costume:" and "decorate" or "equip")
+            originalCount,currentCount = self:Owned(evidence.snapshot,item),self:Owned(current,item)
+            if quantity > self:Count(item) or (not self:Stackable(item) and quantity ~= 1) then return {error="원본 아이템 수량을 초과합니다."} end
+        end
+        if quantity > originalCount-currentCount then return {error="현재 보유량과 비교한 누락 수량을 초과합니다. 이동된 아이템도 보유량에 포함됩니다."} end
+        local caseId = self:NewId()
+        local record = {version=1,caseId=caseId,characterId=target.id,owner=target.uid,state="draft",createdUtc=DateTime.UtcNow.Elapsed,preparedBy=actor,reason=string.sub(reason,1,300),evidence=backupKey,location=location,item=item,tab=tab,quantity=quantity,baseline=originalCount,currentAtReview=currentCount}
+        local ec = target.storage:SetByInfoAndWait(DataStorageKeyInfo("rc_"..target.id.."_"..caseId,"","rc_"..target.id),_HttpService:JSONEncode(record))
+        if ec ~= 0 then return {error="복구 초안 저장 실패: "..tostring(ec)} end
+        log("[Recovery] draft case="..caseId.." actor="..actor)
+        return record
+    end
+
+    @ExecSpace("ServerOnly")
+    method string Review(table target, string caseId, boolean approve, string actor)
+        -- Compare-and-swap prevents duplicate approval and competing operator updates.
+        if string.find(caseId,"[^%w_-]") then return "잘못된 사건 번호입니다." end
+        local key = "rc_"..target.id.."_"..caseId
+        local ec,raw = target.storage:GetAndWait(key)
+        local record = ec == 0 and self:Decode(raw) or nil
+        if record == nil or record.owner ~= target.uid or record.characterId ~= target.id then return "사건을 찾지 못했습니다." end
+        if record.state ~= "draft" and not (not approve and (record.state == "approved" or record.state == "needs_review")) then return "변경 불가 상태: "..tostring(record.state) end
+        record.state = approve and "approved" or "cancelled"
+        record.reviewedBy = actor record.reviewedUtc = DateTime.UtcNow.Elapsed
+        local code = target.storage:UpdateByInfoAndWait(DataStorageKeyInfo(key,"","rc_"..target.id),raw,_HttpService:JSONEncode(record))
+        if code ~= 0 then return "다른 작업과 충돌했거나 저장에 실패했습니다. 다시 조회해주세요." end
+        log("[Recovery] "..record.state.." case="..caseId.." actor="..actor)
+        return approve and "승인 완료. 대상 캐릭터가 다시 입장할 때 한 번 적용됩니다." or "취소 완료."
+    end
+
+    method table BuildGrant(string snapshot, table record)
+        -- Never roll back a character. Append only the approved missing currency/item.
+        if string.find("\n"..snapshot.."\n","\nRREC\t"..record.caseId.."\n",1,true) then return {already=true,snapshot=snapshot} end
+        if not string.match(snapshot,"^M\t%d+") then return {error="invalid_snapshot"} end
+        local quantity = record.quantity
+        if type(quantity) ~= "number" or quantity < 1 or quantity ~= math.floor(quantity) then return {error="invalid_quantity"} end
+        local current = record.location == "meso" and self:Meso(snapshot) or self:Owned(snapshot,record.item)
+        if quantity > record.baseline-current then return {error="no_longer_missing"} end
+        local result = snapshot
+        if record.location == "meso" then
+            local balance = current+quantity
+            if balance > 9000000000000000 then return {error="meso_limit"} end
+            result = string.gsub(snapshot,"^M\t[^\n]+","M\t"..tostring(balance),1)
+        else
+            local allowed={equip=true,consume=true,etc=true,install=true,cash=true,decorate=true}
+            if not allowed[record.tab] then return {error="invalid_tab"} end
+            local occupied = {}
+            for index,value in string.gmatch(snapshot,"I\t"..record.tab.."\t(%d+)\t([^\n]+)") do if value ~= "" then occupied[tonumber(index)]=true end end
+            local slot=0
+            for i=1,128 do if not occupied[i] then slot=i break end end
+            if slot == 0 then return {error="inventory_full"} end
+            local item = record.item
+            if self:Stackable(item) then
+                local fields=self:Fields(item) while #fields<7 do table.insert(fields,"0") end
+                fields[7]=tostring(quantity) item=table.concat(fields,"|")
+            end
+            result=result.."\nI\t"..record.tab.."\t"..tostring(slot).."\t"..item
+        end
+        return {snapshot=result.."\nRREC\t"..record.caseId.."\n"}
+    end
+
+    @ExecSpace("ServerOnly")
+    method table LoadPlan(any storage, table record)
+        -- Both immutable plan halves must exist before an interrupted recovery can resume.
+        local ec,pages=storage:BatchGetAndWait({record.planBefore,record.planAfter})
+        if ec~=0 or pages==nil then return nil end
+        local values={}
+        while true do
+            for _,entry in ipairs(pages:GetCurrentPageDatas() or {}) do values[entry.KeyInfo.Key]=entry.Value end
+            if pages.IsLastPage then break end
+            if pages:LoadNextPageAndWait()~=0 then return nil end
+            pages:MoveToNextPageAndWait()
+        end
+        local before=self:Decode(values[record.planBefore] or "")
+        local after=values[record.planAfter]
+        if before==nil or type(before.snapshot)~="string" or type(after)~="string" then return nil end
+        return {before=before.snapshot,after=after}
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ApplyPending(any storage, string uid, string id, string snapshot)
+        -- A durable immutable plan + atomic state/save commit makes crash recovery retryable.
+        local entries=self:ReadTagged(storage,"rc_"..id)
+        if entries==nil then return {error="복구 기록 조회 실패"} end
+        table.sort(entries,function(a,b) return a.key<b.key end)
+        local applied=0
+        for _,entry in ipairs(entries) do
+            local record=self:Decode(entry.raw)
+            if record and record.characterId==id and record.owner==uid and (record.state=="approved" or record.state=="applying") then
+                local keyInfo=DataStorageKeyInfo(entry.key,"","rc_"..id)
+                local plan=nil
+                if record.state=="approved" then
+                    local grant=self:BuildGrant(snapshot,record)
+                    if grant.error then
+                        record.state=grant.error=="inventory_full" and "approved" or "needs_review"
+                        record.lastError=grant.error
+                        local resetCode=storage:UpdateByInfoAndWait(keyInfo,entry.raw,_HttpService:JSONEncode(record))
+                        if resetCode~=0 then return {error="복구 대기 상태 저장 실패"} end
+                        log_warning("[Recovery] deferred case="..record.caseId.." reason="..grant.error)
+                    else
+                        local attempt=self:NewId()
+                        record.planBefore="rb_"..id.."_"..attempt
+                        record.planAfter="rp_"..id.."_"..attempt
+                        local backup=_HttpService:JSONEncode({version=1,characterId=id,timeUtc=DateTime.UtcNow.Elapsed,source="before_recovery",caseId=record.caseId,snapshot=snapshot})
+                        if #backup>290000 or #grant.snapshot>290000 then return {error="복구 데이터 크기를 확인해주세요."} end
+                        local halves={}
+                        halves[DataStorageKeyInfo(record.planBefore,"","rb_"..id)]=backup
+                        halves[DataStorageKeyInfo(record.planAfter,"","rp_"..id)]=grant.snapshot
+                        local planCode=storage:BatchSetByInfoAndWait(halves)
+                        if planCode~=0 then return {error="복구 계획 저장 실패. 지급하지 않았습니다."} end
+                        record.state="applying" record.claimedUtc=DateTime.UtcNow.Elapsed
+                        local claimed=_HttpService:JSONEncode(record)
+                        local lockCode=storage:UpdateByInfoAndWait(keyInfo,entry.raw,claimed)
+                        if lockCode~=0 then return {error="복구 작업 충돌: 다시 접속해주세요."} end
+                        entry.raw=claimed
+                        plan={before=snapshot,after=grant.snapshot}
+                    end
+                else
+                    plan=self:LoadPlan(storage,record)
+                    if plan==nil then return {error="미완료 복구의 원본 확인이 필요합니다. 사건 번호: "..record.caseId} end
+                end
+                if plan~=nil then
+                    local hasReceipt=string.find("\n"..snapshot.."\n","\nRREC\t"..record.caseId.."\n",1,true)~=nil
+                    if snapshot~=plan.before and not hasReceipt then return {error="복구 계획 이후 저장 내용이 변경되어 입장을 중단했습니다. 사건 번호: "..record.caseId} end
+                    local after=hasReceipt and snapshot or plan.after
+                    record.state="applied" record.appliedUtc=DateTime.UtcNow.Elapsed
+                    local payload={}
+                    payload[DataStorageKeyInfo("save_"..id,"","")]=after
+                    payload[keyInfo]=_HttpService:JSONEncode(record)
+                    -- Identical retry payload cannot add currency a second time.
+                    local ec=storage:TransactSetByInfoAndWait(payload)
+                    if ec~=0 then ec=storage:TransactSetByInfoAndWait(payload) end
+                    if ec~=0 then return {error="복구 저장 실패. 다음 접속 시 같은 복구 계획으로 재시도합니다. 사건 번호: "..record.caseId} end
+                    snapshot=after applied=applied+1
+                    log("[Recovery] applied case="..record.caseId.." character="..id)
+                end
+            end
+        end
+        return {snapshot=snapshot,applied=applied}
+    end
+
+    method string PreserveReceipts(string before, string after)
+        -- Clients cannot erase or invent server-owned recovery receipts.
+        local lines={}
+        for line in string.gmatch(after or "","[^\n]+") do if string.sub(line,1,5)~="RREC\t" then table.insert(lines,line) end end
+        for line in string.gmatch(before or "","[^\n]+") do if string.sub(line,1,5)=="RREC\t" then table.insert(lines,line) end end
+        return table.concat(lines,"\n")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Reply(string uid, string message)
+        -- Operator results are private and do not broadcast player inventory to the map.
+        _MapleHUDManager:ReceiveChat("복구관리",message,"map","",false,uid)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean HandleCommand(string uid, string text)
+        -- Server-only router; no RPC accepts a claimed administrator identity.
+        if text=="/프로필코드" then
+            local p=_UserService:GetUserEntityByUserId(uid)
+            if isvalid(p) then self:Reply(uid,"내 MSW 프로필 코드: "..p.PlayerComponent.ProfileCode) end
+            return true
+        end
+        if not string.match(text,"^/복구[%s]*") then return false end
+        if not self:IsAdmin(uid) then self:Reply(uid,"관리자 전용 명령입니다.") return true end
+        self._T.requests=self._T.requests or {}
+        if _UtilLogic.ElapsedSeconds-(self._T.requests[uid] or -10)<2 then return true end
+        self._T.requests[uid]=_UtilLogic.ElapsedSeconds
+        local args={} for word in string.gmatch(text,"%S+") do table.insert(args,word) end
+        local action=args[2] or "도움말"
+        self._T.targets=self._T.targets or {}
+        if action=="조회" and args[3] then
+            local target=self:Target(args[3])
+            if target==nil then self:Reply(uid,"캐릭터를 찾지 못했습니다.") return true end
+            self._T.targets[uid]=target
+            local backups=self:ReadTagged(target.storage,"rb_"..target.id)
+            local cases=self:ReadTagged(target.storage,"rc_"..target.id)
+            if backups==nil or cases==nil then self:Reply(uid,"저장 기록 조회 실패") return true end
+            table.sort(backups,function(a,b) return a.key>b.key end)
+            local lines={target.name.." / 캐릭터 "..target.id,"현재 메소: "..tostring(self:Meso(self:Current(target) or ""))}
+            local page=math.max(1,math.floor(tonumber(args[4]) or 1))
+            table.insert(lines,"백업 "..tostring(page).." / "..tostring(math.max(1,math.ceil(#backups/8))).." 페이지")
+            for i=(page-1)*8+1,math.min(page*8,#backups) do local b=self:Decode(backups[i].raw) if b then table.insert(lines,backups[i].key.." · "..self:DisplayTime(b.timeUtc).." · 메소 "..tostring(self:Meso(b.snapshot))) end end
+            for _,e in ipairs(cases) do local c=self:Decode(e.raw) if c then table.insert(lines,"사건 "..c.caseId.." "..c.state.." "..tostring(c.quantity).." · "..c.reason) end end
+            self:Reply(uid,table.concat(lines,"\n")) return true
+        end
+        local target=self._T.targets[uid]
+        if action=="도움말" then
+            self:Reply(uid,"/복구 조회 닉네임 [페이지] → 대상·백업·사건 조회\n/복구 백업 백업키 [페이지] → 위치별 원본/현재 수량 비교\n/복구 상세 백업키 위치 → 원본 옵션 데이터\n/복구 이력 [페이지] → 변경 이력\n/복구 메소 백업키 수량 사유\n/복구 아이템 백업키 위치 수량 사유\n/복구 승인 사건번호 또는 /복구 취소 사건번호\n초안은 지급하지 않습니다. 승인 후 대상 캐릭터 재접속 시 적용됩니다.") return true
+        end
+        if target==nil then self:Reply(uid,"먼저 /복구 조회 닉네임 으로 대상을 선택해주세요.") return true end
+        if action=="백업" and args[3] then
+            local b=self:Evidence(target,args[3]) local current=self:Current(target)
+            if b==nil or current==nil then self:Reply(uid,"백업 조회 실패") return true end
+            local lines={"백업 메소 "..tostring(self:Meso(b.snapshot)).." / 현재 "..tostring(self:Meso(current))}
+            local items=_CashItemAudit:Items(b.snapshot)
+            local locations={} for loc,_ in pairs(items) do table.insert(locations,loc) end table.sort(locations)
+            local page=math.max(1,math.floor(tonumber(args[4]) or 1))
+            table.insert(lines,"아이템 "..tostring(page).." / "..tostring(math.max(1,math.ceil(#locations/20))).." 페이지")
+            for i=(page-1)*20+1,math.min(page*20,#locations) do
+                local loc=locations[i] local item=items[loc]
+                table.insert(lines,loc.." "..(string.match(item,"^[^|]+") or "").." 원본합계="..tostring(self:Owned(b.snapshot,item)).." 현재합계="..tostring(self:Owned(current,item)))
+            end
+            self:Reply(uid,table.concat(lines,"\n")) return true
+        elseif action=="상세" and args[3] and args[4] then
+            local b=self:Evidence(target,args[3])
+            local item=b and _CashItemAudit:Items(b.snapshot)[args[4]] or nil
+            self:Reply(uid,item and (args[4].." 원본 아이템 데이터:\n"..item) or "해당 위치의 아이템이 없습니다.") return true
+        elseif action=="이력" then
+            local rows=self:ReadTagged(target.storage,"cashAudit_"..target.id)
+            if rows==nil then self:Reply(uid,"이력 조회 실패") return true end
+            table.sort(rows,function(a,b) return a.key>b.key end)
+            local page=math.max(1,math.floor(tonumber(args[3]) or 1))
+            local lines={"서버가 관측한 저장 변경 이력 · "..tostring(page).." / "..tostring(math.max(1,math.ceil(#rows/10))).." 페이지"}
+            for i=(page-1)*10+1,math.min(page*10,#rows) do local r=self:Decode(rows[i].raw) if r and r.header then table.insert(lines,self:DisplayTime(r.header.timeUtc).." "..r.header.reason.." 메소 "..tostring(r.header.mesoBefore).." → "..tostring(r.header.mesoAfter).." 변경 "..tostring(#(r.changes or {}))) end end
+            self:Reply(uid,table.concat(lines,"\n")) return true
+        elseif action=="승인" or action=="취소" then
+            if args[3] then self:Reply(uid,self:Review(target,args[3],action=="승인",_UserService:GetUserEntityByUserId(uid).PlayerComponent.ProfileCode)) end return true
+        elseif action=="메소" or action=="아이템" then
+            local location=action=="메소" and "meso" or args[4]
+            local quantity=tonumber(args[action=="메소" and 4 or 5]) or 0
+            local reason=table.concat(args," ",action=="메소" and 5 or 6)
+            if args[3]==nil or location==nil or quantity~=math.floor(quantity) then self:Reply(uid,"명령 형식을 확인해주세요. /복구 도움말") return true end
+            local r=self:Prepare(target,args[3],location,quantity,reason,_UserService:GetUserEntityByUserId(uid).PlayerComponent.ProfileCode)
+            self:Reply(uid,r.error or ("초안 "..r.caseId.." · "..location.." "..tostring(quantity).."개/메소\n확인 후 /복구 승인 "..r.caseId)) return true
+        end
+        self:Reply(uid,"명령 형식을 확인해주세요. /복구 도움말") return true
+    end
+end
