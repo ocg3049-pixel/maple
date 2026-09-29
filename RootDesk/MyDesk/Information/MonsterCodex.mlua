@@ -1,0 +1,286 @@
+@Logic
+script MonsterCodex extends Logic
+    property table registered = {}
+    property integer page = 1
+    property integer selected = 1
+    property string characterId = ""
+    property table handlers = {}
+    property any keyHandler = nil
+
+    method table ReadState(string snapshot)
+        local result = {}
+        for line in string.gmatch(snapshot .. "\n", "([^\n]*)\n") do
+            if string.sub(line, 1, 6) == "CODEX\t" then
+                for id in string.gmatch(string.sub(line, 7), "[^,]+") do
+                    if _MonsterCodexCatalog:Get(id) ~= nil then result[id] = true end
+                end
+            end
+        end
+        return result
+    end
+
+    method string StateLine(table state)
+        local ids = {}
+        for _, row in ipairs(_MonsterCodexCatalog:All()) do
+            if state[row.id] == true then table.insert(ids, row.id) end
+        end
+        return "CODEX\t" .. table.concat(ids, ",")
+    end
+
+    method string WriteState(string snapshot, table state)
+        local lines = {}
+        for line in string.gmatch(snapshot .. "\n", "([^\n]*)\n") do
+            if line ~= "" and string.sub(line, 1, 6) ~= "CODEX\t" then table.insert(lines, line) end
+        end
+        table.insert(lines, self:StateLine(state))
+        return table.concat(lines, "\n")
+    end
+
+    method string PreserveState(string authoritative, string incoming)
+        return self:WriteState(incoming, self:ReadState(authoritative))
+    end
+
+    method boolean IsRegistrationRoll(number roll)
+        return roll >= 0 and roll < 0.001
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnMonsterKilled(Entity monster, Entity killer, integer level)
+        if not isvalid(monster) or not isvalid(killer) or not isvalid(killer.PlayerComponent) then return end
+        local kind = string.gsub(monster.Name, "_%d+$", "")
+        local row = _MonsterCodexCatalog:Find(kind, level)
+        if row == nil then return end
+        local component = monster:GetComponent("script.Monster")
+        if isvalid(component) then
+            if component._T.codexLife == component.LifeSerial then return end
+            component._T.codexLife = component.LifeSerial
+        end
+        -- One server-side roll per defeated monster, independent of all loot modifiers.
+        if not self:IsRegistrationRoll(_UtilLogic:RandomDouble()) then return end
+        local uid = killer.PlayerComponent.UserId
+        local sv = _CharacterPersistence._T.sv[uid]
+        if sv == nil or sv.activeId == "" then return end
+        local id = sv.activeId
+        local current = sv.saves[id] or ""
+        sv.codexPending = sv.codexPending or {}
+        local state = sv.codexPending[id] or self:ReadState(current)
+        if state[row.id] then return end
+        state[row.id] = true
+        if current == "" then
+            sv.codexPending[id] = state
+        else
+            sv.saves[id] = self:WriteState(current, state)
+            sv.dirtySaves[id] = true
+        end
+        self:ReceiveRegistration(id, row.id, uid)
+        log("[MonsterCodex] registered " .. row.id)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string id, string snapshot)
+        self.characterId = id
+        self.registered = self:ReadState(snapshot)
+        self.page = 1
+        self.selected = 1
+        self._T.noticeQueue = {}
+        self._T.noticeUntil = 0
+        self:Close()
+        local notice = _EntityService:GetEntityByPath("/ui/MonsterCodexGroup/Notice")
+        if isvalid(notice) then notice.Enable = false end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveRegistration(string character, string id)
+        if character ~= self.characterId or self.registered[id] then return end
+        local row = _MonsterCodexCatalog:Get(id)
+        if row == nil then return end
+        self.registered[id] = true
+        _CharInfoManager:RefreshCharInfo()
+        _CharacterPersistence:MarkDirty("monster_codex")
+        self._T.noticeQueue = self._T.noticeQueue or {}
+        table.insert(self._T.noticeQueue, row.name)
+        if self:IsOpen() then self:Render() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer GetCount()
+        local count = 0
+        for _, row in ipairs(_MonsterCodexCatalog:All()) do
+            if self.registered[row.id] then count += 1 end
+        end
+        return count
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string name)
+        return _EntityService:GetEntityByPath("/ui/DefaultGroup/MonsterCodexWindow" .. (name == "" and "" or "/" .. name))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        local book = _EntityService:GetEntityByPath("/ui/MonsterCodexGroup/MonsterCodexWindow")
+        local parent = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+        if isvalid(book) and isvalid(parent) then book:AttachTo(parent) end
+        self:Close()
+        self:Bind("Close", function() self:Close() end)
+        self:Bind("Prev", function() self:Turn(-1) end)
+        self:Bind("Next", function() self:Turn(1) end)
+        for i = 1, 20 do
+            local n = i
+            self:Bind("Card" .. tostring(i), function()
+                self.selected = (self.page - 1) * 20 + n
+                self:Render()
+            end)
+        end
+        for _,name in ipairs({"Prev","Next"}) do
+            local button=self:UI(name)
+            local previous=name=="Prev"
+            local hover=button:ConnectEvent(ButtonStateChangeEvent,function(event)
+                local hint=self:UI("PageKeyHint")
+                hint.Enable=self:IsOpen() and event.state==ButtonState.Hover
+                if hint.Enable then
+                    hint.UITransformComponent.anchoredPosition=button.UITransformComponent.anchoredPosition+Vector2(0,42)
+                    hint:GetChildByName("Label").TextGUIRendererComponent.Text=previous and "왼쪽 방향키로 이전 페이지" or "오른쪽 방향키로 다음 페이지"
+                end
+            end)
+            table.insert(self.handlers,{e=button,h=hover,eventType=ButtonStateChangeEvent})
+        end
+        self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        log("[MonsterCodex] ready species=" .. tostring(#_MonsterCodexCatalog:All()))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string name, any action)
+        local e = self:UI(name)
+        if not isvalid(e) then return end
+        local h = e:ConnectEvent(ButtonClickEvent, function()
+            if _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/MonsterCodexWindow", _InputService:GetCursorPosition()) then action() end
+        end)
+        table.insert(self.handlers, {e=e, h=h})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        if self.keyHandler ~= nil then _InputService:DisconnectEvent(KeyDownEvent, self.keyHandler) end
+        for _, h in ipairs(self.handlers) do
+            if isvalid(h.e) then h.e:DisconnectEvent(h.eventType or ButtonClickEvent, h.h) end
+        end
+        self.handlers = {}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        if not _LoginFlow:IsInGame() or _KeySettingManager:IsCapturingKey() or _MapleHUDManager:IsChatTyping() or _GameSystemMenu:BlocksInput() then return end
+        if self:IsOpen() and (event.key==KeyboardKey.LeftArrow or event.key==KeyboardKey.RightArrow) then
+            if _CosmeticExchange:BlocksInput() or _CashShopManager:BlocksInput() or _RecoveryPotionManager._T.pending~=nil or _UIItemDiscardManager.pending then return end
+            if _UIClickArbiter:GetKeyboardWindow()~="/ui/DefaultGroup/MonsterCodexWindow" then return end
+            self:Turn(event.key==KeyboardKey.LeftArrow and -1 or 1)
+            return
+        end
+        if _KeySettingManager:GetFuncForKeyEnum(event.key) == "codex" then self:Toggle() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen()
+        local e = self:UI("")
+        return isvalid(e) and e.Enable
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        local hint=self:UI("PageKeyHint")
+        if isvalid(hint) then hint.Enable=false end
+        local e = self:UI("")
+        if isvalid(e) then e.Enable = false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Toggle()
+        if self:IsOpen() then self:Close() return end
+        local e = self:UI("")
+        if not isvalid(e) then return end
+        e.Enable = true
+        _UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/MonsterCodexWindow")
+        self:Render()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Turn(integer direction)
+        local last = math.ceil(#_MonsterCodexCatalog:All() / 20)
+        self.page = math.max(1, math.min(last, self.page + direction))
+        self.selected = (self.page - 1) * 20 + 1
+        self:Render()
+        _UIAudio:Play("Tab")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Text(string name, string value)
+        local e = self:UI(name)
+        if isvalid(e) then e.TextGUIRendererComponent.Text = value end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawMonster(string name, any row, boolean unlocked)
+        local color = self:UI(name .. "/Color")
+        local gray = self:UI(name .. "/Gray")
+        color.Enable = unlocked
+        gray.Enable = not unlocked
+        color.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. row.sprite)
+        gray.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. row.sprite)
+        gray.SpriteGUIRendererComponent:ChangeMaterial("37ba494c-5f39-4f1b-be11-dc6b1aea17d3")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Render()
+        local rows = _MonsterCodexCatalog:All()
+        local count = self:GetCount()
+        self:Text("Progress", "등록 " .. tostring(count) .. " / " .. tostring(#rows) .. "종")
+        self:Text("Page", tostring(self.page) .. " / " .. tostring(math.ceil(#rows / 20)))
+        self:UI("Prev").ButtonComponent.Enable = self.page > 1
+        self:UI("Next").ButtonComponent.Enable = self.page < math.ceil(#rows / 20)
+        for i = 1, 20 do
+            local n = (self.page - 1) * 20 + i
+            local row = rows[n]
+            local name = "Card" .. tostring(i)
+            self:UI(name).Enable = row ~= nil
+            if row ~= nil then
+                local unlocked = self.registered[row.id] == true
+                self:DrawMonster(name, row, unlocked)
+                self:Text(name .. "/Level", "Lv." .. tostring(row.level))
+                self:Text(name .. "/Name", row.name)
+                self:UI(name).SpriteGUIRendererComponent.Color = n == self.selected and Color(0.95,0.78,0.36,1) or (unlocked and Color(0.75,0.47,0.38,1) or Color(0.58,0.58,0.58,1))
+            end
+        end
+        local row = rows[self.selected] or rows[1]
+        local unlocked = self.registered[row.id] == true
+        self:DrawMonster("Portrait", row, unlocked)
+        self:Text("Name", row.name)
+        self:Text("Level", "레벨 : Lv." .. tostring(row.level))
+        self:Text("Status", unlocked and "도감 등록 완료" or "아직 등록되지 않은 몬스터")
+        self:Text("Description", "몬스터 처치 시 0.1% 확률로 등록됩니다.\n같은 몬스터는 한 번만 등록할 수 있습니다.\n\n1종 등록 효과\nSTR / DEX / INT / LUK 각 +2\n공격력 +1 · 마력 +1")
+        self:Text("BonusPanel/Bonuses", "현재 도감 효과  ·  " .. tostring(count) .. "종\nSTR / DEX / INT / LUK 각 +" .. tostring(count * 2) .. "\n공격력 +" .. tostring(count) .. " · 마력 +" .. tostring(count))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        if not _LoginFlow:IsInGame() then
+            if self:IsOpen() then self:Close() end
+            return
+        end
+        local now = _UtilLogic.ElapsedSeconds
+        local notice = _EntityService:GetEntityByPath("/ui/MonsterCodexGroup/Notice")
+        if not isvalid(notice) then return end
+        if now < (self._T.noticeUntil or 0) then return end
+        local queue = self._T.noticeQueue or {}
+        if #queue == 0 then
+            if notice.Enable then notice.Enable = false log("[MonsterCodex] notice hidden") end
+            return
+        end
+        local name = table.remove(queue, 1)
+        notice:GetChildByName("Text").TextGUIRendererComponent.Text = name .. " 몬스터가 도감에 등록되었습니다!"
+        notice.Enable = true
+        self._T.noticeUntil = now + 3.5
+        _StarforcePresentation:PlaySuccessSound()
+        log("[MonsterCodex] notice shown " .. name)
+    end
+end

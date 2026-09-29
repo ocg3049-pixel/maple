@@ -153,9 +153,32 @@ script CosmeticExchange extends Logic
             end)
             table.insert(self._T.links,{entity=card,eventType=ButtonStateChangeEvent,listener=hover})
         end
+        for _,name in ipairs({"Previous","Next"}) do
+            local button=self:UI(name)
+            local previous=name=="Previous"
+            local hover=button:ConnectEvent(ButtonStateChangeEvent,function(event)
+                local hint=self:UI("PageKeyHint")
+                hint.Enable=self.opened and self._T.pending==nil and event.state==ButtonState.Hover
+                if hint.Enable then
+                    hint.UITransformComponent.anchoredPosition=button.UITransformComponent.anchoredPosition+Vector2(0,42)
+                    hint:GetChildByName("Label").TextGUIRendererComponent.Text=previous and "왼쪽 방향키로 이전 페이지" or "오른쪽 방향키로 다음 페이지"
+                end
+            end)
+            table.insert(self._T.links,{entity=button,eventType=ButtonStateChangeEvent,listener=hover})
+        end
         local quantity=self:UI("Confirmation/Quantity")
         local quantityChanged=quantity:ConnectEvent(TextInputValueChangeEvent,function() self:UpdatePurchaseConfirmation() end)
         table.insert(self._T.links,{entity=quantity,eventType=TextInputValueChangeEvent,listener=quantityChanged})
+        for _,field in ipairs({"Quantity","Confirmation/Quantity"}) do
+            local name=field
+            local entry=self:UI(name)
+            local submit=entry:ConnectEvent(TextInputSubmitEvent,function(event)
+                if not self.opened or self._T.mode~="shop" then return end
+                entry.TextGUIRendererInputComponent.Text=event.Text
+                self:SubmitPurchase(name=="Confirmation/Quantity")
+            end)
+            table.insert(self._T.links,{entity=entry,eventType=TextInputSubmitEvent,listener=submit})
+        end
         local input=self:UI("Search")
         local h=input:ConnectEvent(TextInputSubmitEvent,function() self:Search() end)
         table.insert(self._T.links,{entity=input,eventType=TextInputSubmitEvent,listener=h})
@@ -185,6 +208,7 @@ script CosmeticExchange extends Logic
     @ExecSpace("ClientOnly")
     method void Close()
         if not self.opened then return end
+        self:UI("PageKeyHint").Enable=false
         self.opened=false self._T.scanning=nil self._T.pending=nil
         self._T.closedUntil=_UtilLogic.ElapsedSeconds+0.2
         _EntityService:GetEntityByPath("/ui/CosmeticExchangeGroup/Modal").Enable=false
@@ -195,7 +219,27 @@ script CosmeticExchange extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method void SubmitPurchase(boolean confirmation)
+        -- Native submit and the global Enter key can arrive together; act only once.
+        if not self.opened or self._T.mode~="shop" then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now-(self._T.purchaseEnterAt or -1)<0.2 then return end
+        if confirmation then
+            if self._T.pending==nil or self._T.pending.mode~="shop" then return end
+            self._T.purchaseEnterAt=now
+            self:Confirm()
+        elseif self._T.pending==nil then
+            self._T.purchaseEnterAt=now
+            self:Ask()
+        end
+    end
+
+    @ExecSpace("ClientOnly")
     method void OnKey(KeyDownEvent event)
+        if self.opened and self._T.pending~=nil and self._T.pending.mode=="shop" and (event.key==KeyboardKey.Return or event.key==KeyboardKey.KeypadEnter) then
+            if not self:UI("Confirmation/Quantity").TextGUIRendererInputComponent.IsFocused then self:SubmitPurchase(true) end
+            return
+        end
         -- A remappable shop action must not consume typing or key-setting input.
         if _KeySettingManager:GetFuncForKeyEnum(event.key) == "shop" then
             if _KeySettingManager:IsWindowOpen() or (not self.opened and _KeySettingManager:IsCapturingKey()) or _MapleHUDManager:IsChatTyping() or _SocialManager:BlocksInput() or _AppearanceColorPicker:BlocksInput() then return end
@@ -208,6 +252,15 @@ script CosmeticExchange extends Logic
             return
         end
         if not self.opened then return end
+        if event.key==KeyboardKey.LeftArrow or event.key==KeyboardKey.RightArrow then
+            if self._T.pending or self._T.scanning or _RecoveryPotionManager._T.pending~=nil then return end
+            for _,field in ipairs({"Search","Quantity","SellTools/MaxStars","Confirmation/Quantity"}) do
+                local input=self:UI(field)
+                if input.EnabledInHierarchy and input.TextGUIRendererInputComponent.IsFocused then return end
+            end
+            self:Page(event.key==KeyboardKey.LeftArrow and -1 or 1)
+            return
+        end
         if event.key==KeyboardKey.Tab and not self._T.pending then
             local modes={shop="sell",sell="redeem",redeem="dismantle",dismantle="shop"}
             self:SetMode(modes[self._T.mode] or "shop")
@@ -241,6 +294,10 @@ script CosmeticExchange extends Logic
         if self._T.mode=="shop" then
             self._T.scanning=nil
             self._T.rows={{key="equipment_box",name="장비 상자 · 20,000 메소",ruid="90d3412612004466b328850446cb1d68"},{key="meso_pouch",name="메소주머니 · 조각 3개",ruid="17ae6a22966f45738bb92fb97ecc3e9d"}}
+            for _,p in ipairs(_RecoveryPotionManager:Catalog()) do
+                local stat=p.kind=="hp" and "HP" or "MP"
+                table.insert(self._T.rows,{key=p.key,name=p.name.." · "..stat.." +"..tostring(p.tier).."% · ".._UIEquipInventoryManager:FormatMeso(p.price).." 메소",ruid=p.ruid})
+            end
         elseif self._T.mode=="sell" then
             self._T.scanning=nil
             for i=1,128 do
@@ -353,7 +410,7 @@ script CosmeticExchange extends Logic
             self:UI("Action").TextGUIRendererComponent.Text=tostring(count).."개 판매 · ".._UIEquipInventoryManager:FormatMeso(total).." 메소"
             self:UI("Hint").TextGUIRendererComponent.Text="판매가: 0성부터 제작 기댓값의 70% (상자 10,000메소 기준)\n일괄 판매는 현재 분류·검색의 모든 페이지에 적용됩니다."
         end
-        if buying then self:UI("Hint").TextGUIRendererComponent.Text="장비 상자 1개: 20,000 메소 · 메소주머니 1개: 코디 조각 3개\n메소주머니 사용 시 10,000~100,000 메소를 균등 추첨합니다." end
+        if buying then self:UI("Hint").TextGUIRendererComponent.Text="회복 아이템: 1시간 동안 HP·MP 자동회복 증가 · 접속 종료 중 시간 보존\n수량을 입력하거나 아이템을 더블클릭하여 구매할 수 있습니다." end
         self:UI("Status").TextGUIRendererComponent.Text=scanning and "코디 목록을 검색하고 있습니다…" or (tostring(#rows).."개 · "..tostring(self._T.page or 1).." / "..tostring(math.max(1,math.ceil(#rows/12))))
         self:UI("Action").ButtonComponent.Enable=not scanning and (multiple and count>0 or not multiple and self._T.choice~=nil)
         for i=1,12 do
@@ -363,7 +420,12 @@ script CosmeticExchange extends Logic
             local e=self:UI(path) e.Enable=not scanning and row~=nil
             if row~=nil and not scanning then
                 e.SpriteGUIRendererComponent.Color=(multiple and self._T.selected[index] or not multiple and self._T.choice==index) and Color(1,0.86,0.6,1) or Color.white
-                self:UI(path.."/Icon").SpriteGUIRendererComponent.ImageRUID=buying and row.ruid or "thumbnail://"..row.ruid
+                local icon=self:UI(path.."/Icon")
+                icon.UITransformComponent.RectSize=Vector2(56,48)
+                icon.UITransformComponent.anchoredPosition=Vector2(0,20)
+                icon.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.AspectOnly
+                icon.SpriteGUIRendererComponent.ImageRUID=buying and row.ruid or "thumbnail://"..row.ruid
+                _RecoveryPotionManager:FitIcon(icon,buying and row.ruid or "thumbnail://"..row.ruid,56,48)
                 self:UI(path.."/Name").TextGUIRendererComponent.Text=selling and (row.name.." · "..tostring(_UIEquipInventoryManager:ParseStars(row.item)).."성") or row.name
                 self:UI(path.."/Selected").Enable=multiple and self._T.selected[index]==true
             end
@@ -395,7 +457,7 @@ script CosmeticExchange extends Logic
             if count<1 or count>999 then _UIToast:ShowMessage("구매 수량은 1~999개로 입력해주세요.") return end
             self._T.pending={mode="shop",key=row.key,count=count,name=row.name}
             self:UI("Confirmation/Quantity").TextGUIRendererInputComponent.Text=tostring(count)
-            local price=row.key=="equipment_box" and (_UIEquipInventoryManager:FormatMeso(20000*count).." 메소") or (tostring(count*3).." 조각")
+            local price=self:PurchasePriceText(row.key,count)
             message=row.name.."\n"..tostring(count).."개를 "..price.."로 구매할까요?"
         else
             local row=self._T.rows[self._T.choice or 0] if row==nil then return end
@@ -404,7 +466,14 @@ script CosmeticExchange extends Logic
         end
         self:UI("ItemTooltip").Enable=false
         self:UI("Confirmation/Message").TextGUIRendererComponent.Text=message
-        self:UI("Confirmation").Enable=true _UIAudio:Play("DlgNotice")
+        self:UI("PageKeyHint").Enable=false
+        self:UI("Confirmation").Enable=true
+        -- Activating a native input restores its previous edit buffer; set quantity afterward.
+        if self._T.pending~=nil and self._T.pending.mode=="shop" then
+            self:UI("Confirmation/Quantity").TextGUIRendererInputComponent.Text=tostring(self._T.pending.count)
+            self:UpdatePurchaseConfirmation()
+        end
+        _UIAudio:Play("DlgNotice")
     end
 
     @ExecSpace("ClientOnly")
@@ -418,7 +487,7 @@ script CosmeticExchange extends Logic
             self:UI("Confirmation/Message").TextGUIRendererComponent.Text=p.name.."\n구매 수량을 1~999개로 입력해주세요."
             return
         end
-        local price=p.key=="equipment_box" and (_UIEquipInventoryManager:FormatMeso(20000*count).." 메소") or (tostring(count*3).." 조각")
+        local price=self:PurchasePriceText(p.key,count)
         self:UI("Confirmation/Message").TextGUIRendererComponent.Text=p.name.."\n"..tostring(count).."개를 "..price.."로 구매할까요?"
     end
 
@@ -454,6 +523,8 @@ script CosmeticExchange extends Logic
         local desc=""
         if self._T.mode=="shop" then
             desc=row.key=="equipment_box" and "원하는 부위를 선택하여 0~30성 장비 획득\n강화된 장비도 등장합니다.\n1개당 20,000 메소" or "사용 시 10,000~100,000 메소 획득\n범위 안의 정수 금액을 균등 추첨합니다.\n1개당 코디 조각 3개"
+            local recovery=_RecoveryPotionManager:Product(row.key)
+            if recovery~=nil then desc=_RecoveryPotionManager:Description(row.key) end
         elseif self._T.mode=="sell" then
             desc="판매 가격: "..tostring(self:SellPrice(row.item)).." 메소\n현재 스타포스 "..tostring(_UIEquipInventoryManager:ParseStars(row.item)).."성\n0성부터 강화·실패·파괴 재제작 비용의 기댓값 × 70%\n계산용 상자 가격: 10,000 메소 (소수점 버림)\n판매 후 복구할 수 없습니다."
         elseif self._T.mode=="dismantle" then
@@ -594,15 +665,30 @@ script CosmeticExchange extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method integer PurchaseMesoPrice(string product)
+        if product=="equipment_box" then return 20000 end
+        local row=_RecoveryPotionManager:Product(product)
+        return row~=nil and row.price or 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method string PurchasePriceText(string product, integer count)
+        if product=="meso_pouch" then return tostring(count*3).." 조각" end
+        return _UIEquipInventoryManager:FormatMeso(self:PurchaseMesoPrice(product)*count).." 메소"
+    end
+
+    @ExecSpace("ClientOnly")
     method boolean Purchase(string product, integer quantity)
         -- Validate all inputs, capacity and payment before changing either inventory or money.
         local inv = _UIEquipInventoryManager
         local item = ""
         if product == "equipment_box" then item = _SpecialEquipment:BoxItem("normal", 1)
         elseif product == "meso_pouch" then item = self:MesoPouch(1)
-        else return false end
+        else item = _RecoveryPotionManager:Item(product,1) end
+        if item == "" then return false end
+        local mesoPrice = self:PurchaseMesoPrice(product)
         if quantity < 1 or quantity > 999 then return false end
-        if product == "equipment_box" and inv.meso < 20000*quantity then _UIToast:ShowMessage("메소가 부족합니다.") return false end
+        if mesoPrice > 0 and inv.meso < mesoPrice*quantity then _UIToast:ShowMessage("메소가 부족합니다.") return false end
         if product == "meso_pouch" and self:Shards() < quantity*3 then _UIToast:ShowMessage("코디 조각이 부족합니다.") return false end
         local plan, left = {}, quantity
         for pass=1,2 do
@@ -619,7 +705,7 @@ script CosmeticExchange extends Logic
             if left==0 then break end
         end
         if left>0 then _UIToast:ShowMessage("소비 인벤토리에 공간이 부족합니다. 구매하지 않았습니다.") return false end
-        if product=="equipment_box" then inv.meso=inv.meso-20000*quantity
+        if mesoPrice>0 then inv.meso=inv.meso-mesoPrice*quantity
         else
             local cost=quantity*3
             for i=1,128 do

@@ -1,0 +1,236 @@
+@Logic
+script StarforceMini extends Logic
+    property boolean minimized = false
+    property string windowPath = "/ui/DefaultGroup/EnhanceWindow"
+    property table links = {}
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string child)
+        -- Keep one real enhancement window and one transaction owner.
+        return _EntityService:GetEntityByPath(self.windowPath .. (child == "" and "" or "/" .. child))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string child, any action)
+        -- Use the normal window stack to prevent clicks through overlapping windows.
+        local e = self:UI(child)
+        if not isvalid(e) then log_error("[StarforceMini] missing " .. child) return end
+        local listener = e:ConnectEvent(ButtonClickEvent, function()
+            if _UIClickArbiter:AcceptClickAt(self.windowPath, _InputService:GetCursorPosition()) then action() end
+        end)
+        table.insert(self.links, {e=e, listener=listener, event=ButtonClickEvent})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Bind compact controls; ordinary UI audio supplies their click and hover cues.
+        self.minimized = false
+        self.links = {}
+        self._T.groups = {}
+        self:Bind("Minimize", function() self:Minimize() end)
+        self:Bind("MiniPanel/Restore", function() self:Restore() end)
+        self:Bind("MiniPanel/Close", function() self:Close() end)
+        self:Bind("MiniPanel/Run", function() _AutoStarforce:ToggleRunning() self:Refresh() end)
+        self:Bind("MiniPanel/UseBoxes", function()
+            if _AutoStarforce.running then return end
+            _AutoStarforce.useBoxes = not _AutoStarforce.useBoxes
+            _AutoStarforce:UI("UseBoxes/Check/Mark").Enable = _AutoStarforce.useBoxes
+            self:Refresh()
+        end)
+        self:Bind("MiniPanel/Mute", function()
+            _StarforcePresentation:SetSoundMuted(not _StarforcePresentation.soundMuted)
+            self:Refresh()
+        end)
+        local title = self:UI("MiniPanel/Title")
+        local down = title:ConnectEvent(UITouchDownEvent, function(event)
+            if self.minimized and _UIClickArbiter:AcceptClickAt(self.windowPath, event.TouchPoint) then
+                _UIEquipInventoryManager:StartWindowDrag(self.windowPath)
+            end
+        end)
+        local up = title:ConnectEvent(UITouchUpEvent, function() _UIEquipInventoryManager:StopWindowDrag() end)
+        table.insert(self.links, {e=title, listener=down, event=UITouchDownEvent})
+        table.insert(self.links, {e=title, listener=up, event=UITouchUpEvent})
+        self:UI("MiniPanel").Enable = false
+        log("[StarforceMini] ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Minimize()
+        -- Hide only pixels and input: the original animation renderers must remain active.
+        if self.minimized or not _EnhancementManager:IsWindowOpen() or _EnhancementManager.currentTab ~= 1 then return end
+        if _EnhancementManager:IsConfirmDialogOpen() then return end
+        local w = self:UI("")
+        local tr = w.UITransformComponent
+        self._T.fullSize = Vector2(tr.RectSize.x, tr.RectSize.y)
+        self._T.fullPosition = Vector2(tr.anchoredPosition.x, tr.anchoredPosition.y)
+        self._T.groups = {}
+        for _, child in ipairs(w.Children:ToTable()) do
+            if child.Name ~= "MiniPanel" then
+                local canvas = child.CanvasGroupComponent
+                if isvalid(canvas) then
+                    table.insert(self._T.groups, {e=child, alpha=canvas.GroupAlpha, interactive=canvas.Interactable, blocks=canvas.BlocksRaycasts})
+                    canvas.GroupAlpha = 0
+                    canvas.Interactable = false
+                    canvas.BlocksRaycasts = false
+                end
+            end
+        end
+        local input = _AutoStarforce:UI("Goal").TextGUIRendererInputComponent
+        if input.Text == "" then
+            local limit = _CashShopManager:GetMaxStars(_EnhancementManager.enhanceTargetItemStr)
+            input.Text = tostring(math.min(limit, math.max(_AutoStarforce.goalStars, _EnhancementManager.enhanceLevel + 1)))
+        end
+        local goalText = input.Text
+        self.minimized = true
+        tr.RectSize = Vector2(340, 210)
+        tr.anchoredPosition = self._T.miniPosition or Vector2(-760, 140)
+        self:UI("MiniPanel").Enable = true
+        self:UI("MiniPanel/Goal").TextGUIRendererInputComponent.Text = goalText
+        _UILogic:SetSiblingIndex(self:UI("MiniPanel").UITransformComponent, 1000000)
+        _UIEquipInventoryManager:BringWindowToFront(self.windowPath)
+        self:Refresh()
+        self:PlaceEffects()
+        log("[StarforceMini] minimized running=" .. tostring(_AutoStarforce.running))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore()
+        -- Restoring does not start, stop or resolve any enhancement attempt.
+        if not self.minimized then return end
+        self:CommitGoal()
+        self.minimized = false
+        local w = self:UI("")
+        if isvalid(w) then
+            local tr = w.UITransformComponent
+            self._T.miniPosition = Vector2(tr.anchoredPosition.x, tr.anchoredPosition.y)
+            tr.RectSize = self._T.fullSize or Vector2(800, 900)
+            tr.anchoredPosition = self._T.fullPosition or Vector2(-170, 0)
+        end
+        for _, saved in ipairs(self._T.groups or {}) do
+            if isvalid(saved.e) then
+                local canvas = saved.e.CanvasGroupComponent
+                canvas.GroupAlpha = saved.alpha
+                canvas.Interactable = saved.interactive
+                canvas.BlocksRaycasts = saved.blocks
+            end
+        end
+        self._T.groups = {}
+        local panel = self:UI("MiniPanel")
+        if isvalid(panel) then panel.Enable = false end
+        self:PlaceEffects()
+        log("[StarforceMini] restored running=" .. tostring(_AutoStarforce.running))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CommitGoal()
+        -- Share the same goal and validation with the full-size automatic panel.
+        if not self.minimized or _AutoStarforce.running then return end
+        _AutoStarforce:UI("Goal").TextGUIRendererInputComponent.Text = self:UI("MiniPanel/Goal").TextGUIRendererInputComponent.Text
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        -- Closing always stops automation, including an unresolved manual attempt.
+        _AutoStarforce:Stop("강화창을 닫아 중지되었습니다.", true)
+        if _StarforcePresentation.busy then _StarforcePresentation:Cancel() end
+        self:Restore()
+        _EnhancementManager:CloseWindow()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlaceEffects()
+        -- Scale the existing success/fail/destroy sequences around the compact item only.
+        local center = _EntityService:GetEntityByPath(_StarforcePresentation.screenPath)
+        if not isvalid(center) then return end
+        local tr = center.UITransformComponent
+        local effects = _EntityService:GetEntityByPath(_StarforcePresentation.effectPath)
+        local window = self:UI("")
+        if isvalid(effects) and isvalid(window) then
+            effects.Enable = window.EnabledInHierarchy
+            local pos = window.UITransformComponent.anchoredPosition
+            if self.minimized then
+                effects.UITransformComponent.anchoredPosition = pos + self:UI("MiniPanel/Item").UITransformComponent.anchoredPosition
+                effects.UITransformComponent.UIScale = Vector3(0.3, 0.3, 1)
+            else
+                effects.UITransformComponent.anchoredPosition = pos + self:UI("RightPanel").UITransformComponent.anchoredPosition + self:UI("RightPanel/SlotArea").UITransformComponent.anchoredPosition + self:UI("RightPanel/SlotArea/TargetSlotBG").UITransformComponent.anchoredPosition
+                effects.UITransformComponent.UIScale = Vector3.one
+            end
+        end
+        local attemptScale = _StarforcePresentation.tryScale * (self.minimized and 1.5 or 1)
+        for _,name in ipairs({"TryFx1","TryFx2"}) do
+            local attempt = _EntityService:GetEntityByPath(_StarforcePresentation.effectPath .. "/" .. name)
+            if isvalid(attempt) then
+                attempt.UITransformComponent.UIScale = Vector3(attemptScale,attemptScale,1)
+                attempt.UITransformComponent.anchoredPosition = -Vector2(12,139)*attemptScale
+            end
+        end
+        if self.minimized then
+            local w = self:UI("").UITransformComponent
+            tr.anchoredPosition = w.anchoredPosition + self:UI("MiniPanel/Item").UITransformComponent.anchoredPosition
+            tr.UIScale = Vector3(0.27, 0.27, 1)
+        else
+            tr.anchoredPosition = Vector2.zero
+            tr.UIScale = Vector3.one
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Refresh()
+        -- Read the original item and committed stars; never cache a second equipment record.
+        if not self.minimized then return end
+        local e = _EnhancementManager
+        local p = _StarforcePresentation
+        local source = self:UI("RightPanel/SlotArea/TargetSlotBG/TargetIcon")
+        local icon = self:UI("MiniPanel/Item/Icon")
+        local ruid = e.enhanceTargetRUID
+        if self._T.icon ~= ruid then
+            self._T.icon = ruid
+            if ruid ~= "" then icon.SpriteGUIRendererComponent.ImageRUID = DataRef("thumbnail://" .. ruid) end
+        end
+        icon.Enable = ruid ~= ""
+        if isvalid(source) then icon.SpriteGUIRendererComponent.Color = source.SpriteGUIRendererComponent.Color end
+        local level = p.busy and p.displayedLevel >= 0 and p.displayedLevel or e.enhanceLevel
+        self:UI("MiniPanel/Stars").TextGUIRendererComponent.Text = ruid ~= "" and tostring(level) .. "성" or "장비 없음"
+        self:UI("MiniPanel/Run").TextGUIRendererComponent.Text = _AutoStarforce.running and "중지" or "자동강화"
+        self:UI("MiniPanel/Mute").TextGUIRendererComponent.Text = p.soundMuted and "무음" or "소리"
+        self:UI("MiniPanel/Mute").SpriteGUIRendererComponent.Color = p.soundMuted and Color(0.65,0.36,0.3,1) or Color(0.3,0.38,0.42,1)
+        local goal = self:UI("MiniPanel/Goal")
+        goal.CanvasGroupComponent.Interactable = not _AutoStarforce.running
+        if _AutoStarforce.running then goal.TextGUIRendererInputComponent.Text = tostring(_AutoStarforce.goalStars) end
+        self:UI("MiniPanel/UseBoxes/Check/Mark").Enable = _AutoStarforce.useBoxes
+        local status = _AutoStarforce:UI("Status").TextGUIRendererComponent.Text
+        if p.busy then status = p._T.destroyed and "장비 파괴" or "강화 진행 중" end
+        self:UI("MiniPanel/Status").TextGUIRendererComponent.Text = status
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Keep the minimized hit area compact and recover safely from forced closure/tab changes.
+        local button = self:UI("Minimize")
+        if isvalid(button) then button.Enable = not self.minimized and _EnhancementManager.currentTab == 1 end
+        self:PlaceEffects()
+        if not self.minimized then return end
+        local w = self:UI("")
+        if not isvalid(w) or not w.EnabledInHierarchy or _LoginFlow.phase ~= "ingame" or _EnhancementManager.currentTab ~= 1 then
+            _AutoStarforce:Stop("강화창이 닫혀 중지되었습니다.", true)
+            if _StarforcePresentation.busy then _StarforcePresentation:Cancel() end
+            self:Restore()
+            return
+        end
+        local pos = w.UITransformComponent.anchoredPosition
+        w.UITransformComponent.anchoredPosition = Vector2(math.max(-790, math.min(790,pos.x)), math.max(-435,math.min(435,pos.y)))
+        self:PlaceEffects()
+        self._T.refreshIn = (self._T.refreshIn or 0) - delta
+        if self._T.refreshIn <= 0 then self._T.refreshIn = 0.1 self:Refresh() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Restore rendering and disconnect all controls before the next play session.
+        self:Restore()
+        for _, link in ipairs(self.links) do
+            if isvalid(link.e) then link.e:DisconnectEvent(link.event, link.listener) end
+        end
+        self.links = {}
+    end
+end

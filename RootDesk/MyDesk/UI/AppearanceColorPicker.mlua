@@ -119,7 +119,7 @@ script AppearanceColorPicker extends Logic
         _UIEquipInventoryManager:HideTooltip()
         self.opened = true
         _EntityService:GetEntityByPath("/ui/AppearanceColorGroup/Modal").Enable = true
-        if self._T.dye then self:SetHSV(string.match(item,"|dye:(%x%x%x%x%x%x)") or "FFFFFF") end
+        if self._T.dye then self:SetHSV(item) end
         self:Draw()
         _UIAudio:Play("MenuUp")
         log("[AppearanceColor] open=" .. source .. ":" .. tostring(index) .. " colors=" .. tostring(#self._T.colors))
@@ -188,9 +188,7 @@ script AppearanceColorPicker extends Logic
         local updated = row[1] .. "|" .. row[2] .. suffix
         
         if self._T.dye then
-            updated=string.gsub(self._T.original,"|dye:%x%x%x%x%x%x","")
-            local hex=self._T.dyeHex or "FFFFFF"
-            if hex~="FFFFFF" then updated=updated.."|dye:"..hex end
+            updated=self:BuildDyeItem()
         end
         if self._T.source == "deco" then
             local data=_DecoWindowManager:ExportDeco()
@@ -235,14 +233,27 @@ script AppearanceColorPicker extends Logic
     end
 
     @ExecSpace("ClientOnly")
-    method void SetHSV(string hex)
-        -- RGB serialization stays compatible with existing dyed items.
+    method void SetHSV(string item)
+        -- Original brightness is centered at 50%; old RGB-only dyes retain their brightness.
+        local hex=string.match(item,"^%x%x%x%x%x%x$") or string.match(item,"|dye:(%x%x%x%x%x%x)") or "FFFFFF"
         local h,s,v=Color.RGBToHSV(Color.FromHexCode("#"..hex))
         self._T.settingHSV=true
         self:UI("Advanced/Hue").SliderComponent.Value=math.floor(h*359+0.5)
         self:UI("Advanced/Saturation").SliderComponent.Value=math.floor(s*100+0.5)
-        self:UI("Advanced/Value").SliderComponent.Value=math.floor(v*100+0.5)
+        self:UI("Advanced/Value").SliderComponent.Value=v*_DecoWindowManager:DyePower(item)*50
         self._T.settingHSV=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method string BuildDyeItem()
+        -- Keep unrelated item flags, and store extra brightness separately from RGB.
+        local item=string.gsub(self._T.original,"|dye:%x%x%x%x%x%x","")
+        item=string.gsub(item,"|dyePower:%d+","")
+        local hex=self._T.dyeHex or "FFFFFF"
+        local power=self._T.dyePower or 100
+        if hex~="FFFFFF" then item=item.."|dye:"..hex end
+        if power~=100 then item=item.."|dyePower:"..tostring(power) end
+        return item
     end
 
     @ExecSpace("ClientOnly")
@@ -251,9 +262,11 @@ script AppearanceColorPicker extends Logic
         local h=self:UI("Advanced/Hue").SliderComponent.Value
         local s=self:UI("Advanced/Saturation").SliderComponent.Value
         local v=self:UI("Advanced/Value").SliderComponent.Value
-        local tint=Color.HSVToRGB(h/360,s/100,v/100)
+        local power=math.max(1,v/50)
+        local tint=Color.HSVToRGB(h/360,s/100,math.min(1,v/50))
         local hex=string.format("%02X%02X%02X",math.floor(tint.r*255+0.5),math.floor(tint.g*255+0.5),math.floor(tint.b*255+0.5))
         self._T.dyeHex=hex
+        self._T.dyePower=math.floor(power*100+0.5)
         self:UI("Advanced/HueValue").TextGUIRendererComponent.Text=tostring(math.floor(h)).."°"
         self:UI("Advanced/SaturationValue").TextGUIRendererComponent.Text=tostring(math.floor(s)).."%"
         self:UI("Advanced/ValueValue").TextGUIRendererComponent.Text=tostring(math.floor(v)).."%"
@@ -261,16 +274,16 @@ script AppearanceColorPicker extends Logic
         for i=0,47 do
             local ratio=i/47
             self:UI("Advanced/Saturation/Spectrum/Band"..tostring(i)).SpriteGUIRendererComponent.Color=Color.HSVToRGB(h/360,ratio,1)
-            self:UI("Advanced/Value/Spectrum/Band"..tostring(i)).SpriteGUIRendererComponent.Color=Color.HSVToRGB(h/360,s/100,ratio)
+            self:UI("Advanced/Value/Spectrum/Band"..tostring(i)).SpriteGUIRendererComponent.Color=Color.HSVToRGB(h/360,s/100,ratio*2,true)
         end
-        local item=string.gsub(self._T.original,"|dye:%x%x%x%x%x%x","").."|dye:"..hex
+        local item=self:BuildDyeItem()
         self:UI("Name").TextGUIRendererComponent.Text=_UIEquipInventoryManager:ParseName(item)
         self:UI("Preview").SpriteGUIRendererComponent.ImageRUID="thumbnail://".._UIEquipInventoryManager:ParseRUID(item)
-        self:UI("Preview").SpriteGUIRendererComponent.Color=tint
+        self:UI("Preview").SpriteGUIRendererComponent.Color=_DecoWindowManager:DyeColor(hex,self._T.dyePower)
         local cached=self._T.dyePreviewFinals
         if cached~=nil then
             local ruid=_UIEquipInventoryManager:ParseRUID(item)
-            for _,entry in ipairs(cached) do if entry[2]==ruid then entry[3]=hex end end
+            for _,entry in ipairs(cached) do if entry[2]==ruid then entry[3]=hex entry[4]=self._T.dyePower end end
             _DecoWindowManager:ApplyDyes(self:UI("Advanced/Avatar").CostumeManagerComponent,cached)
             return
         end

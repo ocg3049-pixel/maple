@@ -64,18 +64,6 @@ script InformationBook extends Logic
             local n=i
             self:Bind("Hall/Job"..tostring(i),function() self:SelectHall(3,n) end)
         end
-        for i=1,28 do
-            local slot=i
-            self:Bind("Hall/Profile/Equipment/Slot"..tostring(i),function()
-                local d=self._T.hallOwner
-                self:ShowHallItem(d and (d.equips or {})[tostring(slot)] or "")
-            end)
-        end
-        self:Bind("Hall/Profile/RankedItem",function()
-            local row=self.ranks[self.selectedRank]
-            self:ShowHallItem(row and row.item or "")
-        end)
-        self:Bind("Hall/Profile/ItemDetails/Back",function() self:Show("Hall/Profile/ItemDetails",false) end)
         self:Bind("Hall/Profile/Ticket",function()
             self._T.hallOriginal=not self._T.hallOriginal self:DrawHallOwner() _UIAudio:Play("Tab")
         end)
@@ -120,6 +108,7 @@ script InformationBook extends Logic
 
     @ExecSpace("ClientOnly")
     method void Close()
+        self:HideHallTooltip()
         local e = self:UI("")
         if isvalid(e) then e.Enable = false end
     end
@@ -286,11 +275,21 @@ script InformationBook extends Logic
             table.insert(lines, "각 아이템을 독립 추첨하므로 여러 개가 함께 나옵니다.")
             table.insert(lines, "아이템 감각: 메소량·비고정 아이템 확률에 적용.")
             table.insert(lines, "아이템 감각은 메소 드롭 확률을 높이지 않습니다.")
-            table.insert(lines, "메소량 = 레벨 구간 원래 기본값의 80~120% × 50%")
+            table.insert(lines, "메소량 = 레벨 구간 원래 기본값의 80~120% × 75%")
             table.insert(lines, "이 금액에 아이템 감각과 레벨 차이 배율을 곱합니다.")
-            table.insert(lines, "공격 속도의 비약: 기본 0.03% × 레벨 차이 배율")
+            table.insert(lines, "공격 속도의 비약: 기본 0.003% × 레벨 차이 배율")
             table.insert(lines, "비약에는 아이템 감각 보너스를 적용하지 않습니다.")
             table.insert(lines, "아바타 장비는 장비 상자로 획득합니다.")
+            table.insert(lines, "")
+            table.insert(lines, "파티 사냥 메소 분배")
+            table.insert(lines, "같은 맵의 접속 중인 분배 대상 파티원 수로 계산.")
+            table.insert(lines, "파티원 1명당 총 메소 10% 감소 후 분배합니다.")
+            table.insert(lines, "솔로 / 같은 맵의 분배 대상 1명: 감소 없음.")
+            for count=2,6 do
+                table.insert(lines, tostring(count).."명: 총 메소 "..tostring(math.floor(_SocialManager:PartyMesoRate(count)*100+0.5)).."% 분배")
+            end
+            table.insert(lines, "감소 후 총액의 80%는 균등, 20%는 처치자에게.")
+            table.insert(lines, "소수점은 총액 내림 후 나머지를 나누어 지급합니다.")
             table.insert(lines, "")
             table.insert(lines, "메소 기본값 · 아이템 감각 적용 전")
             local tiers = {}
@@ -325,6 +324,7 @@ script InformationBook extends Logic
 
     @ExecSpace("ClientOnly")
     method void Render()
+        self:HideHallTooltip()
         local titles = {"큐브 등장 옵션", "각종 확률", "데미지 공식", "몬스터 드롭", "명예의 전당", "치장 상자 도감", "장비·장신구 상자"}
         self:Text("Title", titles[self.tab])
         for i = 1, 7 do
@@ -591,7 +591,7 @@ script InformationBook extends Logic
         local ticket=equips["28"] or ""
         local enabled=_AvatarTicketManager:IsTicket(ticket) and not _AvatarTicketManager:IsExpired(ticket)
         local avatar=self:UI("Hall/Profile/Avatar")
-        if (self._T.fittingDeco.skin or "")=="" then table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"}) end
+        if ((d.deco or {}).skin or "")=="" then table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"}) end
         _AvatarTicketManager:Apply(avatar.CostumeManagerComponent,d.uid,finals,_AvatarTicketManager:ShouldShowWorld(d.uid,enabled,self._T.hallOriginal==true))
         self:Show("Hall/Profile/Ticket",enabled)
         self:Text("Hall/Profile/Ticket",self._T.hallOriginal and "게임 코디" or "MSW 코디")
@@ -608,25 +608,55 @@ script InformationBook extends Logic
     end
 
     @ExecSpace("ClientOnly")
-    method void ShowHallItem(string item)
-        if item==nil or item=="" then return end
-        local name=_UIEquipInventoryManager:ParseName(item)
-        local stars=_UIEquipInventoryManager:ParseStars(item)
-        local text=name.."\n"
-        if _AvatarTicketManager:IsTicket(item) then text=text.._AvatarTicketManager:ExpiryText(item)
-        elseif tonumber(_ItemHallOfFame:Field(item,3))==1 or tonumber(_ItemHallOfFame:Field(item,3))==2 then
-            text=text.."헤어·성형 아이템\n색상 변경은 소유자의 장비창에서 가능합니다."
-        else
-            text=text.."스타포스 "..tostring(stars).."성\n"
-            text=text.._UIEquipInventoryManager:BuildTooltipStatsText(name,stars,_UIEquipInventoryManager:ParseUpgrade(item))
-            text=text.._UIEquipInventoryManager:BuildPotentialText(item)
+    method boolean UpdateHallTooltip(Vector2 point)
+        -- Reuse the inventory tooltip for ranking rows and the inspected character's gear.
+        local inv=_UIEquipInventoryManager
+        local target=nil
+        local item=""
+        local window=self._T.windowPath or "/ui/DefaultGroup/Book"
+        if self:IsOpen() and self.tab==5 and not _AppearanceColorPicker.opened and _UIClickArbiter:IsTopmostAt(window,point) then
+            if self.hallBoard==1 then
+                for i=1,10 do
+                    local row=self.ranks[(self.page-1)*10+i]
+                    local slot=self:UI("Rank"..tostring(i))
+                    if row~=nil and row.item~=nil and _UICursorManager:Hit(slot,point) then target=slot item=row.item break end
+                end
+            end
+            if target==nil and self._T.hallOwner~=nil then
+                for i=1,28 do
+                    local slot=self:UI("Hall/Profile/Equipment/Slot"..tostring(i))
+                    if _UICursorManager:Hit(slot,point) then
+                        target=slot item=(self._T.hallOwner.equips or {})[tostring(i)] or "" break
+                    end
+                end
+            end
+            if target==nil then
+                local slot=self:UI("Hall/Profile/RankedItem")
+                local row=self.ranks[self.selectedRank]
+                if row~=nil and row.item~=nil and _UICursorManager:Hit(slot,point) then target=slot item=row.item end
+            end
         end
-        self:Text("Hall/Profile/ItemDetails/Text",text)
-        self:UI("Hall/Profile/ItemDetails/Icon").SpriteGUIRendererComponent.ImageRUID=DataRef(_UIEquipInventoryManager:ItemIconRUID(item))
-        self:Show("Hall/Profile/ItemDetails",true)
-        _UIAudio:Play("BtMouseClick")
+        if target~=nil and item~="" then
+            local signature=target.Path..":"..item
+            local tip=_EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
+            if self._T.hallTipSignature~=signature or inv.tooltipSource~="hall" or not isvalid(tip) or not tip.Enable then
+                self._T.hallTipSignature=signature
+                inv.tooltipSource="hall"
+                inv:ShowTooltipFromStr(item,inv:ParseSlotIdx(item)>=1,target.Path,window)
+            end
+            inv:FollowItemTooltip()
+            return true
+        end
+        self:HideHallTooltip()
+        return false
     end
 
+    @ExecSpace("ClientOnly")
+    method void HideHallTooltip()
+        -- Do not close a tooltip belonging to another window.
+        self._T.hallTipSignature=""
+        if _UIEquipInventoryManager.tooltipSource=="hall" then _UIEquipInventoryManager:HideTooltip() end
+    end
 
     @ExecSpace("ClientOnly")
     method void ResetFitting()
@@ -670,26 +700,61 @@ script InformationBook extends Logic
         local avatar=self:UI("Cosmetics/Fitting/Avatar")
         if not isvalid(avatar) then return end
         local finals=_DecoWindowManager:ComposeAppearance(self._T.fittingEquips,self._T.fittingDeco,_UIMyInfoManager:GetSelectedCharacterJobIdx())
-        table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"})
+        if (self._T.fittingDeco.skin or "")=="" then table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"}) end
         avatar.CostumeManagerComponent.UseCustomEquipOnly=true
-        _DecoWindowManager:ApplyCostumeSnapshot(avatar.CostumeManagerComponent,finals)
+        self:ApplyFittingChanges(avatar.CostumeManagerComponent,finals)
         self:UpdateFittingView()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyFittingChanges(any cm, table finals)
+        -- Compare slots before changing them; never clear unchanged clothes or weapons.
+        local earShapes = {["de06c3d28f6047008264755f841f28a2"]=true,["279b4de94cf8460a98ce25e86bbbb5df"]=true,["f11aa974673f4722b6830fae9acc9041"]=true,["40eac2af3a4b4799b6ca4fb871da5d26"]=true}
+        local desired = {[19]=""}
+        for _,f in ipairs(finals) do
+            desired[f[1]]=f[2]
+            if f[1]==18 and earShapes[f[2]] then desired[19]=f[2] desired[18]="" end
+        end
+        local changed=0
+        -- Remove only conflicting old slots before equipping their replacements.
+        for _,emptyPass in ipairs({true,false}) do
+            for c,ruid in pairs(desired) do
+                local category=_DecoWindowManager:CatEnum(c)
+                if (ruid=="")==emptyPass and _DecoWindowManager:SafeEquip(cm,category)~=ruid then
+                    cm:SetEquip(category,ruid)
+                    changed=changed+1
+                end
+            end
+        end
+        _DecoWindowManager:ApplyDyes(cm,finals)
+        self._T.fittingRevision=(self._T.fittingRevision or 0)+1
+        local revision=self._T.fittingRevision
+        _TimerService:SetTimerOnce(function()
+            if isvalid(cm) and self._T.fittingRevision==revision then _DecoWindowManager:ApplyDyes(cm,finals) end
+        end,0.4)
+        log("[Fitting] changed slots="..tostring(changed))
     end
 
     @ExecSpace("ClientOnly")
     method void UpdateFittingView()
         -- Change only the independent fitting avatar.
         local avatar=self:UI("Cosmetics/Fitting/Avatar")
-        local scale=self._T.fittingZoom and 1 or 0.5
+        -- Fit the complete avatar inside the preview bounds without stretching.
+        avatar.AvatarGUIRendererComponent.PreserveAvatar=PreserveSpriteType.AspectOnly
+        local scale=self._T.fittingZoom and 1 or 0.8
         avatar.UITransformComponent.UIScale=Vector3(scale,scale,1)
-        self:UI("Cosmetics/Fitting/Zoom").TextGUIRendererComponent.Text=self._T.fittingZoom and "x1" or "x2"
+        self:UI("Cosmetics/Fitting/Zoom").TextGUIRendererComponent.Text=self._T.fittingZoom and "축소" or "확대"
         local poses={{"서기","stand1"},{"걷기","walk1"},{"앉기","sit"},{"점프","jump"},{"엎드리기","prone"}}
         local pose=poses[self._T.fittingPose or 1]
         self:UI("Cosmetics/Fitting/Pose").TextGUIRendererComponent.Text=pose[1].." >"
         local body=avatar.AvatarGUIRendererComponent:GetBodyEntity()
         local action=pose[2]
         if action=="stand1" and avatar.CostumeManagerComponent.CustomCapEquip=="aeb1286a232949c98b4dc07ab8d2c14e" then action="alert" end
-        if isvalid(body) then body:SendEvent(ActionStateChangedEvent(action,action,1,SpriteAnimClipPlayType.Loop)) end
+        if isvalid(body) and (self._T.fittingAction~=action or self._T.fittingBody~=body) then
+            body:SendEvent(ActionStateChangedEvent(action,action,1,SpriteAnimClipPlayType.Loop))
+            self._T.fittingAction=action
+            self._T.fittingBody=body
+        end
         log("[Fitting] zoom="..tostring(scale).." pose="..pose[2])
     end
 end
