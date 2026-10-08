@@ -11,6 +11,9 @@ script Monster extends Component
     @Sync property integer LifeSerial = 0
     @Sync property boolean RespawnOn = false
     @Sync property boolean IsDead = false
+    @Sync property number SpawnFadeStarted = -1
+    @Sync property number DeathFadeStarted = -1
+    @Sync property number DeathFadeAlpha = 1
     @Sync property number HealthBarUntil = 0
     property number HealthBarOffsetY = 0
     @Sync property integer NameTagLevel = 0
@@ -21,6 +24,8 @@ script Monster extends Component
     property integer MonsterLevel = 15
     property string MonsterDisplayName = ""
     property boolean Stationary = false
+    @Sync property boolean IsStageBoss = false
+    @Sync property boolean IsBossSummon = false
 
     -- (요청 2026-08-09) 어그로 지속시간(초). 마지막으로 맞은 시점부터 이만큼 공격자를 쫓고,
     -- 만료되면 추적을 풀고 다시 혼자 배회한다.
@@ -31,8 +36,8 @@ script Monster extends Component
     -- 기본값 false라 기존 몬스터는 영향 없음.
     @Sync property boolean NeverDie = false
     -- 명시한 전용 소리가 우선한다. 비어 있으면 애니메이션에 대응하는 공식 몬스터 팩에서 선택한다.
-    property string HitSoundRUID = ""
-    property string DeathSoundRUID = ""
+    @Sync property string HitSoundRUID = ""
+    @Sync property string DeathSoundRUID = ""
 
     -- (요청 2026-08-11) 리젠 자리(최초 배치 좌표). 리젠은 항상 이 좌표에서 일어난다(_T.spawnX/Y와
     -- 같은 값). @Sync로 공개하는 이유: 자동사냥(클라)이 "죽어서 리젠 대기 중인 몬스터의 리젠 자리"에
@@ -47,6 +52,53 @@ script Monster extends Component
     -- 엔티티를 다시 켜면 붙어 있던 루프 이펙트가 그대로 살아난다.
     -- → 몬스터가 죽는 순간 **붙어 있던 표시 이펙트를 전부 지운다**. 스턴/빙결처럼 대상에 붙는
     --   루프 이펙트는 전부 여기에 등록해야 한다(PlayerAttack의 Play*StunEffect 참고).
+
+    method boolean IsSpawnProtected()
+        local encounter=(self.Entity:GetComponent("script.ManoEncounter") or self.Entity:GetComponent("script.StumpyEncounter"))
+        if isvalid(encounter) and not encounter.CombatActive then return true end
+        -- The server clock gives damage and visuals the same 0.5-second boundary.
+        return not self.NeverDie and self.SpawnFadeStarted >= 0 and _UtilLogic.ServerElapsedSeconds < self.SpawnFadeStarted + 0.5
+    end
+
+    method number GetLifecycleAlpha()
+        -- Fade independently of hit tint and the hidden authoritative sprite.
+        if self.NeverDie then return 1 end
+        local now = _UtilLogic.ServerElapsedSeconds
+        if self.IsDead then
+            if self.DeathFadeStarted < 0 then return 0 end
+            return self.DeathFadeAlpha * math.max(0, math.min(1, 1 - (now - self.DeathFadeStarted)))
+        end
+        local blink=1
+        local mano=(self.Entity:GetComponent("script.ManoEncounter") or self.Entity:GetComponent("script.StumpyEncounter"))
+        if isvalid(mano) then
+            local elapsed=now-mano.HitAt
+            if elapsed>=0 and elapsed<0.4 and math.floor(elapsed/0.1)%2==0 then blink=0.15 end
+        end
+        local snail=self.Entity:GetComponent("script.ManoSnail") or self.Entity:GetComponent("script.StumpyFlyeye")
+        if isvalid(snail) then
+            local elapsed=now-snail.HitAt
+            if elapsed>=0 and elapsed<0.4 and math.floor(elapsed/0.1)%2==0 then blink=0.15 end
+        end
+        if self.SpawnFadeStarted < 0 then return blink end
+        return blink*math.max(0, math.min(1, now - self.SpawnFadeStarted))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginSpawnFade()
+        -- Disable the native hitbox as well as guarding custom HitEvents.
+        self.SpawnFadeStarted = _UtilLogic.ServerElapsedSeconds
+        self.DeathFadeStarted = -1
+        local serial = self.LifeSerial
+        local hit = self.Entity.HitComponent
+        if isvalid(hit) then
+            if self._T.spawnHitEnabled == nil then self._T.spawnHitEnabled = hit.Enable end
+            hit.Enable = false
+        end
+        _TimerService:SetTimerOnce(function()
+            if not isvalid(self.Entity) or self.IsDead or self.LifeSerial ~= serial then return end
+            if isvalid(hit) then hit.Enable = self._T.spawnHitEnabled ~= false end
+        end, 0.5)
+    end
 
     @ExecSpace("ClientOnly")
     method void RegisterStatusEffect(integer serial)
@@ -211,7 +263,7 @@ script Monster extends Component
             log("[MonsterNameTag] client created " .. self.Entity.Name)
             self:UpdateMonsterNameTagColor(math.max(1, _UIMyInfoManager.DisplayLevel))
         end
-        local pos = self.Entity.TransformComponent.WorldPosition
+        local pos = _NetworkMotionVisual:Position(self.Entity)
         nameEntity.TransformComponent.WorldPosition = Vector3(pos.x, pos.y, pos.z - 0.01)
         nameEntity.Enable = true
     end
@@ -303,18 +355,22 @@ script Monster extends Component
         _TimerService:SetTimerOnce(function()
             if not isvalid(entInit) then return end
             self:ApplyAggroState(false, nil)
+            if self._T.mapSimulationActive == false then self:SetMapSimulationActive(false) end
         end, 0.2)
         log("Monster: OnBeginPlay, MaxHp=" .. tostring(self.MaxHp) .. " spawnPos=" .. tostring(spawnPos.x) .. "," .. tostring(spawnPos.y))
-        if self.GroupRespawn then
-            _MonsterZoneRespawn:Register(self)
-        end
+        if not self.NeverDie then self:BeginSpawnFade() end
+        _MonsterZoneRespawn:Register(self)
     end
 
     @ExecSpace("ServerOnly")
     @EventSender("Self")
     handler HandleHitEvent(HitEvent event)
-        if self.IsDead then return end
+        if self.IsDead or self:IsSpawnProtected() then return end
         self.Hp = self.Hp - event.TotalDamage
+        local snail=self.Entity:GetComponent("script.ManoSnail") or self.Entity:GetComponent("script.StumpyFlyeye")
+        if isvalid(snail) and _UtilLogic.ServerElapsedSeconds-snail.HitAt>=0.4 then snail.HitAt=_UtilLogic.ServerElapsedSeconds end
+        local mano=(self.Entity:GetComponent("script.ManoEncounter") or self.Entity:GetComponent("script.StumpyEncounter"))
+        if isvalid(mano) and _UtilLogic.ServerElapsedSeconds-mano.HitAt>=0.4 then mano.HitAt=_UtilLogic.ServerElapsedSeconds end
         -- 예약 데미지(ReserveDamage)로 미리 잡아둔 몫이 실제로 들어왔으므로 그만큼 덜어낸다.
         -- 안 덜면 "Hp는 이미 줄었는데 예약은 그대로" 상태가 되어 아직 여유가 있는 몬스터까지
         -- 치사 예약으로 오판해 대상 선정에서 빠진다.
@@ -327,13 +383,14 @@ script Monster extends Component
         if isvalid(directAttack) and directAttack:GetExpectedDamageLineCount(event.Extra or "") > 0 then
             directAttack:ShowResolvedDamage(self.Entity, event.TotalDamage, event.IsCritical, directAttack:GetHitDamageSkinId())
         end
-        self:RememberLastAttacker(event.AttackerEntity)
+        -- Resolve the projectile owner once for aggro, drops and battle statistics.
         -- (요청 2026-08-09) 맞았으니 이제부터 **그 공격자만** 쫓는다.
         -- ⚠ 공격자 해석은 _T.lastKiller(RememberLastAttacker)가 아니라 BattleStatsManager.ResolveOwner를
         --   쓴다 - 전자는 표창/어벤져 투사체만 되짚도록 만들어져 있어서, 그것만 믿으면 궁수·마법사의
         --   다른 투사체로 때렸을 때 어그로가 안 걸린다. ResolveOwner는 OwnerComponentNames 목록으로
         --   모든 투사체/소환수를 커버한다(새 투사체는 그 목록에 등록하면 여기도 자동으로 따라온다).
         local aggroOwner = _BattleStatsManager:ResolveOwner(event.AttackerEntity)
+        if isvalid(aggroOwner) then self._T.lastKiller=aggroOwner end
         local ownerAttack = isvalid(aggroOwner) and aggroOwner:GetComponent("script.PlayerAttack") or nil
         if isvalid(ownerAttack) then ownerAttack:RecordAutoHuntContact(self.Entity, self.LifeSerial) end
         if event.TotalDamage > 0 and isvalid(aggroOwner) then
@@ -353,8 +410,7 @@ script Monster extends Component
         -- (전투분석) 실제 적용 데미지를 시전자 플레이어에게 귀속 - 모든 스킬/투사체/소환수가
         -- 이 HitEvent 한 곳으로 수렴하므로 여기 한 줄이면 전 직업을 커버한다.
         -- event.Extra = Attack() 호출의 attackInfo 태그(스킬 식별용, 기본공격은 nil).
-        _BattleStatsManager:ReportHitTagged(self.Entity, event.AttackerEntity, event.TotalDamage, event.Extra)
-        log("Monster: Hit! TotalDamage=" .. tostring(event.TotalDamage) .. " Hp=" .. tostring(self.Hp))
+        _BattleStatsManager:ReportHitTagged(self.Entity, aggroOwner, event.TotalDamage, event.Extra)
         self:PlayHitSound()
         -- (전투분석 허수아비) 불사 몬스터는 HP가 바닥나면 만피로 리필 - 데미지 표시/집계(위에서 완료)는
         -- 그대로 두고 사망 경로만 차단한다.
@@ -524,6 +580,7 @@ script Monster extends Component
         if self._T.monsterSoundProfile == nil then
             -- MSW 리소스 API 확인: 2026-09-22. 빈 값은 해당 팩에 소리가 등록되지 않은 경우다.
             local profiles = {
+            ["04d56278279f45c6a99f6726ef5c91fe"] = {"dfed4b65571f4432a43753658eed63b2", "ba58626a6f30402789d82a2096be2fad"}, -- 플라이아이 / mob/4230107.img
             ["96e955c1bf27415e84f96deea200a8f1"] = {"6eb2ef8a783c4393bd7ee6a2c199bda7", "c49646f7299e4c6e81e953c96e20b294"}, -- 주황버섯 / mob/1210102.img
             ["cf2a470436cd4b2aa265648e15198c45"] = {"b5430bb5b1da4095a3033a408bdbffe3", "5a1056a232dd422d933f7e9714c24de5"}, -- 스텀프 / mob/0130100.img
             ["0c69164656d24f64bd1a1f6ee4019dff"] = {"892c25924e3f49f4a42dcb9a39525800", "e704d4ea59f4457ca1833423aef36340"}, -- 파란 달팽이 / mob/0100101.img
@@ -646,8 +703,37 @@ script Monster extends Component
     end
 
     @ExecSpace("ServerOnly")
+    method void SetMapSimulationActive(boolean active)
+        -- Pause only AI and contact attacks; preserve HP, position, death and status timers.
+        local previous = self._T.mapSimulationActive
+        self._T.mapSimulationActive = active
+        local types = {"MOD.Core.AIChaseComponent", "MOD.Core.AIWanderComponent", "MOD.Core.AIComponent"}
+        if not active then
+            self._T.sleepAI = self._T.sleepAI or {}
+            local movement = self.Entity.MovementComponent
+            if isvalid(movement) then movement:Stop() end
+            for _, name in ipairs(types) do
+                local ai = self.Entity:GetComponent(name)
+                if isvalid(ai) and ai.Enable then self._T.sleepAI[name] = true; ai.Enable = false end
+            end
+        elseif previous == false then
+            for name, _ in pairs(self._T.sleepAI or {}) do
+                local ai = self.Entity:GetComponent(name)
+                if isvalid(ai) then ai.Enable = true end
+            end
+            self._T.sleepAI = nil
+            if not self.IsDead and (self._T.aggroUntil or 0) <= _UtilLogic.ServerElapsedSeconds then
+                self:ApplyAggroState(false, nil)
+            end
+        end
+        local attack = self.Entity:GetComponent("script.MonsterAttack")
+        if isvalid(attack) then attack:SetMapActivity(active) end
+    end
+
+    @ExecSpace("ServerOnly")
     method void TickFieldPatrol(number delta)
         -- AI 트리만 이동을 소유하며 피격·빙결·사망 중의 모션을 덮어쓰지 않는다.
+        if self._T.mapSimulationActive == false then return end
         local movement = self.Entity.MovementComponent
         local body = self.Entity.RigidbodyComponent
         local state = self.Entity.StateComponent
@@ -709,7 +795,8 @@ script Monster extends Component
             if state.CurrentStateName ~= "IDLE" then state:ChangeState("IDLE") end
         else
             local scale = self.Entity.TransformComponent.Scale
-            self.Entity.TransformComponent.Scale = Vector3(math.abs(scale.x) * -direction, scale.y, scale.z)
+            local facingX = math.abs(scale.x) * -direction
+            if scale.x ~= facingX then self.Entity.TransformComponent.Scale = Vector3(facingX, scale.y, scale.z) end
             movement:MoveToDirection(Vector2(direction, 0), 0)
             if state.CurrentStateName ~= "MOVE" then state:ChangeState("MOVE") end
         end
@@ -722,8 +809,11 @@ script Monster extends Component
         local ai = self.Entity.AIChaseComponent
         local aw = self.Entity.AIWanderComponent
         if self._T.fieldPatrolReady and isvalid(ai) then
-            self._T.patrolTarget = (aggro and isvalid(target)) and target or nil
-            ai:SetTarget(self._T.patrolTarget)
+            local nextTarget=(aggro and isvalid(target)) and target or nil
+            if self._T.patrolTarget~=nextTarget then
+                self._T.patrolTarget=nextTarget
+                ai:SetTarget(nextTarget)
+            end
             ai.IsChaseNearPlayer = false
             return
         end
@@ -739,6 +829,8 @@ script Monster extends Component
             end
             if isvalid(aw) and not aw.Enable then aw.Enable = true end
         end
+        -- An aggro-expiry callback must not wake AI after the last player left.
+        if self._T.mapSimulationActive == false then self:SetMapSimulationActive(false) end
     end
 
     @ExecSpace("ServerOnly")
@@ -846,6 +938,8 @@ script Monster extends Component
 	@ExecSpace("ServerOnly")
 	method void Dead()
         if self.IsDead then return end
+        self.DeathFadeAlpha = self:GetLifecycleAlpha()
+        self.DeathFadeStarted = _UtilLogic.ServerElapsedSeconds
         self.IsDead = true
         self:PlayDeathSound()
         self.HealthBarUntil = 0
@@ -871,6 +965,8 @@ script Monster extends Component
         if isvalid(sc) then
             sc:ChangeState("DEAD")
         end
+        local snail=self.Entity:GetComponent("script.ManoSnail") or self.Entity:GetComponent("script.StumpyFlyeye")
+        if isvalid(snail) then snail:BeginDeathMotion() end
         log("Monster: Dead()")
 
 		local deathPos = self.Entity.TransformComponent.WorldPosition
@@ -893,7 +989,20 @@ script Monster extends Component
 			local pa=fireMarkOwner:GetComponent("script.PlayerAttack")
 			if isvalid(pa) then pa:TrySummonFireDemonMinion(deathPos,fireMarkLevel) end
 		end
-        _MonsterDropRules:Drop(self.Entity, killer, self.NameTagLevel > 0 and self.NameTagLevel or self.MonsterLevel)
+        if self.IsStageBoss then
+            -- 공격 중 잘라 둔 프레임과 피격 투명도를 사망 모션으로 넘기지 않는다.
+            local sprite = self.Entity.SpriteRendererComponent
+            sprite.StartFrameIndex = 0 sprite.EndFrameIndex = 2147483647 sprite.PlayRate = 1
+            self.DeathFadeAlpha = 1
+            self.DeathFadeStarted = _UtilLogic.ServerElapsedSeconds + 1.8
+            self.DestroyDelay = 2.8
+            self.Entity.HitComponent.Enable = false
+            self.Entity.SpriteRendererComponent.SpriteRUID = isvalid(self.Entity:GetComponent("script.StumpyEncounter")) and "e1b4fc8f0f0f4991b13728ad30c40039" or "f430051f6fc34f2eb56fe5e62b346eac"
+            _MonsterCodex:OnMonsterKilled(self.Entity,killer,self.MonsterLevel)
+            _BossStageManager:BossDefeated(self.Entity)
+        elseif not self.IsBossSummon then
+            _MonsterDropRules:Drop(self.Entity, killer, self.NameTagLevel > 0 and self.NameTagLevel or self.MonsterLevel)
+        end
 
         local entity = self.Entity
         local me = self
@@ -912,7 +1021,7 @@ script Monster extends Component
             else
                 _EntityService:Destroy(entity)
             end
-        end, self.DestroyDelay)
+        end, math.max(1.0, self.DestroyDelay))
     end
 
     @ExecSpace("ServerOnly")
@@ -935,6 +1044,7 @@ script Monster extends Component
         self.IncomingHitDamage = 0
         self.IncomingHitExpires = 0
         self.LifeSerial = self.LifeSerial + 1
+        self:BeginSpawnFade()
         -- (요청 2026-08-09) 리젠하면 원한도 초기화 - 다시 맞기 전까지는 아무도 쫓지 않고 배회한다.
         self._T.lastKiller = nil
         self._T.aggroUntil = nil
@@ -960,6 +1070,7 @@ script Monster extends Component
         -- (버그 수정) 차지 블로우 빙결/화상으로 스프라이트가 물들거나 정지(PlayRate=0)된 채로 죽으면
         -- 그 상태가 리스폰까지 따라 나온다. 살아날 때 렌더 상태를 항상 기본값으로 초기화한다.
         self:ResetTint()
+        self:SetMapSimulationActive(_MonsterZoneRespawn:IsMapActive(self.Entity.CurrentMap))
         log("Monster: Respawn(), Hp=" .. tostring(self.Hp) .. " pos=" .. tostring(self._T.spawnX) .. "," .. tostring(self._T.spawnY))
     end
 
@@ -972,40 +1083,26 @@ script Monster extends Component
 
     @ExecSpace("ClientOnly")
     method void PaintHealthBar()
-        -- HP가 바뀔 때만 흰 테두리, 검정 여백, 왼쪽부터 차는 게이지를 다시 그린다.
-        local bar = self._T.healthBar
-        if not isvalid(bar) then return end
-        local pixel = bar.PixelRendererComponent
-        if not isvalid(pixel) then return end
-        local ratio = 0
-        if self.MaxHp > 0 then ratio = math.max(0, math.min(1, self.Hp / self.MaxHp)) end
-        local fill = math.floor(46 * ratio)
-        if ratio > 0 then fill = math.max(1, fill) end
-        local color = Color(0.3, 0.95, 0.1, 1)
-        if ratio <= 0.1 then
-            color = Color(1, 0.12, 0.08, 1)
-        elseif ratio < 0.5 then
-            color = Color(1, 0.55, 0.05, 1)
+        -- The four one-pixel textures are initialized once. Hits only resize the fill.
+        local fill=self._T.healthFill
+        if not isvalid(fill) then return end
+        local ratio=self.MaxHp>0 and math.max(0,math.min(1,self.Hp/self.MaxHp)) or 0
+        local width=ratio>0 and math.max(1,math.floor(46*ratio)) or 0
+        local band=ratio<=0.1 and 1 or (ratio<0.5 and 2 or 3)
+        if self._T.healthFillWidth~=width then
+            fill.TransformComponent.Scale=Vector3(math.max(0.001,width/52),3/9,1)
+            fill.TransformComponent.Position=Vector3((width-46)/10400,0,0)
+            fill.Enable=width>0
+            self._T.healthFillWidth=width
         end
-        local black = Color(0, 0, 0, 1)
-        local white = Color(1, 1, 1, 1)
-        local pixels = {}
-        for y = 1, 9 do
-            for x = 1, 52 do
-                local c = black
-                if x >= 2 and x <= 51 and y >= 2 and y <= 8
-                    and (x == 2 or x == 51 or y == 2 or y == 8) then
-                    c = white
-                elseif y >= 4 and y <= 6 and x >= 4 and x < 4 + fill then
-                    c = color
-                end
-                pixels[#pixels + 1] = c
-            end
+        if self._T.healthFillBand~=band then
+            local color=band==1 and Color(1,0.12,0.08,1) or (band==2 and Color(1,0.55,0.05,1) or Color(0.3,0.95,0.1,1))
+            fill.PixelRendererComponent:FillColor(color)
+            self._T.healthFillBand=band
         end
-        pixel:SetPixels(pixels)
-        self._T.healthBarDirty = false
-        self._T.healthBarHp = self.Hp
-        self._T.healthBarMaxHp = self.MaxHp
+        self._T.healthBarDirty=false
+        self._T.healthBarHp=self.Hp
+        self._T.healthBarMaxHp=self.MaxHp
     end
 
     @ExecSpace("ClientOnly")
@@ -1039,6 +1136,7 @@ script Monster extends Component
 
     @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
+        if not self.NeverDie then _NetworkMotionVisual:Register(self.Entity) end
         -- 클라이언트 기본 스포너도 비활성화하여 MISS와 0이 겹치지 않게 한다.
         local spawner = self.Entity.DamageSkinSpawnerComponent
         if isvalid(spawner) and spawner.Enable then spawner.Enable = false end
@@ -1065,13 +1163,29 @@ script Monster extends Component
             bar = _SpawnService:SpawnByModelId("monsterhealthbar", "HP_" .. self.Entity.Id, Vector3(0, 0, 0), currentMap)
             if not isvalid(bar) then return end
             self._T.healthBar = bar
+            self._T.healthFillWidth=nil
+            self._T.healthFillBand=nil
             bar.PixelRendererComponent.SortingLayer = self:GetMonsterOverlayLayer()
-            bar.PixelRendererComponent.OrderInLayer = 32766
-            bar.PixelRendererComponent:ResetWithColor(52, 9, Color(0, 0, 0, 0))
+            bar.PixelRendererComponent.OrderInLayer = 32760
+            bar.TransformComponent.Scale=Vector3(52*4/3,9*4/3,1)
+            bar.PixelRendererComponent:ResetWithColor(1,1,Color(0,0,0,1))
+            local layers={{name="Frame",w=50,h=7,color=Color(1,1,1,1)}, {name="Inset",w=48,h=5,color=Color(0,0,0,1)}, {name="Fill",w=46,h=3,color=Color(0.3,0.95,0.1,1)}}
+            for i,row in ipairs(layers) do
+                local part=_SpawnService:SpawnByModelId("monsterhealthbar",row.name,Vector3.zero,bar)
+                if isvalid(part) then
+                    part.TransformComponent.Position=Vector3.zero
+                    part.TransformComponent.Scale=Vector3(row.w/52,row.h/9,1)
+                    part.PixelRendererComponent.SortingLayer=self:GetMonsterOverlayLayer()
+                    part.PixelRendererComponent.OrderInLayer=32760+i
+                    part.PixelRendererComponent:ResetWithColor(1,1,row.color)
+                    part.Enable=true
+                    if row.name=="Fill" then self._T.healthFill=part end
+                end
+            end
             self._T.healthBarDirty = true
             log("[MonsterHPBar] created " .. self.Entity.Name)
         end
-        local pos = self.Entity.TransformComponent.WorldPosition
+        local pos = _NetworkMotionVisual:Position(self.Entity)
         local height = self.HealthBarOffsetY
         if height <= 0 then
             height = 1.2

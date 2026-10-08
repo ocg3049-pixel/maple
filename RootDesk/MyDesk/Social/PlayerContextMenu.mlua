@@ -8,7 +8,9 @@ script PlayerContextMenu extends Logic
     @ExecSpace("ClientOnly")
     method Entity UI(string path)
         -- Both panels share the existing equipment/tooltip window layer.
-        return _EntityService:GetEntityByPath("/ui/DefaultGroup/" .. path)
+        local e=_EntityService:GetEntityByPath("/ui/DefaultGroup/"..path)
+        if not isvalid(e) then e=_EntityService:GetEntityByPath("/ui/SocialWindow/"..path) end
+        return e
     end
 
     @ExecSpace("ClientOnly")
@@ -29,8 +31,9 @@ script PlayerContextMenu extends Logic
             if isvalid(player) and (includeSelf or player ~= me) and player.CurrentMap == me.CurrentMap and player.EnabledInHierarchy and player.VisibleInHierarchy and isvalid(player.PlayerComponent) then
                 local pos = player.TransformComponent.WorldPosition
                 local dx, dy = world.x - pos.x, world.y - (pos.y + 0.45)
-                if math.abs(dx) <= 0.45 and dy >= -0.6 and dy <= 0.8 then
+                if math.abs(dx) <= 0.55 and dy >= -0.6 and dy <= 0.95 then
                     local score = dx*dx + dy*dy
+                    if includeSelf and self._T.clickedUid==player.PlayerComponent.UserId and _UtilLogic.ElapsedSeconds-(self._T.clickedAt or -10)<=0.65 then score=score-10 end
                     if score < distance then best=player distance=score end
                 end
             end
@@ -42,6 +45,8 @@ script PlayerContextMenu extends Logic
     method void OpenAt(Entity player, Vector2 point)
         -- A response is accepted only for this latest selected player.
         if not isvalid(player) or not isvalid(player.PlayerComponent) then return end
+        self:UI("PlayerContext"):AttachTo(_EntityService:GetEntityByPath("/ui/DefaultGroup"))
+        self._T.roster=false
         self.targetUid=player.PlayerComponent.UserId self.targetName=""
         self._T.originalOutfit=false
         self._T.targetMap=player.CurrentMap
@@ -64,7 +69,8 @@ script PlayerContextMenu extends Logic
         if now < (self._T.requestAt[senderUserId] or 0) then return end
         self._T.requestAt[senderUserId]=now+0.25
         local me, other=_SocialManager:Record(senderUserId),_SocialManager:Record(uid)
-        if uid == senderUserId or not _SocialManager:SameMap(me,other) then self:ReceiveDetails(uid,{},senderUserId) return end
+        local related=me~=nil and other~=nil and (_SocialManager:SameParty(me,other) or me.friends[other.name]==true)
+        if uid == senderUserId or (not related and not _SocialManager:SameMap(me,other)) then self:ReceiveDetails(uid,{},senderUserId) return end
         local sv=_CharacterPersistence._T.sv[uid]
         local raw=sv.saves[other.id] or ""
         local result={name=other.name,job=other.job,level=other.level,hp=other.player.PlayerComponent.Hp,maxHp=other.player.PlayerComponent.MaxHp,equips={}}
@@ -82,6 +88,7 @@ script PlayerContextMenu extends Logic
     method void ReceiveDetails(string uid, table data)
         -- Discard late responses after closing, changing maps, or changing target.
         if uid ~= self.targetUid or not self:IsOpen() then return end
+        if self._T.roster and self.targetName~="" and data.name~=self.targetName then return end
         if data.name == nil then self:Close() _UIToast:ShowMessage("상대방이 같은 맵에 없습니다.") return end
         self.targetName=data.name self.equips=data.equips or {}
         self._T.details=data
@@ -96,9 +103,11 @@ script PlayerContextMenu extends Logic
         if self.targetName == "" then return end
         local player=_UserService:GetUserEntityByUserId(self.targetUid)
         local me=_UserService.LocalPlayer
-        if not isvalid(player) or not isvalid(me) or player.CurrentMap ~= me.CurrentMap then self:Close() return end
+        if not self._T.roster and (not isvalid(player) or not isvalid(me) or player.CurrentMap ~= me.CurrentMap) then self:Close() return end
+        if (action==1 or action==2) and self._T.details==nil then _UIToast:ShowMessage("접속 중인 캐릭터 정보만 볼 수 있습니다.") return end
         self:UI("PlayerContext").Enable=false
         if action==1 or action==2 then
+            if self._T.roster then _SocialManager:UI("Window").Enable=false end
             self.page=action==1 and "info" or "equip"
             self:UI("PlayerInspect").Enable=true self:Draw()
             _UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/PlayerInspect")
@@ -133,7 +142,7 @@ script PlayerContextMenu extends Logic
         if avatar.Enable then
             _AvatarTicketManager:Apply(avatar.CostumeManagerComponent, self.targetUid, outfit.finals or {}, _AvatarTicketManager:ShouldShowWorld(self.targetUid, outfit.ticket==true, self._T.originalOutfit==true))
         end
-        for i=1,28 do
+        for i=1,29 do
             local slot=self:UI("PlayerInspect/Equipment/Slot"..tostring(i))
             local item=self.equips[tostring(i)] or ""
             local icon=slot:GetChildByName("Icon")
@@ -151,7 +160,7 @@ script PlayerContextMenu extends Logic
             if _UIEquipInventoryManager.tooltipSource=="inspect" then _UIEquipInventoryManager:HideTooltip() end
             return false
         end
-        for i=1,28 do
+        for i=1,29 do
             local slot=self:UI("PlayerInspect/Equipment/Slot"..tostring(i))
             if _UICursorManager:Hit(slot,point) and _UIClickArbiter:IsTopmostAt("/ui/DefaultGroup/PlayerInspect",point) then
                 local item=self.equips[tostring(i)] or ""
@@ -176,6 +185,7 @@ script PlayerContextMenu extends Logic
     method void Close()
         -- Cancel late responses and return Escape ownership to the game.
         self:UI("PlayerContext").Enable=false self:UI("PlayerInspect").Enable=false
+        self:UI("PlayerContext"):AttachTo(_EntityService:GetEntityByPath("/ui/DefaultGroup"))
         self.targetUid="" self.targetName="" self.equips={} self._T.details=nil
         if _UIEquipInventoryManager.tooltipSource=="inspect" then _UIEquipInventoryManager:HideTooltip() end
         _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2
@@ -186,11 +196,13 @@ script PlayerContextMenu extends Logic
         -- PC right-click is Mouse1; prevent clicks through any UI.
         if not _LoginFlow:IsInGame() then return end
         if event.key==KeyboardKey.Escape and self:IsOpen() then self:Close() return end
+        if event.key==KeyboardKey.Mouse0 then self:HandlePlayerClick(_InputService:GetCursorPosition()) end
         if event.key==KeyboardKey.Mouse0 and self:UI("PlayerContext").Enable then
             if not _UICursorManager:Hit(self:UI("PlayerContext"),_InputService:GetCursorPosition()) then self:UI("PlayerContext").Enable=false end
         end
         if event.key~=KeyboardKey.Mouse1 or _GameSystemMenu:BlocksInput() or _MapleHUDManager:IsChatTyping() then return end
         local point=_InputService:GetCursorPosition()
+        if _SocialManager:OpenRowContext(point) then return end
         if _UIClickArbiter:BlocksWorldClick(point) then return end
         local target=self:PickPlayer(point,false)
         if isvalid(target) then self:OpenAt(target,point) else self:UI("PlayerContext").Enable=false end
@@ -232,7 +244,12 @@ script PlayerContextMenu extends Logic
         if not self:IsOpen() then return end
         local me=_UserService.LocalPlayer
         local target=_UserService:GetUserEntityByUserId(self.targetUid)
-        if not _LoginFlow:IsInGame() or not isvalid(me) or not isvalid(target) or target.CurrentMap~=me.CurrentMap or me.CurrentMap~=self._T.targetMap then self:Close() return end
+        if not _LoginFlow:IsInGame() or not isvalid(me) or me.CurrentMap~=self._T.targetMap then self:Close() return end
+        if self._T.roster then
+            if not _SocialManager:UI("Window").EnabledInHierarchy and self:UI("PlayerContext").Enable then self:Close() end
+            return
+        end
+        if not isvalid(target) or target.CurrentMap~=me.CurrentMap then self:Close() return end
         local now=_UtilLogic.ElapsedSeconds
         if (self:UI("PlayerInspect").Enable or self.targetName=="") and now>=(self._T.refreshAt or 0) then self._T.refreshAt=now+2 self:RequestDetails(self.targetUid) end
     end
@@ -247,16 +264,24 @@ script PlayerContextMenu extends Logic
     @ExecSpace("ClientOnly")
     method void OnPointer(ScreenTouchEvent event)
         if event.TouchId~=1 then return end
+        self:HandlePlayerClick(event.TouchPoint)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HandlePlayerClick(Vector2 point)
+        -- Native mouse and touch can describe the same press; count it once.
+        local now=_UtilLogic.ElapsedSeconds
+        if now-(self._T.pointerDispatchAt or -10)<0.03 then return end
+        self._T.pointerDispatchAt=now
         if not _LoginFlow:IsInGame() or _GameSystemMenu:BlocksInput() or _MapleHUDManager:IsChatTyping() or _UIItemDiscardManager:BlocksInput() then self._T.clickedUid=nil return end
-        local point=event.TouchPoint
         if _UIClickArbiter:BlocksWorldClick(point) then self._T.clickedUid=nil return end
         local target=self:PickPlayer(point,true)
         if not isvalid(target) then self._T.clickedUid=nil return end
         local uid=target.PlayerComponent.UserId
-        local now=_UtilLogic.ElapsedSeconds
-        local double=self._T.clickedUid==uid and now-(self._T.clickedAt or -10)<=0.45
+        local double=self._T.clickedUid==uid and now-(self._T.clickedAt or -10)<=0.65
         self._T.clickedUid=uid self._T.clickedAt=now
-        if double then self._T.clickedUid=nil self:OpenStatus(target,point) end
+        if _MobileUIManager:IsMobile() then self._T.clickedUid=nil self:OpenAt(target,point)
+        elseif double then self._T.clickedUid=nil self:OpenStatus(target,point) end
     end
 
     @ExecSpace("ClientOnly")
@@ -283,6 +308,27 @@ script PlayerContextMenu extends Logic
         end
         _UIAudio:Play("MenuUp")
         log("[PlayerContext] double-click status opened self="..tostring(target==_UserService.LocalPlayer))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenRoster(table row, Vector2 point)
+        if row==nil then return end
+        local me=_UserService.LocalPlayer
+        if not isvalid(me) then return end
+        if row.uid==me.PlayerComponent.UserId then self:OpenStatus(me,point) return end
+        self:Close()
+        self._T.roster=true self._T.originalOutfit=false
+        self.targetUid=row.uid or "" self.targetName=row.name self._T.targetMap=me.CurrentMap
+        self:UI("PlayerContext"):AttachTo(_EntityService:GetEntityByPath("/ui/SocialWindow"))
+        self:UI("PlayerContext").Enable=true
+        _UILogic:SetSiblingIndex(self:UI("PlayerContext").UITransformComponent,1000)
+        self:UI("PlayerContext/Name").TextGUIRendererComponent.Text=row.name..(row.online and "" or " (오프라인)")
+        for i=1,5 do self:UI("PlayerContext/Action"..tostring(i)).ButtonComponent.Enable=i>2 end
+        local p=_UILogic:ScreenToUIPosition(point)
+        self:UI("PlayerContext").UITransformComponent.anchoredPosition=Vector2(math.max(-830,math.min(830,p.x+128)),math.max(-395,math.min(395,p.y-132)))
+        _UIEquipInventoryManager:BringWindowToFront("/ui/DefaultGroup/PlayerContext")
+        if row.online and self.targetUid~="" then self:RequestDetails(self.targetUid) end
+        log("[Social] roster context opened: "..row.name)
     end
 
 end

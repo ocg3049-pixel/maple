@@ -1,6 +1,8 @@
 @Logic
 script FieldCameraBounds extends Logic
 
+	property number BaseZoomRatio = 100
+
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
 		-- 짧은 맵은 세로 시야를 고정하고, 맵 이동/줌/화면 비율 변경 때 네이티브 경계를 다시 적용한다.
@@ -15,17 +17,32 @@ script FieldCameraBounds extends Logic
 		local mini = _EntityService:GetEntityByPath("/ui/MiniMapUI")
 		if isvalid(mini) then
 			local controller = mini:GetFirstChildComponentByTypeName("script.MiniMapUIManager", true)
-			if isvalid(controller) and controller._T.capturing then return end
+			if isvalid(controller) and controller._T.capturing then
+				self._T.lastZoom = nil
+				self._T.height = nil
+				return
+			end
 		end
 		local map = player.CurrentMap
-		if self._T.map ~= map or self._T.camera ~= camera then
-			if self._T.restoreZoom ~= nil then
-				local allowed = camera.IsAllowZoomInOut
-				camera.IsAllowZoomInOut = true
-				_CameraService:ZoomTo(self._T.restoreZoom, 0)
-				camera.IsAllowZoomInOut = allowed
-				self._T.restoreZoom = nil
-			end
+        if _BossStageManager:IsArena(map.Name) then
+            if math.abs(camera.ZoomRatio-120)>0.01 then
+                local allowed=camera.IsAllowZoomInOut camera.IsAllowZoomInOut=true
+                camera.ZoomRatio=120 _CameraService:ZoomTo(120,0) camera.IsAllowZoomInOut=allowed
+            end
+            camera.UseCustomBound=true camera.ConfineCameraArea=true
+            camera.LeftBottom=Vector2(-8.5,-1.76) camera.RightTop=Vector2(7.8,4.35)
+            self._T.map=nil
+            return
+        end
+		local baseZoom = self:GetBaseZoom()
+		if self._T.map ~= map or self._T.camera ~= camera or self._T.baseZoom ~= baseZoom then
+			self._T.baseZoom = baseZoom
+			-- 맵마다 기본 시야에서 시작한다. 촬영/전환 중 관측한 배율은 기준으로 저장하지 않는다.
+			local allowed = camera.IsAllowZoomInOut
+			camera.IsAllowZoomInOut = true
+			camera.ZoomRatio = baseZoom
+			_CameraService:ZoomTo(baseZoom, 0)
+			camera.IsAllowZoomInOut = allowed
 			camera.UseCustomBound = false
 			camera.ConfineCameraArea = true
 			local lo, hi = camera:GetBound()
@@ -35,6 +52,25 @@ script FieldCameraBounds extends Logic
 			self._T.lo = lo
 			self._T.hi = hi
 			self._T.height = nil
+			return -- 렌더 카메라가 새 배율을 적용한 다음 경계를 계산한다.
+		end
+		-- 촬영 배율이 남거나 복원 중이면 축소된 시야로 맵 경계를 계산하지 않는다.
+		if camera.ZoomRatio < baseZoom - 0.01 then
+			local allowed = camera.IsAllowZoomInOut
+			camera.IsAllowZoomInOut = true
+			camera.ZoomRatio = baseZoom
+			_CameraService:ZoomTo(baseZoom, 0)
+			camera.IsAllowZoomInOut = allowed
+			self._T.height = nil
+			log("[FieldCamera] 기본 시야 복원 zoom=" .. tostring(baseZoom))
+			return
+		end
+		if math.abs(_CameraService.currentZoomRatio - camera.ZoomRatio) > 0.01 then return end
+		-- 실제 렌더링까지 같은 배율로 한 주기 정착한 뒤에만 시야 높이를 사용한다.
+		if self._T.lastZoom ~= camera.ZoomRatio then
+			self._T.lastZoom = camera.ZoomRatio
+			self._T.height = nil
+			return
 		end
 		local a = _UILogic:ScreenToWorldPosition(Vector2.zero)
 		local b = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
@@ -44,16 +80,26 @@ script FieldCameraBounds extends Logic
 		self._T.height = height
 		local lo, hi = self._T.lo, self._T.hi
 		local mapHeight = hi.y - lo.y
+        local base=_ChannelManager:BaseName(map.Name)
+        local mine=tonumber(base) or 0
+        if mine>=211041000 and mine<=211042402 then
+            -- Keep the mine's upper/lower art edges outside the moving viewport.
+            local inset=math.min(1.5,math.max(0,(mapHeight-height)*0.5))
+            lo=Vector2(lo.x,lo.y+inset) hi=Vector2(hi.x,hi.y-inset)
+            mapHeight=hi.y-lo.y
+        end
 		-- 시야보다 배경 경계가 낮으면 경계 안에 맞도록 확대한다(맵 밖 빈 공간 방지).
 		if height > mapHeight + 0.01 then
 			local previousZoom = _CameraService.currentZoomRatio
-			local zoom = math.min(500, previousZoom * height / mapHeight)
-			if self._T.restoreZoom == nil then self._T.restoreZoom = previousZoom end
+			local zoom = math.max(baseZoom, math.min(500, previousZoom * height / mapHeight))
 			local allowed = camera.IsAllowZoomInOut
 			camera.IsAllowZoomInOut = true
+			camera.ZoomRatio = zoom
 			_CameraService:ZoomTo(zoom, 0)
 			camera.IsAllowZoomInOut = allowed
-			height = height * previousZoom / zoom
+			self._T.height = nil
+			self._T.lastZoom = nil
+			return
 		end
 		camera.ConfineCameraArea = true
 		camera.UseCustomBound = true
@@ -69,4 +115,11 @@ script FieldCameraBounds extends Logic
 			log("[FieldCamera] 맵 경계 제한 " .. map.Name)
 		end
 	end
+
+	@ExecSpace("ClientOnly")
+	method number GetBaseZoom()
+		-- 모바일은 기본 시야의 가로·세로를 20% 넓힌다.
+		return self.BaseZoomRatio / (_MobileUIManager:IsMobile() and 1.2 or 1)
+	end
+
 end

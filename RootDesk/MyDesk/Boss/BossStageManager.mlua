@@ -1,0 +1,1180 @@
+@Logic
+script BossStageManager extends Logic
+    property boolean opened = false
+    property integer selected = 1
+    property integer cleared = 0
+
+    method table StageNames()
+        -- Playable progression begins with Mano, then Stumpy.
+        if self._T.stageNames==nil then
+            self._T.stageNames={"마노","스텀피","머쉬맘","블루 머쉬맘","좀비 머쉬맘","킹 슬라임","다일","킹크랑","파우스트","반 레온","메탈 골렘","포장마차","주니어 발록","엘리쟈","크림슨 발록","설산의 마녀","세르프","데우","파파픽시","힐라","디트와 로이 & 네오 휴로이드","키메라 & 호문스큘러","프랑켄로이드 & 미스릴 뮤테","차우 & 원시멧돼지","에피네아 & 샤이닝 페어리","롬바드 & 킹 블록골렘","타이머 & 틱톡","마스터 스펙터 & 사신 스펙터","마스터 버크 & 듀얼 버크","아카이럼","마뇽 ×2","그리프 ×2","크세르크세스 ×2","파풀라투스 ×2","알리샤르 ×2","스노우맨 ×2","리치 ×2","아니 ×3","킹 오멘 ×3","매그너스","타르가","스칼리온","요괴선사","데비존","라바나","레비아탄","도도","릴리노흐","라이카","핑크빈","락 스피릿","타란튤로스","드래고니카","드래곤라이더","호크아이","이카르트","이리나","오즈","미하일","시그너스","피아누스","렉스","카웅","변형된 스텀피","하늘 수호령","게오르크","타락마족 강화늑대기수","아르마","츄릅나무","스우","클리너","악화된 조화의 정령","증발하는 에르다스","아랑","봉선","오공","송달","황룡","적호","무공","아라네아","빛의 집행자","히아데스","공허의 하수인","데미안","황혼의 하수인","거대한 골렘","리버스 다크 소울","절망의 칼날","윌","안세스티온","어센시온","엠브리온","각성한 아랑","각성한 봉선","각성한 오공","각성한 송달","각성한 황룡","각성한 적호","각성한 무공"}
+        end
+        return self._T.stageNames
+    end
+
+    method integer TimeLimitSeconds()
+        -- Shared by the server deadline and initial client countdown.
+        return 300
+    end
+
+    method integer StageCount()
+        -- All iteration and bounds follow the catalog length rather than a partial floor count.
+        return #self:StageNames()
+    end
+
+    method table Stage(integer n)
+        -- Stage data is shared by entry, UI, spawning and the encounter controller.
+        local names=self:StageNames()
+        if names[n]==nil then return {} end
+        return {name=names[n],level=n==2 and 15 or 10,recommended=n==1 and 15 or (n==2 and 20 or 0),mult=n==2 and 1.3 or 1,implemented=n<=2,
+            hp=n==2 and math.floor(16667*1.3+0.5) or 16667,model=n==2 and "bossstumpy" or "bossmano",
+            encounter=n==2 and "StumpyEncounter" or "ManoEncounter",portrait=n==2 and "0b6c2f6faccc44da980ce832ab636bf6" or "e035bb90c053401b88de2159dfa230eb"}
+    end
+
+    method integer ReadClear(string snapshot)
+        -- Mano title plus the versioned server record proves progression.
+        -- Legacy BOSS counts never count as Stumpy clears.
+        if _ManoTitle:Read(snapshot or "").kills<=0 then return 0 end
+        return string.match("\n"..(snapshot or ""),"\nBOSS_V2\t2[\r\n]?")~=nil and 2 or 1
+    end
+
+    method integer ChallengeStage(integer progress)
+        -- Focus the first unlocked, playable uncleared boss; fall back to the latest playable clear.
+        local latest=1
+        for i=1,self:StageCount() do
+            if self:Stage(i).implemented and self:IsStageUnlocked(i,progress) then
+                latest=i
+                if i>progress then return i end
+            end
+        end
+        return latest
+    end
+
+    method boolean IsStageUnlocked(integer stage, integer progress)
+        -- A stage requires its immediate predecessor, with Mano available from the start.
+        return stage>=1 and self:Stage(stage).name~=nil and stage<=progress+1
+    end
+
+    method string WriteClear(string snapshot, integer cleared)
+        local lines={}
+        for line in string.gmatch(snapshot or "","[^\r\n]+") do if string.sub(line,1,5)~="BOSS\t" and string.sub(line,1,8)~="BOSS_V2\t" then table.insert(lines,line) end end
+        table.insert(lines,"BOSS_V2\t"..tostring(math.max(0,math.min(2,cleared))))
+        return table.concat(lines,"\n")
+    end
+
+    method boolean IsArena(string name)
+        return string.sub(name or "",1,11)=="boss_stage_"
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsEncounterVisible(table run)
+        -- Result presentation keeps the arena alive without reopening combat or rewards.
+        return run~=nil and (run.state=="active" or (run.state=="result" and run.won==false))
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsInBattle(string uid)
+        return self._T.runs~=nil and self._T.runs[uid]~=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsBossTarget(Entity boss, Entity defender)
+        -- A living companion is protected by the same private encounter ownership.
+        local owner=defender
+        if not isvalid(defender.PlayerComponent) then
+            if self:SummonMaxHp(defender)<=0 then return false end
+            owner=self:SummonOwner(defender)
+        end
+        if not isvalid(owner) or not isvalid(owner.PlayerComponent) or owner.PlayerComponent.Hp<=0 or owner.CurrentMap~=defender.CurrentMap then return false end
+        local r=(self._T.runs or {})[owner.PlayerComponent.UserId]
+        return r~=nil and r.boss==boss and r.state=="active" and (r.elapsed or 0)>=1.5 and defender.CurrentMap==boss.CurrentMap
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity SummonOwner(Entity target)
+        -- Include HP-bearing demon and ember minions as well as humanoid companions.
+        if not isvalid(target) then return nil end
+        for _,name in ipairs({"script.HeroSummon","script.HealerSummon","script.SummonDragon","script.IceDemonMinion","script.FireAffinityEmber"}) do
+            local c=target:GetComponent(name)
+            if isvalid(c) and isvalid(c.OwnerEntity) then return c.OwnerEntity end
+        end
+        return nil
+    end
+
+    method number SummonMaxHp(Entity target)
+        -- Only damageable player companions qualify, never monsters or projectiles.
+        if not isvalid(target) then return 0 end
+        local h=target:GetComponent("script.HeroSummon")
+        if isvalid(h) and h.HeroHp>0 then return h.HeroMaxHp end
+        local healer=target:GetComponent("script.HealerSummon")
+        if isvalid(healer) and healer.HealerHp>0 then return healer.HealerMaxHp end
+        local dragon=target:GetComponent("script.SummonDragon")
+        if isvalid(dragon) and dragon.DragonHp>0 then return dragon.DragonMaxHp end
+        local demon=target:GetComponent("script.IceDemonMinion")
+        if isvalid(demon) and demon.Hp>0 then return demon.MaxHp end
+        local ember=target:GetComponent("script.FireAffinityEmber")
+        if isvalid(ember) and ember.Hp>0 then return ember.MaxHp end
+        return 0
+    end
+
+    @ExecSpace("Server")
+    method void RequestStatus()
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or sv.activeId=="" then return end
+        local rewardData=_BossRewards:Read(sv.saves[sv.activeId] or "")
+        _BossRewards:Receive(sv.activeId,_BossRewards:Record(rewardData),senderUserId)
+        self:ReceiveStatus(self:ReadClear(sv.saves[sv.activeId] or ""),not _BossRewards:Eligible(rewardData,1,_BossRewards:Week(DateTime.UtcNow.Elapsed)),not _BossRewards:Eligible(rewardData,2,_BossRewards:Week(DateTime.UtcNow.Elapsed)),senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveStatus(integer value, boolean practice, boolean stumpyPractice)
+        self.cleared=value self._T.statusReady=true self._T.practice={[1]=practice,[2]=stumpyPractice}
+        if self.opened then
+            if self._T.autoFocusChallenge then
+                self._T.autoFocusChallenge=false
+                self.selected=self:ChallengeStage(self.cleared)
+                self._T.bossSelected=true
+                self._T.listResetAt=_UtilLogic.ElapsedSeconds+0.15
+            end
+            self:Draw()
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestEnter(integer stage)
+        self:Enter(senderUserId,stage)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Enter(string uid, integer stage)
+        self._T.runs=self._T.runs or {}
+        if self._T.runs[uid]~=nil then return end
+        local sv=_CharacterPersistence._T.sv[uid]
+        local session=_LoginFlow._T.sessions[uid]
+        local p=_UserService:GetUserEntityByUserId(uid)
+        local data=self:Stage(stage)
+        if data.name~=nil and not data.implemented then self:Notice("준비중...",uid) return end
+        if sv==nil or sv.activeId=="" or session==nil or not session.entered or not isvalid(p) or not isvalid(p.CurrentMap) or data.name==nil then return end
+        if not self:IsStageUnlocked(stage,self:ReadClear(sv.saves[sv.activeId] or "")) then self:Notice("이전 보스를 먼저 처치해 주세요.",uid) return end
+        if p.PlayerComponent.Hp<=0 or self:IsArena(p.CurrentMap.Name) or p.CurrentMap.Name=="login" then return end
+        if (_ChannelManager._T.pending or {})[uid]~=nil then self:Notice("맵 이동이 끝난 뒤 입장해 주세요.",uid) return end
+        local highest=_LevelCosmeticRewards:ReadState(sv.saves[sv.activeId] or "").highest
+        if highest<data.level then self:Notice("입장 레벨은 "..tostring(data.level).."입니다.",uid) return end
+        self._T.serial=(self._T.serial or 0)+1
+        local name="boss_stage_"..tostring(self._T.serial)
+        local r={uid=uid,id=sv.activeId,stage=stage,map=name,origin=p.CurrentMap.Name,position=p.TransformComponent.WorldPosition,state="loading",age=0}
+        r.practice=not _BossRewards:Eligible(_BossRewards:Read(sv.saves[sv.activeId] or ""),stage,_BossRewards:Week(DateTime.UtcNow.Elapsed))
+        self._T.runs[uid]=r
+        self:Notice(r.practice and "연습 모드: 이번 주 보상을 이미 획득했습니다." or "주간 보상 도전: 처치 시 이번 주 보상이 확정됩니다.",uid)
+        local result=_DynamicMapService:CreateDynamicMap(stage==2 and "stumpy_arena" or "login",name)
+        if result~=DynamicMapResultCode.Success then self._T.runs[uid]=nil self:Notice("보스전을 준비하지 못했습니다. 다시 시도해 주세요.",uid) return end
+        self:Prepare(name,stage,uid)
+        _TeleportService:TeleportToMapPosition(p,Vector3(-2,0.3,0),name)
+        log("[BossStage] enter stage="..tostring(stage).." map="..name)
+    end
+
+    @ExecSpace("Client")
+    method void Prepare(string mapName, integer stage)
+        self:Close()
+        self._T.stage=stage
+        self._T.destination=mapName self._T.arrivedAt=nil self._T.resources=false self._T.readySent=false self._T.revealReady=false self._T.beginSent=false
+        _MobileUIManager:ReleaseControls()
+        _LoginFlow:UpdateTransitionInput()
+        self:UI("Cover").Enable=true
+        local resources={"5a55b82229f24b3ca689fb433fa6f542","d425a37027a540d7b6de46d3c567ce40","41e13add2ba746d9bbe624a31205a848","4a789e378be34ed9980b4f21fb202186","ba389f19b1164975a83e193e85be4896","d7852ad775ea4db8ac46a11c3735b9e1","e6061e1f1efc4858805bb5d0d9944ff9","fa71427649df4eeb8a3fd1ddf4cf9023","cd9efdf128a2434c89d347759715ad95","5a1056a232dd422d933f7e9714c24de5","e035bb90c053401b88de2159dfa230eb","1b787a72c5a74cbf84af29880ed40e0e","3ffc4aa431ff49f598205f93c0157c40","1609b1cdb35a4a3e806c1e9a7e56224d","4a729e5b7b0f4759ba197dcbb1d25a8b","4b482b706462493198a9a09a1e7355a0","40a15832a52048da855199f373d4ccc2","7b4a813bfbf94649a832224f5624376c","b9d99f347701432ea0cbb66731327df1","f40108c8b0b84696a67337b801201f7d","6450d7b1419948b8bed4bc55a4f1256e","8960e0548d684b9fb7af0b9fb0ff6812","f430051f6fc34f2eb56fe5e62b346eac"}
+        table.insert(resources,"ae028d0a7425405d81e19b17ef017b62")
+        table.insert(resources,"ec808ad55fd04cc787d06f02db1a6c39")
+        table.insert(resources,"ffc24d0153d944e9850133eed7aaf08d")
+        table.insert(resources,"2a81a3bbb4d94a7494d047552cbe6eb1")
+        table.insert(resources,"1efb3091b08f472c968f80127c77d632")
+        table.insert(resources,"3287a4d1a95948c18d53eba9a5df6715")
+        table.insert(resources,self:BattleMusic(stage))
+        table.insert(resources,"7222e57897534b84a228012017a51627")
+        table.insert(resources,"ad3fde2e53314fe29ec759886bc88e04")
+        for _,id in ipairs({"3eb056d03f034a29b52bfa917319d71a","755980d09e4847d4b351ad211f1feaa0","6a5a541305bb489d8d83730b4a245953"}) do table.insert(resources,id) end
+        for _,special in ipairs({false,true}) do
+            for color=1,3 do for key,value in pairs(self:SnailAppearance(special,color)) do if key~="name" then table.insert(resources,value) end end end
+        end
+        for _,id in ipairs({"0b6c2f6faccc44da980ce832ab636bf6","36e33516befa4b2db894d0c7f105b97e","3a3034172ea14fe0b5e636604e352306","c2e78c4ac4924aa28e2892d108d22f73","7731041d2d2d4d1daaef345c1c8d8ef5","c6b3f052e977479ea5ad5329ce0981ca","e1b4fc8f0f0f4991b13728ad30c40039","c9516522ac8243a591cc97281026e606","0f0a0ba4c91d467d9ec355380af24223","94323d0cd3a64228b29cea3ac0a2ba8b"}) do if stage==2 then table.insert(resources,id) end end
+        if stage==2 then
+            for _,id in ipairs({"9ecfbf934fc242b89fb12bedfcf6da34","2eaeb65bcdab4350a2273e1e8bfd55d5","6d20710bc80047d9a870a8a29d329614","d8efb8701dd24e0ab4dbf9633772facf","b1ad4e54249d4415aa21aabb3f8c4188","3e8a52ae0e4d43c7b7d52c8e299e3373","35e7323d0fe74a4cb8ae7059b7c8c2aa","8cd517d140e443b7841a506adaee340f","04d56278279f45c6a99f6726ef5c91fe","da1ea90aa01a4d1ba8bf15f1f9a5e4f6","d69b6340252740a48b4631ce00d058c7","114f794d7a3f4894a69a08370cefdb7e","19adfadeeb3346558da7f05d182a67dc","792bb5b307b64b4e8c46b7eaf758f72a","55abe85fd84a479e9c88389fdf251d82","ef43e8877d094b8f89d6f297755f9db8","3cc6e9d3ad6b41fbbe2a6ab17b364b94"}) do table.insert(resources,id) end
+        end
+        _ResourceService:PreloadAsync(resources,function(ok) if self._T.destination==mapName then self._T.resources=true end end)
+    end
+
+    @ExecSpace("Server")
+    method void RequestReady(string mapName)
+        local r=(self._T.runs or {})[senderUserId]
+        local p=_UserService:GetUserEntityByUserId(senderUserId)
+        if r==nil or r.map~=mapName or r.state~="loading" or not isvalid(p) or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=mapName then return end
+        r.state="spawning"
+        local music=p.CurrentMap.SoundComponent
+        if not isvalid(music) then music=p.CurrentMap:AddComponent("MOD.Core.SoundComponent") end
+        if isvalid(music) then
+            music.AudioClipRUID=self:BattleMusic(r.stage)
+            music.Bgm=true music.Loop=true music.Volume=1 music.PlayOnEnable=false
+        end
+        local data=self:Stage(r.stage)
+        local boss=_SpawnService:SpawnByModelId(data.model,"StageBoss",Vector3(1.3,0.3,0),p.CurrentMap)
+        if not isvalid(boss) then self:Finish(r,"보스 소환에 실패했습니다.",false) return end
+        if (self._T.runs or {})[senderUserId]~=r or r.state~="spawning" then boss:Destroy() return end
+        r.boss=boss
+        boss.HitComponent.Enable=false
+        local m=boss:GetComponent("script.Monster")
+        m.MonsterLevel=r.stage==2 and 20 or 10 m.MonsterDisplayName=data.name m:SetupMonsterNameTag()
+        m.MaxHp=data.hp m.Hp=data.hp m._T.spawnHitEnabled=false
+        local encounter=boss:AddComponent(data.encounter) encounter.OwnerId=senderUserId encounter:Decorate()
+        if (self._T.runs or {})[senderUserId]~=r or r.state~="spawning" or not isvalid(boss) then
+            if isvalid(boss) then boss:Destroy() end
+            return
+        end
+        r.boss=boss r.state="revealing" r.elapsed=0 r.phase="rest" r.remaining=3 r.pattern=0 r.emit=0
+        self:RevealReady(mapName,boss,senderUserId)
+        log("[BossStage] ready hp="..tostring(m.Hp))
+    end
+
+    @ExecSpace("Client")
+    method void BattleStarted(integer stage)
+        self._T.destination=nil self._T.battle=true self._T.stage=stage
+        self:StartManoMusic()
+        _LoginFlow:UpdateTransitionInput()
+        self:UI("Cover").Enable=false self:UI("Battle").Enable=true
+        local data=self:Stage(stage)
+        self:UI("Battle/Portrait/Inner/PortraitArt").SpriteGUIRendererComponent.ImageRUID=DataRef("thumbnail://"..data.portrait)
+        self:UpdateBattle(data.hp,data.hp,self:TimeLimitSeconds())
+        self:UI("TargetControl").Enable=true
+        self._T.targetHeldKey=nil self._T.targetCooldownUntil=0 self._T.parryActiveUntil=0
+        self:ReceiveTargetMode(false,false)
+        if stage==2 then self:WarningText("상호작용: 패링 · 1.2초 안에 공격을 막으면 1.5초 무적·재사용 5초, 실패 시 20초. 그림자 스텀프 접촉도 패링 가능하며, 보스의 일반 몸통 접촉은 막지 못합니다.") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Advance(table r, Entity player, number delta)
+        -- The encounter component owns actions; this manager owns entry and results.
+        r.elapsed=r.elapsed+delta
+        if r.elapsed>=self:TimeLimitSeconds() then self:Finish(r,"제한 시간이 끝났습니다.",false) return end
+        if r.elapsed>=1.5 then
+            r.boss:GetComponent("script.MonsterAttack"):AttackNear()
+            if player.PlayerComponent.Hp<=0 then self:Finish(r,"다시 도전해 보세요.",false) return end
+        end
+        local ai=r.boss:GetComponent("script."..self:Stage(r.stage).encounter)
+        if r.elapsed>1.5 and isvalid(ai) and not ai._T.stepping then
+            ai._T.stepping=true
+            ai:Tick(player,math.min(delta,r.elapsed-1.5))
+            if isvalid(ai) then ai._T.stepping=false end
+        end
+        r.emit=r.emit+delta
+        if r.emit>=0.25 then
+            r.emit=0 local m=r.boss:GetComponent("script.Monster")
+            self:UpdateBattle(m.Hp,m.MaxHp,math.max(0,self:TimeLimitSeconds()-r.elapsed),r.uid)
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ManoEffect(Entity boss, string ruid, boolean sound)
+        -- Play the specified visual once, on the owning client's map.
+        if not isvalid(boss) or not (self._T.battle or (self._T.result and not self._T.resultWon)) then return end
+        if ruid~="" then _EffectService:PlayEffectAttached(ruid,boss,Vector3.zero,0,Vector3.one,false,{SortingLayer="MapLayer0",OrderInLayer=5}) end
+        if sound then _SoundService:PlaySound("e1fee594c7c643a79f2de2bf9b02b350",0.65) end
+    end
+
+    @ExecSpace("Client")
+    method void PlayDashImpact(Entity player)
+        -- Keep the centered impact visible at 90% opacity.
+        if player~=_UserService.LocalPlayer or not isvalid(player) or not self._T.battle then return end
+        self:ClearDashImpact()
+        self._T.dashImpactCount=(self._T.dashImpactCount or 0)+1
+        local effect=self:UI("DashImpactTemplate"):Clone("DashImpactLive"..tostring(self._T.dashImpactCount))
+        effect.UITransformComponent.anchoredPosition=Vector2.zero
+        effect.SpriteGUIRendererComponent.Color=Color(1,1,1,0.9)
+        effect.SpriteGUIRendererComponent.LocalScale=Vector2(3,3)
+        self._T.dashImpact=effect
+        self._T.dashImpactEnd=effect:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function()
+            if self._T.dashImpact==effect then self:ClearDashImpact() end
+        end)
+        effect.Enable=true
+        _UILogic:SetSiblingIndex(effect.UITransformComponent,1000000)
+        _GameAudio:PlaySound("f10ce91969e2454a99186b594f9de6a8",2)
+        log("[BossStage] dash impact screen center scale=3 alpha=0.9 soundGain=2 count="..tostring(self._T.dashImpactCount))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearDashImpact()
+        -- Remove transient screen effects when animation ends, another hit arrives or battle exits.
+        local effect=self._T.dashImpact
+        self._T.dashImpact=nil
+        if isvalid(effect) then
+            if self._T.dashImpactEnd~=nil then effect:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,self._T.dashImpactEnd) end
+            effect:Destroy()
+            log("[BossStage] dash screen impact removed")
+        end
+        self._T.dashImpactEnd=nil
+    end
+
+    @ExecSpace("Client")
+    method void PlayManoHealSound(Entity boss)
+        -- Dusk healing begins once per consumed dew.
+        local player=_UserService.LocalPlayer
+        if not self._T.battle or not isvalid(boss) or not isvalid(player) or boss.CurrentMap~=player.CurrentMap then return end
+        _GameAudio:PlaySound("36177e74e216446fa085e3b3a7baf301",1)
+        log("[BossStage] heal sound once")
+    end
+
+    @ExecSpace("Client")
+    method void WarningText(string message)
+        -- Yellow notice holds briefly, then fades as one UI group.
+        if not self._T.battle then return end
+        self._T.warningUntil=_UtilLogic.ElapsedSeconds+4
+        local e=self:UI("DewWarning") e.Enable=true e.CanvasGroupComponent.GroupAlpha=1
+        e:GetChildByName("Text").TextGUIRendererComponent.Text=message
+    end
+
+    @ExecSpace("Client")
+    method void RestoreDewMp(string character, string mapName)
+        -- Ignore late packets after switching character or leaving the arena.
+        local p=_UserService.LocalPlayer
+        if _MonsterCodex.characterId~=character or not isvalid(p) or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=mapName or p.PlayerComponent.Hp<=0 then return end
+        local restored=_MpManager:GetCurrentMp()<_MpManager:GetMaxMp()
+        _MpManager:RestoreMp(_MpManager:GetMaxMp())
+        if restored then _MapleHUDManager:FlashRecoveryBar("mp") end
+        _GameAudio:PlaySound("ad3fde2e53314fe29ec759886bc88e04",1)
+        _UIToast:ShowMessage("이슬을 획득하여 MP를 모두 회복했습니다.")
+    end
+
+    @ExecSpace("Client")
+    method void RestoreDewHp(string character, string mapName, integer healed)
+        local p=_UserService.LocalPlayer
+        if _MonsterCodex.characterId~=character or not isvalid(p) or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=mapName or p.PlayerComponent.Hp<=0 then return end
+        _GameAudio:PlaySound("ad3fde2e53314fe29ec759886bc88e04",1)
+        local attack=p:GetComponent("script.PlayerAttack")
+        if healed>0 then _MapleHUDManager:FlashRecoveryBar("hp") end
+        if healed>0 and isvalid(attack) then
+            attack:ShowHealDamageSkin(p,healed)
+            log("[BossStage] dew heal skin amount="..tostring(healed))
+        end
+        _UIToast:ShowMessage("황혼의 이슬을 획득하여 HP를 모두 회복했습니다.")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BossDefeated(Entity boss)
+        for _,r in pairs(self._T.runs or {}) do
+            if r.boss==boss and r.state=="active" then self:Finish(r,"STAGE CLEAR",true) return end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Finish(table r, string message, boolean won)
+        if r.state=="clearing" or r.state=="result" or r.state=="leaving" then return end
+        r.state=won and "clearing" or "result" r.phase="rest" r.age=0 r.won=won
+        if won then self:BeginClear(r.uid) end
+        if isvalid(r.boss) then
+            local ai=r.boss:GetComponent("script."..self:Stage(r.stage).encounter)
+            if isvalid(ai) then
+                if won then ai:Cleanup() else ai.CombatActive=false end
+            end
+            if not won then
+                for _,m in ipairs(r.boss.CurrentMap:GetChildComponentsByTypeName("script.Monster",true)) do
+                    if m.IsBossSummon then m.Entity.HitComponent.Enable=false end
+                end
+                log("[BossStage] defeat arena retained until leave")
+            end
+            r.boss:GetComponent("script.MonsterAttack"):SetMapActivity(false)
+            if not won then r.boss.HitComponent.Enable=false end
+        end
+        local sv=_CharacterPersistence._T.sv[r.uid]
+        if won and sv~=nil and sv.activeId==r.id then
+            local first=self:ReadClear(sv.saves[r.id] or "")<r.stage
+            sv.saves[r.id]=self:WriteClear(sv.saves[r.id] or "",math.max(r.stage,self:ReadClear(sv.saves[r.id] or "")))
+            _ManoTitle:Grant(r.uid,r.id)
+            sv.dirtySaves[r.id]=true
+            _CharacterPersistence:WriteCharacterSaves(sv,false)
+            message=r.practice and "PRACTICE CLEAR · 보상 없음" or first and "STAGE CLEAR · 최초 클리어" or "STAGE CLEAR"
+            if not r.practice then _BossRewards:Award(r) end
+        end
+        if won then
+            r.resultMessage=message r.age=0
+        else self:Result(message,false,r.stage,r.uid) end
+        log("[BossStage] result won="..tostring(won).." stage="..tostring(r.stage))
+    end
+
+    @ExecSpace("Server")
+    method void RequestRetry()
+        -- Only the owner of a failed result can queue a fresh, normally validated entry.
+        local r=(self._T.runs or {})[senderUserId]
+        local p=_UserService:GetUserEntityByUserId(senderUserId)
+        if r==nil or r.state~="result" or r.won~=false or not isvalid(p) or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=r.map then return end
+        r.retry=true
+        self:Leave(r)
+        log("[BossStage] retry queued stage="..tostring(r.stage))
+    end
+
+    @ExecSpace("Server")
+    method void RequestNext()
+        -- Validate the completed run before chaining to an implemented next arena.
+        local r=(self._T.runs or {})[senderUserId]
+        local p=_UserService:GetUserEntityByUserId(senderUserId)
+        if r==nil or r.state~="result" or r.won~=true or not isvalid(p) or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=r.map then return end
+        if not self:Stage(r.stage+1).implemented then return end
+        r.nextStage=r.stage+1 self:Leave(r)
+        log("[BossStage] next stage queued="..tostring(r.nextStage))
+    end
+
+    @ExecSpace("Server")
+    method void RequestLeave()
+        local r=(self._T.runs or {})[senderUserId]
+        if r~=nil then self:Leave(r) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Leave(table r)
+        if r.state=="leaving" then return end
+        r.state="leaving" r.phase="rest" r.age=0
+        if isvalid(r.boss) then r.boss:Destroy() end
+        local p=_UserService:GetUserEntityByUserId(r.uid)
+        if isvalid(p) then
+            local attack=p:GetComponent("script.PlayerAttack")
+            if isvalid(attack) then attack.BossNearestTarget=false end
+            if p.PlayerComponent.Hp<=0 then p.PlayerComponent:Respawn() end
+            _TeleportService:TeleportToMapPosition(p,r.position,r.origin)
+        end
+        self:EndBattle(r.uid)
+    end
+
+    method void OnUpdate(number delta)
+        if self:IsClient() then self:TickClient(delta) return end
+        for uid,r in pairs(self._T.runs or {}) do
+            local p=_UserService:GetUserEntityByUserId(uid)
+            r.age=(r.age or 0)+delta
+            if not isvalid(p) then
+                if isvalid(r.boss) then r.boss:Destroy() end
+                _DynamicMapService:DestroyDynamicMap(r.map) self._T.runs[uid]=nil
+            elseif r.state=="leaving" then
+                if isvalid(p.CurrentMap) and p.CurrentMap.Name~=r.map then
+                    _DynamicMapService:DestroyDynamicMap(r.map) self._T.runs[uid]=nil
+                    if r.nextStage then self:Enter(uid,r.nextStage) elseif r.retry then self:Enter(uid,r.stage) end
+                elseif r.age>5 then r.age=0 _TeleportService:TeleportToMapPosition(p,r.position,r.origin) end
+            elseif r.state=="loading" or r.state=="spawning" or r.state=="revealing" then
+                if isvalid(p.MovementComponent) then p.MovementComponent:Stop() end
+                if r.age>25 then self:Leave(r) end
+            elseif r.state=="clearing" then
+                if not isvalid(p.CurrentMap) or p.CurrentMap.Name~=r.map then self:Leave(r)
+                elseif r.resultMessage~=nil and r.age>=3 then
+                    r.state="result" r.age=0
+                    self:Result(r.resultMessage,true,r.stage,r.uid)
+                    log("[BossStage] clear animation shown after3seconds")
+                end
+            elseif r.state=="result" then
+                if not isvalid(p.CurrentMap) or p.CurrentMap.Name~=r.map or r.age>20 then self:Leave(r)
+                elseif not r.won and isvalid(r.boss) then
+                    local ai=r.boss:GetComponent("script."..self:Stage(r.stage).encounter)
+                    if isvalid(ai) and not ai._T.stepping then
+                        ai._T.stepping=true ai:TickAfterDefeat(p,delta)
+                        if isvalid(ai) then ai._T.stepping=false end
+                    end
+                end
+            elseif not isvalid(p.CurrentMap) or p.CurrentMap.Name~=r.map then self:Leave(r)
+            elseif p.PlayerComponent.Hp<=0 then self:Finish(r,"다시 도전해 보세요.",false)
+            elseif not isvalid(r.boss) then self:Finish(r,"보스전을 종료합니다.",false)
+            else
+                local pos=p.TransformComponent.WorldPosition
+                if pos.y < -1 or pos.x < -7.7 or pos.x > 7.5 then p.RigidbodyComponent:SetWorldPosition(Vector2(math.max(-7.5,math.min(7.3,pos.x)),0.1)) end
+                self:Advance(r,p,delta)
+            end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void Notice(string message)
+        self._T.enterPending=false _UIToast:ShowMessage(message)
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- Resolve each UI path once; discard references if Maker recreates the UI.
+        self._T.uiCache=self._T.uiCache or {}
+        local entity=self._T.uiCache[path]
+        if not isvalid(entity) then
+            entity=_EntityService:GetEntityByPath("/ui/BossStage/"..path)
+            self._T.uiCache[path]=entity
+        end
+        return entity
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        local e=string.sub(path,1,4)=="/ui/" and _EntityService:GetEntityByPath(path) or self:UI(path)
+        table.insert(self._T.links,{e=e,h=e:ConnectEvent(ButtonClickEvent,function() _MobileUIManager:EndChatForAction(e) _UIAudio:Play("BtMouseClick") callback() end)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.uiCache={} self._T.targetDisplay={}
+        self._T.links={}
+        self:Bind("/ui/DefaultGroup/MapleHUD/BtnBoss",function() self:Toggle() end)
+        self:Bind("/ui/DefaultGroup/MapleHUD/BtnEvent",function() _EventRewards:Toggle() end)
+        local header=self:UI("Modal/Panel/Header")
+        self._T.panelDrag=header:ConnectEvent(UITouchDragEvent,function(e)
+            if self.opened then _RewardCenter:DragPanel(header.Parent,e.TouchPoint,e.TouchDelta) end
+        end)
+        self:Bind("Modal/Panel/Close",function() self:Close() end)
+        self:Bind("Modal/Panel/TitleEquip",function() _ManoTitle:RequestToggle() end)
+        self:Bind("Modal/Panel/Enter",function()
+            if not self._T.bossSelected or not self._T.statusReady or self._T.enterPending then return end
+            local data=self:Stage(self.selected)
+            if not data.implemented or not self:IsStageUnlocked(self.selected,self.cleared) then return end
+            self._T.enterPending=true self._T.enterUntil=_UtilLogic.ElapsedSeconds+10
+            self:RequestEnter(self.selected)
+        end)
+        self:Bind("Battle/Leave",function() self:RequestLeave() end)
+        self:Bind("TargetControl/Button",function() if _UtilLogic.ElapsedSeconds<(self._T.targetSuppressUntil or 0) then return end self:TryToggleTarget() end)
+        self:BindTargetDrag()
+        for i=1,self:StageCount() do
+            local stage=i
+            self:Bind("Modal/Panel/BossList/Boss"..tostring(i),function()
+                if _UtilLogic.ElapsedSeconds<(self._T.listSuppressUntil or 0) then return end
+                self:SelectBoss(stage)
+            end)
+        end
+        self:BindBossListDrag()
+        for i=1,3 do
+            local tab=i
+            self:Bind("Modal/Panel/Info/Tab"..tostring(i),function() self._T.infoTab=tab self:Draw() end)
+        end
+        self:Bind("Result/Leave",function() self:RequestLeave() end)
+        self:Bind("Result/Retry",function() if self._T.result then if self._T.resultWon then self:RequestNext() else self:RequestRetry() end end end)
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,function(e)
+            if self.opened and e.key==KeyboardKey.Escape then self:Close() return end
+            if not _LoginFlow:IsInGame() or _MapleHUDManager:IsChatTyping() or _KeySettingManager:IsCapturingKey() then return end
+            if self:IsTargetInteractionKey(e.key) then
+                if self._T.targetHeldKey==nil then self._T.targetHeldKey=e.key self:TryToggleTarget() end
+                return
+            end
+            if self.opened and e.key==KeyboardKey.Escape then self:Close() return end
+            if _KeySettingManager:GetFuncForKeyEnum(e.key)=="boss" then self:Toggle() end
+        end)
+        self._T.targetKeyUp=_InputService:ConnectEvent(KeyUpEvent,function(e)
+            if self._T.targetHeldKey==e.key then self._T.targetHeldKey=nil end
+        end)
+        log("[BossStage] entrance UI ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        return self.opened or self._T.result==true or self._T.destination~=nil or _UtilLogic.ElapsedSeconds<(self._T.closedUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Toggle()
+        if self.opened then self:Close() return end
+        if not _LoginFlow:IsInGame() or self._T.battle or _GameSystemMenu:BlocksInput() then return end
+        if _EnhancementManager:RequireCubeChoice() then return end
+        self.opened=true self.cleared=_ManoTitle.kills>0 and 1 or 0
+        self.selected=self:ChallengeStage(self.cleared)
+        self._T.bossSelected=true self._T.autoFocusChallenge=true self._T.infoTab=1 self._T.statusReady=false self._T.enterPending=false
+        _MobileUIManager:ReleaseControls()
+        _UIEquipInventoryManager:HideTooltip()
+        self:UI("Modal").Enable=true
+        self._T.listResetAt=_UtilLogic.ElapsedSeconds+0.15
+        self:Draw() self:RequestStatus()
+        _UIAudio:Play("MenuUp")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        self._T.closedUntil=_UtilLogic.ElapsedSeconds+0.2
+        self._T.listDrag=nil self._T.listResetAt=nil self._T.autoFocusChallenge=false
+        self.opened=false
+        local e=self:UI("Modal") if isvalid(e) then e.Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectBoss(integer stage)
+        if self:Stage(stage).name==nil then return end
+        self._T.autoFocusChallenge=false self._T.listResetAt=nil
+        self.selected=stage self._T.bossSelected=true self._T.infoTab=1 self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawBossList()
+        -- Unimplemented rows remain inspectable while entry is disabled independently of unlocks.
+        for i=1,self:StageCount() do
+            local data=self:Stage(i)
+            local unlocked=self._T.statusReady and self:IsStageUnlocked(i,self.cleared)
+            local row=self:UI("Modal/Panel/BossList/Boss"..tostring(i))
+            local status="기록 확인 중"
+            if self._T.statusReady then
+                if data.implemented then status=not unlocked and "잠김 · 이전 보스 처치 필요" or ((self._T.practice or {})[i] and "이번 주 보상 완료 · 연습 모드" or "주간 보상 도전 가능")
+                else status=unlocked and "준비중... · 해금 완료" or "준비중... · 잠김" end
+            elseif not data.implemented then status="준비중... · 기록 확인 중" end
+            row:GetChildByName("State").TextGUIRendererComponent.Text=status
+            row:GetChildByName("Label").TextGUIRendererComponent.Text=data.implemented and (data.name.."  Lv."..tostring(data.recommended)) or data.name
+            local selected=self._T.bossSelected and self.selected==i
+            row.SpriteGUIRendererComponent.Color=selected and Color(0.95,0.79,0.36,1) or (unlocked and Color(0.89,0.86,0.74,1) or Color(0.80,0.82,0.82,1))
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindBossListDrag()
+        -- Do not activate a boss row when the player was scrolling across it.
+        local function bind(ev,callback)
+            table.insert(self._T.targetTouch,{ev=ev,h=_InputService:ConnectEvent(ev,callback)})
+        end
+        bind(ScreenTouchEvent,function(e)
+            if not self.opened or self._T.listDrag~=nil then return end
+            if _UIClickArbiter:ContainsScreenPoint(self:UI("Modal/Panel/BossList"),e.TouchPoint) then
+                self._T.listDrag={id=e.TouchId,point=_UILogic:ScreenToUIPosition(e.TouchPoint),moved=false}
+            end
+        end)
+        bind(ScreenTouchHoldEvent,function(e)
+            local drag=self._T.listDrag
+            if drag==nil or drag.id~=e.TouchId then return end
+            if not self.opened then self._T.listDrag=nil return end
+            local delta=_UILogic:ScreenToUIPosition(e.TouchPoint)-drag.point
+            if math.abs(delta.x)+math.abs(delta.y)>8 then drag.moved=true end
+            if drag.moved then
+                self._T.listSuppressUntil=_UtilLogic.ElapsedSeconds+0.4
+                self._T.autoFocusChallenge=false self._T.listResetAt=nil
+            end
+        end)
+        bind(ScreenTouchReleaseEvent,function(e)
+            local drag=self._T.listDrag
+            if drag==nil or drag.id~=e.TouchId then return end
+            if drag.moved then self._T.listSuppressUntil=_UtilLogic.ElapsedSeconds+0.4 end
+            self._T.listDrag=nil
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Draw details and list state from the selected catalog entry and server progress.
+        local selected=self._T.bossSelected==true
+        local data=self:Stage(self.selected)
+        local unlocked=self._T.statusReady and self:IsStageUnlocked(self.selected,self.cleared)
+        self:UI("Modal/Panel/Name").TextGUIRendererComponent.Text=selected and data.name or "보스 도전"
+        self:UI("Modal/Panel/Info").Enable=selected
+        self:UI("Modal/Panel/Placeholder").Enable=not selected
+        local tab=self._T.infoTab or 1
+        local pages={
+            "메이플 월드에서 가장 장수하는 달팽이. 오랜 세월을 살아온 만큼 거대한 덩치를 자랑하며, 얼굴에 흰 수염이 돋아 있기도 하다.\n\n새벽 이슬을 좋아하여, 새벽마다 풀잎에 맺힌 이슬을 먹기 위해 돌아다니곤 한다고 한다.\n\n아주 가끔씩 마노에게서 무지개색 달팽이 등껍질이라는 특별한 물건을 얻을 수 있는데, 그것에는 소원을 이루어 준다는 믿을 수 없는 소문이 있기도 하다.",
+            "접촉 주의   마노는 최대 HP 50% · 일반 달팽이는 최대 HP 30%\n돌진 공격   특수 달팽이는 최대 HP 80% · 피격 무적 관통\n\n달팽이 소환   일반 3마리 · 10~15초 간격\n새벽의 이슬   일반 15마리 + 특수 2마리 · 7초 유지\n황혼의 이슬   제자리에서 3초간 20회로 나눠 HP 20% 회복\n5월의 이슬   마노 이동속도 30% 증가\n도주 / 순간이동   이슬 획득을 우선하며, 끝에서는 순간이동\n\n이슬은 2분 유지 · 먼저 획득하면 황혼은 HP, 나머지는 MP 회복\n각 행동은 하나씩 발동 · 상호작용 키로 우선 타겟 전환",
+            "체력 16,667 · 권장 Lv.15 (입장 Lv.10)\n도전 인원 1인 · 제한 시간 5분\n최초 처치: 마노 정복자 칭호 ★1 · 모든 능력치 +1\n주간 처치: 캐릭터별·보스별 1회\nLv.20 몬스터 메소 100회 · 아이템 50회 추첨분\n사냥 보너스·레벨 차이 배율 적용\n무지개색 달팽이 등껍질: 고정 2%\n기타 보유 시 공격력 +10 · 중첩 없음\n목요일 00:00 (한국 시간) 초기화\n보상 확정 후 재입장은 연습 모드 · 추가 보상 없음\n미수령 전리품은 보상창에 보관됩니다."
+        }
+        if self.selected==2 then
+            pages={"페리온 고원 지역을 오랫동안 연구해 온 학자 윈스턴의 보고에 의하면 아주 오랜 옛날의 페리온은 지금과 같이 척박하고 메마른 땅이 아니었다고 한다. 엘리니아 못지 않은 거대한 숲이 우거졌던 흔적이 고원 곳곳에 보이고 있다고 그는 주장한다. 그리고, 그의 주장을 뒷받침하는 몬스터가 페리온에 등장했다. 거대한 나무의 형태를 가진 스텀피가 바로 그것이다. 윈스턴의 말에 따르면 스텀피와 같은 거목이 자라려면 수분과 영양이 풍부해야만 하는데 과거의 페리온이 바로 그런 곳이었다고 한다. 하지만 어째서인지 페리온의 영양은 모두 말라 버리고, 고대 숲의 유일한 유물이라 할 수 있는 스텀피는 페리온의 얼마 남지 않는 수분을 빨아먹는 괴물이 되는 처지에 이르렀다는데...",
+                "기본 이동   플레이어 방향으로 3~4초 이동 후 1~2초 정지\n\n점프 내려찍기   최대 HP 60% · 착지 시 충격과 화면 흔들림\n입에서 구체 발사   최대 HP 30% · 발사 순간 플레이어 방향으로 비행\n돌진   1.5초 준비 후 고속 돌진 · 최대 HP 50%\n접촉   최대 HP 20%\n\n내려찍기와 돌진은 점프로 피하세요.\n돌진은 준비 동작 때 방향이 고정됩니다.",
+                "체력 21,667 · 권장 Lv.20 (입장 Lv.15)\n마노 처치 시 해금 · 도전 인원 1인 · 제한 시간 5분\n\n주간 처치: 캐릭터별·보스별 1회\nLv.20 몬스터 메소 100회 · 아이템 50회 추첨분\n포션과 마노 전용 등껍질은 드롭되지 않습니다.\n목요일 00:00 (한국 시간) 초기화\n보상 확정 후 재입장은 연습 모드\n미수령 전리품은 보상창에 보관됩니다."}
+        end
+        if not data.implemented then
+            local previous=self:Stage(self.selected-1).name or "이전 보스"
+            local state=not self._T.statusReady and "클리어 기록 확인 중" or (unlocked and "해금 완료 · 업데이트 후 도전할 수 있습니다." or ("잠김 · "..previous.." 처치 시 해금됩니다."))
+            pages={"준비중...\n\n이 보스의 에피소드는 추후 공개됩니다.\n\n"..state,"준비중...\n\n패턴은 보스 업데이트와 함께 공개됩니다.\n\n"..state,"준비중...\n\n체력과 권장 레벨은 추후 공개됩니다.\n\n"..state}
+        end
+        self:UI("Modal/Panel/Info/Body/Text").TextGUIRendererComponent.Text=pages[tab]
+        self:UI("Modal/Panel/Info/Body/Text").TextGUIRendererComponent.FontSize=self.selected==2 and tab==1 and 22 or 24
+        self:DrawBossList()
+        for i=1,3 do
+            self:UI("Modal/Panel/Info/Tab"..tostring(i)).SpriteGUIRendererComponent.Color=i==tab and Color(0.63,0.84,0.72,1) or Color(0.85,0.765,0.604,1)
+        end
+        local ready=selected and self._T.statusReady==true and data.implemented and unlocked
+        self:UI("Modal/Panel/Enter").ButtonComponent.Enable=ready
+        self:UI("Modal/Panel/Enter").TextGUIRendererComponent.Text=not selected and "보스를 선택해 주세요" or (not data.implemented and "준비중..." or (ready and ((self._T.practice or {})[self.selected] and "연습 모드 입장" or data.name.." 도전하기") or (self._T.statusReady and "이전 보스 처치 필요" or "기록 확인 중")))
+        self:UI("Modal/Panel/TitleEquip").Enable=_ManoTitle:CanClaim()
+        self:UI("Modal/Panel/TitleEquip").TextGUIRendererComponent.Text="칭호 받기 · ★"..tostring(_ManoTitle.kills)
+    end
+
+    @ExecSpace("Client")
+    method void UpdateBattle(integer hp, integer maxHp, number seconds)
+        if not self._T.battle then return end
+        local ratio=math.max(0,math.min(1,hp/math.max(1,maxHp)))
+        self:UI("Battle/Bar/Fill").UITransformComponent.RectSize=Vector2(600*ratio,28)
+        self:UI("Battle/Bar/Fill").Enable=ratio>0
+        self:UI("Battle/Percent").TextGUIRendererComponent.Text=ratio==1 and "100%" or (ratio==0 and "0%" or string.format("%.1f%%",math.max(0.1,ratio*100)))
+        local left=math.max(0,math.ceil(seconds))
+        self:UI("Battle/Timer/Value").TextGUIRendererComponent.Text=string.format("%02d:%02d",math.floor(left/60),left%60)
+    end
+
+    @ExecSpace("Client")
+    method void Pattern(integer pattern, string phase, number x, number y, number w, number h, number duration)
+        if not self._T.battle then return end
+        self._T.pattern={pattern=pattern,phase=phase,x=x,y=y,w=w,h=h,untilTime=_UtilLogic.ElapsedSeconds+duration}
+        if phase=="attack" then _SoundService:PlaySound("e1fee594c7c643a79f2de2bf9b02b350",0.65) end
+        self:DrawWarning()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawWarning()
+        local a=self._T.pattern
+        local p=_UserService.LocalPlayer
+        local e=self:UI("Warning")
+        if not isvalid(e) then return end
+        if a==nil or a.phase=="rest" or _UtilLogic.ElapsedSeconds>a.untilTime or not isvalid(p) or not isvalid(p.CurrentMap) or not self:IsArena(p.CurrentMap.Name) then if e.Enable then e.Enable=false end return end
+        local lo=_UILogic:ScreenToUIPosition(_UILogic:WorldToScreenPosition(Vector2(a.x-a.w/2,a.y-a.h/2)))
+        local hi=_UILogic:ScreenToUIPosition(_UILogic:WorldToScreenPosition(Vector2(a.x+a.w/2,a.y+a.h/2)))
+        e.UITransformComponent.anchoredPosition=(lo+hi)/2
+        e.UITransformComponent.RectSize=Vector2(math.abs(hi.x-lo.x),math.abs(hi.y-lo.y))
+        e.SpriteGUIRendererComponent.Color=a.phase=="tell" and Color(1,0.65,0.05,0.35) or Color(1,0.15,0.05,0.65)
+        e.Enable=true
+    end
+
+
+    @ExecSpace("Client")
+    method void BeginClear()
+        -- Keep the arena visible for the death animation before showing the result dialog.
+        self:ClearDashImpact()
+        self._T.result=true self._T.battle=false self._T.destination=nil
+        self._T.targetBlinkAt=nil self._T.targetHeldKey=nil
+        self._T.pattern=nil self:DrawWarning()
+        self._T.warningUntil=0 self:UI("DewWarning").Enable=false
+        self:UI("TargetControl").Enable=false
+        self:UI("Cover").Enable=false self:UI("Result").Enable=false
+        self:UI("Battle/Bar/Fill").Enable=false
+        self:UI("Battle/Percent").TextGUIRendererComponent.Text="0%"
+        _MobileUIManager:ReleaseControls()
+        log("[BossStage] death animation wait started")
+    end
+
+    @ExecSpace("Client")
+    method void Result(string message, boolean won, integer stage)
+        -- Present the requested clear/defeat animation without a result window.
+        self:ClearDashImpact() self:ClearResultEffect()
+        self:UI("TargetControl").Enable=false
+        self._T.targetBlinkAt=nil self._T.targetCooldownUntil=0 self._T.targetHeldKey=nil
+        self._T.pattern=nil self:DrawWarning()
+        self._T.warningUntil=0 self:UI("DewWarning").Enable=false
+        self._T.result=true self._T.battle=false self._T.destination=nil
+        self:UI("Cover").Enable=false self:UI("Battle").Enable=false self:UI("Result").Enable=true
+        self._T.resultWon=won
+        local hasNext=won and self:Stage(stage+1).implemented==true
+        self:UI("Result/Retry").Enable=not won or hasNext
+        self:UI("Result/Retry").TextGUIRendererComponent.Text=won and ("다음 · "..(self:Stage(stage+1).name or "")) or "재도전"
+        self:UI("Result/Leave").UITransformComponent.anchoredPosition=Vector2((not won or hasNext) and 152 or 0,-200)
+        if won then self.cleared=math.max(self.cleared,stage) end
+        local effect=self:UI("Result/AnimationTemplate"):Clone("ResultAnimation")
+        local renderer=effect.SpriteGUIRendererComponent
+        local scale=renderer.LocalScale
+        renderer.LocalScale=Vector2(scale.x/3,scale.y/3)
+        renderer.ImageRUID=DataRef(won and "ae028d0a7425405d81e19b17ef017b62" or "ec808ad55fd04cc787d06f02db1a6c39")
+        renderer.AnimClipPlayType=SpriteAnimClipPlayType.Onetime
+        self._T.resultEffect=effect
+        self._T.resultEffectEnd=effect:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function()
+            if self._T.resultEffect~=effect then return end
+            if self._T.panelDrag then self:UI("Modal/Panel/Header"):DisconnectEvent(UITouchDragEvent,self._T.panelDrag) end
+            self:ClearResultEffect()
+            log("[BossStage] result animation removed won="..tostring(won))
+        end)
+        effect.Enable=true
+        local normalDeath=_EntityService:GetEntityByPath("/ui/RespawnGroup/Window")
+        if isvalid(normalDeath) then normalDeath.Enable=false end
+        _MobileUIManager:ReleaseControls()
+        log("[BossStage] result animation shown won="..tostring(won))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearResultEffect()
+        -- A fresh clone restarts the animation on every victory or defeat.
+        local effect=self._T.resultEffect
+        if isvalid(effect) then
+            if self._T.resultEffectEnd then effect:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,self._T.resultEffectEnd) end
+            effect.Enable=false
+            effect:Destroy()
+        end
+        self._T.resultEffect=nil self._T.resultEffectEnd=nil
+    end
+
+    @ExecSpace("Client")
+    method void EndBattle()
+        self:ClearResultEffect()
+        self:ClearDashImpact()
+        if isvalid(self._T.bossMusic) then self._T.bossMusic:Stop() end
+        self._T.bossMusic=nil self._T.musicPending=false
+        self:UI("TargetControl").Enable=false
+        self._T.targetBlinkAt=nil self._T.targetCooldownUntil=0 self._T.targetHeldKey=nil
+        self._T.pattern=nil self:DrawWarning()
+        self._T.warningUntil=0 self:UI("DewWarning").Enable=false
+        if isvalid(self._T.warning) then self._T.warning:Destroy() end
+        self._T.warning=nil self._T.result=false self._T.battle=false self._T.destination=nil self._T.enterPending=false
+        self:UI("Battle").Enable=false self:UI("Cover").Enable=false self:UI("Result").Enable=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean HidesFieldNotices()
+        -- Keep normal-field notices hidden through entry, combat and the result screen.
+        local p=_UserService.LocalPlayer
+        return self._T.destination~=nil or (isvalid(p) and isvalid(p.CurrentMap) and self:IsArena(p.CurrentMap.Name))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TickClient(number delta)
+        local p=_UserService.LocalPlayer
+        local inGame=_LoginFlow:IsInGame()
+        self:UpdateTargetControl()
+        if self.opened and self._T.listResetAt~=nil and _UtilLogic.ElapsedSeconds>=self._T.listResetAt then
+            self._T.listResetAt=nil
+            self:UI("Modal/Panel/BossList").ScrollLayoutGroupComponent:SetScrollPositionByItemIndex(self.selected-1)
+        end
+        if self._T.musicPending and self._T.battle then self:StartManoMusic() end
+        self:UI("Open").Enable=false self:UI("Event").Enable=false
+        local show=inGame and not _MobileUIManager:IsMobile() and not self._T.battle
+        for _,name in ipairs({"BtnBoss","BtnEvent"}) do
+            local button=_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..name)
+            if isvalid(button) then button.Enable=show end
+        end
+        if not inGame then if self.opened then self:Close() end return end
+        if self._T.enterPending and _UtilLogic.ElapsedSeconds>(self._T.enterUntil or 0) then self._T.enterPending=false end
+        if self._T.destination and isvalid(p) and isvalid(p.CurrentMap) and p.CurrentMap.Name==self._T.destination then
+            self._T.arrivedAt=self._T.arrivedAt or _UtilLogic.ElapsedSeconds
+            if not self._T.readySent and self._T.resources and _UtilLogic.ElapsedSeconds-self._T.arrivedAt>=2 then
+                self._T.readySent=true self:RequestReady(self._T.destination)
+            end
+        end
+        if self._T.destination and self._T.revealReady and not self._T.beginSent then
+            local boss=self._T.revealBoss
+            if not isvalid(boss) and isvalid(p) and isvalid(p.CurrentMap) then boss=p.CurrentMap:GetChildByName("StageBoss") end
+            if isvalid(boss) and isvalid(p) and boss.CurrentMap==p.CurrentMap and p.CurrentMap.Name==self._T.destination then
+                self:UI("Cover").Enable=false
+                if _LoginFlow._T.fullScreenFade==nil and not _LoginFlow._T.entryTransition and not p.PlayerControllerComponent.IsUpdateBlocked then
+                    self._T.beginSent=true self:RequestBegin(self._T.destination)
+                end
+            end
+        end
+        self:DrawWarning()
+        local warning=self:UI("DewWarning")
+        if isvalid(warning) and warning.Enable then
+            local remaining=(self._T.warningUntil or 0)-_UtilLogic.ElapsedSeconds
+            warning.CanvasGroupComponent.GroupAlpha=math.max(0,math.min(1,remaining))
+            if remaining<=0 then warning.Enable=false end
+        end
+    end
+
+    method void OnEndPlay()
+        if self:IsClient() then
+            self:ClearResultEffect()
+            self:ClearDashImpact()
+            for _,l in ipairs(self._T.targetTouch or {}) do _InputService:DisconnectEvent(l.ev,l.h) end
+            for _,l in ipairs(self._T.links or {}) do if isvalid(l.e) then l.e:DisconnectEvent(ButtonClickEvent,l.h) end end
+            if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+            if self._T.targetKeyUp then _InputService:DisconnectEvent(KeyUpEvent,self._T.targetKeyUp) end
+            if isvalid(self._T.warning) then self._T.warning:Destroy() end
+        end
+        self._T.runs=nil
+    end
+    @ExecSpace("Client")
+    method void RevealReady(string mapName, Entity boss)
+        -- Spawn acknowledgement does not start combat; the client must finish both covers first.
+        if self._T.destination~=mapName then return end
+        self._T.revealReady=true self._T.revealBoss=boss
+    end
+
+    @ExecSpace("Server")
+    method void RequestBegin(string mapName)
+        -- Only the owning player in this exact prepared arena can start the timer and AI once.
+        local r=(self._T.runs or {})[senderUserId]
+        local p=_UserService:GetUserEntityByUserId(senderUserId)
+        if r==nil or r.map~=mapName or r.state~="revealing" or not isvalid(r.boss) then return end
+        if not isvalid(p) or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=mapName or p.PlayerComponent.Hp<=0 then return end
+        r.state="active" r.elapsed=0 r.targetNextAt=0
+        p:GetComponent("script.PlayerAttack").BossNearestTarget=false
+        r.boss:GetComponent("script."..self:Stage(r.stage).encounter).CombatActive=true
+        r.boss:GetComponent("script.Monster")._T.spawnHitEnabled=true
+        r.boss.HitComponent.Enable=true
+        self:BattleStarted(r.stage,senderUserId)
+        log("[BossStage] screen revealed; combat started "..mapName)
+    end
+
+
+    method table SnailAppearance(boolean special, integer color)
+        -- Verified native monster packs and pet packs 5002264/65/66.
+        local ordinary={
+            {name="달팽이",stand="17b55730c26f4fd6b8fcfa288da388de",move="f40108c8b0b84696a67337b801201f7d",hit="a3feafdb656943baa3f8897a7042b21f",die="a25ed762135448ccb2307604f3179565"},
+            {name="파란 달팽이",stand="0c69164656d24f64bd1a1f6ee4019dff",move="ca6e5b65e1d643838ba920fbbeb32d8f",hit="938c814d2142406c8a6480ee2b025ac3",die="af2e35a7899d4cc18e4f4aec7f8e9f06"},
+            {name="빨간 달팽이",stand="ffb9e9fba641457c818e9bf9d724461a",move="4f8eab1a9fbf4a35b28f986c4fa12f48",hit="a9c736c7e74544c18740d6eb36b2f103",die="d5fad1d29d4d4254855d8ee1c4bda507"}
+        }
+        local specials={
+            {name="특수 빨간 달팽이",stand="791308a26d594d3f97d785f59336d219",move="48bebe02ca7b490abb99f961a8931f84",hit="222fb8ad82904e958ec433d6d1362415",die="3980735003d8422db819258c65c80f4c",angry="763517e8afcf416b9c41893c5e8801c2",sleep="1333102b40da4f3aa2d0ee84607f0355",roll="68ef2089106446779fa610f8e1089ddf"},
+            {name="특수 파란 달팽이",stand="4b87a7d7c50849ea80324a096a2696cd",move="efd14699882e43a3812c0f533f145e96",hit="5e707eb29bad426f980241691eae18b2",die="2868fe2359604496af8e2fc0d286f7ce",angry="a51be8ee9cdf49d68030357b22ba7d09",sleep="fcd01d91572e4979ba16a4d431727317",roll="a51a6a2df83248969b38d7fe46b57acb"},
+            {name="특수 보라 달팽이",stand="86049b9cb6da4c479d78b4895ba7bcac",move="7ac20de57308480f9b55db16ddd7a949",hit="490a25fc72d1467cbe13b513240cc99c",die="4a083487c4c341cd89a0917d7e919952",angry="67840b3526644dee983abf65ab50097a",sleep="1d630326d3b84eaaa85248d74e7cf087",roll="26a4157757274a07b9ca2814a02475d7"}
+        }
+        return (special and specials or ordinary)[math.max(1,math.min(3,color))]
+    end
+
+    method string BattleMusic(integer stage)
+        -- Stumpy uses the original 102020500 (돌풍지대) map's BGM.
+        return stage==2 and "f555b438ab2a41b0a714ccc6dbe720df" or "d479098207e2405a8dfdaff121b04ebc"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StartManoMusic()
+        -- The arena owns its music; normal map audio resumes after leaving it.
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or not isvalid(p.CurrentMap) or not self:IsArena(p.CurrentMap.Name) then return end
+        local map=p.CurrentMap
+        local sound=map.SoundComponent
+        if not isvalid(sound) then self._T.musicPending=true return end
+        self._T.musicPending=false
+        sound:Stop() sound.AudioClipRUID=self:BattleMusic(self._T.stage or 1)
+        sound.Bgm=true sound.Loop=true sound.Volume=1
+        self._T.bossMusic=sound
+        _ResourceService:PreloadAsync({sound.AudioClipRUID},function()
+            if isvalid(sound) and self._T.bossMusic==sound and isvalid(p) and p.CurrentMap==map then
+                sound:Play()
+                log("[BossStage] BGM playing stage="..tostring(self._T.stage).." ruid="..tostring(sound.AudioClipRUID))
+            end
+        end)
+    end
+    @ExecSpace("ClientOnly")
+    method boolean IsTargetInteractionKey(any key)
+        return self._T.battle==true and (key==KeyboardKey.Tab or _KeySettingManager:GetFuncForKeyEnum(key)=="interact")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TryToggleTarget()
+        if not self._T.battle or self._T.result or self._T.destination~=nil then return end
+        if _GameSystemMenu:BlocksInput() or _MapleHUDManager:IsChatTyping() or _MapleHUDManager:HasOpenChatBlockingWindow() or _KeySettingManager:IsCapturingKey() then return end
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now<(self._T.targetCooldownUntil or 0) then return end
+        self._T.targetCooldownUntil=now+1
+        self:RequestToggleTarget()
+    end
+
+    @ExecSpace("Server")
+    method void RequestToggleTarget()
+        self:ToggleTargetForUser(senderUserId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ToggleTargetForUser(string uid)
+        local r=(self._T.runs or {})[uid]
+        local p=_UserService:GetUserEntityByUserId(uid)
+        if r==nil or r.state~="active" or not isvalid(r.boss) or not isvalid(p) or p.PlayerComponent.Hp<=0 or not isvalid(p.CurrentMap) or p.CurrentMap.Name~=r.map then return end
+        if r.stage==2 then self:BeginStumpyParry(r,p) return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(r.targetNextAt or 0) then return end
+        local attack=p:GetComponent("script.PlayerAttack")
+        if not isvalid(attack) then return end
+        r.targetNextAt=now+1
+        attack.BossNearestTarget=not attack.BossNearestTarget
+        self:ReceiveTargetMode(attack.BossNearestTarget,true,uid)
+        log("[BossStage] target mode="..(attack.BossNearestTarget and "nearest" or "boss"))
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveTargetMode(boolean nearest, boolean animate)
+        if not self._T.battle then return end
+        if self._T.stage==2 then
+            self:UI("TargetControl/Button/Icon").SpriteGUIRendererComponent.ImageRUID=DataRef("thumbnail://19adfadeeb3346558da7f05d182a67dc")
+            self:UI("TargetControl/Button/Mode").TextGUIRendererComponent.Text="패링"
+            self:UpdateTargetControl() return
+        end
+        self._T.targetNearest=nearest
+        local icon=self:UI("TargetControl/Button/Icon").SpriteGUIRendererComponent
+        icon.ImageRUID=DataRef(nearest and "thumbnail://17b55730c26f4fd6b8fcfa288da388de" or ("thumbnail://"..self:Stage(self._T.stage or 1).portrait))
+        self:UI("TargetControl/Button/Mode").TextGUIRendererComponent.Text=nearest and "가까운 적 우선" or "보스 우선"
+        if animate then
+            self._T.targetBlinkAt=_UtilLogic.ElapsedSeconds
+            self._T.targetCooldownUntil=_UtilLogic.ElapsedSeconds+1
+            _AutoHuntManager._T.target=nil _AutoHuntManager._T.nextScan=0 _AutoHuntManager._T.platformScanAt=0
+            log("[BossStage] target button changed; blink start")
+        else self._T.targetBlinkAt=nil end
+        self:UpdateTargetControl()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindTargetDrag()
+        -- Screen events keep dragging alive when the pointer leaves the button.
+        self._T.targetTouch={}
+        local function bind(event,callback)
+            table.insert(self._T.targetTouch,{ev=event,h=_InputService:ConnectEvent(event,callback)})
+        end
+        bind(ScreenTouchEvent,function(e)
+            if not self._T.battle or self:BlocksInput() or self._T.targetDrag~=nil then return end
+            local control=self:UI("TargetControl")
+            if not _UIClickArbiter:ContainsScreenPoint(control,e.TouchPoint) then return end
+            if _GameSystemMenu:BlocksInput() then return end
+            self._T.targetDrag={id=e.TouchId,start=_UILogic:ScreenToLocalUIPosition(e.TouchPoint,control.Parent.UITransformComponent),position=control.UITransformComponent.anchoredPosition,moved=false}
+        end)
+        bind(ScreenTouchHoldEvent,function(e)
+            local drag=self._T.targetDrag
+            if drag==nil or drag.id~=e.TouchId then return end
+            if not self._T.battle or self:BlocksInput() then self._T.targetDrag=nil return end
+            local control=self:UI("TargetControl")
+            local point=_UILogic:ScreenToLocalUIPosition(e.TouchPoint,control.Parent.UITransformComponent)
+            local delta=point-drag.start
+            if math.abs(delta.x)+math.abs(delta.y)<8 and not drag.moved then return end
+            drag.moved=true self._T.targetSuppressUntil=_UtilLogic.ElapsedSeconds+0.4
+            local size=control.Parent.UITransformComponent.RectSize
+            local p=drag.position+delta
+            control.UITransformComponent.anchoredPosition=Vector2(math.max(8,math.min(size.x-176,p.x)),math.max(-size.y/2+117,math.min(size.y/2-117,p.y)))
+        end)
+        bind(ScreenTouchReleaseEvent,function(e)
+            local drag=self._T.targetDrag
+            if drag==nil or drag.id~=e.TouchId then return end
+            if drag.moved then self._T.targetSuppressUntil=_UtilLogic.ElapsedSeconds+0.4 end
+            self._T.targetDrag=nil
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateTargetControl()
+        if not self._T.battle then self._T.targetDrag=nil return end
+        local now=_UtilLogic.ElapsedSeconds
+        local start=self._T.targetBlinkAt
+        local glow=false
+        if start~=nil then
+            local age=now-start
+            glow=(age<0.12) or (age>=0.24 and age<0.36)
+            if age>=0.48 then self._T.targetBlinkAt=nil log("[BossStage] target button blink complete count=2") end
+        end
+        local display=self._T.targetDisplay or {}
+        self._T.targetDisplay=display
+        if display.glow~=glow then
+            display.glow=glow self:UI("TargetControl/Button/Flash").Enable=glow
+        end
+        local left=math.max(0,(self._T.targetCooldownUntil or 0)-now)
+        local active=self._T.stage==2 and now<(self._T.parryActiveUntil or 0)
+        local cooldown=active and "방어 중" or (left>0 and string.format("%.1f",left) or "")
+        if display.cooldown~=cooldown then
+            display.cooldown=cooldown
+            self:UI("TargetControl/Button/Cooldown").TextGUIRendererComponent.Text=cooldown
+        end
+        if now>=(display.nextKeyCheck or 0) then
+            display.nextKeyCheck=now+0.25
+            local key=_KeySettingManager:GetKeyForFunc("interact")
+            if display.key~=key then
+                display.key=key
+                self:UI("TargetControl/KeyBox/Inner/Key").TextGUIRendererComponent.Text=key~="" and key or "미지정"
+            end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void StumpyEffect(Entity boss, string ruid, Vector3 position, number direction, boolean attached, string sound, boolean shake)
+        local p=_UserService.LocalPlayer
+        if not (self._T.battle or (self._T.result and not self._T.resultWon)) or not isvalid(boss) or not isvalid(p) or p.CurrentMap~=boss.CurrentMap then return end
+        local effectId=0
+        if shake then
+            -- The authoritative landing packet also snaps the interpolated visual to the floor.
+            boss.SpriteRendererComponent.SpriteRUID="3a3034172ea14fe0b5e636604e352306"
+            boss.SpriteRendererComponent.StartFrameIndex=9 boss.SpriteRendererComponent.EndFrameIndex=23
+            boss.SpriteRendererComponent.PlayRate=1
+            _NetworkMotionVisual:SnapImpact(boss,position)
+        end
+        if ruid~="" then
+            if attached then effectId=_EffectService:PlayEffectAttached(ruid,boss,position,0,Vector3.one,false,{SortingLayer="MapLayer0",OrderInLayer=5})
+            else effectId=_EffectService:PlayEffect(ruid,boss,position,0,Vector3(-direction,1,1),false,{SortingLayer="MapLayer0",OrderInLayer=5}) end
+        end
+        local parrySound=sound=="5a55b82229f24b3ca689fb433fa6f542" or sound=="4a789e378be34ed9980b4f21fb202186" or sound=="ba389f19b1164975a83e193e85be4896"
+        local volume=parrySound and 1.6 or 0.8
+        if sound~="" then _GameAudio:PlaySound(sound,volume) end
+        if shake and isvalid(p.CameraComponent) then p.CameraComponent:ShakeCamera(0.35,0.5) end
+        log("[Stumpy] effect="..ruid.." id="..tostring(effectId).." fixed="..tostring(not attached).." position="..tostring(position).." direction="..tostring(direction).." shake="..tostring(shake).." sound="..sound.." volume="..tostring(volume))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginStumpyParry(table r, Entity player)
+        -- Only the encounter owner can open a parry window; the server owns both cooldowns.
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(r.parryNextAt or 0) then return end
+        r.parryUntil=now+1.2 r.parryNextAt=now+21.2
+        self:ParryState(r.map,"active",1.2,21.2,r.uid)
+        log("[StumpyParry] active window=1.2")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickStumpyParry(string uid)
+        -- Resolve an unused window once, then start its twenty-second failure cooldown.
+        local r=(self._T.runs or {})[uid]
+        if r==nil or r.stage~=2 or r.state~="active" or r.parryUntil==nil then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now>=r.parryUntil then
+            r.parryUntil=nil r.parryNextAt=now+20
+            self:ParryState(r.map,"failed",0,20,uid)
+            log("[StumpyParry] failed cooldown=20")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsStumpyParryInvincible(Entity player)
+        -- A per-encounter deadline cannot be cleared early by ordinary hit timers or leak into another map.
+        if not isvalid(player) or not isvalid(player.PlayerComponent) or player.PlayerComponent.Hp<=0 then return false end
+        local r=(self._T.runs or {})[player.PlayerComponent.UserId]
+        if r==nil or r.stage~=2 or r.state~="active" or not isvalid(player.CurrentMap) or player.CurrentMap.Name~=r.map then return false end
+        return _UtilLogic.ServerElapsedSeconds<(r.parryInvincibleUntil or 0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean TryStumpyParry(Entity player, Entity attacker, string attackInfo, any impact)
+        -- Only the shadow summons are parryable on ordinary body contact.
+        if attackInfo~="boss.stumpy.ball" and attackInfo~="boss.stumpy.slam" and attackInfo~="boss.stumpy.dash" and attackInfo~="boss.stumpy.bats" and attackInfo~="boss.stumpy.flyeye" and attackInfo~="boss.stumpy.shadow" then return false end
+        if not isvalid(player.PlayerComponent) or player.PlayerComponent.Hp<=0 then return false end
+        local uid=player.PlayerComponent.UserId
+        local r=(self._T.runs or {})[uid]
+        if r==nil or r.stage~=2 or r.state~="active" or not isvalid(r.boss) or player.CurrentMap~=r.boss.CurrentMap or attacker.CurrentMap~=player.CurrentMap then return false end
+        if attacker~=r.boss then
+            local a=attacker:GetComponent("script.MonsterAttack")
+            if not isvalid(a) or a.BossOwner~=uid then return false end
+        end
+        if attackInfo=="boss.stumpy.shadow" then
+            local shadow=attacker:GetComponent("script.ManoSnail")
+            if not isvalid(shadow) or not shadow._T.shadow then return false end
+        end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if r.parryUntil==nil or now>r.parryUntil then return false end
+        r.parryUntil=nil r.parryNextAt=now+5 r.parryInvincibleUntil=now+1.5
+        local hit=player:GetComponent("script.PlayerHit")
+        if isvalid(hit) then hit:PlayInvincibleBlink(1.5) end
+        local pos=impact or player.TransformComponent.WorldPosition+Vector3(0,0.5,0)
+        if attackInfo=="boss.stumpy.flyeye" then pos=attacker.TransformComponent.WorldPosition end
+        if attackInfo=="boss.stumpy.dash" then
+            self:StumpyEffect(player,"41e13add2ba746d9bbe624a31205a848",Vector3(0,0.4,0),1,true,"5a55b82229f24b3ca689fb433fa6f542",false,uid)
+        elseif attackInfo=="boss.stumpy.shadow" then
+            self:StumpyEffect(player,"d7852ad775ea4db8ac46a11c3735b9e1",Vector3(0,0.4,0),1,true,"ba389f19b1164975a83e193e85be4896",false,uid)
+        else
+            local sound=(attackInfo=="boss.stumpy.ball" or attackInfo=="boss.stumpy.flyeye") and "4a789e378be34ed9980b4f21fb202186" or ""
+            self:StumpyEffect(r.boss,"19adfadeeb3346558da7f05d182a67dc",pos,1,false,sound,false,uid)
+        end
+        self:ParryState(r.map,"success",0,5,uid)
+        log("[StumpyParry] success kind="..attackInfo.." cooldown=5 invincible=1.5")
+        return true
+    end
+
+    @ExecSpace("Client")
+    method void ParryState(string mapName, string result, number active, number cooldown)
+        -- Share the same touch button and remappable interaction key on PC and mobile.
+        local p=_UserService.LocalPlayer
+        if not self._T.battle or self._T.stage~=2 or not isvalid(p) or p.CurrentMap.Name~=mapName then return end
+        self._T.parryActiveUntil=_UtilLogic.ElapsedSeconds+active
+        self._T.targetCooldownUntil=_UtilLogic.ElapsedSeconds+cooldown
+        if result=="success" then self._T.targetBlinkAt=_UtilLogic.ElapsedSeconds end
+        self:UI("TargetControl/Button/Mode").TextGUIRendererComponent.Text=result=="active" and "패링 준비" or "패링"
+        self:UpdateTargetControl()
+        log("[StumpyParry] UI "..result.." cooldown="..tostring(cooldown))
+    end
+    @ExecSpace("ServerOnly")
+    method void BossContactHit(Entity attacker, Entity player, string attackInfo)
+        -- Called only after accepted positive damage; pattern hits and blocked hits do not use this cue.
+        if attackInfo~=nil and attackInfo~="" and attackInfo~="boss.mano.contact" and attackInfo~="boss.stumpy.contact" and attackInfo~="boss.stumpy.shadow" then return end
+        if not isvalid(attacker) or not isvalid(player) or not isvalid(player.PlayerComponent) then return end
+        local uid=player.PlayerComponent.UserId
+        local r=(self._T.runs or {})[uid]
+        if r==nil or r.state~="active" or player.CurrentMap.Name~=r.map or attacker.CurrentMap~=player.CurrentMap then return end
+        local attack=attacker:GetComponent("script.MonsterAttack")
+        if attacker~=r.boss and (not isvalid(attack) or attack.BossOwner~=uid) then return end
+        local p=player.TransformComponent:ToWorldPoint(Vector3(0,0.35,0))
+        local hit=attacker.HitComponent
+        local offset=isvalid(hit) and hit.ColliderOffset or Vector2(0,0.35)
+        local a=attacker.TransformComponent:ToWorldPoint(Vector3(offset.x,offset.y,0))
+        local first=_UtilLogic:RandomIntegerRange(0,1)*4
+        self:BossContactImpact(player,(p+a)*0.5,first,_UtilLogic:RandomDouble()*360,uid)
+    end
+
+    @ExecSpace("Client")
+    method void BossContactImpact(Entity player, Vector3 position, integer first, number angle)
+        -- Human frames 1-4 / 5-8 map to zero-based inclusive ranges 0-3 / 4-7.
+        if not isvalid(player) or player~=_UserService.LocalPlayer or not self._T.battle then return end
+        _GameAudio:PlaySound("e6061e1f1efc4858805bb5d0d9944ff9",0.8)
+        local serial=_EffectService:PlayEffect("fa71427649df4eeb8a3fd1ddf4cf9023",player,position,angle,Vector3.one,false,{StartFrameIndex=first,EndFrameIndex=first+3,SortingLayer="MapLayer0",OrderInLayer=7})
+        log("[BossContact] effect="..tostring(serial).." frames="..tostring(first+1).."-"..tostring(first+4).." angle="..tostring(angle))
+    end
+end

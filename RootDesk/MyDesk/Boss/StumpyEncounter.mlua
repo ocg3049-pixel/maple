@@ -1,0 +1,381 @@
+@Component
+script StumpyEncounter extends Component
+    property string OwnerId = ""
+    @Sync property boolean CombatActive = false
+    @Sync property number HitAt = -10
+    @Sync property number SlamStarted = -1
+    @Sync property Vector3 SlamOrigin = Vector3.zero
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        self._T.balls={} self._T.summons={} self._T.serial=0 self._T.pattern=0 self._T.cleaned=false
+        self.Entity.RigidbodyComponent.WalkSpeed=0.8
+        self.Entity.MovementComponent.InputSpeed=1
+        self.Entity.MovementComponent.JumpForce=1
+        self:Mode("walk",3+_UtilLogic:RandomDouble(),"36e33516befa4b2db894d0c7f105b97e")
+        log("[Stumpy] encounter initialized")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Decorate()
+        -- The dedicated, Maker-editable arena owns its terrain and background.
+        local traversal=self.Entity.CurrentMap:AddComponent("ManoArenaTraversal")
+        traversal:SetupStumpy(self.OwnerId)
+        log("[Stumpy] arena template=stumpy_arena")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Mode(string mode, number duration, string clip)
+        self._T.mode=mode self._T.age=0 self._T.duration=duration
+        self.Entity.MovementComponent:Stop()
+        if self.Entity.SpriteRendererComponent.SpriteRUID~=clip then self.Entity.SpriteRendererComponent.SpriteRUID=clip end
+        self.Entity.SpriteRendererComponent.PlayRate=1
+        self.Entity.SpriteRendererComponent.StartFrameIndex=0 self.Entity.SpriteRendererComponent.EndFrameIndex=2147483647
+        self.Entity.TransformComponent.ZRotation=0
+        log("[Stumpy] mode="..mode.." duration="..tostring(duration))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Face(Entity player)
+        local dx=player.TransformComponent.WorldPosition.x-self.Entity.TransformComponent.WorldPosition.x
+        self._T.dir=dx>=0 and 1 or -1
+        self.Entity.TransformComponent.Scale=Vector3(-self._T.dir,1,1)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Strike(Vector2 position, Vector2 size, string kind, table hits)
+        local attack=self.Entity:GetComponent("script.MonsterAttack")
+        attack._T.stumpyHits=hits
+        attack._T.stumpyImpactPosition=Vector3(position.x,position.y,0)
+        attack:AttackFast(BoxShape(position,size,0),"boss.stumpy."..kind,CollisionGroups.HitBox)
+        attack._T.stumpyHits=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void LaunchBall(Entity player)
+        local p=self.Entity.TransformComponent.WorldPosition
+        local start=Vector3(p.x+self._T.dir*0.5,p.y+0.8,0)
+        local aim=player.TransformComponent.WorldPosition+Vector3(0,0.35,0)
+        local dx=aim.x-start.x local dy=aim.y-start.y
+        local length=math.max(0.01,math.sqrt(dx*dx+dy*dy))
+        local ball=_SpawnService:SpawnByModelId("stumpyball","StumpyBall",start,self.Entity.CurrentMap)
+        if not isvalid(ball) then return end
+        if self._T.cleaned then ball:Destroy() return end
+        -- The authored ball faces left; mirror horizontally, then tilt into its travel vector.
+        ball.SpriteRendererComponent.FlipX=dx>=0
+        ball.TransformComponent.ZRotation=math.deg(math.atan(dy/math.max(0.0001,math.abs(dx))))*(dx>=0 and 1 or -1)
+        table.insert(self._T.balls,{entity=ball,x=start.x,y=start.y,vx=dx/length*3,vy=dy/length*3,age=0,hits={}})
+        log("[Stumpy] mouth ball launched direction="..tostring(self._T.dir))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickBalls(number delta)
+        for i=#self._T.balls,1,-1 do
+            local b=self._T.balls[i]
+            b.age=b.age+delta
+            if not isvalid(b.entity) or b.age>=6 or math.abs(b.x)>9 or b.y< -0.5 then
+                if isvalid(b.entity) then b.entity:Destroy() end
+                table.remove(self._T.balls,i)
+            else
+                local x=b.x+b.vx*delta local y=b.y+b.vy*delta
+                self:Strike(Vector2((b.x+x)/2,(b.y+y)/2),Vector2(0.1+math.abs(x-b.x),0.1+math.abs(y-b.y)),"ball",b.hits)
+                b.x=x b.y=y b.entity.TransformComponent.WorldPosition=Vector3(x,y,0)
+                if next(b.hits)~=nil then b.entity:Destroy() table.remove(self._T.balls,i) end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        if self._T.cleaned or (not self.CombatActive and not self._T.defeatVisual) or self.Entity.Monster.IsDead then return end
+        self:TickBalls(delta)
+        self:TickSwarm(delta)
+        _BossStageManager:TickStumpyParry(self.OwnerId)
+        local t=self._T local e=self.Entity local rb=e.RigidbodyComponent
+        t.age=t.age+delta
+        local p=e.TransformComponent.WorldPosition
+        -- Stumpy never uses the temporary player platforms, including after external displacement.
+        if t.mode~="jump" and rb:IsOnGround() then
+            local foot=rb:GetCurrentFoothold()
+            local owner=foot~=nil and _EntityService:GetEntity(foot.OwnerId) or nil
+            if isvalid(owner) and string.sub(owner.Name,1,12)=="ManoPlatform" then
+                -- A one-time correction below this surface also handles spawn/knockback edge cases.
+                rb:SetWorldPosition(Vector2(p.x,p.y-0.1))
+                log("[Stumpy] bypassed temporary platform")
+                return
+            end
+        end
+        if t.mode=="walk" then
+            self:Face(player)
+            local dir=t.dir
+            if math.abs(player.TransformComponent.WorldPosition.x-p.x)<0.8 or (p.x<=-6.8 and dir<0) or (p.x>=6.8 and dir>0) then dir=0 end
+            e.MovementComponent:MoveToDirection(Vector2(dir,0),0)
+            if t.age>=t.duration then self:Mode("pause",1+_UtilLogic:RandomDouble(),"0b6c2f6faccc44da980ce832ab636bf6") end
+        elseif t.mode=="pause" then
+            if t.age<t.duration then return end
+            self:Face(player) t.pattern=t.pattern%6+1
+            if t.pattern==1 then
+                self:Mode("slamTell",0.75,"3a3034172ea14fe0b5e636604e352306")
+                e.SpriteRendererComponent.EndFrameIndex=4
+                t.origin=p
+                self:PrepareSlam()
+                _BossStageManager:StumpyEffect(e,"",p,t.dir,false,"05c2c35cb8d14ad59a0de03e6bd891fc",false,self.OwnerId)
+            elseif t.pattern==2 then
+                self:Mode("cast",0.8,"7731041d2d2d4d1daaef345c1c8d8ef5")
+                _BossStageManager:StumpyEffect(e,"",p,t.dir,false,"767b7de0d1e9447b91edbaeed49e7c2b",false,self.OwnerId)
+            elseif t.pattern==3 then
+                self:Mode("charge",1.5,"0b6c2f6faccc44da980ce832ab636bf6")
+                t.origin=p
+                _BossStageManager:StumpyEffect(e,"c9516522ac8243a591cc97281026e606",Vector3(p.x-t.dir*0.7,p.y-0.15,0),t.dir,false,"",false,self.OwnerId)
+                _BossStageManager:WarningText("스텀피가 돌진을 준비합니다! 점프하거나 패링하세요.",self.OwnerId)
+            elseif t.pattern==4 then
+                self:Mode("shadowCast",2.7,"7731041d2d2d4d1daaef345c1c8d8ef5")
+                _BossStageManager:StumpyEffect(e,"",p,t.dir,false,"3cc6e9d3ad6b41fbbe2a6ab17b364b94",false,self.OwnerId)
+            elseif t.pattern==5 then
+                self:Mode("swarmCast",2.7,"7731041d2d2d4d1daaef345c1c8d8ef5")
+                _BossStageManager:StumpyEffect(e,"792bb5b307b64b4e8c46b7eaf758f72a",Vector3(0,0.5,0),t.dir,true,"",false,self.OwnerId)
+                _BossStageManager:WarningText("박쥐 떼가 몰려옵니다! 아래 방향으로 숙이세요.",self.OwnerId)
+            else
+                self:Mode("flyCast",2.7,"7731041d2d2d4d1daaef345c1c8d8ef5")
+                _BossStageManager:StumpyEffect(e,"ef43e8877d094b8f89d6f297755f9db8",Vector3(0,0.5,0),t.dir,true,"",false,self.OwnerId)
+            end
+        elseif t.mode=="slamTell" then
+            if t.age>=t.duration then
+                self:Mode("jump",1.2,"3a3034172ea14fe0b5e636604e352306")
+                t.jumpOrigin=p t.jumpTime=0
+                self.SlamOrigin=p self.SlamStarted=_UtilLogic.ServerElapsedSeconds
+                rb.MoveVelocity=Vector2.zero rb:SetForce(Vector2.zero) rb:SetForceReserve(Vector2.zero)
+                rb.KinematicMove=true rb.KinematicMoveAcceleration=Vector2(1,1)
+                rb:SetWorldPosition(Vector2(p.x,p.y)) rb:PositionReset()
+                e.SpriteRendererComponent.StartFrameIndex=5 e.SpriteRendererComponent.EndFrameIndex=8
+            end
+        elseif t.mode=="jump" then
+            -- Integrate one continuous arc, ignoring temporary footholds only during this jump.
+            local previous=t.jumpTime
+            local nextTime=math.min(t.duration,previous+delta)
+            local newHeight=6.8*(nextTime/t.duration)*(1-nextTime/t.duration)
+            -- 현재 위치를 기준으로 보정하여 프레임 속도와 이전 점프의 오차가 누적되지 않는다.
+            local velocity=(t.jumpOrigin.y+newHeight-p.y)/math.max(0.001,delta)
+            t.jumpTime=nextTime
+            e.MovementComponent.InputSpeed=math.abs(velocity)
+            e.MovementComponent:MoveToDirection(Vector2(0,velocity>=0 and 1 or -1),0)
+            if nextTime>=t.duration then
+                self.SlamStarted=-1
+                self:FinishMotion()
+                rb.KinematicMove=false
+                rb:SetWorldPosition(Vector2(t.jumpOrigin.x,t.jumpOrigin.y))
+                e.MovementComponent.InputSpeed=1
+                p=t.jumpOrigin
+                self:Mode("recover",2.07,"3a3034172ea14fe0b5e636604e352306")
+                e.SpriteRendererComponent.StartFrameIndex=9 e.SpriteRendererComponent.EndFrameIndex=23
+                _BossStageManager:StumpyEffect(e,"94323d0cd3a64228b29cea3ac0a2ba8b",p,t.dir,false,"87191102a92f4ee88c2ac991d98309b1",true,self.OwnerId)
+                if t.slamBounds~=nil then self:Strike(t.slamBounds.center,t.slamBounds.size,"slam",{}) end
+                log("[Stumpy] slam landed damage=60%")
+            end
+        elseif t.mode=="cast" then
+            if t.age>=t.duration then self:Mode("ball",2.28,"c2e78c4ac4924aa28e2892d108d22f73") e.SpriteRendererComponent.PlayRate=1.5 t.fired=false end
+        elseif t.mode=="ball" then
+            if not t.fired and t.age>=0.9 then
+                t.fired=true self:LaunchBall(player)
+                _BossStageManager:StumpyEffect(e,"",p,t.dir,false,"01c18b475d034421a49eceb0e8177dab",false,self.OwnerId)
+            end
+            if t.age>=t.duration then self:Mode("recover",0.7,"0b6c2f6faccc44da980ce832ab636bf6") end
+        elseif t.mode=="charge" then
+            if t.age>=t.duration then
+                _BossStageManager:StumpyEffect(e,"0f0a0ba4c91d467d9ec355380af24223",Vector3(t.origin.x-t.dir*0.7,t.origin.y-0.15,0),t.dir,false,"d425a37027a540d7b6de46d3c567ce40",false,self.OwnerId)
+                self:Mode("dash",1.2,"36e33516befa4b2db894d0c7f105b97e")
+                self:DashTrail(true,self.OwnerId)
+                t.dashHits={} t.x=p.x t.y=p.y t.dashStart=p
+                t.dashWalkSpeed=rb.WalkSpeed t.dashAcceleration=rb.WalkAcceleration
+                rb.WalkSpeed=3.2 rb.WalkAcceleration=100 rb:SetForce(Vector2.zero)
+                e.MovementComponent:MoveToDirection(Vector2(t.dir,0),0)
+            end
+        elseif t.mode=="dash" then
+            -- Stay in foothold movement: switching KinematicMove restores its cached foothold position.
+            e.TransformComponent.ZRotation=-t.dir*20
+            local x=p.x
+            self:Strike(Vector2((x+t.x)/2,p.y+0.55),Vector2(0.3625+math.abs(x-t.x),0.55),"dash",t.dashHits)
+            t.x=x
+            if t.age>=t.duration or (t.dir>0 and x>=6.8) or (t.dir<0 and x<=-6.8) then
+                self:FinishMotion()
+                self:Mode("recover",1.2,"0b6c2f6faccc44da980ce832ab636bf6")
+                log("[Stumpy] physical dash landed x="..tostring(x).." upright=true")
+            else
+                e.MovementComponent:MoveToDirection(Vector2(t.dir,0),0)
+            end
+        elseif (t.mode=="shadowCast" or t.mode=="flyCast" or t.mode=="swarmCast") and t.age>=t.duration then
+            local action=t.mode
+            self:Mode("recover",1,"0b6c2f6faccc44da980ce832ab636bf6")
+            if action=="swarmCast" then self:LaunchSwarm()
+            else self:SummonWave(action=="flyCast") end
+        elseif t.mode=="recover" and t.age>=t.duration then
+            self:Mode("walk",3+_UtilLogic:RandomDouble(),"36e33516befa4b2db894d0c7f105b97e")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        -- Finish the current action and let projectiles fly out; never begin another boss pattern.
+        if self._T.cleaned then return end
+        local t=self._T t.defeatVisual=true
+        if t.mode=="walk" or t.mode=="pause" or t.mode=="defeatIdle" or (t.mode=="recover" and t.age+delta>=t.duration) then
+            self:TickBalls(delta) self:TickSwarm(delta)
+            if t.mode~="defeatIdle" then
+                self:FinishMotion()
+                self:Mode("defeatIdle",0,"0b6c2f6faccc44da980ce832ab636bf6")
+                log("[Stumpy] defeat pattern completed; arena retained")
+            end
+        else self:Tick(player,delta) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void FinishMotion()
+        -- Stop at the body's actual destination without queuing another teleport.
+        self:DashTrail(false,self.OwnerId)
+        local rb=self.Entity.RigidbodyComponent
+        self.Entity.MovementComponent:Stop()
+        rb.MoveVelocity=Vector2.zero
+        rb:SetForce(Vector2.zero)
+        rb:SetForceReserve(Vector2.zero)
+        if self._T.dashWalkSpeed~=nil then
+            rb.WalkSpeed=self._T.dashWalkSpeed rb.WalkAcceleration=self._T.dashAcceleration
+            self._T.dashWalkSpeed=nil self._T.dashAcceleration=nil
+        end
+        self.Entity.TransformComponent.ZRotation=0
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PrepareSlam()
+        -- Connected foothold segments are one platform; jumping off it avoids the impact.
+        local t=self._T
+        t.slamFoothold=self.Entity.RigidbodyComponent:GetCurrentFoothold()
+        t.slamBounds=nil
+        local f=t.slamFoothold
+        if f==nil then return end
+        local left=math.min(f.StartPoint.x,f.EndPoint.x)
+        local right=math.max(f.StartPoint.x,f.EndPoint.x)
+        local bottom=math.min(f.StartPoint.y,f.EndPoint.y)
+        local top=math.max(f.StartPoint.y,f.EndPoint.y)
+        for _,part in ipairs(self.Entity.CurrentMap.FootholdComponent:GetFootholdAll()) do
+            if self:SamePlatform(f,part) and not part:IsVertical() then
+                left=math.min(left,part.StartPoint.x,part.EndPoint.x)
+                right=math.max(right,part.StartPoint.x,part.EndPoint.x)
+                bottom=math.min(bottom,part.StartPoint.y,part.EndPoint.y)
+                top=math.max(top,part.StartPoint.y,part.EndPoint.y)
+            end
+        end
+        t.slamBounds={center=Vector2((left+right)/2,(bottom+top)/2+0.8),size=Vector2(right-left+0.2,top-bottom+2)}
+        if t.mode=="slamTell" then _BossStageManager:WarningText("내려찍기! 착지하는 순간 점프하거나 패링하세요.",self.OwnerId) end
+    end
+
+    method boolean SamePlatform(any a, any b)
+        -- Foothold IDs vary along a continuous floor, so compare owner, layer and group.
+        if a==nil or b==nil then return false end
+        if a.Id==b.Id then return true end
+        return a.GroupId>0 and a.GroupId==b.GroupId and a.OwnerId==b.OwnerId and a.SortingLayer==b.SortingLayer
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsSlamTarget(Entity target)
+        -- Reject airborne targets before the hit pipeline consumes shields or invincibility.
+        if not isvalid(target) or target.CurrentMap~=self.Entity.CurrentMap then return false end
+        local rb=target.RigidbodyComponent
+        if not isvalid(rb) or not rb:IsOnGround() then return false end
+        return self:SamePlatform(self._T.slamFoothold,rb:GetCurrentFoothold())
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        if self._T.cleaned then return end
+        self._T.cleaned=true self.CombatActive=false
+        if self.SlamStarted>=0 then
+            self.Entity.RigidbodyComponent:SetWorldPosition(Vector2(self.SlamOrigin.x,self.SlamOrigin.y))
+        end
+        self.SlamStarted=-1
+        self:DashTrail(false,self.OwnerId)
+        self.Entity.MovementComponent:Stop()
+        self.Entity.RigidbodyComponent.KinematicMove=false
+        self.Entity.TransformComponent.ZRotation=0
+        for _,b in ipairs(self._T.balls or {}) do if isvalid(b.entity) then b.entity:Destroy() end end
+        self._T.balls={}
+        if self._T.swarm~=nil and isvalid(self._T.swarm.entity) then self._T.swarm.entity:Destroy() end
+        self._T.swarm=nil
+        for _,e in ipairs(self._T.summons or {}) do if isvalid(e) then e:Destroy() end end
+        self._T.summons={}
+        local traversal=self.Entity.CurrentMap:GetComponent("script.ManoArenaTraversal")
+        if isvalid(traversal) then traversal:OnEndPlay() end
+        log("[Stumpy] encounter cleaned")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        self:Cleanup()
+    end
+    @ExecSpace("ServerOnly")
+    method void SummonWave(boolean flying)
+        -- Preserve living summons; release only destroyed references between waves.
+        for i=#self._T.summons,1,-1 do
+            local old=self._T.summons[i]
+            if not isvalid(old) then table.remove(self._T.summons,i) end
+        end
+        local count=flying and _UtilLogic:RandomIntegerRange(3,5) or 4
+        for i=1,count do
+            if self._T.cleaned or (not self.CombatActive and not self._T.defeatVisual) then return end
+            local p=self.Entity.TransformComponent.WorldPosition
+            local x=math.max(-6.6,math.min(6.6,p.x+(i-(count+1)/2)*(flying and 0.12 or 0.8)))
+            local model=flying and "stumpyflyeye" or (i==4 and "stumpyshadowaxestump" or "stumpyshadowstump")
+            self._T.serial=self._T.serial+1
+            local e=_SpawnService:SpawnByModelId(model,"StumpySummon"..tostring(self._T.serial),Vector3(x,flying and p.y+0.65+_UtilLogic:RandomDouble()*0.15 or p.y+0.08,0),self.Entity.CurrentMap)
+            if not isvalid(e) then continue end
+            local run=(_BossStageManager._T.runs or {})[self.OwnerId]
+            if self._T.cleaned or not _BossStageManager:IsEncounterVisible(run) or run.boss~=self.Entity then e:Destroy() return end
+            if run.state~="active" then e.HitComponent.Enable=false end
+            table.insert(self._T.summons,e)
+            e:GetComponent("script.MonsterAttack").BossOwner=self.OwnerId
+            if flying then
+                local ai=e:AddComponent("StumpyFlyeye") ai.OwnerId=self.OwnerId ai:Configure(i,count)
+            else
+                local ai=e:AddComponent("ManoSnail") ai.OwnerId=self.OwnerId ai:ConfigureShadow(i==4)
+            end
+        end
+        log("[Stumpy] wave flying="..tostring(flying).." count="..tostring(count))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void LaunchSwarm()
+        -- One fixed-height sweep crosses the arena; crouching filters damage explicitly.
+        local dir=_UtilLogic:RandomDouble()<0.5 and 1 or -1
+        local e=_SpawnService:SpawnByModelId("stumpybatswarm","StumpyBatSwarm",Vector3(-dir*8.2,0.65,0),self.Entity.CurrentMap)
+        if not isvalid(e) then return end
+        if self._T.cleaned then e:Destroy() return end
+        e.SpriteRendererComponent.FlipX=dir>0
+        self._T.swarm={entity=e,x=-dir*8.2,dir=dir,age=0,hits={}}
+        log("[Stumpy] bat sweep direction="..tostring(dir))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickSwarm(number delta)
+        -- Sweep the travelled segment so a fast swarm cannot skip a standing player.
+        local b=self._T.swarm
+        if b==nil then return end
+        b.age=b.age+delta
+        if not isvalid(b.entity) or b.age>4.5 or math.abs(b.x)>9 then
+            if isvalid(b.entity) then b.entity:Destroy() end
+            self._T.swarm=nil return
+        end
+        local x=b.x+b.dir*6*delta
+        self:Strike(Vector2((x+b.x)/2,0.65),Vector2(1.2+math.abs(x-b.x),0.65),"bats",b.hits)
+        b.x=x b.entity.TransformComponent.WorldPosition=Vector3(x,0.65,0)
+    end
+    @ExecSpace("Client")
+    method void DashTrail(boolean active)
+        -- Follow the interpolated boss visual and stop exactly when the dash ends.
+        if self._T.dashTrail~=nil then _EffectService:RemoveEffect(self._T.dashTrail) self._T.dashTrail=nil end
+        if not active then return end
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then return end
+        local visual=_NetworkMotionVisual:Register(self.Entity)
+        self._T.dashTrail=_EffectService:PlayEffectAttached("cd9efdf128a2434c89d347759715ad95",visual,Vector3(0,0.4,0),0,Vector3.one,true,{SortingLayer="MapLayer0",OrderInLayer=6})
+        log("[Stumpy] dash trail started id="..tostring(self._T.dashTrail))
+    end
+end

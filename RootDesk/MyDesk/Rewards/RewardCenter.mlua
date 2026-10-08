@@ -1,0 +1,326 @@
+@Logic
+script RewardCenter extends Logic
+    property boolean opened = false
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string child)
+        -- One modal owns the reward list on both PC and mobile.
+        return _EntityService:GetEntityByPath("/ui/RewardCenter/Modal"..(child=="" and "" or "/Panel/"..child))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Retain every event subscription for Maker reloads.
+        self._T.links={}
+        local bind=function(e,fn)
+            if isvalid(e) then table.insert(self._T.links,{e=e,h=e:ConnectEvent(ButtonClickEvent,function()
+                _MobileUIManager:EndChatForAction(e)
+                fn()
+            end)}) end
+        end
+        bind(self:UI("Close"),function() self:Close() end)
+        bind(self:UI("Claim"),function() self:ClaimAll() end)
+        bind(self:UI("Prev"),function() self._T.page=math.max(1,(self._T.page or 1)-1) self:Draw() end)
+        bind(self:UI("Next"),function() self._T.page=(self._T.page or 1)+1 self:Draw() end)
+        for _,path in ipairs({"/ui/DefaultGroup/MapleHUD/BtnReward","/ui/MobileBase/HUD/Reward"}) do
+            bind(_EntityService:GetEntityByPath(path),function() self:Toggle() end)
+        end
+        for i=1,5 do
+            local index=i
+            bind(self:UI("Row"..tostring(i)),function() self:ClaimRow(index) end)
+        end
+        local title=self:UI("Title")
+        self._T.drag=title:ConnectEvent(UITouchDragEvent,function(e)
+            if not self.opened then return end
+            self:DragPanel(title.Parent,e.TouchPoint,e.TouchDelta)
+        end)
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,self.OnKey)
+        self:UI("").Enable=false
+        log("[RewardCenter] HUD, hotkey and claim-all ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Clean up listeners without changing the character's reward ledger.
+        for _,link in ipairs(self._T.links or {}) do if isvalid(link.e) then link.e:DisconnectEvent(ButtonClickEvent,link.h) end end
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+        if self._T.drag then self:UI("Title"):DisconnectEvent(UITouchDragEvent,self._T.drag) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Pending()
+        -- Unconfirmed delivery must be retried before other inventory operations.
+        return _ManoTitle._T.pending==true or _EventRewards._T.pending~=nil or _OfflineRestRewards._T.retryAction~=nil or _OfflineRestRewards._T.busy==true or (_OfflineRestRewards._T.view or {}).claim~=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        -- A short close guard prevents Escape from also opening the game menu.
+        return self.opened or self._T.running==true or _UtilLogic.ElapsedSeconds<(self._T.closedUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        if self.opened and event.key==KeyboardKey.Escape then self:Close() return end
+        -- Respect chat and remapping before handling the configured reward shortcut.
+        if not _LoginFlow:IsInGame() or _MapleHUDManager:IsChatTyping() or _KeySettingManager:IsCapturingKey() then return end
+        if self.opened and event.key==KeyboardKey.Escape then self:Close() return end
+        if _KeySettingManager:GetFuncForKeyEnum(event.key)=="reward" then self:Toggle() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Toggle()
+        -- Mouse and keyboard use the same modal guards.
+        if self.opened then self:Close() else self:Open() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open()
+        -- All eligibility is refreshed from the active character's cached server ledger.
+        local cl=_CharacterPersistence._T.cl
+        if not _LoginFlow:IsInGame() or cl==nil or not cl.entered or (_GameSystemMenu:BlocksInput() and _EventRewards._T.pending==nil) then return end
+        if _EnhancementManager:RequireCubeChoice() then return end
+        self.opened=true self._T.page=1 self._T.received={} self._T.message=""
+        _MobileUIManager:ReleaseControls() _UIEquipInventoryManager:HideTooltip()
+        _MobileUIManager:UI("MenuPanel").Enable=false
+        self:UI("").Enable=true
+        _EventRewards:RequestStatus(_EventRewards._T.id)
+        _OfflineRestRewards:RequestStatus(_OfflineRestRewards._T.id)
+        self:Draw() _UIAudio:Play("MenuUp")
+        log("[RewardCenter] opened")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        -- Never let a provisional inventory grant be spent before its receipt is saved.
+        if self._T.running or self:Pending() then _UIToast:ShowMessage("보상 저장 확인이 필요합니다. 보상 받기로 재시도해주세요.") return end
+        self.opened=false self:UI("").Enable=false self._T.closedUntil=_UtilLogic.ElapsedSeconds+0.2
+    end
+
+    @ExecSpace("ClientOnly")
+    method table Tasks()
+        -- The existing event schedule is the single source for all goal/milestone rewards.
+        local tasks={} local ev=_EventRewards local rest=_OfflineRestRewards
+        if _ManoTitle:CanClaim() then table.insert(tasks,{kind="title",key=0}) end
+        local state=ev._T.state or ev:ReadState("")
+        if ev._T.pending then
+            table.insert(tasks,{kind=ev._T.pending.kind,key=ev._T.pending.key,retry=true})
+            return tasks
+        end
+        if rest._T.retryAction or (rest._T.view or {}).claim then
+            return {{kind=rest._T.retryAction=="weekly" and "weekly" or "rest",key=0,retry=true}}
+        end
+        if ev._T.ready then
+            if _MapleIslandTutorial.step>=11 and not ev:HasLevel(state,1000) then table.insert(tasks,{kind="tutorial",key=1000}) end
+            if ev._T.day and state.last<ev._T.day then table.insert(tasks,{kind="attendance",key=state.total%14+1}) end
+            for _,lv in ipairs(ev:Levels()) do
+                if _LevelCosmeticRewards.highest>=lv and not ev:HasLevel(state,lv) then table.insert(tasks,{kind="level",key=lv}) end
+            end
+        end
+        local account=rest._T.account
+        if account then
+            if rest._T.week and account.week<rest._T.week then table.insert(tasks,{kind="weekly",key=0}) end
+            local pending=rest:DisplayCharacter().pending
+            if pending then table.insert(tasks,{kind="rest",key=0,pending=pending}) end
+        end
+        for key,bundle in pairs((_BossRewards._T.data or {}).bundles or {}) do
+            if not ev:HasLevel(state,tonumber(key)) then table.insert(tasks,{kind="boss",key=tonumber(key)}) end
+        end
+        return tasks
+    end
+
+    @ExecSpace("ClientOnly")
+    method table RowsFor(table task)
+        -- Each item carries its acquisition reason, even when a bundle spans pages.
+        local rows={} local kind=task.kind local key=task.key
+        local title=kind=="tutorial" and "튜토리얼 완료" or kind=="attendance" and ("출석 "..tostring(key).."일차") or kind=="level" and ("Lv."..tostring(key).." 달성 이벤트") or kind=="weekly" and "주간 휴식 시간" or "휴식 보상"
+        if kind=="boss" then
+            local bundle=((_BossRewards._T.data or {}).bundles or {})[tostring(key)] or {}
+            title=(_BossStageManager:Stage(bundle.stage or 1).name or "보스").." 주간 처치 보상"
+        end
+        local add=function(label,item) table.insert(rows,{title=title,reward=label,item=item,task=task}) end
+        if kind=="title" then title="보스 최초 처치 칭호" add("마노 정복자 ★"..tostring(_ManoTitle.kills).." · 올스탯 +"..tostring(_ManoTitle.kills),_ManoTitle:Item(_ManoTitle.kills)) return rows end
+        if task.retry then add("이전 수령의 저장 확인 · 추가 차감 없이 재시도",nil) return rows end
+        if kind=="weekly" then add("휴식 시간 20시간",nil)
+        elseif kind=="rest" then
+            local pending=task.pending or _OfflineRestRewards:DisplayCharacter().pending
+            if pending then
+                if (pending.meso or 0)>0 then add(string.format("%d 메소",pending.meso),nil) end
+                local items={} for item,count in pairs(pending.items or {}) do table.insert(items,{item=item,count=count}) end
+                table.sort(items,function(a,b) return a.item<b.item end)
+                for _,entry in ipairs(items) do add(_UIEquipInventoryManager:ParseName(entry.item).." ×"..tostring(entry.count),entry.item) end
+                if #rows==0 then add("이번 휴식의 획득품 없음 · 정산 완료 처리",nil) end
+            end
+        else
+            if _EventRewards:RewardMeso(kind,key)>0 then add(tostring(_EventRewards:RewardMeso(kind,key)).." 메소",nil) end
+            for _,gift in ipairs(_EventRewards:Rewards(kind,key)) do
+                local label=_UIEquipInventoryManager:ParseName(gift).." ×"..tostring(_RecoveryManager:Count(gift))
+                if string.find(gift,"|meso_pouch",1,true) then label=label.." (개봉 시 1만~10만 메소)" end
+                add(label,gift)
+            end
+        end
+        return rows
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClaimAll()
+        -- Serialize reward families; never apply two provisional snapshots together.
+        if not self.opened or self._T.running then return end
+        if _EventRewards._T.busy or _OfflineRestRewards._T.busy then return end
+        if not _EventRewards._T.ready or _OfflineRestRewards._T.account==nil then
+            _EventRewards:RequestStatus(_EventRewards._T.id) _OfflineRestRewards:RequestStatus(_OfflineRestRewards._T.id)
+            self._T.message="보상 정보를 확인 중입니다. 잠시 후 다시 눌러주세요." self:Draw() return
+        end
+        self._T.queue=self:Tasks() self._T.index=1 self._T.skipped=0 self._T.received={}
+        self._T.running=#self._T.queue>0 self._T.waiting=nil self._T.message=""
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClaimRow(integer index)
+        local row=(self._T.visibleRows or {})[index]
+        if not self.opened or self._T.running or row==nil or row.task==nil then return end
+        if _EventRewards._T.busy or _OfflineRestRewards._T.busy then return end
+        if not _EventRewards._T.ready or _OfflineRestRewards._T.account==nil then return end
+        for _,task in ipairs(self:Tasks()) do
+            if task.kind==row.task.kind and task.key==row.task.key then
+                self._T.queue={task} self._T.index=1 self._T.skipped=0 self._T.received={}
+                self._T.running=true self._T.waiting=nil self._T.message=""
+                self:Draw()
+                log("[RewardCenter] single bundle selected "..task.kind..":"..tostring(task.key))
+                return
+            end
+        end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DragPanel(Entity panel, Vector2 point, Vector2 delta)
+        local parent=panel.Parent.UITransformComponent
+        local a=_UILogic:ScreenToLocalUIPosition(point,parent)
+        local b=_UILogic:ScreenToLocalUIPosition(point-delta,parent)
+        local lo=_UILogic:ScreenToLocalUIPosition(Vector2.zero,parent)
+        local hi=_UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight),parent)
+        local tr=panel.UITransformComponent local pos=tr.anchoredPosition+a-b
+        local half=tr.RectSize*0.5*tr.UIScale.x
+        local minX=math.min(lo.x,hi.x)+half.x local maxX=math.max(lo.x,hi.x)-half.x
+        local minY=math.min(lo.y,hi.y)+half.y local maxY=math.max(lo.y,hi.y)-half.y
+        pos.x=minX>maxX and (minX+maxX)*0.5 or math.max(minX,math.min(maxX,pos.x))
+        pos.y=minY>maxY and (minY+maxY)*0.5 or math.max(minY,math.min(maxY,pos.y))
+        tr.anchoredPosition=pos
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RunNext()
+        -- A full inventory skips that bundle and keeps it available for a later claim.
+        if not self._T.running or self._T.waiting~=nil then return end
+        local cl=_CharacterPersistence._T.cl
+        if cl==nil or not cl.entered or cl.flushing then return end
+        local task=self._T.queue[self._T.index]
+        if task==nil then
+            self._T.running=false self._T.message=(self._T.skipped or 0)>0 and "공간이 부족한 보상은 보관했습니다. 인벤토리를 비우고 다시 받아주세요." or "보상 수령 완료! 남은 보상을 확인하세요."
+            self._T.page=1 self:Draw() log("[RewardCenter] batch complete skipped="..tostring(self._T.skipped)) return
+        end
+        local kind=task.kind
+        self._T.waiting=(kind=="weekly" or kind=="rest" or kind=="title") and kind or "event"
+        self._T.deadline=_UtilLogic.ElapsedSeconds+25
+        local started=true
+        if kind=="title" then started=_ManoTitle:Claim()
+        elseif kind=="weekly" then _OfflineRestRewards._T.fromCenter=true _OfflineRestRewards:Weekly()
+        elseif kind=="rest" then
+            _OfflineRestRewards._T.fromCenter=true _OfflineRestRewards:Claim()
+            started=_OfflineRestRewards._T.busy==true
+            if not started then _OfflineRestRewards._T.fromCenter=false end
+        else started=_EventRewards:ClaimFromCenter(kind,task.key) end
+        if not started then self._T.waiting=nil self._T.skipped=self._T.skipped+1 self._T.index=self._T.index+1 end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnClaimResult(string family, boolean ok)
+        -- Acknowledgements advance the queue, while retries preserve the original receipt.
+        if self._T.waiting~=family then return end
+        if ok then
+            self._T.index=self._T.index+1
+        else
+            self._T.running=false self._T.message="저장 확인이 필요합니다. 다시 받기를 눌러주세요. 미수령 보상은 보관됩니다."
+        end
+        self._T.waiting=nil self:Draw()
+        log("[RewardCenter] acknowledged "..family.." ok="..tostring(ok))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Paginate long rest item lists and fit the modal inside any viewport.
+        if not self.opened then return end
+        local modal=self:UI("") local tr=modal.Parent.UITransformComponent
+        local a=_UILogic:ScreenToLocalUIPosition(Vector2.zero,tr)
+        local b=_UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight),tr)
+        modal.UITransformComponent.RectSize=Vector2(math.abs(b.x-a.x)+4,math.abs(b.y-a.y)+4)
+        modal.UITransformComponent.anchoredPosition=(a+b)*0.5
+        local scale=math.min(1,(math.abs(b.x-a.x)-32)/1100,(math.abs(b.y-a.y)-32)/860)
+        self:UI("Title").Parent.UITransformComponent.UIScale=Vector3(scale,scale,1)
+        local rows={}
+        local tasks=self:Tasks()
+        for _,task in ipairs(tasks) do for _,row in ipairs(self:RowsFor(task)) do table.insert(rows,row) end end
+        local pages=math.max(1,math.ceil(#rows/5)) self._T.page=math.min(self._T.page or 1,pages)
+        self._T.visibleRows={}
+        for i=1,5 do
+            local row=rows[(self._T.page-1)*5+i] local path="Row"..tostring(i)
+            self:UI(path).Enable=row~=nil
+            if row then
+                self:UI(path.."/Title").TextGUIRendererComponent.Text=row.title
+                self._T.visibleRows[i]=row
+                self:UI(path).ButtonComponent.Enable=row.task~=nil and not self._T.running
+                local icon=self:UI(path.."/Icon")
+                if row.item then
+                    _EventRewards:DrawIcon(icon,row.item,64)
+                else
+                    icon.SpriteGUIRendererComponent.ImageRUID="02a489cccff24a139a6c3582a5871f58"
+                    icon.UITransformComponent.RectSize=Vector2(64,64)
+                    _RecoveryPotionManager:FitIcon(icon,"02a489cccff24a139a6c3582a5871f58",64,64)
+                end
+                icon.Enable=row.item~=nil or string.find(row.reward,"메소",1,true)~=nil
+                self:UI(path.."/Reward").TextGUIRendererComponent.Text=row.reward
+            end
+        end
+        self:UI("Empty").Enable=#rows==0
+        self:UI("Empty").TextGUIRendererComponent.Text=_EventRewards._T.ready and "지금 받을 보상이 없습니다.\n성장 목표를 달성하면 보상 버튼이 반짝입니다." or "보상 정보를 확인하고 있습니다…"
+        self:UI("Pages").TextGUIRendererComponent.Text=tostring(self._T.page).." / "..tostring(pages)
+        self:UI("Prev").ButtonComponent.Enable=self._T.page>1 self:UI("Next").ButtonComponent.Enable=self._T.page<pages
+        self:UI("Claim").ButtonComponent.Enable=not self._T.running and #tasks>0
+        self:UI("Claim").TextGUIRendererComponent.Text=self._T.running and "받는 중…" or self:Pending() and "저장 확인 · 다시 받기" or "모두 받기 ("..tostring(#tasks)..")"
+        self:UI("Status").TextGUIRendererComponent.Text=self._T.running and "보상을 받고 있습니다. 잠시만 기다려주세요." or self._T.message~="" and self._T.message or (_MobileUIManager:IsMobile() and "항목 터치: 해당 보상 묶음 받기 · 상자는 아이템 → 소비 탭" or "항목 클릭: 해당 보상 묶음 받기 · 상자/주머니는 소비 탭 · 공간 부족 시 보관")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Poll cached state only; server status requests are throttled to thirty seconds.
+        local cl=_CharacterPersistence._T.cl local ready=_LoginFlow:IsInGame() and cl~=nil and cl.entered
+        if not ready then self.opened=false self._T.running=false self._T.waiting=nil self:UI("").Enable=false return end
+        local id=_EventRewards._T.id
+        if self._T.id~=id then self._T.id=id self._T.nextStatus=0 self._T.received={} self._T.message="" end
+        local now=_UtilLogic.ElapsedSeconds
+        if now>=(self._T.nextStatus or 0) and not self._T.running and not self:Pending() then
+            self._T.nextStatus=now+30 _EventRewards:RequestStatus(id)
+        end
+        if self._T.waiting and now>(self._T.deadline or now) then
+            self._T.running=false self._T.waiting=nil self._T.message="응답을 기다리고 있습니다. 저장 확인을 다시 눌러주세요."
+        end
+        self._T.tick=(self._T.tick or 0)+delta
+        if self._T.tick<0.2 then return end
+        self._T.tick=0
+        self:RunNext()
+        local available=#self:Tasks()>0
+        for _,path in ipairs({"/ui/DefaultGroup/MapleHUD/BtnReward","/ui/MobileBase/HUD/Reward"}) do
+            local button=_EntityService:GetEntityByPath(path)
+            if isvalid(button) then
+                local glow=button:GetChildByName("Glow")
+                if isvalid(glow) then glow.Enable=available glow.SpriteGUIRendererComponent:SetAlpha(0.35+0.45*(0.5+0.5*math.sin(now*5))) end
+                local label=button:GetChildByName("Label")
+                if isvalid(label) then label.TextGUIRendererComponent.Text=available and "보상 !" or "보상" end
+            end
+        end
+        if self.opened then self:Draw() end
+    end
+end

@@ -117,6 +117,9 @@ script SocialManager extends Logic
             if #nextParty.members>=6 or (action=="join" and (me.party~=nil or other.uid~=party.leader)) then party.busy=false return false end
             if nextParty.profiles[me.uid]~=nil then party.busy=false return false end
             table.insert(nextParty.members,me.uid) nextParty.profiles[me.uid]=self:PartyProfile(me)
+        elseif action=="delegate" then
+            if not self:CanDelegate(me,other) then party.busy=false return false end
+            nextParty.leader=other.uid
         elseif action=="leave" or action=="kick" then
             local uid=action=="leave" and me.uid or (other and other.uid or "")
             if action=="kick" and (party.leader~=me.uid or uid==me.uid) then party.busy=false return false end
@@ -251,7 +254,29 @@ script SocialManager extends Logic
         if me == nil then return end
         self._T.invites = self._T.invites or {}
         if action == "refresh" then self:SendState(me) return end
-        if action == "leave" then self:Leave(me.uid)
+        if action=="location" or action=="follow" or action=="delegate" then
+            local other=self:Find(target)
+            if not self:SameParty(me,other) then self:Notice("접속 중인 같은 파티원을 선택해 주세요.",me.uid) return end
+            if action=="location" then
+                local mapId=_ChannelManager:BaseName(other.player.CurrentMap.Name)
+                self:ShowPartyLocation(other.name,mapId,_ChannelManager:UserChannel(other.uid),me.uid)
+            elseif action=="follow" then
+                if other.uid==me.uid then return end
+                self._T.followAt=self._T.followAt or {}
+                if _UtilLogic.ElapsedSeconds<(self._T.followAt[me.uid] or 0) then return end
+                self._T.followAt[me.uid]=_UtilLogic.ElapsedSeconds+1
+                local reason=_ChannelManager:FollowUser(me.uid,other.player,_ChannelManager:UserChannel(other.uid))
+                if reason~="" then self:Notice(reason,me.uid) end
+            else
+                if not self:CanDelegate(me,other) then self:Notice("파티장만 다른 파티원에게 위임할 수 있습니다.",me.uid) return end
+                if self:ChangeParty("delegate",me,other) then
+                    for _,uid in ipairs(me.party.members) do
+                        local rec=self:Record(uid)
+                        if rec~=nil then self:Notice(other.name.."님에게 파티장을 위임했습니다.",uid) self:SendState(rec) end
+                    end
+                end
+            end
+        elseif action == "leave" then self:Leave(me.uid)
         elseif action == "create" then
             if me.party == nil then self:ChangeParty("create",me,nil) end
         elseif action == "kick" then
@@ -305,7 +330,8 @@ script SocialManager extends Logic
             local pc=rec and rec.player.PlayerComponent or nil
             table.insert(rows,{kind=kind,uid=profile.uid or "",id=profile.id or profile.name,name=profile.name,
                 job=rec and rec.job or profile.job or 0,level=rec and rec.level or profile.level or 0,
-                power=rec and rec.power or profile.power or 0,same=same,online=rec~=nil,hp=pc and pc.Hp or 0,maxHp=pc and pc.MaxHp or 1})
+                power=rec and rec.power or profile.power or 0,same=same,online=rec~=nil,hp=pc and pc.Hp or 0,maxHp=pc and pc.MaxHp or 1,
+                mapId=rec and _ChannelManager:BaseName(rec.player.CurrentMap.Name) or "",channel=rec and _ChannelManager:UserChannel(rec.uid) or 0})
         end
         if me.party~=nil then
             for _, uid in ipairs(me.party.members) do
@@ -414,19 +440,27 @@ script SocialManager extends Logic
 
     @ExecSpace("ServerOnly")
     method void RouteChat(string uid, string mode, string target, string text)
-        local me = self:Record(uid)
-        if me == nil then return end
-        if mode ~= "map" and mode ~= "party" and mode ~= "friend" and mode ~= "whisper" then return end
-        local recipient = mode == "whisper" and self:Find(target) or nil
-        if mode == "whisper" and recipient == nil then self:Notice("귓속말 대상이 접속 중이 아닙니다.", uid) return end
-        if mode == "party" and me.party == nil then self:Notice("파티에 가입되어 있지 않습니다.", uid) return end
-        for _, player in ipairs(_UserService.UserEntities.Values) do
-            if isvalid(player.PlayerComponent) then
-                local other = self:Record(player.PlayerComponent.UserId)
-                local allowed = other ~= nil and (other.uid == uid or (mode == "map" and self:SameMap(me,other)) or (mode == "party" and me.party ~= nil and other.party == me.party) or (mode == "friend" and me.friends[other.name] == true) or (mode == "whisper" and other == recipient))
-                if allowed then _MapleHUDManager:ReceiveChat(me.name, text, mode, mode == "whisper" and target or "", other.uid == uid, other.uid) end
+        local me=self:Record(uid)
+        if me==nil then return end
+        if mode~="map" and mode~="party" and mode~="friend" and mode~="whisper" then return end
+        local recipient=mode=="whisper" and self:Find(target) or nil
+        if mode=="whisper" and recipient==nil then self:Notice("귓속말 대상이 접속 중이 아닙니다.",uid) return end
+        if mode=="party" and me.party==nil then self:ChatNotice("현재 파티가 없습니다.",uid) return end
+        if mode=="friend" and self:FriendCount(me)==0 then self:ChatNotice("현재 등록된 친구가 없습니다.",uid) return end
+        local recipients={}
+        for _,player in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(player.PlayerComponent) and player.PlayerComponent.UserId~=uid then
+                local other=self:Record(player.PlayerComponent.UserId)
+                local allowed=other~=nil and ((mode=="map" and self:SameMap(me,other)) or (mode=="party" and self:SameParty(me,other)) or (mode=="friend" and me.friends[other.name]==true) or (mode=="whisper" and other==recipient))
+                if allowed then table.insert(recipients,other.uid) end
             end
         end
+        if #recipients==0 and (mode=="party" or mode=="friend") then
+            self:ChatNotice(mode=="party" and "현재 접속해 있는 파티원이 없습니다." or "현재 접속해 있는 친구가 없습니다.",uid)
+            return
+        end
+        _MapleHUDManager:ReceiveChat(me.name,text,mode,mode=="whisper" and target or "",true,uid)
+        for _,otherUid in ipairs(recipients) do _MapleHUDManager:ReceiveChat(me.name,text,mode,mode=="whisper" and target or "",false,otherUid) end
     end
 
     @ExecSpace("ClientOnly")
@@ -485,6 +519,7 @@ script SocialManager extends Logic
         self:UI("Window/InviteButton").UITransformComponent.anchoredPosition = Vector2(party and 0 or -164, -236)
         self:UI("Window/InviteButton").TextGUIRendererComponent.Text = party and "파티 초대" or "친구 추가"
         self:UI("Window/Leave").TextGUIRendererComponent.Text = party and "파티 탈퇴" or "친구 삭제"
+        self:DrawMemberActions()
     end
 
     @ExecSpace("ClientOnly")
@@ -522,7 +557,7 @@ script SocialManager extends Logic
         local panel=self:UI("PartyHUD")
         panel.Enable=ingame and #rows>0
         local height=34+29*math.max(1,#rows)
-        panel.UITransformComponent.RectSize=Vector2(320,height)
+        panel.UITransformComponent.RectSize=Vector2(440,height)
         self:UI("PartyHUD/Header").UITransformComponent.anchoredPosition=Vector2(0,height/2-16)
         local me=_UserService.LocalPlayer
         for i=1,6 do
@@ -541,6 +576,9 @@ script SocialManager extends Logic
                 e:GetChildByName("Name").TextGUIRendererComponent.Text=row.name..(row.online==false and " (오프라인)" or "")
                 e:GetChildByName("Name").TextGUIRendererComponent.FontColor=row.same and Color(0.1,0.1,0.1,1) or Color(0.45,0.45,0.45,1)
                 e:GetChildByName("Bar"):GetChildByName("Fill").UITransformComponent.RectSize=Vector2(98*ratio,8)
+                local follow=e:GetChildByName("Follow")
+                follow.Enable=row.online==true and not same
+                follow.TextGUIRendererComponent.Text="따라가기 CH."..tostring(row.channel or 1)
                 if same then
                     local p=player.TransformComponent.WorldPosition
                     local screen=_UILogic:WorldToScreenPosition(Vector2(p.x,p.y+1.1))
@@ -596,6 +634,17 @@ script SocialManager extends Logic
         self:Bind(base .. "Window/Create",function() self:Request("create","") end)
         self:Bind(base .. "Window/InviteButton",function() self:Request(self.tab=="party" and "inviteParty" or "inviteFriend",self:UI("Window/NameInput").TextGUIRendererInputComponent.Text) end)
         self:Bind(base .. "Window/Leave",function() self:Request(self.tab=="party" and "leave" or "removeFriend",self.selectedName) end)
+        for _,action in ipairs({"location","follow","delegate"}) do
+            local choice=action
+            self:Bind(base.."Window/"..action,function() self:MemberAction(choice,self.selectedName) end)
+        end
+        for i=1,6 do
+            local index=i
+            self:Bind(base.."PartyHUD/Row"..tostring(i).."/Follow",function()
+                local row=self.partyRows[index]
+                if row~=nil then self:MemberAction("follow",row.name) end
+            end)
+        end
         local grid = self:UI("Window/List").GridViewComponent
         grid.ItemEntity = self:UI("Window/RowTemplate")
         self._T.gridRows = {}
@@ -604,13 +653,14 @@ script SocialManager extends Logic
             if row == nil then return end
             local binding = self._T.gridRows[entity.Id]
             if binding == nil then
-                binding = {}
+                binding = {entity=entity}
                 self._T.gridRows[entity.Id] = binding
                 local connection = entity:ConnectEvent(ButtonClickEvent, function()
                     local selected = binding.row
                     if selected ~= nil then
                         self.selectedName = selected.name self.whisperName = selected.name
                         self:UI("Window/NameInput").TextGUIRendererInputComponent.Text = selected.name
+                        self:DrawMemberActions()
                         _UIAudio:Play("BtMouseClick")
                     end
                 end)
@@ -669,6 +719,7 @@ script SocialManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnKey(KeyDownEvent event)
+        if _MobileNumberPad:BlocksInput() then return end
         -- Consume Escape before text-focus guards, regardless of listener ordering.
         if not _LoginFlow:IsInGame() then return end
         if event.key == KeyboardKey.Escape and self:IsOpen() and not _GameSystemMenu.opened then
@@ -685,7 +736,8 @@ script SocialManager extends Logic
             return
         end
         if _KeySettingManager:IsCapturingKey() or _MapleHUDManager:IsChatTyping() or self:BlocksInput() or _GameSystemMenu:BlocksInput() then return end
-        if event.key==KeyboardKey.P then self:Open("party") elseif event.key==KeyboardKey.F then self:Open("friend") elseif event.key==KeyboardKey.H then self:SelectChat("whisper") end
+        local func=_KeySettingManager:GetFuncForKeyEnum(event.key)
+        if func=="party" then self:Open("party") elseif func=="friend" then self:Open("friend") elseif event.key==KeyboardKey.H then self:SelectChat("whisper") end
     end
 
     @ExecSpace("ClientOnly")
@@ -731,6 +783,81 @@ script SocialManager extends Logic
             return (a.id or "")<(b.id or "")
         end)
         return sorted
+    end
+
+    method boolean SameParty(table me, table other)
+        -- Cached membership identity must still belong to the active characters.
+        if me==nil or other==nil or me.party==nil or me.party~=other.party then return false end
+        local a,b=me.party.profiles[me.uid],me.party.profiles[other.uid]
+        return a~=nil and b~=nil and a.id==me.id and b.id==other.id
+    end
+
+    method boolean CanDelegate(table me, table other)
+        -- Pure authority predicate reused by the durable transaction and RPC.
+        return self:SameParty(me,other) and me.party.leader==me.uid and other.uid~=me.uid
+    end
+
+    @ExecSpace("Client")
+    method void ShowPartyLocation(string name, string mapId, integer channel)
+        -- Location is printed privately into the caller's existing chat log.
+        local mapName=_WorldMapManager:GetMapDisplayName(mapId)
+        if mapName=="" then mapName=mapId end
+        _MapleHUDManager:ReceiveChat("파티 위치",name.." : "..mapName.." · CH."..tostring(channel),"party","",false)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void MemberAction(string action, string name)
+        -- Roster selection, not arbitrary typed names, owns member actions.
+        if name=="" then _UIToast:ShowMessage("파티원을 먼저 선택해 주세요.") return end
+        if action=="follow" and _MapleIslandTutorial:Active() and _MapleIslandTutorial.step<9 then
+            _UIToast:ShowMessage("튜토리얼 안내를 먼저 완료해 주세요.") return
+        end
+        self:Request(action,name)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawMemberActions()
+        -- Show channel and availability immediately when a row is selected.
+        local selected,leader=nil,false
+        local me=_UserService.LocalPlayer
+        for _,row in ipairs(self.partyRows or {}) do
+            if row.name==self.selectedName then selected=row end
+            if isvalid(me) and row.uid==me.PlayerComponent.UserId and row.kind=="L" then leader=true end
+        end
+        for _,action in ipairs({"location","follow","delegate"}) do
+            local button=self:UI("Window/"..action)
+            button.Enable=self.tab=="party"
+            local enabled=selected~=nil and selected.online==true
+            if action=="delegate" then enabled=enabled and leader and isvalid(me) and selected.uid~=me.PlayerComponent.UserId end
+            if action=="follow" then enabled=enabled and isvalid(me) and selected.uid~=me.PlayerComponent.UserId end
+            button.ButtonComponent.Enable=enabled
+            button.SpriteGUIRendererComponent.Color=enabled and Color(1,0.82,0.52,1) or Color(0.72,0.72,0.72,1)
+        end
+        self:UI("Window/follow").TextGUIRendererComponent.Text=selected~=nil and selected.online and ("따라가기 CH."..tostring(selected.channel or 1)) or "따라가기"
+    end
+
+    @ExecSpace("Client")
+    method void ChatNotice(string message)
+        _MapleHUDManager:ReceiveChat("",message,"notice","",false)
+        log("[Social] chat notice: "..message)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean OpenRowContext(Vector2 point)
+        if not self:UI("Window").EnabledInHierarchy or not _UICursorManager:Hit(self:UI("Window/List"),point) then return false end
+        if self:UI("Invite").EnabledInHierarchy or self:UI("Whisper").EnabledInHierarchy then return false end
+        if not _UIClickArbiter:IsTopmostAt("/ui/SocialWindow/Window",point) then return false end
+        for _,binding in pairs(self._T.gridRows or {}) do
+            if binding.row~=nil and isvalid(binding.entity) and binding.entity.EnabledInHierarchy and _UICursorManager:Hit(binding.entity,point) then
+                local row=binding.row
+                self.selectedName=row.name self.whisperName=row.name
+                self:UI("Window/NameInput").TextGUIRendererInputComponent.Text=row.name
+                self:DrawMemberActions()
+                _PlayerContextMenu:OpenRoster(row,point)
+                return true
+            end
+        end
+        return false
     end
 
 end

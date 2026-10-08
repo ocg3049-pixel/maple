@@ -11,8 +11,8 @@ script BuffBarManager extends Logic
 		-- cancel = (요청) 아이콘 우클릭 시 그 버프/스킬을 즉시 중단하는 처리. 클라 표시(HideBuff)와
 		-- 클라 전용 스탯 정리(CharInfoManager)는 여기서, 서버 상태는 SkillManager.RequestCancelBuff로 정리한다.
 		self._T.buffList = {
-            {path="/ui/DefaultGroup/BuffBar/RecoveryPotion_hp", getRemaining=function() return _RecoveryPotionManager.hpRemaining end, cancel=function() _RecoveryPotionManager:Cancel("hp") end},
-            {path="/ui/DefaultGroup/BuffBar/RecoveryPotion_mp", getRemaining=function() return _RecoveryPotionManager.mpRemaining end, cancel=function() _RecoveryPotionManager:Cancel("mp") end},
+            {path="/ui/DefaultGroup/BuffBar/RecoveryPotion_hp", getRemaining=function() return _RecoveryPotionManager.hpRemaining end, cancel=function() _RecoveryPotionManager:RequestCancel("hp") end},
+            {path="/ui/DefaultGroup/BuffBar/RecoveryPotion_mp", getRemaining=function() return _RecoveryPotionManager.mpRemaining end, cancel=function() _RecoveryPotionManager:RequestCancel("mp") end},
 			{ path = "/ui/DefaultGroup/BuffBar/AttackSpeedPotionIcon", getRemaining = function() return _CharInfoManager.attackSpeedPotionRemaining end,
 				cancel = function() _CharInfoManager:CancelAttackSpeedPotion() end },
 			{ path = "/ui/DefaultGroup/BuffBar/HasteIcon",       getRemaining = function() return _HasteBuffUI:GetRemaining() end,
@@ -127,55 +127,44 @@ script BuffBarManager extends Logic
 		-- (요청) 버프 아이콘 우클릭 취소. PC 우클릭은 ScreenTouchEvent(TouchId=2는 모바일 두 손가락)가
 		-- 아니라 KeyDownEvent(KeyboardKey.Mouse1)로만 온다(프로젝트 공통 규칙).
 		self._T.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+        self._T.touchHandler=_InputService:ConnectEvent(ScreenTouchEvent,function(e) self:CancelBuffAt(e.TouchPoint.x-960,e.TouchPoint.y-540) end)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyDown(KeyDownEvent e)
 		-- 우클릭이면 커서 위치를 UI 좌표(중앙 원점 1920×1080)로 바꿔 아이콘 판정에 넘긴다.
-		if e.key ~= KeyboardKey.Mouse1 then return end
+		if e.key ~= KeyboardKey.Mouse1 and e.key ~= KeyboardKey.Mouse0 then return end
 		local cursor = _InputService:GetCursorPosition()
 		self:CancelBuffAt(cursor.x - 960, cursor.y - 540)
 	end
 
 	@ExecSpace("ClientOnly")
-	method void CancelBuffAt(number cx, number cy)
-		-- (cx, cy) = 중앙 원점 UI 좌표. 활성 버프 아이콘 위면 그 버프를 취소한다.
-		-- 아이콘 절대 좌표: BuffBar는 우상단 앵커/피벗(1,1)에 오프셋 (-20,-20), 크기 120×56이라
-		-- 중심이 (880, 492)다. 각 아이콘은 BuffBar 중앙 앵커 기준 anchoredPosition.x(Reorder가 재배치)에
-		-- 놓이므로 아이콘 중심 = (880 + x, 492), 크기 56×56 → 반경 28로 판정한다.
-		for _, b in ipairs(self._T.buffList) do
-			if b.getRemaining() > 0 then
-				local ent = _EntityService:GetEntityByPath(b.path)
-				if isvalid(ent) then
-					local iconX = 880 + ent.UITransformComponent.anchoredPosition.x
-					local iconY = 492
-					if math.abs(cx - iconX) <= 28 and math.abs(cy - iconY) <= 28 then
-						log("[BuffBarManager] 버프 아이콘 우클릭 취소: " .. b.path)
-						b.cancel()
-						return
-					end
-				end
-			end
-		end
-	end
+    method void CancelBuffAt(number cx, number cy)
+        -- Shared native hit testing respects anchors, scale and both mobile/PC input.
+        local now=_UtilLogic.ElapsedSeconds
+        if now<(self._T.cancelUntil or 0) or _MobileUIManager._T.layoutEditing then return end
+        for _,b in ipairs(self._T.buffList or {}) do
+            if b.getRemaining()>0 then
+                local ent=_EntityService:GetEntityByPath(b.path)
+                if _UICursorManager:Hit(ent,Vector2(cx+960,cy+540)) then
+                    self._T.cancelUntil=now+0.2 b.cancel()
+                    log("[BuffBar] cancelled "..b.path) return
+                end
+            end
+        end
+    end
 
 	@ExecSpace("ClientOnly")
-	method string GetHoveredSkillRUID(number cx, number cy)
-		-- 활성 버프 아이콘 위의 스킬 RUID를 돌려준다. SkillManager가 이를 카탈로그 설명과 연결한다.
-		for _, b in ipairs(self._T.buffList or {}) do
-			if b.getRemaining() > 0 then
-				local ent = _EntityService:GetEntityByPath(b.path)
-				if isvalid(ent) then
-					local iconX = 880 + ent.UITransformComponent.anchoredPosition.x
-					if math.abs(cx - iconX) <= 28 and math.abs(cy - 492) <= 28 then
-						local spr = ent.SpriteGUIRendererComponent
-						if isvalid(spr) then return tostring(spr.ImageRUID or "") end
-					end
-				end
-			end
-		end
-		return ""
-	end
+    method string GetHoveredSkillRUID(number cx, number cy)
+        -- Use the same icon geometry for hover and cancellation.
+        for _,b in ipairs(self._T.buffList or {}) do
+            if b.getRemaining()>0 then
+                local ent=_EntityService:GetEntityByPath(b.path)
+                if _UICursorManager:Hit(ent,Vector2(cx+960,cy+540)) then return tostring(ent.SpriteGUIRendererComponent.ImageRUID or "") end
+            end
+        end
+        return ""
+    end
 
 	method void Reorder()
 		local active = {}
@@ -186,15 +175,24 @@ script BuffBarManager extends Logic
 			end
 		end
 
-		table.sort(active, function(a, b) return a.remaining > b.remaining end)
+		table.sort(active, function(a, b) if a.remaining==b.remaining then return a.path<b.path end return a.remaining > b.remaining end)
+        local keys={tostring(_MobileUIManager:IsMobile())}
+        for _,entry in ipairs(active) do keys[#keys+1]=entry.path end
+        local signature=table.concat(keys,"|")
+        if self._T.layoutSignature==signature then return end
+        self._T.layoutSignature=signature
 
-		local slotWidth = 60
+		local slotWidth = _MobileUIManager:IsMobile() and 88 or 60
+        local bar=_EntityService:GetEntityByPath("/ui/DefaultGroup/BuffBar")
+        if isvalid(bar) then bar.UITransformComponent.AlignmentOption=AlignmentType.TopCenter bar.UITransformComponent.Pivot=Vector2(0.5,1) bar.UITransformComponent.anchoredPosition=Vector2(0,-20) end
 		for i, b in ipairs(active) do
 			local ent = _EntityService:GetEntityByPath(b.path)
 			if isvalid(ent) then
 				local ut = ent.UITransformComponent
-				local x = -(28 + (i - 1) * slotWidth)
-				ut.anchoredPosition = Vector2(x, ut.anchoredPosition.y)
+				local columns=math.min(8,#active) local row=math.floor((i-1)/8) local count=math.min(8,#active-row*8)
+                local x=((i-1)%8-(count-1)/2)*slotWidth
+                ut.anchoredPosition=Vector2(x,-row*slotWidth)
+                local scale=_MobileUIManager:IsMobile() and 1.35 or 1 ut.UIScale=Vector3(scale,scale,1)
 			end
 		end
 	end
@@ -203,7 +201,8 @@ script BuffBarManager extends Logic
 		if self._T.timerId then
 			_TimerService:ClearTimer(self._T.timerId)
 		end
-		if self._T.keyHandler then
+		if self._T.touchHandler then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.touchHandler) end
+        if self._T.keyHandler then
 			_InputService:DisconnectEvent(KeyDownEvent, self._T.keyHandler)
 		end
 	end

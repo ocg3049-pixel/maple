@@ -32,6 +32,7 @@ script UIEquipInventoryManager extends Logic
 	property string equip26 = ""
 	property string equip27 = ""
 	property string equip28 = ""
+    property string equip29 = "" -- 두 번째 펜던트
 	property string equip25 = ""  -- 엠블렘 (잠금)
 
 	-- 메소
@@ -59,10 +60,12 @@ script UIEquipInventoryManager extends Logic
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		self._T.lockMode = false
+        self:BindEquipActions()
         local lockButton = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/LockButton")
         if isvalid(lockButton) then self._T.lockListener = lockButton:ConnectEvent(ButtonClickEvent,function() self:ToggleLockMode() end) end
 		self._T.winStack = {}
 		self._T.tabData = { equip={}, consume={}, etc={}, install={}, cash={}, decorate={} }
+        self._T.pendingDestructionShards=0
 		self._T.activeTab = "equip"
 		self._T.scrollRow = 0
 		self._T.minimized = false
@@ -275,7 +278,7 @@ script UIEquipInventoryManager extends Logic
 		log("[EquipInven] inven wired (128 slots)")
 
 		-- 탭 버튼 와이어링: tabEnt, TabBG, TabLbl 모두에 연결 (displayOrder=10=front)
-		local tabKeys = {"equip","consume","etc","install","cash","decorate"}
+		local tabKeys = {"equip","consume","etc","decorate","install","cash"}
 		for _, tk in ipairs(tabKeys) do
 			local capturedTk = tk
 			local tabBase = "/ui/DefaultGroup/InvenWindow/InvenTab_" .. tk
@@ -482,6 +485,7 @@ script UIEquipInventoryManager extends Logic
 		setEnable("/ui/DefaultGroup/EnhanceWindow",        false)
 		setEnable("/ui/DefaultGroup/CharInfoWindow",       false)
 		setEnable("/ui/DefaultGroup/ItemTypeSelectPopup", false)
+        setEnable("/ui/DefaultGroup/ItemActionPopup", false)
 		setEnable("/ui/DefaultGroup/BoxQuantityPopup",    false)
 		-- Enable 애니메이션이 자식 위치를 오염시키므로 완료 후 복원
 		wait(0.5)
@@ -497,6 +501,8 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyDown(KeyDownEvent event)
+        if _SkillManager:BlocksAmountInput() then return end
+        if _MobileNumberPad:BlocksInput() then return end
 		if _CosmeticExchange:BlocksInput() or _AppearanceColorPicker:BlocksInput() then return end
 		-- 채팅 중의 문자/Tab 입력으로 인벤토리나 장비창이 변하지 않게 한다.
 		if _MapleHUDManager:IsChatTyping() then return end
@@ -520,7 +526,7 @@ script UIEquipInventoryManager extends Logic
 			elseif front == "/ui/DefaultGroup/DecoWindow" then
 				_DecoWindowManager:SwitchToEquip()
 			elseif front == "/ui/DefaultGroup/InvenWindow" then
-				local tabOrder = {"equip","consume","etc","install","cash","decorate"}
+				local tabOrder = {"equip","consume","etc","decorate"}
 				local current = self._T.activeTab
 				local nextIdx = 1
 				for i, tk in ipairs(tabOrder) do
@@ -575,6 +581,7 @@ script UIEquipInventoryManager extends Logic
 			end
 		else
 			w.Enable = false
+            if path=="/ui/DefaultGroup/InvenWindow" then self:CancelLockMode() end
 			self:RemoveWin(path)
 			-- 창이 닫힐 때 해당 창 소속 툴팁이 열려있으면 같이 닫기
 			if path == "/ui/DefaultGroup/EquipWindow" and self.tooltipSource == "equip" then
@@ -678,7 +685,7 @@ script UIEquipInventoryManager extends Logic
 	method boolean AcceptWindowClick(UITouchDownEvent e, string winPath)
 		-- 좌클릭이면서, 겹친 창들 중 winPath가 클릭 지점의 최상단 창일 때만 true.
 		-- 겹친 창을 관통해 뒤 창의 클릭 핸들러까지 발동하던 문제를 막는 공용 게이트.
-		if e.TouchId ~= -1 then return false end
+		if e.TouchId ~= -1 and not ((Environment:IsMobilePlatform() or _MobileUIManager:IsMobile()) and e.TouchId >= 0) then return false end
 		return _UIClickArbiter:AcceptClickAt(winPath, e.TouchPoint)
 	end
 
@@ -785,6 +792,54 @@ script UIEquipInventoryManager extends Logic
 		self:ShowEquipTooltip(9)
 	end
 
+    @ExecSpace("ClientOnly")
+    method void BindEquipActions()
+        self._T.equipActionLinks={}
+        for _,name in ipairs({"Unequip","Enhance"}) do
+            local action=name
+            local e=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/Actions/"..name)
+            if isvalid(e) then table.insert(self._T.equipActionLinks,{e=e,h=e:ConnectEvent(ButtonClickEvent,function()
+                if not self:ValidateEquipActions() then return end
+                local slot=self._T.equipActionSlot
+                self:ConsumeEnhancePick() self:HideEquipActions() self:HideTooltip()
+                self.lastEquipSlot=0
+                if action=="Unequip" then self:MoveEquipToInven(slot)
+                else _EnhancementManager:OpenEquipmentFromRightClick("equip",slot) end
+            end)}) end
+        end
+        self:HideEquipActions()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HideEquipActions()
+        self._T.equipActionSlot=nil self._T.equipActionItem=nil
+        local panel=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/Actions")
+        if isvalid(panel) then panel.Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean ValidateEquipActions()
+        local slot=self._T.equipActionSlot
+        if slot==nil then return false end
+        local window=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow")
+        local weapon=isvalid(window) and window:GetChildByName("SlotWeapon") or nil
+        if not isvalid(window) or not window.EnabledInHierarchy or not isvalid(weapon) or not weapon.EnabledInHierarchy or self:GetEquip(slot)~=self._T.equipActionItem then self:HideEquipActions() return false end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowEquipActions(integer slot)
+        local item=self:GetEquip(slot)
+        if item=="" then self:HideEquipActions() return end
+        self._T.equipActionSlot=slot self._T.equipActionItem=item
+        local panel=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/Actions")
+        if not isvalid(panel) then return end
+        panel.Enable=true
+        panel:GetChildByName("Name").TextGUIRendererComponent.Text=self:ParseName(item)
+        panel:GetChildByName("Enhance").ButtonComponent.Enable=_EnhancementManager:IsEnhanceableSlot(self:ParseSlotIdx(item))
+        log("[EquipActions] selected slot="..tostring(slot))
+    end
+
 	-- 모든 슬롯 공유 호버 엑시트
 	@ExecSpace("ClientOnly")
 	method void OnHoverExit(UITouchExitEvent e)
@@ -795,12 +850,14 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnSlotClick(string winType, number slotIdx)
+        if winType~="equip" and _MobileUIManager:IsMobile() and not _MobileUIManager._T.itemActionBypass then _MobileUIManager:SelectItem(winType,slotIdx) return end
         if winType == "inven" and self._T.lockMode then self:ToggleItemLock(slotIdx) return end
-        if _EnhancementManager:RequireCubeChoice() then return end
+        if not (winType == "inven" and self._T.activeTab == "decorate") and _EnhancementManager:RequireCubeChoice() then return end
 		local t = _UtilLogic.ElapsedSeconds
 		if winType == "equip" then
 			if self.lastEquipSlot == slotIdx and t - self.lastEquipTime < 0.5 then
 				-- 더블클릭 확정: 첫 클릭이 기록해 둔 클릭-클릭 픽(+고스트)은 폐기한다
+				self:HideEquipActions()
 				local discardPick = self:ConsumeEnhancePick()
 				if _EnhancementManager:IsWindowOpen() then
 					-- (요청) 강화창이 열려 있으면 더블클릭으로도 장착 중 장비를 강화 대상으로 바로 올린다
@@ -813,6 +870,7 @@ script UIEquipInventoryManager extends Logic
 			else
 				self.lastEquipSlot = slotIdx
 				self.lastEquipTime = t
+                self:ShowEquipActions(slotIdx)
 				-- (신규) 강화창 클릭-클릭 배정: 강화창이 열린 상태의 단일 클릭이면 이 장비를
 				-- "선택된 아이템"으로 기억해 둔다 - 이어서 강화창의 대상 슬롯을 클릭하면 올라간다.
 				if _EnhancementManager:IsWindowOpen() and self:GetEquip(slotIdx) ~= "" then
@@ -828,7 +886,7 @@ script UIEquipInventoryManager extends Logic
 						ghost.SpriteGUIRendererComponent.ImageRUID = DataRef(self:ItemIconRUID(es))
 						ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
 						local cur = _InputService:GetCursorPosition()
-						ghost.UITransformComponent.anchoredPosition = Vector2(cur.x - 960, cur.y - 540)
+						ghost.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(cur)
 						_UILogic:SetSiblingIndex(ghost.UITransformComponent, 9999)
 						ghost.Enable = true
 						self._T.enhancePickGhost = true
@@ -851,6 +909,16 @@ script UIEquipInventoryManager extends Logic
 				return
 			end
 			local dragS = self:GetInven(slotIdx)
+            if self._T.activeTab == "etc" and _DestructionFragments:IsShard(dragS) then
+                if self.lastInvenSlot == slotIdx and t - self.lastInvenTime < 0.5 then
+                    self.lastInvenSlot = 0
+                    _DestructionFragments:OpenShop()
+                else
+                    self.lastInvenSlot = slotIdx self.lastInvenTime = t
+                    self:StartInvenDrag(slotIdx)
+                end
+                return
+            end
 			local dragSI = dragS ~= "" and self:ParseSlotIdx(dragS) or -1
 			local dragName = dragS ~= "" and self:ParseName(dragS) or ""
 			-- 회복 버프 소비 아이템: HP·MP 각각 한 종류씩 유지한다.
@@ -1123,6 +1191,7 @@ script UIEquipInventoryManager extends Logic
 		elseif i == 24 then return self.equip24
 		elseif i == 26 then return self.equip26
 		elseif i == 27 then return self.equip27
+		elseif i == 29 then return self.equip29
 		elseif i == 28 then return self.equip28
 		elseif i == 25 then return self.equip25
 		end
@@ -1158,6 +1227,7 @@ script UIEquipInventoryManager extends Logic
 		elseif i == 24 then self.equip24 = v
 		elseif i == 26 then self.equip26 = v
 		elseif i == 27 then self.equip27 = v
+		elseif i == 29 then self.equip29 = v
 		elseif i == 28 then self.equip28 = v
 		elseif i == 25 then self.equip25 = v
 		end
@@ -1598,12 +1668,13 @@ script UIEquipInventoryManager extends Logic
 		return self:WithStackCount(item, 1)
 	end
 
-	@ExecSpace("ClientOnly")
 	method number GetItemMaxStack(string ruid)
+        if ruid=="3eb056d03f034a29b52bfa917319d71a" then return 999 end
         if _RecoveryPotionManager:IsIcon(ruid) then return 999 end
         if ruid == "17ae6a22966f45738bb92fb97ecc3e9d" then return 999 end
         if ruid == "fcaef6c94e144f498bac3c713e7e97e4" or ruid == "90d3412612004466b328850446cb1d68" or ruid == "1ba8494660c64b0a94a4c6bd0d67294c" then return 999 end
-        if ruid=="a5f0c36308b84847a8c573e3cf3e849f" then return 999 end
+        if ruid=="69421a781fc04221a7d7a2c79f6b94f1" then return 9999 end
+        if ruid=="a5f0c36308b84847a8c573e3cf3e849f" or ruid=="463fc242992b421ea8a50423825cc516" then return 999 end
 		-- 강화/보호 주문서는 소비 슬롯에 99개씩 보관한다.
 		if self:IsSpecialEnhanceScroll(ruid) then return 99 end
 		if ruid == "47841bc4d3554cf0a68bd05f19de1f18" then return 999 end
@@ -1626,7 +1697,6 @@ script UIEquipInventoryManager extends Logic
 		return baseName .. "|" .. ruid .. "|" .. tostring(slotIdx) .. "|" .. tostring(stars) .. "|" .. tostring(scrolls) .. "|" .. tostring(upgrade)
 	end
 
-	@ExecSpace("ClientOnly")
 	method boolean IsSpecialEnhanceScroll(string ruid)
 		-- 기존 장비강화 주문서와 1회 스타포스 보호 주문서의 공통 사용 경로.
 		return ruid == "bb6c1532d7364170a11abd2d8835bc81" or ruid == "a6c6ff42196548dd874b83332ad5b336"
@@ -1729,10 +1799,10 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method table ResolveEquipmentScroll(string itemStr, number roll, integer starGain)
-		-- 90% 성공이면 균등 추첨한 1~5성을 추가한다. 보호는 성공/실패 모두 이번 시도에 소모한다.
+		-- 70% 성공이면 균등 추첨한 1~5성을 추가한다. 보호는 성공/실패 모두 이번 시도에 소모한다.
 		local protected = self:HasStarforceProtection(itemStr)
 		local updated = self:WithStarforceProtection(itemStr, false)
-		if roll < 0.9 then
+		if roll < 0.7 then
 			local fields = _EnhancementManager:SplitItemFieldsPreserve(updated)
 			local oldStars = self:ParseStars(itemStr)
 			local stars = math.min(_CashShopManager:GetMaxStars(itemStr), oldStars + math.max(1, math.min(5, starGain)))
@@ -1813,6 +1883,7 @@ script UIEquipInventoryManager extends Logic
 		local updated = self:ResolveAppearance(result.item, _UIMyInfoManager:GetSelectedCharacterJobIdx())
 		if equipSlot > 0 then self:SetEquipStr(equipSlot, updated)
 		else self:SetTabItem(itemTab, itemSlot, updated) end
+        if result.outcome=="destroy" and updated=="" then _DestructionFragments:AwardDestroyed(itemStr) end
 		self:HideTooltip()
 		self:RefreshUI()
 		if equipSlot > 0 then _DecoWindowManager:ApplyAppearance() end
@@ -1859,13 +1930,13 @@ script UIEquipInventoryManager extends Logic
 		hairN = _AppearanceColorCatalog:GetItemName(hairR, hairN)
 		self.equip1 = self:MarkStarterEquipment(faceN .. "|" .. faceR .. "|1|0|0|0")
 		self.equip2 = self:MarkStarterEquipment(hairN .. "|" .. hairR .. "|2|0|0|0")
-		-- 생성 시 선택한 외형과 현재 개방된 모든 장비 부위를 0성으로 착용한다.
-        for i = 3, 28 do self:SetEquipStr(i, "") end
+		-- 생성 시 얼굴·머리 외형을 유지하고 안전 강화 무기만 지급한다.
+        for i = 3, 29 do self:SetEquipStr(i, "") end
         local jobIdx = _UIMyInfoManager:GetSelectedCharacterJobIdx()
-        for i = 3, 9 do self:SetEquipStr(i, self:MarkStarterEquipment(self:GetStarterEquipment(jobIdx, i))) end
-        log("[StarterEquip] 직업별 0성 장비 적용 job=" .. tostring(jobIdx))
+        self:SetEquipStr(6, self:MarkStarterEquipment(self:GetStarterEquipment(jobIdx, 6)))
+        log("[StarterEquip] 직업별 안전 강화 무기만 지급 job=" .. tostring(jobIdx))
 
-		for _, tab in ipairs({"equip","consume","etc","install","cash","decorate"}) do
+		for _, tab in ipairs({"equip","consume","etc","decorate","install","cash"}) do
 			self._T.tabData[tab] = {}
 		end
 		self._T.activeTab = "equip"
@@ -2064,12 +2135,8 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void MoveEquipToInven(number slotIdx)
+        if _EnhancementManager:BlockEquipmentChange() then return end
 		log("[EquipInven] MoveEquipToInven slot=" .. tostring(slotIdx))
-		-- 강화 대상으로 올라간 장착 장비는 해제 금지 - 해제되면 대상 참조(equipSlot)가 끊겨 강화 결과가 유실된다
-		if _EnhancementManager:HasEnhanceTarget() and _EnhancementManager.enhanceTargetEquipSlot == slotIdx then
-			_UIToast:ShowMessage("강화 중인 아이템은 해제할 수 없습니다.")
-			return
-		end
 		local s = self:GetEquip(slotIdx)
 		if s == "" then return end
 		local ruid = self:ParseRUID(s)
@@ -2089,6 +2156,7 @@ script UIEquipInventoryManager extends Logic
 		end
 		self:SetInvenStr(emptySlot, s)
 		self:SetEquipStr(slotIdx, "")
+        _EnhancementManager:RelocateTarget("equip",slotIdx,"inven",emptySlot)
 		self._T.activeTab = savedTab
 
 		-- 외형 반영은 치장(외형 우선) + 장비를 합쳐 계산하는 DecoWindowManager가 전담한다
@@ -2098,31 +2166,26 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void MoveInvenToEquip(number invenIdx)
-		-- 강화 대상으로 올라간 인벤 아이템은 장착 금지 - 장착 스왑으로 대상 위치(invenIdx)가 바뀌어
-		-- 강화 결과가 유실된다 (같은 탭·같은 칸일 때만 좁게 차단)
-		if _EnhancementManager:HasEnhanceTarget() and _EnhancementManager.enhanceTargetEquipSlot == 0
-			and _EnhancementManager.enhanceTargetInvenIdx == invenIdx
-			and (_EnhancementManager.enhanceTargetSrcTab == "" or _EnhancementManager.enhanceTargetSrcTab == self._T.activeTab) then
-			_UIToast:ShowMessage("강화 중인 아이템은 장착할 수 없습니다.")
-			return
-		end
+        if _EnhancementManager:BlockEquipmentChange() then return end
 		if self._T.activeTab ~= "equip" then return end
 		local s = self:ResolveAppearance(self:GetInven(invenIdx), _UIMyInfoManager:GetSelectedCharacterJobIdx())
 		if s == "" then return end
 		local slotIdx = self:ParseSlotIdx(s)
-		if slotIdx < 1 or (slotIdx > 9 and not ((slotIdx == 14 and _CashShopManager:IsHalfEarring(s)) or (slotIdx == 28 and _AvatarTicketManager:IsTicket(s)) or _SpecialEquipment:Kind(s) ~= "")) then return end
-		local displaced = { slotIdx }
+		if slotIdx < 1 or (slotIdx > 9 and not ((slotIdx == 14 and _CashShopManager:IsHalfEarring(s)) or (slotIdx == 28 and _AvatarTicketManager:IsTicket(s)) or _SpecialEquipment:Kind(s) ~= "" or _ManoTitle:IsTitle(s))) then return end
+		if slotIdx==10 or slotIdx==15 then
+            slotIdx=_SpecialEquipment:EquipDestination(invenIdx,s,slotIdx)
+            if slotIdx==0 then return end
+        end
+        local displaced = { slotIdx }
 		if slotIdx == 3 and self:IsLongcoatItem(s) and self:GetEquip(4) ~= "" then table.insert(displaced, 4) end
 		if slotIdx == 4 and self:IsLongcoatItem(self:GetEquip(3)) then table.insert(displaced, 3) end
-		local returns = {}
-		for _, slot in ipairs(displaced) do
-			if _EnhancementManager:HasEnhanceTarget() and _EnhancementManager.enhanceTargetEquipSlot == slot then
-				_UIToast:ShowMessage("강화 중인 아이템은 해제할 수 없습니다.")
-				return
-			end
-			local old = self:GetEquip(slot)
-			if old ~= "" then table.insert(returns, old) end
-		end
+        local returns = {} local returnSlots = {}
+        local em=_EnhancementManager
+        local targetIncoming=em:HasEnhanceTarget() and em.enhanceTargetEquipSlot==0 and em.enhanceTargetInvenIdx==invenIdx and (em.enhanceTargetSrcTab=="" or em.enhanceTargetSrcTab=="equip")
+        for _, slot in ipairs(displaced) do
+            local old = self:GetEquip(slot)
+            if old ~= "" then table.insert(returns, old) table.insert(returnSlots,slot) end
+        end
 		-- 들어오는 아이템의 칸도 빈칸으로 센다. 모든 반환 위치가 확보된 후에만 변경한다.
 		local destinations = { invenIdx }
 		for i = 1, 128 do
@@ -2135,7 +2198,9 @@ script UIEquipInventoryManager extends Logic
 		self:SetTabItem("equip", invenIdx, "")
 		for i, old in ipairs(returns) do self:SetTabItem("equip", destinations[i], old) end
 		for _, slot in ipairs(displaced) do self:SetEquipStr(slot, "") end
-		self:SetEquipStr(slotIdx, s)
+        self:SetEquipStr(slotIdx, s)
+        if targetIncoming then em:RelocateTarget("inven",invenIdx,"equip",slotIdx)
+        else for i,slot in ipairs(returnSlots) do em:RelocateTarget("equip",slot,"inven",destinations[i]) end end
 		log("[EquipAppearance] 장착 slot=" .. tostring(slotIdx) .. " 반환=" .. tostring(#returns))
 		self:RefreshUI()
 		_DecoWindowManager:ApplyAppearance()
@@ -2173,7 +2238,7 @@ script UIEquipInventoryManager extends Logic
         if string.sub(itemType or "",1,9)=="cosmetic:" then return _CosmeticBoxCatalog:GrantBox(itemType,1) end
 		if ruid == "47841bc4d3554cf0a68bd05f19de1f18" then name = "장비 상자" end
 		-- avataritem → 장비 탭, 나머지 → 소비 탭
-		local targetTab = (itemType == "avataritem") and "equip" or "consume"
+		local targetTab = (itemType == "avataritem") and "equip" or (itemType=="etc" and "etc" or "consume")
 		local slotMark = (itemType == "avataritem") and "7" or "0"
 		local td = self._T.tabData[targetTab]
 
@@ -2237,6 +2302,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RefreshUI()
+        _DestructionFragments:RefreshMaterials()
 		_CashShopManager:UpdateEarringUI()
 		self:RefreshEquipmentAppearance()
 		-- 공용 드롭 모델 이름이 저장된 박스는 수량/옵션을 보존하고 이름만 복구한다.
@@ -2280,11 +2346,11 @@ script UIEquipInventoryManager extends Logic
 	-- 새 아이템 필드도 손실 없이 보존된다.
 	@ExecSpace("ClientOnly")
 	method table ExportSaveTable()
-		local out = { equips = {}, tabs = {}, meso = self.meso }
-		for i = 1, 28 do
+		local out = { equips = {}, tabs = {}, meso = self.meso, pendingDestructionShards=self._T.pendingDestructionShards or 0 }
+		for i = 1, 29 do
 			out.equips[tostring(i)] = self:GetEquip(i)
 		end
-		for _, tab in ipairs({"equip","consume","etc","install","cash","decorate"}) do
+		for _, tab in ipairs({"equip","consume","etc","decorate","install","cash"}) do
 			local td = self._T.tabData[tab] or {}
 			local tt = {}
 			for idx, s in pairs(td) do
@@ -2302,10 +2368,10 @@ script UIEquipInventoryManager extends Logic
 	method void ImportSaveTable(table t)
 		if t == nil then return end
 		local eq = t.equips or {}
-		for i = 1, 28 do
+		for i = 1, 29 do
 			self:SetEquipStr(i, tostring(eq[tostring(i)] or ""))
 		end
-		for _, tab in ipairs({"equip","consume","etc","install","cash","decorate"}) do
+		for _, tab in ipairs({"equip","consume","etc","decorate","install","cash"}) do
 			local newTd = {}
 			local src = (t.tabs or {})[tab] or {}
 			for idxStr, s in pairs(src) do
@@ -2316,7 +2382,8 @@ script UIEquipInventoryManager extends Logic
 			end
 			self._T.tabData[tab] = newTd
 		end
-		self.meso = math.floor(tonumber(t.meso) or 0)
+		self._T.pendingDestructionShards=math.max(0,math.floor(tonumber(t.pendingDestructionShards) or 0))
+        self.meso = math.floor(tonumber(t.meso) or 0)
 		self:UpdateMesoUI()
 		self:RefreshUI()
 	end
@@ -2349,9 +2416,14 @@ script UIEquipInventoryManager extends Logic
 	@ExecSpace("ClientOnly")
 	method void UpdateEquipUI()
 		-- 창을 처음 열 때도 빈 아이콘을 숨겨 흰색 기본 스프라이트가 슬롯을 덮지 않게 한다.
-		local slotNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove", [10]="SlotRing", [14]="SlotEarring", [15]="SlotPendant", [26]="SlotFaceAccessory", [27]="SlotEyeAccessory", [28]="SlotTicket" }
+		local slotNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove", [10]="SlotRing", [11]="SlotRing2", [12]="SlotRing3", [13]="SlotRing4", [29]="SlotPendant2", [14]="SlotEarring", [15]="SlotPendant", [26]="SlotFaceAccessory", [27]="SlotEyeAccessory", [28]="SlotTicket", [22]="SlotTitle" }
 		for i, sn in pairs(slotNames) do
 			local d    = self:GetEquip(i)
+            if i==22 then
+                local starsEntity=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/SlotTitle/Stars")
+                if isvalid(starsEntity) then starsEntity.TextGUIRendererComponent.Text=_ManoTitle:IsTitle(d) and ("★"..tostring(self:ParseStars(d))) or "" end
+                _ManoTitle.equipped=_ManoTitle:IsTitle(d)
+            end
 			local ruid = self:ParseRUID(d)
 			local name = self:ParseName(d)
 			local has  = ruid ~= ""
@@ -2395,6 +2467,7 @@ script UIEquipInventoryManager extends Logic
 	-- 툴팁: 장비창 슬롯 호버 (1프레임 지연으로 스쳐지나감 필터링)
 	@ExecSpace("ClientOnly")
 	method void ShowEquipTooltip(number slotIdx)
+        if _MobileUIManager:IsMobile() then return end
 		self._T.hoverEquipSlot = slotIdx
 		self._T.hoverInvenSlot = 0
 		self._T.pendingHideTooltip = false
@@ -2405,6 +2478,7 @@ script UIEquipInventoryManager extends Logic
 	-- 툴팁: 인벤 슬롯 호버 (1프레임 지연으로 스쳐지나감 필터링)
 	@ExecSpace("ClientOnly")
 	method void ShowInvenTooltip(number invenIdx)
+        if _MobileUIManager:IsMobile() then return end
 		self._T.hoverInvenSlot = invenIdx
 		self._T.hoverEquipSlot = 0
 		self._T.pendingHideTooltip = false
@@ -2439,6 +2513,12 @@ script UIEquipInventoryManager extends Logic
 		if self.tooltipSource ~= "equip" and self.tooltipSource ~= "deco" then
 			if kind == "equip" then
 				local eqS = self:GetEquip(si)
+                if si==10 or si==15 then
+                    for _,slot in ipairs(si==10 and {13,12,11,10} or {29,15}) do
+                        local item=self:GetEquip(slot)
+                        if item~="" then eqS=item break end
+                    end
+                end
 				if eqS ~= "" and eqS ~= s then cmpStr = eqS end
 			elseif kind == "deco" then
 				local slotKey = _DecoWindowManager:SlotKeyForCat(self:GetField(s, 4))
@@ -2495,6 +2575,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void FollowItemTooltip()
+        if _MobileUIManager:IsMobile() and _MobileUIManager._T.selectedItem~=nil then return end
 		-- 호버 대상이 닫히거나 가려지면 즉시 닫고, 그렇지 않으면 커서 옆을 따라간다.
 		local tp = _EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
 		if not isvalid(tp) or not tp.Enable then return end
@@ -2522,20 +2603,27 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void UpdatePointerItemTooltip(Vector2 point)
+        if _MobileUIManager:IsMobile() then return end
         if _PlayerContextMenu:UpdateTooltip(point) then return end
         if _InformationBook:UpdateHallTooltip(point) then return end
 		if _AppearanceColorPicker.opened then self:HideTooltip() return end
 		-- 자식 이미지 간 Enter/Exit 순서와 무관하게 현재 슬롯/데이터를 최종 판정한다.
 		local target = _UICursorManager:TargetAt(point)
-		if target == nil or (target.kind ~= "inven" and target.kind ~= "equip" and target.kind ~= "deco") then
+		if target == nil or (target.kind ~= "inven" and target.kind ~= "equip" and target.kind ~= "deco" and target.kind ~= "enhance") then
 			self._T.pointerItemSignature = ""
-			if self.tooltipSource == "inven" or self.tooltipSource == "equip" or self.tooltipSource == "deco" then self:HideTooltip() end
+			if self.tooltipSource == "inven" or self.tooltipSource == "equip" or self.tooltipSource == "deco" or self.tooltipSource == "enhance" then self:HideTooltip() end
 			return
 		end
 		local item = ""
 		local winPath = "/ui/DefaultGroup/EquipWindow"
-		if target.kind == "equip" then
-			item = self:GetEquip(target.index)
+        if target.kind == "enhance" then
+            if _EnhancementManager:IsConfirmDialogOpen() or _StarforcePresentation.busy or self.isDragging or self._T.isDraggingEquipToEnhance or self._T.isDraggingInvenItem then
+                self._T.pointerItemSignature="" self:HideTooltip() return
+            end
+            winPath="/ui/DefaultGroup/EnhanceWindow"
+            item=_EnhancementManager.enhanceTargetItemStr
+        elseif target.kind == "equip" then
+            item = self:GetEquip(target.index)
         elseif target.kind == "deco" then
             winPath = "/ui/DefaultGroup/DecoWindow"
             local key = _DecoWindowManager:SlotUIKeys()[target.index]
@@ -2606,7 +2694,9 @@ script UIEquipInventoryManager extends Logic
 		-- 2) 별 (장비만: 보유 별을 덮는 행까지, 15개/행)
 		local starText = ""
 		local starRows = 0
-		if kind == "equip" and not appearanceOnly then
+		if _ManoTitle:IsTitle(s) then
+            starText="★ "..tostring(stars).." · 새로운 보스 최초 처치 시 성장" starRows=1
+        elseif kind == "equip" and not appearanceOnly then
 			local maxStars = _CashShopManager:GetMaxStars(s)
 			starRows = math.max(1, math.ceil(math.min(stars, maxStars) / 15))
 			if starRows > 7 then starRows = 7 end
@@ -2659,8 +2749,13 @@ script UIEquipInventoryManager extends Logic
                 infoText = infoText .. "\n<color=#FFD477>최대 5성 · 고정 잠재능력 변경 불가</color>\n강화별 외형·추가 효과: 1번 정보창"
             end
             if self:IsStarterEquipment(s) then
-                infoText = infoText .. "\n<color=#FFCC66>캐릭터 생성 전용 특수 장비</color>\n<color=#FF3333>3성까지 강화 성공률 100%</color>\n주문서 사용 불가"
-				if si2 == 6 then infoText = infoText .. "\n<color=#FF7777>최대 3성 · 이후 강화 불가</color>" end
+                infoText = infoText .. "\n<color=#FFCC66>캐릭터 생성 전용 장비</color>"
+                if si2==6 then
+                    infoText=infoText.."\n<color=#6FDBA2>10성까지 성공 100% · 파괴 없음 · 최대 10성</color>"
+                else
+                    infoText=infoText.."\n5성까지 성공 50% · 실패 시 유지 · 파괴 없음"
+                end
+                infoText=infoText.."\n주문서 사용 불가"
 			end
 			if self:HasStarforceProtection(s) then
 				infoText = infoText .. "\n<color=#7EDCFF>프로텍트 주문서 적용</color>"
@@ -2681,7 +2776,8 @@ script UIEquipInventoryManager extends Logic
 		else
 			local d = _CosmeticBoxCatalog:Description(s)
             if appearanceOnly then d = d .. "\n우클릭하여 치장 색상을 변경할 수 있습니다." end
-            if _CosmeticExchange:IsShard(s) then d="일반 코디 분해: 조각 1개\n기본 지급 코디 분해: 조각 0개\n조각 30개: 원하는 코디 교환\n조각 3개: 메소주머니 구매\n인벤토리 상점 이용 / 최대 999개" end
+            if _DestructionFragments:IsShard(s) then d="파괴 직전 별 수만큼 획득 (5성 파괴 → 5개)\n더블클릭: 파괴의 상점 열기 · 강화 재료 교환\n칸당 최대 9,999개 · 잠긴 조각은 구매 시 사용하지 않음" end
+        if _CosmeticExchange:IsShard(s) then d="일반 코디 분해: 조각 1개\n기본 지급 코디 분해: 조각 0개\n조각 30개: 원하는 코디 교환\n조각 3개: 메소주머니 구매\n인벤토리 상점 이용 / 최대 999개" end
             if _CosmeticExchange:IsMesoPouch(s) then d="더블클릭하여 메소를 획득합니다.\n10,000~100,000 메소 무작위\n범위 내 각 금액의 확률은 동일합니다.\n구매: 코디 조각 3개 / 최대 999개" end
             if d=="" then d=self:GetItemBaseDescription(baseName) end
 			if d == "" then d = "설명이 없는 아이템입니다." end
@@ -2700,8 +2796,8 @@ script UIEquipInventoryManager extends Logic
 				d = table.concat(out, "\n")
 			end
 			metaText = d
-            if _CosmeticExchange:IsMesoPouch(s) or _CosmeticExchange:IsShard(s) or _SpecialEquipment:BoxKind(s) ~= "" or _CosmeticBoxCatalog:BoxId(s) ~= "" then
-                metaText = _CosmeticExchange:IsShard(s) and "기타 아이템" or "소비 아이템"
+            if _DestructionFragments:IsShard(s) or _CosmeticExchange:IsMesoPouch(s) or _CosmeticExchange:IsShard(s) or _SpecialEquipment:BoxKind(s) ~= "" or _CosmeticBoxCatalog:BoxId(s) ~= "" then
+                metaText = (_CosmeticExchange:IsShard(s) or _DestructionFragments:IsShard(s)) and "기타 아이템" or "소비 아이템"
                 infoText = d
             end
 		end
@@ -2714,12 +2810,17 @@ script UIEquipInventoryManager extends Logic
 			infoText = "<color=#7EDCFF>우클릭하여 원하는 색상을 선택할 수 있습니다.</color>\n인벤토리 또는 장비창에서 사용할 수 있습니다."
 		end
 
+        if _BossRewards:IsShell(s) then
+            metaText="기타 아이템 · 마노 희귀 전리품"
+            infoText="<color=#FFD166>기타 인벤토리 보유 효과: 공격력 +10</color>\n여러 개 보유해도 효과는 중첩되지 않습니다.\n마노 주간 처치 보상에서 2% 확률로 획득\n드롭률 증가와 레벨 차이에 영향을 받지 않습니다."
+        end
+
         if (kind == "deco" or appearanceOnly) and self:IsStarterCosmetic(s) then
             infoText = infoText .. "\n<color=#FF6A6A>분해 시 코디 조각을 얻을 수 없습니다.</color>\n<color=#FF6A6A>조각 0개 · 분해하면 아이템이 삭제됩니다.</color>"
         end
 
         if kind == "equip" and _EnhancementManager:IsEnhanceableSlot(si2) and not appearanceOnly and not _AvatarTicketManager:IsTicket(s) then
-            local hint = self:IsItemLocked(s) and "잠금 설정된 장비는 강화할 수 없습니다." or "우클릭: 강화창 열고 장비 등록"
+            local hint = self:IsItemLocked(s) and "잠금 설정된 장비는 강화할 수 없습니다." or "우클릭: 장착 또는 강화 선택"
             infoText = infoText .. "\n<color=#7EDCFF>" .. hint .. "</color>"
         end
 
@@ -2784,7 +2885,7 @@ script UIEquipInventoryManager extends Logic
 					spr.ImageRUID = DataRef(self:DisplayItemRUID(s))
 				end
 				spr.PreserveSprite=PreserveSpriteType.None
-				_RecoveryPotionManager:FitIcon(iconEnt,self:DisplayItemRUID(s),66,66)
+				_RecoveryPotionManager:FitIcon(iconEnt,self:ItemIconRUID(s),66,66)
 				spr.Color = Color(1, 1, 1, 1)
 			else
 				spr.ImageRUID = ""
@@ -2912,6 +3013,7 @@ script UIEquipInventoryManager extends Logic
 	-- 스타포스 누적 수치 포함 능력치 텍스트 생성
 	@ExecSpace("ClientOnly")
 	method string BuildTooltipStatsText(string name, integer stars, integer upgrade)
+        if name=="마노 정복자" then return "보스 처치 성장 칭호 · ★"..tostring(stars).."\n올스탯 : +"..tostring(stars).."\n공격력 / 마력 : +"..tostring(math.floor(stars/5)).."\n마노 처치 시 별 +1 · 일반 강화 불가" end
 		if name == "하프 이어링" then
 			local level = math.max(0, math.min(5, stars))
 			return "최대 스타포스 : 5성\n공격력 : +" .. tostring(level * 3)
@@ -3020,7 +3122,7 @@ script UIEquipInventoryManager extends Logic
 		elseif name == "잠재능력 부여주문서" then
 			return "장비에 잠재능력을 부여합니다.\n성공률: 70%\n실패 시 아이템 파괴\n이미 부여된 아이템에 사용 불가"
 		elseif name == "장비강화 주문서" or name == "장비 강화 주문서" then
-			return "성공률: 90%\n스타포스 1~5성 추가 (각 20%)\n최대 50성 / 실패 시 장비 파괴\n프로텍트 적용 시 파괴 방지\n강화창 > 주문서에서 사용"
+			return "성공률: 70% / 파괴: 30%\n스타포스 1~5성 추가 (각 20%)\n최대 50성 / 실패 시 장비 파괴\n프로텍트 적용 시 파괴 방지\n강화창 > 주문서에서 사용"
 		elseif name == "프로텍트 주문서" then
 			return "스타포스 30성 이하 장비 전용\n성공률: 100%\n다음 스타포스 강화 1회 파괴 방지\n스타포스 Fail 시 보호 유지\n성공·파괴 방지 시 보호 소모\n장비강화 주문서는 결과와 무관하게 소모\n중복 적용 불가 / 소모 후 재사용 가능"
 		elseif name == "에디셔널 잠재능력 부여주문서" then
@@ -3038,7 +3140,7 @@ script UIEquipInventoryManager extends Logic
 		elseif name == "장비 상자" or name == "드롭 아이템" then
             return "부위를 선택하여 장비를 획득합니다.\n높은 강화 수치의 장비도 등장합니다.\n0~30성 무작위 / 확률: 1번 정보창\n더블클릭으로 사용 / 최대 999개"
         elseif name == "고급 장비 상자" then
-            return "높은 강화 수치의 장비가 등장하는 상자.\n각 5성 이상 확률이 장비 상자의 10배!\n5성 이상 합계 18.75% / 0~30성 무작위\n상세 확률: 1번 정보창 / 최대 999개"
+            return "높은 강화 수치의 장비가 등장하는 상자.\n각 5성 이상 확률이 장비 상자의 10배!\n5성 이상 합계 " .. string.format("%.4g%%", 100 * _SpecialEquipment:StarProbabilityAtLeast(5, true)) .. " / 0~30성 무작위\n상세 확률: 1번 정보창 / 최대 999개"
         elseif name == "장신구 상자" then
             return "특수 장신구 6종 중 1개를 획득합니다.\n각각 1/6 확률 / 최대 5성 / 고정 잠재능력\n강화 단계별 외형 및 옵션: 1번 정보창\n더블클릭으로 사용 / 최대 999개"
 		elseif string.find(name, "포션") ~= nil then
@@ -3065,7 +3167,7 @@ script UIEquipInventoryManager extends Logic
 			ghost.SpriteGUIRendererComponent.ImageRUID = ruid
 			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
 			local cur = _InputService:GetCursorPosition()
-			ghost.UITransformComponent.anchoredPosition = Vector2(cur.x - 960, cur.y - 540)
+			ghost.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(cur)
 			_UILogic:SetSiblingIndex(ghost.UITransformComponent, 9999)
 			ghost.Enable = true
 		end
@@ -3100,7 +3202,7 @@ script UIEquipInventoryManager extends Logic
 			ghost.SpriteGUIRendererComponent.ImageRUID = ruid
 			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
 			local cur = _InputService:GetCursorPosition()
-			ghost.UITransformComponent.anchoredPosition = Vector2(cur.x - 960, cur.y - 540)
+			ghost.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(cur)
 			_UILogic:SetSiblingIndex(ghost.UITransformComponent, 9999)
 			ghost.Enable = true
 		end
@@ -3132,7 +3234,7 @@ script UIEquipInventoryManager extends Logic
 				ghost.SpriteGUIRendererComponent.ImageRUID = DataRef(self:ItemIconRUID(s))
 			end
 			local cur = _InputService:GetCursorPosition()
-			ghost.UITransformComponent.anchoredPosition = Vector2(cur.x - 960, cur.y - 540)
+			ghost.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(cur)
 			_UILogic:SetSiblingIndex(ghost.UITransformComponent, 9999)
 			ghost.Enable = true
 		end
@@ -3214,7 +3316,7 @@ script UIEquipInventoryManager extends Logic
 			ghost.SpriteGUIRendererComponent.ImageRUID = self:ItemIconRUID(s)
 			ghost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
 			local cur = _InputService:GetCursorPosition()
-			ghost.UITransformComponent.anchoredPosition = Vector2(cur.x - 960, cur.y - 540)
+			ghost.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(cur)
 			_UILogic:SetSiblingIndex(ghost.UITransformComponent, 9999)
 			ghost.Enable = true
 		end
@@ -3322,6 +3424,7 @@ script UIEquipInventoryManager extends Logic
 				log("[PotScroll] 성공! " .. fields[10] .. " / " .. fields[11] .. " / " .. fields[12])
 			else
 				self:SetEquipStr(equipSlot, "")
+                _DestructionFragments:AwardDestroyed(itemStr)
 				log("[PotScroll] 실패! 아이템 파괴됨")
 			end
 			self:RefreshUI()
@@ -3357,6 +3460,7 @@ script UIEquipInventoryManager extends Logic
 				log("[AddPotScroll] 성공! " .. fields[14] .. " / " .. fields[15] .. " / " .. fields[16])
 			else
 				self:SetEquipStr(equipSlot, "")
+                _DestructionFragments:AwardDestroyed(itemStr)
 				log("[AddPotScroll] 실패! 아이템 파괴됨")
 			end
 			self:RefreshUI()
@@ -3399,11 +3503,17 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+        self:ValidateEquipActions()
+		-- Any close path ends inventory lock selection, including ESC and mobile window tools.
+        if self._T.lockMode then
+            local bag=_EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+            if not isvalid(bag) or not bag.EnabledInHierarchy then self:CancelLockMode() end
+        end
 		-- 표시 중인 아이템/장비 설명창의 위치와 호버 유효성을 갱신한다.
 		self:FollowItemTooltip()
 		local cursor = _InputService:GetCursorPosition()
 		local cursorUI = Vector2(cursor.x, cursor.y)
-		local ghostUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local ghostUI = _UILogic:ScreenToUIPosition(cursor)
 		-- 툴팁 1프레임 지연 표시: Enter 후 같은 프레임에 Exit가 오면 취소됨
 		if self._T.pendingShowSlotType ~= "" then
 			local t = self._T.pendingShowSlotType
@@ -3416,7 +3526,7 @@ script UIEquipInventoryManager extends Logic
 					self:HideTooltip()
 				else
 					self.tooltipSource = "equip"
-					local slotNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove", [10]="SlotRing", [14]="SlotEarring", [15]="SlotPendant", [26]="SlotFaceAccessory", [27]="SlotEyeAccessory", [28]="SlotTicket" }
+					local slotNames = { "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove", [10]="SlotRing", [11]="SlotRing2", [12]="SlotRing3", [13]="SlotRing4", [29]="SlotPendant2", [14]="SlotEarring", [15]="SlotPendant", [26]="SlotFaceAccessory", [27]="SlotEyeAccessory", [28]="SlotTicket", [22]="SlotTitle" }
 					self:ShowTooltipFromStr(s, true, "/ui/DefaultGroup/EquipWindow/" .. slotNames[idx], "/ui/DefaultGroup/EquipWindow")
 				end
 			elseif t == "inven" and self._T.hoverInvenSlot == idx then
@@ -3735,7 +3845,7 @@ script UIEquipInventoryManager extends Logic
 		if path == "/ui/DefaultGroup/InvenWindow" then
 			return Vector2(200, 0)
 		elseif path == "/ui/DefaultGroup/EquipWindow" then
-			return Vector2(-230, 0)
+			return Vector2(-330, 0)
 		elseif path == "/ui/DefaultGroup/EnhanceWindow" then
 			return Vector2(550, 0)
 		elseif path == "/ui/DefaultGroup/CharInfoWindow" then
@@ -3750,6 +3860,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void StartWindowDrag(string winPath)
+        if _MobileUIManager:IsMobile() then return end
 		local w = _EntityService:GetEntityByPath(winPath)
 		if not isvalid(w) then return end
 		if self.isDragging then self:CancelDrag() end
@@ -3779,6 +3890,7 @@ script UIEquipInventoryManager extends Logic
 			"/ui/DefaultGroup/CharInfoWindow",
 			"/ui/DefaultGroup/TooltipPanel",
 			"/ui/DefaultGroup/ItemTypeSelectPopup",
+            "/ui/DefaultGroup/ItemActionPopup",
 			"/ui/DefaultGroup/BoxQuantityPopup",
 			"/ui/DefaultGroup/KeySettingWindow",
 			"/ui/DefaultGroup/BattleStatsWindow",
@@ -3808,6 +3920,10 @@ script UIEquipInventoryManager extends Logic
 		local target = _EntityService:GetEntityByPath(winPath)
 		if isvalid(target) then
 			_UILogic:SetSiblingIndex(target.UITransformComponent, maxIdx)
+            if winPath=="/ui/DefaultGroup/TooltipPanel" then
+                local actions=_EntityService:GetEntityByPath("/ui/DefaultGroup/ItemActionPopup")
+                if isvalid(actions) and actions.EnabledInHierarchy then _UILogic:SetSiblingIndex(actions.UITransformComponent,maxIdx+1) end
+            end
 		end
 	end
 
@@ -3952,6 +4068,7 @@ script UIEquipInventoryManager extends Logic
 				log("[PotScroll] 성공! " .. fields[10] .. " / " .. fields[11] .. " / " .. fields[12])
 			else
 				self:SetInvenStr(invenSlot, "")
+                _DestructionFragments:AwardDestroyed(itemStr)
 				log("[PotScroll] 실패! 아이템 파괴됨")
 			end
 			self:RefreshUI()
@@ -3989,6 +4106,7 @@ script UIEquipInventoryManager extends Logic
 				log("[AddPotScroll] 성공! " .. fields[14] .. " / " .. fields[15] .. " / " .. fields[16])
 			else
 				self:SetInvenStr(invenSlot, "")
+                _DestructionFragments:AwardDestroyed(itemStr)
 				log("[AddPotScroll] 실패! 아이템 파괴됨")
 			end
 			self:RefreshUI()
@@ -4037,12 +4155,12 @@ script UIEquipInventoryManager extends Logic
 	@ExecSpace("ClientOnly")
 	method void UpdateTabColors()
 		-- 둥근 그라데이션 스킨 위에 청록색 선택 면과 흰 글자를 유지한다.
-		local tabKeys = {"equip","consume","etc","install","cash","decorate"}
+		local tabKeys = {"equip","consume","etc","decorate","install","cash"}
 		local base = "/ui/DefaultGroup/InvenWindow/InvenTab_"
-		local activeBG     = Color(0.21, 0.74, 0.82, 1.0)
-		local inactiveBG   = Color(0.25, 0.32, 0.37, 1.0)
-		local activeFont   = Color(1.0, 1.0, 1.0, 1.0)
-		local inactiveFont = Color(0.91, 0.93, 0.95, 1.0)
+		local activeBG     = Color(0.63,0.84,0.72,1)
+		local inactiveBG   = Color(0.85,0.765,0.604,1)
+		local activeFont   = Color(0.286,0.224,0.173,1)
+		local inactiveFont = Color(0.286,0.224,0.173,1)
 		for _, tk in ipairs(tabKeys) do
 			local isActive = (tk == self._T.activeTab)
 			local tabBG = _EntityService:GetEntityByPath(base .. tk .. "/TabBG")
@@ -4064,6 +4182,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnTabSwitch(string tabKey)
+        if tabKey == "install" or tabKey == "cash" then return end
 		if self._T.activeTab ~= tabKey then _UIAudio:Play("Tab") end
 		self._T.activeTab = tabKey
 		self._T.scrollRow = 0
@@ -4251,6 +4370,10 @@ script UIEquipInventoryManager extends Logic
         end
         table.sort(entries, function(a, b)
             if (tab == "equip" or tab == "consume" or tab == "decorate") and a.categoryOrder ~= b.categoryOrder then return a.categoryOrder < b.categoryOrder end
+            if tab == "equip" then
+                local aStars, bStars = self:ParseStars(a.value), self:ParseStars(b.value)
+                if aStars ~= bStars then return aStars > bStars end
+            end
 			local comparison = self:CompareItemNames(a.name, b.name)
 			if comparison == 0 then
 				if tab == "equip" and a.powerGain ~= b.powerGain then return a.powerGain > b.powerGain end
@@ -4293,7 +4416,7 @@ script UIEquipInventoryManager extends Logic
 			end
 		end
 		local winEnt = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
-		local tabKeys = {"equip","consume","etc","install","cash","decorate"}
+		local tabKeys = {"equip","consume","etc","decorate","install","cash"}
 		local rowY = {210, 140, 70, 0, -70, -140, -210, -280}
 		local winW = self._T.minimized and 372 or 1200
 		if isvalid(winEnt) then winEnt.UITransformComponent.RectSize = Vector2(winW, 760) end
@@ -4585,7 +4708,7 @@ script UIEquipInventoryManager extends Logic
 		if not isvalid(win) then return end
 		local winPos = win.UITransformComponent.anchoredPosition
 		local cursor = _InputService:GetCursorPosition()
-		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local cursorUI = _UILogic:ScreenToUIPosition(cursor)
 		local localY = cursorUI.y - winPos.y
 		local thumb = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/InvenScrollThumb")
 		if isvalid(thumb) then
@@ -4616,7 +4739,7 @@ script UIEquipInventoryManager extends Logic
 		if not isvalid(win) or not win.Enable then return end
 		local winPos = win.UITransformComponent.anchoredPosition
 		local cursor = _InputService:GetCursorPosition()
-		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local cursorUI = _UILogic:ScreenToUIPosition(cursor)
 		local localX = cursorUI.x - winPos.x
 		local localY = cursorUI.y - winPos.y
 		if localX < -227.5 or localX > 227.5 or localY < -380.0 or localY > 380.0 then return end
@@ -4644,7 +4767,7 @@ script UIEquipInventoryManager extends Logic
 		if not isvalid(win) then return end
 		local winPos = win.UITransformComponent.anchoredPosition
 		local cursor = _InputService:GetCursorPosition()
-		local cursorUI = Vector2(cursor.x - 960, cursor.y - 540)
+		local cursorUI = _UILogic:ScreenToUIPosition(cursor)
 		local localY = cursorUI.y - winPos.y
 		-- 썸 이동 범위: topLimit=192, botLimit=-272, range=464
 		local progress = (192 - localY) / 464
@@ -4748,7 +4871,7 @@ script UIEquipInventoryManager extends Logic
 			popup.Enable = true
 		end
 		log("[Box] 수량 팝업 표시 maxQty=" .. tostring(maxQty))
-		if isvalid(inputEnt) then inputEnt.TextInputComponent:ActivateInputField() end
+		if isvalid(inputEnt) then _MobileNumberPad:Focus(inputEnt) end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -4809,6 +4932,7 @@ script UIEquipInventoryManager extends Logic
         fields[4]=tostring(_SpecialEquipment:RollStars(_UtilLogic:RandomDouble(),false))
         self:SetTabItem("equip",free,table.concat(fields,"|"))
         self:SetTabItem("consume",source,self:WithStackCount(box,self:ParseCount(box)-1))
+        _MapleIslandTutorial:Notify("box_open")
         _CharacterPersistence:MarkDirty("equipment_box")
         self:RefreshUI()
         log("[AutoStarforce] box opened slot="..tostring(equipSlot).." inventory="..tostring(free).." stars="..fields[4])
@@ -4887,6 +5011,7 @@ script UIEquipInventoryManager extends Logic
 			self:SetInvenStr(sourceSlot, table.concat(fields, "|"))
 		end
 		self._T.activeTab = savedTab
+        if added>0 then _MapleIslandTutorial:Notify("box_open") end
         _CharacterPersistence:MarkDirty("equipment_box")
 		self:HideBoxQuantityPopup()
 		self:RefreshUI()
@@ -4900,6 +5025,7 @@ script UIEquipInventoryManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+        for _,link in ipairs(self._T.equipActionLinks or {}) do if isvalid(link.e) then link.e:DisconnectEvent(ButtonClickEvent,link.h) end end
         local lock = _EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/LockButton")
         if isvalid(lock) and self._T.lockListener then lock:DisconnectEvent(ButtonClickEvent,self._T.lockListener) end
 		-- 강화창 닫기 버튼의 세션별 이벤트 연결을 해제한다.
@@ -5936,6 +6062,19 @@ script UIEquipInventoryManager extends Logic
     method boolean IsItemLocked(string item)
         -- Protection travels with the item through sorting, moving and character saves.
         return string.find((item or "").."|", "|locked:1|", 1, true) ~= nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CancelLockMode()
+        -- Closing the bag must not leave the next item click in lock mode.
+        self._T.lockMode=false
+        local button=_EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow/LockButton")
+        if isvalid(button) then
+            button.TextGUIRendererComponent.Text="잠금"
+            button.TextGUIRendererComponent.FontColor=Color.black
+            button.SpriteGUIRendererComponent.Color=Color.white
+        end
+        _UICursorManager._T.lockClickUntil=0
     end
 
     @ExecSpace("ClientOnly")

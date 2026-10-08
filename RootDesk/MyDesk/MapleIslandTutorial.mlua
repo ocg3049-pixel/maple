@@ -1,199 +1,500 @@
 @Logic
 script MapleIslandTutorial extends Logic
-
     property integer step = 11
+    property boolean mesoGranted = false
+    property boolean boxesGranted = false
+    property boolean potionClicked = true
+    property boolean reachedLevel15 = false
+    property integer practiceKills = 0
+    property boolean boxOpened = false
 
     @ExecSpace("ClientOnly")
     method void OnBeginPlay()
-        self._T.links = {}
-        self._T.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
-        for _, name in ipairs({"Skip", "Action", "Back", "Next"}) do
-            local entity = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/" .. name)
-            if isvalid(entity) then
-                local action = name
-                local listener = entity:ConnectEvent(ButtonClickEvent, function() self:OnAction(action) end)
-                table.insert(self._T.links, {entity = entity, listener = listener})
-            end
+        self._T.links={}
+        for _,name in ipairs({"Action","Back","Next","Choice1","Choice2","Choice3","Choice4","Collapse","Collapsed"}) do
+            local entity=_EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/"..name)
+            local action=name
+            if isvalid(entity) then table.insert(self._T.links,{entity=entity,event=ButtonClickEvent,listener=entity:ConnectEvent(ButtonClickEvent,function()
+                if not _UIClickArbiter:CanUseNoticeButton(entity) then return end
+                if action=="Collapse" or action=="Collapsed" then
+                    _GameSystemMenu.tutorialNoticeCollapsed=not _GameSystemMenu.tutorialNoticeCollapsed
+                    _GameSystemMenu:SavePreferences() self:Draw()
+                else self:OnAction(action) end
+            end)}) end
         end
-        local title = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Title")
-        if isvalid(title) then
-            self._T.dragTitle = title
-            self._T.dragListener = title:ConnectEvent(UITouchDragEvent, function(event)
-                local guide = title.Parent
-                local current = _UILogic:ScreenToLocalUIPosition(event.TouchPoint, guide.Parent.UITransformComponent)
-                local previous = _UILogic:ScreenToLocalUIPosition(event.TouchPoint - event.TouchDelta, guide.Parent.UITransformComponent)
-                guide.UITransformComponent.anchoredPosition = guide.UITransformComponent.anchoredPosition + current - previous
-            end)
-        end
-        log("[Tutorial] ready")
+        local goalButton=_EntityService:GetEntityByPath("/ui/MapleTutorial/FirstGoal/Action")
+        table.insert(self._T.links,{entity=goalButton,event=ButtonClickEvent,listener=goalButton:ConnectEvent(ButtonClickEvent,function()
+            if not _UIClickArbiter:CanUseNoticeButton(goalButton) then return end
+            if _CharInfoManager:GetDisplayLevel()>=15 then _BossStageManager:Toggle() else _EnhancementManager:OpenWindowWithTab(1) end
+        end)})
+        local icon=_EntityService:GetEntityByPath("/ui/MapleTutorial/FirstGoal/Collapsed")
+        table.insert(self._T.links,{entity=icon,event=ButtonClickEvent,listener=icon:ConnectEvent(ButtonClickEvent,function()
+            if not _UIClickArbiter:CanUseNoticeButton(icon) then return end
+            _GameSystemMenu.goalNoticeCollapsed=false _GameSystemMenu:SavePreferences() self._T.nextGoalDraw=0 self:UpdateFirstGoal()
+        end)})
+        local fold=_EntityService:GetEntityByPath("/ui/MapleTutorial/FirstGoal/Collapse")
+        table.insert(self._T.links,{entity=fold,event=ButtonClickEvent,listener=fold:ConnectEvent(ButtonClickEvent,function()
+            if not _UIClickArbiter:CanUseNoticeButton(fold) then return end
+            _GameSystemMenu.goalNoticeCollapsed=not _GameSystemMenu.goalNoticeCollapsed
+            _GameSystemMenu:SavePreferences() self._T.nextGoalDraw=0 self:UpdateFirstGoal()
+            log("[NoticeFold] goal="..tostring(_GameSystemMenu.goalNoticeCollapsed))
+        end)})
+        local title=_EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Title")
+        if isvalid(title) then table.insert(self._T.links,{entity=title,event=UITouchDragEvent,listener=title:ConnectEvent(UITouchDragEvent,function(e)
+            local guide=title.Parent
+            local a=_UILogic:ScreenToLocalUIPosition(e.TouchPoint,guide.Parent.UITransformComponent)
+            local b=_UILogic:ScreenToLocalUIPosition(e.TouchPoint-e.TouchDelta,guide.Parent.UITransformComponent)
+            guide.UITransformComponent.anchoredPosition=guide.UITransformComponent.anchoredPosition+a-b
+        end)}) end
+        log("[Tutorial] auto-hunt first guidance ready")
     end
 
     @ExecSpace("ClientOnly")
     method void OnEndPlay()
-        if isvalid(self._T.dragTitle) and self._T.dragListener then self._T.dragTitle:DisconnectEvent(UITouchDragEvent, self._T.dragListener) end
-        if self._T.keyHandler then _InputService:DisconnectEvent(KeyDownEvent, self._T.keyHandler) end
-        for _, link in ipairs(self._T.links or {}) do
-            if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent, link.listener) end
-        end
+        for _,link in ipairs(self._T.links or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(link.event,link.listener) end end
     end
 
     @ExecSpace("ClientOnly")
     method void Restore(string raw)
-        local saved = tonumber(string.match("\n" .. raw, "\nQ\t(%d+)"))
-        local version = tonumber(string.match("\n" .. raw, "\nQ\t%d+\t(%d+)")) or 1
-        if saved ~= nil and version < 2 and saved >= 7 then saved = saved + 1 end
-        self.step = raw == "" and 1 or math.max(1, math.min(11, math.floor(saved or 11)))
-        self._T.leftPressed = false
-        self._T.rightPressed = false
-        self._T.viewStep = self.step
-        self._T.startX = nil
-        self._T.jumpY = nil
-        self._T.drawnStep = nil
-        self._T.practiceResult = ""
-        log("[Tutorial] restore step=" .. tostring(self.step))
+        self._T.restoring=true
+        local saved=tonumber(string.match("\n"..raw,"\nQ\t(%d+)")) or (raw=="" and 4 or 11)
+        local version=tonumber(string.match("\n"..raw,"\nQ\t%d+\t(%d+)")) or 0
+        if version<6 and saved==5 then saved=4 end
+        if version<7 and saved==7 then saved=6 end
+        self.step=math.max(4,math.min(11,math.floor(saved)))
+        self.mesoGranted=string.match("\n"..raw,"\nQ\t%d+\t%d+\t1")~=nil
+        self.boxesGranted=string.match("\n"..raw,"\nQ\t%d+\t%d+\t%d+\t1")~=nil
+        self.potionClicked=true
+        local kills,opened=string.match("\n"..raw,"\nQ\t%d+\t%d+\t%d+\t%d+\t%d+\t%d+\t(%d+)\t(%d+)")
+        self.practiceKills=math.min(3,tonumber(kills) or 0) self.boxOpened=opened=="1"
+        self._T.lastKills=nil self._T.beforePower=nil self._T.beforeLevel=nil
+        self.reachedLevel15=string.match("\n"..raw,"\nQ\t%d+\t%d+\t%d+\t%d+\t%d+\t1")~=nil or (tonumber(string.match("\n"..raw,"\nLV\t(%d+)")) or 0)>=15
+        self._T.viewStep=self.step self._T.drawnStep=nil self._T.effectPhase=0
+        self._T.restoring=false
+        log("[Tutorial] restore step="..tostring(self.step).." reached15="..tostring(self.reachedLevel15))
     end
 
     @ExecSpace("ClientOnly")
     method boolean Active()
-        return self.step < 11 and _LoginFlow.phase == "ingame"
+        return not self._T.restoring and self.step<11 and _LoginFlow.phase=="ingame"
     end
 
     @ExecSpace("ClientOnly")
     method void Advance(integer expected)
-        if not self:Active() or self.step ~= expected then return end
-        local following = (self._T.viewStep or self.step) == self.step
-        self.step = self.step + 1
-        _GameAudio:PlayCue("Quest")
-        if following then self._T.viewStep = self.step end
-        self._T.drawnStep = nil
-        _CharacterPersistence:MarkDirty("tutorial")
-        _CharacterPersistence:FlushToServer()
-        log("[Tutorial] completed=" .. tostring(expected) .. " next=" .. tostring(self.step))
-        if self.step == 11 then _UIToast:ShowMessage("튜토리얼 완료! 새로운 모험을 시작하세요.") end
+        if not self:Active() or self.step~=expected then return end
+        self.step=self.step+1 self._T.viewStep=self.step self._T.drawnStep=nil
+        _GameAudio:PlayCue("Quest") _CharacterPersistence:MarkDirty("tutorial") _CharacterPersistence:FlushToServer()
+        log("[Tutorial] completed="..tostring(expected).." next="..tostring(self.step))
     end
 
     @ExecSpace("ClientOnly")
     method void Notify(string action)
-        if action == "snail" then self:Advance(5)
-        elseif action == "enhance" then self:Advance(6)
-        elseif action == "autohunt" then self:Advance(8)
-        elseif action == "worldmap" then self:Advance(9) end
-    end
-
-    @ExecSpace("ClientOnly")
-    method void OnKey(KeyDownEvent event)
-        if not self:Active() or _KeySettingManager:IsCapturingKey() then return end
-        local action = _KeySettingManager:GetFuncForKeyEnum(event.key)
-        if self.step == 1 then
-            if event.key == KeyboardKey.LeftArrow then self._T.leftPressed = true end
-            if event.key == KeyboardKey.RightArrow then self._T.rightPressed = true end
-            if self._T.leftPressed and self._T.rightPressed then self:Advance(1) end
-        elseif self.step == 2 and action == "jump" then
-            local p = _UserService.LocalPlayer
-            if isvalid(p) then self._T.jumpY = p.TransformComponent.WorldPosition.y end
-        elseif self.step == 3 and action == "attack" then self:Advance(3) end
+        if action=="box_open" and self:Active() then
+            self.boxOpened=true _CharacterPersistence:MarkDirty("tutorial_box_open") self._T.drawnStep=nil
+        elseif action=="enhance" then self:CheckGrowth()
+        elseif action=="autohunt" then self:Advance(4)
+        elseif action=="worldmap" then self:Advance(9) end
     end
 
     @ExecSpace("ClientOnly")
     method void OnAction(string action)
         if not self:Active() then return end
-        if action == "Back" or action == "Next" then
-            local direction = action == "Back" and -1 or 1
-            self._T.viewStep = math.max(1, math.min(self.step, (self._T.viewStep or self.step) + direction))
-            self._T.drawnStep = nil
-            log("[Tutorial] review=" .. tostring(self._T.viewStep) .. " progress=" .. tostring(self.step))
-            return
+        if action=="Back" or action=="Next" then
+            self._T.viewStep=math.max(4,math.min(self.step,(self._T.viewStep or self.step)+(action=="Back" and -1 or 1))) self._T.drawnStep=nil return
         end
-        if action == "Skip" then
-            self.step = 9
-            self._T.viewStep = 9
-            self._T.drawnStep = nil
-            _CharacterPersistence:MarkDirty("tutorial_skip")
-            _CharacterPersistence:FlushToServer()
-            return
-        end
-        if (self._T.viewStep or self.step) ~= self.step then return end
-        if self.step == 6 or self.step == 7 then
-            -- 성장 안내를 읽고 확인하면 완료한다.
-            log("[Tutorial] enhancement guide acknowledged")
-            self:Advance(self.step)
-        elseif self.step >= 9 then
-            _WorldMapManager:ShowMapPage("victoria")
+        if (self._T.viewStep or self.step)~=self.step then return end
+        if self.step==7 and action=="Action" then
+            if self:GrantBoxes() then self:Advance(7) end
+        elseif self.step==8 and action=="Action" then
+            local inv=_UIEquipInventoryManager
+            local win=_EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+            if not win.Enable then inv:ToggleWin(win.Path) end
+            inv:OnTabSwitch(self.boxOpened and "equip" or "consume")
         end
     end
 
-
     @ExecSpace("ClientOnly")
     method void CompleteAfterLeaving(string mapName)
-        -- 월드맵으로 앞 단계를 건너뛰어도 실제 수련장 이탈을 확인한 뒤 한 번만 완료·저장한다.
-        local destination = _ChannelManager:BaseName(mapName)
-        if not self:Active() or destination == "" or destination == "login" or destination == "001010000" then return end
-        self.step = 11
-        self._T.viewStep = 11
-        self._T.drawnStep = nil
-        self._T.jumpY = nil
-        _GameAudio:PlayCue("Quest")
-        _CharacterPersistence:MarkDirty("tutorial")
-        _CharacterPersistence:FlushToServer()
-        _UIToast:ShowMessage("튜토리얼 완료! 새로운 모험을 시작하세요.")
-        log("[Tutorial] completed on departure map=" .. destination)
+        local destination=_ChannelManager:BaseName(mapName)
+        if not self:Active() or self.step<9 or destination=="" or destination=="login" or destination=="001010000" then return end
+        self.step=11 self._T.viewStep=11 self._T.drawnStep=nil
+        _CharacterPersistence:MarkDirty("tutorial") _CharacterPersistence:FlushToServer()
+        _UIToast:ShowMessage("튜토리얼 완료! 보상 버튼에서 20,000 메소, 장비 상자 5개, 하얀 포션·맑은 물 각 1개를 받으세요.")
+        log("[Tutorial] completed on departure map="..destination)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean HasTaskWindow()
+        if _RewardCenter:BlocksInput() or _SkillManager:IsAmountOpen() or _GameSystemMenu.opened then return true end
+        if _MobileUIManager:IsMobile() and (_MobileUIManager:CurrentWindow()~="" or _MobileUIManager:UI("MenuPanel").Enable) then return true end
+        for _,path in ipairs(_UIClickArbiter:GetWindowPaths()) do
+            local entity=_EntityService:GetEntityByPath(path)
+            if path~="/ui/DefaultGroup/Board" and isvalid(entity) and entity.EnabledInHierarchy then return true end
+        end
+        local map=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        return isvalid(map) and map.Enable
     end
 
     @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
-        -- 도착 맵이 실제로 바뀐 뒤 완료 처리하므로 이동 실패·취소에는 진행을 유지한다.
-        local arrived = _UserService.LocalPlayer
-        if isvalid(arrived) and isvalid(arrived.CurrentMap) then self:CompleteAfterLeaving(arrived.CurrentMap.Name) end
-        local guide = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide")
-        if not isvalid(guide) then return end
-        local active = self:Active()
-        local worldMap = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
-        guide.Enable = active and not (isvalid(worldMap) and worldMap.Enable)
+        if self._T.restoring then return end
+        local ingame=_LoginFlow.phase=="ingame"
+        if ingame and not self.reachedLevel15 and _UtilLogic.ElapsedSeconds>=(self._T.nextLevelHintCheck or 0) then
+            self._T.nextLevelHintCheck=_UtilLogic.ElapsedSeconds+0.5
+            if _CharInfoManager:GetDisplayLevel()>=15 then
+            self.reachedLevel15=true _CharacterPersistence:MarkDirty("tutorial_level15") _CharacterPersistence:FlushToServer()
+            log("[PotionHint] first level15 reached; guidance retired")
+            end
+        end
+        local player=_UserService.LocalPlayer
+        if isvalid(player) and isvalid(player.CurrentMap) then self:CompleteAfterLeaving(player.CurrentMap.Name) end
+        local active=self:Active()
+        local guide=_EntityService:GetEntityByPath("/ui/MapleTutorial/Guide")
+        if isvalid(guide) and _UtilLogic.ElapsedSeconds>=(self._T.nextGuideCheck or 0) then
+            self._T.nextGuideCheck=_UtilLogic.ElapsedSeconds+0.1
+            self._T.taskWindowOpen=self:HasTaskWindow()
+            guide.Enable=active
+        end
+        local hint=_EntityService:GetEntityByPath("/ui/TutorialHighlight/MobileHint") if isvalid(hint) then hint.Enable=false end
+        self:UpdateGuidance(active,delta)
+        self:UpdateFirstGoal()
         if not active then return end
-        local player = _UserService.LocalPlayer
-        if not isvalid(player) or not isvalid(player.CurrentMap) then return end
-        local pos = player.TransformComponent.WorldPosition
-        if self.step == 2 and self._T.jumpY ~= nil and pos.y > self._T.jumpY + 0.2 then
-            self:Advance(2)
-        elseif self.step == 4 then
-            for key, slot in pairs(_SkillManager:ExportHotkeys()) do
-                if slot.name == "달팽이 세마리" and _SkillManager:GetBarPosForKey(key) ~= "" then
-                    self._T.snailKey = key
-                    self:Advance(4)
-                    break
+        if self.step==5 then
+            local bindings=_MobileUIManager:IsMobile() and _MobileUIManager:ExportMobileSkills() or _SkillManager:ExportHotkeys()
+            for key,slot in pairs(bindings) do if slot.name=="달팽이 세마리" and (_MobileUIManager:IsMobile() or _SkillManager:GetBarPosForKey(key)~="") then self:Advance(5) break end end
+        elseif self.step==4 and _AutoHuntManager.autoOn then self:Advance(4)
+        elseif self.step==6 and not self.mesoGranted then
+            self.mesoGranted=true _UIEquipInventoryManager:AddMeso(900)
+            _CharacterPersistence:MarkDirty("tutorial_meso") _CharacterPersistence:FlushToServer()
+            log("[Tutorial] practice meso granted=900")
+        end
+        if self.step==6 then self:CheckGrowth() end
+        if self.step==8 then
+            local inv=_UIEquipInventoryManager
+            for _,slot in ipairs({3,5,7,8,9}) do
+                local item=inv:GetEquip(slot)
+                if item~="" and not inv:IsStarterEquipment(item) then
+                    self.boxOpened=true self:Advance(8) break
                 end
             end
         end
-        if self._T.drawnStep ~= (self._T.viewStep or self.step) then self:Draw() end
+        if self._T.drawnStep~=(self._T.viewStep or self.step) or self._T.drawnMobile~=_MobileUIManager:IsMobile() then self:Draw() end
     end
 
     @ExecSpace("ClientOnly")
     method void Draw()
-        local shown = math.min(self._T.viewStep or self.step, 10)
-        self._T.drawnStep = shown
-        local key = function(id) return _KeySettingManager:GetKeyForFunc(id) end
-        local texts = {
-            "<color=#CE3030>왼쪽과 오른쪽 방향키를 각각 한 번씩</color> 눌러보세요.",
-            "[" .. key("jump") .. "] 키로 점프해 보세요.\n아래 방향키와 함께 누르면 아래로 내려갑니다.",
-            "[" .. key("attack") .. "] 키로 기본 공격을 해보세요.",
-            "[" .. key("skill") .. "] 스킬창의 기본(0) 탭을 여세요.\n달팽이 세마리를 화면 아래 퀵슬롯으로 드래그하세요.",
-            "퀵슬롯에 표시된 키 [" .. tostring(self._T.snailKey or "등록한 키") .. "] 를 눌러\n달팽이 세마리를 사용해보세요.",
-            "[" .. key("enhance") .. "] 키로 강화창을 열 수 있습니다.\n장비를 올리고 스타포스를 강화하세요.\n<color=#CE3030>강화에는 메소가 들며 실패할 수 있습니다.</color>\n처음 받은 장비는 3성까지 반드시 성공합니다.\n읽었다면 확인을 눌러주세요.",
-            "<color=#CE3030>레벨은 장비의 전투력으로 결정됩니다.</color>\n착용한 아이템을 강화하면 전투력이 오르고,\n<color=#CE3030>전투력 기준을 넘으면 레벨도 올라갑니다.</color>\n몬스터 사냥으로 메소를 모아 장비를 강화하세요.\n읽었다면 확인을 눌러주세요.",
-            "[" .. key("autohunt") .. "] 키로 자동사냥을 켜보세요.\n살아 있는 몬스터가 있어야 시작됩니다.\n같은 키를 다시 누르면 중지합니다.",
-            "[" .. key("worldmap") .. "] 키 또는 아래 버튼으로 월드맵을 여세요.\n내 레벨에 맞는 몬스터가 있는 지역을 찾아보세요.",
-            "노란점에 마우스를 올려 몬스터와 레벨을 확인하세요.\n내 레벨에 맞는 몬스터가 있는 지역을 고른 뒤\n노란점이나 오른쪽 목록을 두 번 클릭해 이동하세요.\n수련장을 떠나면 튜토리얼이 완료됩니다."
+        local shown=math.min(self._T.viewStep or self.step,10) self._T.drawnStep=shown
+        local key=function(id) return _KeySettingManager:GetKeyForFunc(id) end
+        local mobile=_MobileUIManager:IsMobile()
+        local texts={
+            [5]=(mobile and "스킬창에서 달팽이 세마리를 선택하세요.\n등록 버튼 → 오른쪽 퀵슬롯을 누르세요." or "["..key("skill").."] 스킬창을 여세요.\n달팽이 세마리를 아래 퀵슬롯에\n드래그해 등록하세요.").."\n자동사냥은 퀵슬롯에 등록된\n스킬만 사용합니다.",
+            [4]=mobile and "오른쪽 위 자동사냥 버튼을\n누르면 사냥을 시작합니다.\n다시 누르면 중지됩니다." or "["..key("autohunt").."] 키 또는 오른쪽 위 자동사냥 버튼을 누르세요.\n다시 누르면 자동사냥이 중지됩니다.",
+            [6]="첫 목표: 무기 2성 → Lv.5!\n연습비 900메소를 지급했습니다.\n"..(mobile and "메뉴 → 장비 → 무기 선택 → [장비 강화]" or "["..key("equip").."] 장비창 → 무기 선택 → [장비 강화]").."\n무기를 2번 강화하세요.\n시작 무기: 10성까지 100% · 파괴 없음",
+            [7]="첫 성장 성공! Lv."..tostring(self._T.beforeLevel or 4).." → "..tostring(_CharInfoManager:GetDisplayLevel()).."\n전투력 "..tostring(self._T.beforePower or 9).." → "..tostring(math.floor(_CharInfoManager:CalcCombatPower())).."\n강화로 레벨과 전투력이 올랐습니다.\n연습 장비 상자 5개를 받아보세요.\n직업 스킬은 Lv.10에 배울 수 있습니다!",
+            [8]=self.boxOpened and ("아이템창의 장비 탭을 여세요.\n새로 얻은 방어구를 "..(mobile and "선택 후 장착하세요." or "더블클릭해 장착하세요.").."\n남은 상자는 비어 있는 부위를 채우세요.\n다음 목표는 Lv.10 직업 스킬입니다.") or ("상자를 직접 열어 방어구를 얻어봅시다!\n아이템창 → 소비 → 장비 상자\n"..(mobile and "상자를 선택한 뒤 사용을 누르세요." or "상자를 더블클릭하세요.").."\n모자·옷·장갑·신발 중 하나를 골라\n1개를 개봉하고 장착하세요."),
+            [9]=mobile and "오른쪽 위 맵 버튼을 누르세요." or "["..key("worldmap").."] 월드맵을 여세요.\n추천 사냥터 이동으로 적당한 사냥터를 찾을 수 있습니다.",
+            [10]="월드맵의 추천 사냥터 이동을 누르세요.\n수련장을 떠나면 튜토리얼 완료!\n보상창: 20,000 메소 + 추가 상자 5개\n하얀 포션·맑은 물 각 1개"
         }
-        local title = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Title")
-        local body = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Body")
-        local action = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Action")
-        local skip = _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Skip")
-        title.TextGUIRendererComponent.Text = "메이플 아일랜드 · " .. tostring(shown) .. " / 10"
-        body.TextGUIRendererComponent.Text = texts[shown] or "모험을 시작하세요!"
-        action.Enable = shown == self.step and (self.step == 6 or self.step == 7 or self.step == 9 or self.step == 10)
-        _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Back").Enable = shown > 1
-        _EntityService:GetEntityByPath("/ui/MapleTutorial/Guide/Next").Enable = shown < self.step
-        action.TextGUIRendererComponent.Text = (self.step == 6 or self.step == 7) and "확인" or "월드맵 열기"
-        skip.Enable = self.step < 9
+        if mobile then
+            texts[5]="스킬 → 달팽이 세마리 선택\n[퀵슬롯에 등록] → 오른쪽 슬롯 터치\n자동사냥은 퀵슬롯에 등록된\n스킬만 사용합니다."
+            texts[6]="메뉴 → 장비 → 무기 선택\n[장비 강화]를 눌러 2성까지 강화!\n연습비 900메소가 지급되었습니다.\n강화하면 레벨과 전투력이 오릅니다."
+            texts[7]="첫 성장 성공! Lv."..tostring(self._T.beforeLevel or 4).." → "..tostring(_CharInfoManager:GetDisplayLevel()).."\n전투력 "..tostring(self._T.beforePower or 9).." → "..tostring(math.floor(_CharInfoManager:CalcCombatPower())).."\n아래에서 연습 상자 5개를 받으세요.\n직업 스킬은 Lv.10에 배웁니다."
+            texts[8]=self.boxOpened and "아이템창의 장비 탭을 여세요.\n새 방어구를 선택 → [사용 / 장착]\n남은 상자로 빈 부위도 채워보세요.\n다음 목표는 Lv.10 직업 스킬입니다." or "아이템 → 소비 → 장비 상자 선택\n[사용 / 장착]을 누르세요.\n방어구 종류를 골라 1개를 개봉!\n장비 탭에서 새 방어구를 선택한 뒤\n[사용 / 장착]으로 장착하세요."
+        end
+        local base="/ui/MapleTutorial/Guide/"
+        local folded=_GameSystemMenu.tutorialNoticeCollapsed
+        local guide=_EntityService:GetEntityByPath("/ui/MapleTutorial/Guide")
+        self:PlaceMobileNotice(guide)
+        guide.UITransformComponent.RectSize=folded and Vector2(88,88) or Vector2(450,350)
+        guide.SpriteGUIRendererComponent.Enable=not folded
+        guide:GetChildByName("Title").Enable=not folded
+        guide:GetChildByName("Collapse").Enable=not folded
+        guide:GetChildByName("Collapsed").Enable=folded
+        guide:GetChildByName("Title").UITransformComponent.anchoredPosition=Vector2(-22,folded and 0 or 151)
+        guide:GetChildByName("Collapse").TextGUIRendererComponent.Text=folded and "+" or "−"
+        _EntityService:GetEntityByPath(base.."Title").TextGUIRendererComponent.Text="메이플 아일랜드 · "..tostring(shown-3).." / 7"
+        local body=_EntityService:GetEntityByPath(base.."Body")
+        body.Enable=not folded
+        body.TextGUIRendererComponent.Text=texts[shown] or "모험을 시작하세요!"
+        body.UITransformComponent.anchoredPosition=Vector2(0,mobile and 0 or 30)
+        body.UITransformComponent.RectSize=Vector2(390,mobile and 164 or 190)
+        body.TextGUIRendererComponent.BestFit=not mobile
+        body.TextGUIRendererComponent.FontSize=mobile and 22 or 20
+        for _,name in ipairs({"Back","Action","Next"}) do
+            local tr=guide:GetChildByName(name).UITransformComponent
+            tr.anchoredPosition=Vector2(tr.anchoredPosition.x,mobile and -127 or -121)
+        end
+        guide:GetChildByName("Collapse").UITransformComponent.RectSize=mobile and Vector2(88,88) or Vector2(44,44)
+        guide:GetChildByName("Title").UITransformComponent.RectSize=Vector2(mobile and 300 or 370,34)
+        guide:GetChildByName("Title").UITransformComponent.anchoredPosition=Vector2(mobile and -42 or -22,151)
+        self._T.drawnMobile=mobile
+        _EntityService:GetEntityByPath(base.."Action").Enable=not folded and shown==self.step and (shown==7 or shown==8)
+        _EntityService:GetEntityByPath(base.."Action").TextGUIRendererComponent.Text=shown==8 and "아이템창 열기" or "연습 상자 받기"
+        _EntityService:GetEntityByPath(base.."Answer").Enable=false
+        _EntityService:GetEntityByPath(base.."Back").Enable=not folded and shown>4
+        _EntityService:GetEntityByPath(base.."Next").Enable=not folded and shown<self.step
+        for i=1,4 do _EntityService:GetEntityByPath(base.."Choice"..tostring(i)).Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Export()
+        return "Q\t"..tostring(self.step).."\t7\t"..(self.mesoGranted and "1" or "0").."\t"..(self.boxesGranted and "1" or "0").."\t1\t"..(self.reachedLevel15 and "1" or "0").."\t"..tostring(self.practiceKills).."\t"..(self.boxOpened and "1" or "0")
+    end
+
+    @ExecSpace("ClientOnly")
+
+    method boolean GrantBoxes()
+        -- Plan the entire grant before changing slots; a full bag never loses a reward.
+        if self.boxesGranted then return true end
+        local inv = _UIEquipInventoryManager
+        local gift = "장비 상자|47841bc4d3554cf0a68bd05f19de1f18|0|0|0|0|1"
+        local plan, left = {}, 5
+        for i=1,128 do plan[i] = inv:GetTabItem("consume",i) end
+        for i=1,128 do
+            local item=plan[i]
+            if inv:ConsumableStackKey(item)==inv:ConsumableStackKey(gift) and not inv:IsItemLocked(item) then
+                local count=inv:ParseCount(item)
+                local add=math.min(left,math.max(0,999-count))
+                if add>0 then plan[i]=inv:WithStackCount(item,count+add) left=left-add end
+            end
+        end
+        if left>0 then
+            for i=1,128 do if plan[i]=="" then plan[i]=inv:WithStackCount(gift,left) left=0 break end end
+        end
+        if left>0 then _UIToast:ShowMessage("소비 인벤토리에 빈 공간이 필요합니다.") return false end
+        for i=1,128 do inv:SetTabItem("consume",i,plan[i]) end
+        self.boxesGranted=true
+        _CharacterPersistence:MarkDirty("tutorial_boxes")
+        inv:RefreshUI()
+        log("[Tutorial] equipment boxes granted=5")
+        return true
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void CheckGrowth()
+        -- Advance only after the guaranteed two-star upgrade produces the first level.
+        if not self:Active() or self.step~=6 then return end
+        self._T.beforePower=self._T.beforePower or math.floor(_CharInfoManager:CalcCombatPower())
+        self._T.beforeLevel=self._T.beforeLevel or _CharInfoManager:GetDisplayLevel()
+        local inv=_UIEquipInventoryManager
+        local weapon=inv:GetEquip(6)
+        if weapon~="" and inv:ParseStars(weapon)>=2 and _CharInfoManager:GetDisplayLevel()>=5 then
+            self._T.lastKills=nil self:Advance(6)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsTyping()
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnMobileAction(string action)
+        -- Movement and jump practice are no longer tutorial stages.
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity GuidanceTarget()
+        local mobile=_MobileUIManager:IsMobile() local ui=_MobileUIManager
+        if self.step==4 then
+            return mobile and ui:UI("Auto") or _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnAutoHunt")
+        elseif self.step==5 then
+            local book=mobile and ui:UI("SkillBook") or _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+            if isvalid(book) and book.EnabledInHierarchy then
+                if not mobile then return nil end
+                if _SkillManager:IsClickMode() then return ui:UI(ui:ButtonPath(1)) end
+                if _SkillManager._T.activeSkillTab~="0" then return ui:UI("SkillBook/Tab0") end
+                local selected=_SkillManager:GetTabSkills("0")[ui._T.bookIndex or 1]
+                if selected and selected.name=="달팽이 세마리" then return ui:UI("SkillBook/Register") end
+                for _,cell in pairs(ui._T.listCells or {}) do
+                    local skill=cell.kind=="skill" and _SkillManager:GetTabSkills("0")[cell.index+1] or nil
+                    if skill and skill.name=="달팽이 세마리" and isvalid(cell.entity) and cell.entity.EnabledInHierarchy then return cell.entity end
+                end
+                return nil
+            end
+            return mobile and ui:UI("Skill") or _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnSkill")
+        elseif self.step==6 then
+            if _EnhancementManager:IsWindowOpen() and _EnhancementManager.enhanceTargetEquipSlot==6 then
+                return _EntityService:GetEntityByPath(_EnhancementManager.pathContent.."/StarforceContent/EnhanceBtn")
+            end
+            local equipment=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow")
+            if isvalid(equipment) and equipment.EnabledInHierarchy then
+                local actions=equipment:GetChildByName("Actions")
+                if isvalid(actions) and actions.EnabledInHierarchy and _UIEquipInventoryManager._T.equipActionSlot==6 then return actions:GetChildByName("Enhance") end
+                return equipment:GetChildByName("SlotWeapon")
+            end
+            return mobile and ui:UI(ui:UI("MenuPanel").Enable and "MenuPanel/Equip" or "Menu") or _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnEquip")
+        elseif self.step==8 then
+            local inv=_UIEquipInventoryManager
+            local bag=_EntityService:GetEntityByPath("/ui/DefaultGroup/InvenWindow")
+            if not isvalid(bag) or not bag.EnabledInHierarchy then
+                return mobile and ui:UI("Inventory") or _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnInven")
+            end
+            for _,name in ipairs({"ItemTypeSelectPopup","BoxQuantityPopup","ItemActionPopup"}) do
+                local popup=_EntityService:GetEntityByPath("/ui/DefaultGroup/"..name)
+                if isvalid(popup) and popup.EnabledInHierarchy then return nil end
+            end
+            local tab=self.boxOpened and "equip" or "consume"
+            local selected=ui._T.selectedItem
+            if mobile and selected and selected.source=="inven" and selected.tab==tab and ui:UI("ItemActions").EnabledInHierarchy then
+                local correct=tab=="consume" and inv:ParseName(selected.item)=="장비 상자" or tab=="equip" and inv:ParseSlotIdx(selected.item)>0 and not inv:IsStarterEquipment(selected.item)
+                if correct then return ui:UI("ItemActions/Use") end
+            end
+            if inv._T.activeTab~=tab then return bag:GetChildByName("InvenTab_"..tab) end
+            local wanted=0
+            for i=1,128 do
+                local item=inv:GetTabItem(tab,i)
+                if item~="" and not inv:IsItemLocked(item) then
+                    if tab=="consume" and inv:ParseName(item)=="장비 상자" then wanted=i break end
+                    if tab=="equip" and inv:ParseSlotIdx(item)>0 and not inv:IsStarterEquipment(item) then wanted=i break end
+                end
+            end
+            if wanted==0 then return nil end
+            local visible=inv._T.minimized and 32 or 128
+            for v=1,visible do if inv:VisualToDataIdx(v)==wanted then return bag:GetChildByName("InvenSlot"..tostring(v)) end end
+            if inv._T.minimized then
+                inv._T.scrollRow=math.floor((wanted-1)/4) inv:UpdateInvenViewport()
+                for v=1,32 do if inv:VisualToDataIdx(v)==wanted then return bag:GetChildByName("InvenSlot"..tostring(v)) end end
+            end
+            return nil
+        elseif self.step>=9 then
+            local map=ui:UI("WorldMap")
+            if isvalid(map) and map.Enable then return ui:UI("WorldMap/Hunt") end
+            return mobile and ui:UI("Map") or _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnMap")
+        end
+        return nil
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void UpdateFirstGoal()
+        -- Keep the first boss objective visible after training until its first confirmed clear.
+        local now=_UtilLogic.ElapsedSeconds
+        if now<(self._T.nextGoalDraw or 0) then return end
+        self._T.nextGoalDraw=now+0.3
+        local panel=_EntityService:GetEntityByPath("/ui/MapleTutorial/FirstGoal")
+        if not isvalid(panel) then return end
+        panel.Enable=_LoginFlow:IsInGame() and self.step>=11 and _ManoTitle.kills==0 and not _BossStageManager:HidesFieldNotices()
+        if not panel.Enable then return end
+        self:PlaceMobileNotice(panel)
+        local folded=_GameSystemMenu.goalNoticeCollapsed
+        local mobile=_MobileUIManager:IsMobile()
+        panel.UITransformComponent.RectSize=folded and Vector2(88,88) or Vector2(450,mobile and 280 or 190)
+        panel:GetChildByName("Collapse").UITransformComponent.RectSize=mobile and Vector2(88,88) or Vector2(44,44)
+        panel:GetChildByName("Title").UITransformComponent.RectSize=Vector2(mobile and 300 or 378,30)
+        panel:GetChildByName("Body").UITransformComponent.anchoredPosition=Vector2(0,mobile and 12 or 4)
+        panel:GetChildByName("Action").UITransformComponent.RectSize=Vector2(220,mobile and 88 or 46)
+        panel:GetChildByName("Action").UITransformComponent.anchoredPosition=Vector2(0,mobile and -82 or -64)
+        panel.SpriteGUIRendererComponent.Enable=not folded
+        panel:GetChildByName("Title").Enable=not folded
+        panel:GetChildByName("Collapse").Enable=not folded
+        panel:GetChildByName("Collapsed").Enable=folded
+        panel:GetChildByName("Title").UITransformComponent.anchoredPosition=Vector2(mobile and -42 or -22,folded and 0 or (mobile and 112 or 65))
+        panel:GetChildByName("Body").Enable=not folded panel:GetChildByName("Action").Enable=not folded
+        panel:GetChildByName("Collapse").TextGUIRendererComponent.Text=folded and "+" or "−"
+        local level=_CharInfoManager:GetDisplayLevel()
+        local ready=level>=15
+        panel:GetChildByName("Title").TextGUIRendererComponent.Text=ready and "첫 보스 목표 · 마노 처치" or "다음 목표 · Lv.15 → 마노"
+        panel:GetChildByName("Body").TextGUIRendererComponent.Text=ready and "보스 창에서 마노에게 도전하세요.\n첫 처치 칭호와 주간 보상 획득!" or ("현재 Lv."..tostring(level).." / 15 · 강화하며 사냥!\n지급 무기 10성 + 방어구 장착·강화")
+        panel:GetChildByName("Action").TextGUIRendererComponent.Text=ready and "마노 도전" or "장비 강화"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlaceMobileNotice(Entity panel)
+        -- Keep the expanded tutorial/goal clear of the joystick and SP notice; preserve dragged positions per mode.
+        self._T.noticeLayouts=self._T.noticeLayouts or {}
+        local mobile=_MobileUIManager:IsMobile()
+        local saved=self._T.noticeLayouts[panel.Path]
+        if saved==nil then
+            saved={mobile=false,pc=panel.UITransformComponent.anchoredPosition,touch=Vector2(380,-340)}
+            self._T.noticeLayouts[panel.Path]=saved
+        end
+        if saved.mobile==mobile then return end
+        if mobile then saved.pc=panel.UITransformComponent.anchoredPosition
+        else saved.touch=panel.UITransformComponent.anchoredPosition end
+        panel.UITransformComponent.anchoredPosition=mobile and saved.touch or saved.pc
+        saved.mobile=mobile
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector2 GuidanceCenter(Entity entity)
+        local rect=entity.UITransformComponent
+        local center=Vector2((0.5-rect.Pivot.x)*rect.RectSize.x,(0.5-rect.Pivot.y)*rect.RectSize.y)
+        local world=_UILogic:LocalUIToWorldPosition(center,rect)
+        return _UILogic:ScreenToLocalUIPosition(_UILogic:WorldToScreenPosition(world),_EntityService:GetEntityByPath("/ui/TutorialHighlight").UITransformComponent)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateGuidance(boolean active, number delta)
+        local base="/ui/TutorialHighlight/"
+        local frame=_EntityService:GetEntityByPath(base.."Highlight")
+        local keyGuard=_EntityService:GetEntityByPath(base.."KeyHint")
+        if not isvalid(frame) or not isvalid(keyGuard) then return end
+        local target=active and self:GuidanceTarget() or nil
+        frame.Enable=isvalid(target) and target.EnabledInHierarchy and not _SkillManager:IsAmountOpen() and not _EnhancementManager:IsConfirmDialogOpen() and not _AppearanceColorPicker:BlocksInput()
+        if frame.Enable then
+            frame.UITransformComponent.anchoredPosition=self:GuidanceCenter(target)
+            local rect=target.UITransformComponent
+            local corner=Vector2((1-rect.Pivot.x)*rect.RectSize.x,(1-rect.Pivot.y)*rect.RectSize.y)
+            local world=_UILogic:LocalUIToWorldPosition(corner,rect)
+            local edge=_UILogic:ScreenToLocalUIPosition(_UILogic:WorldToScreenPosition(world),frame.Parent.UITransformComponent)
+            local center=self:GuidanceCenter(target)
+            local width=math.max(72,math.abs(edge.x-center.x)*2+16)
+            local height=math.max(64,math.abs(edge.y-center.y)*2+16)
+            frame.UITransformComponent.RectSize=Vector2(width,height)
+            for _,name in ipairs({"Top","Bottom","Left","Right"}) do
+                local border=frame:GetChildByName(name)
+                local horizontal=name=="Top" or name=="Bottom"
+                border.UITransformComponent.RectSize=horizontal and Vector2(width,5) or Vector2(5,height)
+                border.UITransformComponent.anchoredPosition=horizontal and Vector2(0,(name=="Top" and 1 or -1)*height/2) or Vector2((name=="Right" and 1 or -1)*width/2,0)
+            end
+            frame.SpriteGUIRendererComponent.PlayRate=2.2
+            frame.CanvasGroupComponent.GroupAlpha=0.8+0.2*math.sin(_UtilLogic.ElapsedSeconds*6)
+            local marker=frame:GetChildByName("Marker") marker.Enable=true marker.SpriteGUIRendererComponent.PlayRate=2.2
+            marker.UITransformComponent.anchoredPosition=Vector2(0,height/2+40)
+        end
+        local book=_MobileUIManager:IsMobile() and _MobileUIManager:UI("SkillBook") or _EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow")
+        local map=_MobileUIManager:UI("WorldMap")
+        local keyHint=_EntityService:GetEntityByPath(base.."KeyHint")
+        local equipment=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow")
+        local func=self.step==4 and "autohunt" or self.step==5 and "skill" or self.step==6 and "equip" or "worldmap"
+        local window=self.step==5 and book or self.step==6 and equipment or map
+        local modal=_AppearanceColorPicker:BlocksInput() or _RewardCenter:BlocksInput() or _GameSystemMenu.opened
+        local prompt=active and not modal and not _MobileUIManager:IsMobile() and (self.step==4 or self.step==5 or self.step==6 or self.step>=9) and (self.step==4 or not (isvalid(window) and window.EnabledInHierarchy))
+        if self.step==6 and _EnhancementManager:IsWindowOpen() then prompt=false end
+        keyHint.Enable=prompt
+        local player=_UserService.LocalPlayer
+        if prompt and isvalid(player) then
+            local pos=player.TransformComponent.WorldPosition
+            local screen=_UILogic:WorldToScreenPosition(Vector2(pos.x,pos.y+1.4))
+            keyHint.UITransformComponent.anchoredPosition=_UILogic:ScreenToLocalUIPosition(screen,keyHint.Parent.UITransformComponent)+Vector2(0,math.sin(_UtilLogic.ElapsedSeconds*6)*7)
+            keyHint:GetChildByName("Key").TextGUIRendererComponent.Text=_KeySettingManager:GetKeyForFunc(func)
+            keyHint:GetChildByName("Caption").TextGUIRendererComponent.Text=self.step==4 and "자동사냥 시작" or (self.step==5 and "스킬창" or self.step==6 and "장비창" or "월드맵").." 열기"
+        end
+        local mouse=_EntityService:GetEntityByPath(base.."DragDemo")
+        mouse.Enable=active and self.step==5 and book.Enable and not _SkillManager:IsAmountOpen() and not _MobileUIManager:IsMobile()
+        if not mouse.Enable then self._T.effectPhase=0 return end
+        local source=nil local destination=nil
+        if _MobileUIManager:IsMobile() then
+            for _,cell in pairs(_MobileUIManager._T.listCells or {}) do
+                local skill=cell.kind=="skill" and _SkillManager:GetTabSkills(_SkillManager._T.activeSkillTab)[cell.index+1] or nil
+                if skill~=nil and skill.name=="달팽이 세마리" and isvalid(cell.entity) and cell.entity.EnabledInHierarchy then source=cell.entity:GetChildByName("Icon") break end
+            end
+            destination=_MobileUIManager:UI(_MobileUIManager:ButtonPath(1))
+        else
+            for i=1,10 do local name=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow/SkillCard"..tostring(i).."/Name") if name.TextComponent.Text=="달팽이 세마리" then source=name.Parent:GetChildByName("Icon") break end end
+            -- 기능 단축키가 들어 있는 칸은 스킬 등록 대상에서 제외한다.
+            for _,pos in ipairs({"1","2","3","4","5","6","Q","W","E","R","T","U","V","X","A","S","D","F","G","H","J","L"}) do
+                local key=_SkillManager:GetKeyForBarPos(pos)
+                if _KeySettingManager:GetFuncOnKey(key)=="" and _SkillManager._T.slotData[key]==nil then destination=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_"..pos) break end
+            end
+        end
+        if not isvalid(source) or not isvalid(destination) or not source.EnabledInHierarchy or not destination.EnabledInHierarchy then mouse.Enable=false return end
+        self._T.effectPhase=((self._T.effectPhase or 0)+delta)%2.8
+        local t=math.max(0,math.min(1,(self._T.effectPhase-0.45)/1.5)) t=t*t*(3-2*t)
+        mouse.UITransformComponent.anchoredPosition=self:GuidanceCenter(source)*(1-t)+self:GuidanceCenter(destination)*t
+        mouse:GetChildByName("Skill").Enable=self._T.effectPhase>0.45 and self._T.effectPhase<2.35
+        mouse.SpriteGUIRendererComponent.Color=Color(1,1,1,self._T.effectPhase>2.55 and 0.2 or 1)
     end
 end

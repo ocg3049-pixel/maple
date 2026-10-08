@@ -37,6 +37,8 @@ script UIAudio extends Logic
         self._T.playing = {}
         self._T.mapGain = 1
         self._T.time = 0
+        self._T.clickDue = nil
+        self._T.windowCueAt = nil
         self._T.pending = self._T.pending or {}
         local preload = {}
         for name, id in pairs(self:Clips()) do
@@ -52,7 +54,7 @@ script UIAudio extends Logic
     end
 
     @ExecSpace("ClientOnly")
-    method void Play(string name)
+    method void PlayNow(string name)
         if _GameAudio.muted then return end
         local id = self:Clips()[name]
         if id == nil or id == "" then return end
@@ -81,12 +83,13 @@ script UIAudio extends Logic
             if not self._T.bound[entity] then
                 self._T.bound[entity] = true
                 local click = entity:ConnectEvent(ButtonClickEvent, function()
-                    if button.EnableInHierarchy then self:Play("BtMouseClick") end
+                    if button.EnableInHierarchy and not self:IsQuietMobileControl(entity) then self:Play("BtMouseClick") end
                 end)
                 local hovering = false
                 local hover = entity:ConnectEvent(ButtonStateChangeEvent, function(event)
+                    if event.state==ButtonState.Pressed and button.EnableInHierarchy then _MobileUIManager:EndChatForAction(entity) end
                     if event.state == ButtonState.Normal then hovering = false end
-                    if event.state == ButtonState.Hover and not hovering and button.EnableInHierarchy then
+                    if event.state == ButtonState.Hover and not hovering and button.EnableInHierarchy and not self:IsQuietMobileControl(entity) then
                         hovering = true self:Play("BtMouseOver")
                     end
                 end)
@@ -116,12 +119,6 @@ script UIAudio extends Logic
     method void OnUpdate(number delta)
         if self._T.weights == nil then return end
         self._T.time = self._T.time + delta
-        for name, deadline in pairs(self._T.pending or {}) do
-            local e = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/" .. name)
-            if isvalid(e) and e.SoundComponent:IsAudioClipLoaded() then
-                self._T.pending[name] = nil _GameAudio:PlayCue(name)
-            elseif _UtilLogic.ElapsedSeconds > deadline then self._T.pending[name] = nil end
-        end
         local inGame = _LoginFlow.phase == "ingame"
         local equipPath, decoPath = "/ui/DefaultGroup/EquipWindow", "/ui/DefaultGroup/DecoWindow"
         local swappingEquip = (self._T.windows[equipPath] == true and not self:IsOpen(equipPath) and self:IsOpen(decoPath)) or (self._T.windows[decoPath] == true and not self:IsOpen(decoPath) and self:IsOpen(equipPath))
@@ -144,6 +141,7 @@ script UIAudio extends Logic
         self:Watch("/ui/DefaultGroup/MonsterCodexWindow", "MenuUp", "MenuDown", inGame)
         self:Watch("/ui/WorldMapGroup", "WorldmapOpen", "WorldmapClose", inGame)
         self:Watch("/ui/GameSystem/Overlay", "MenuUp", "MenuDown", inGame)
+        self:FlushCues()
         local equip = _UIEquipInventoryManager
         local sk = _SkillManager._T
         local dragging = equip.isDragging or equip._T.isDraggingPotion == true or equip._T.isDraggingEquipToEnhance == true or equip._T.isDraggingInvenItem == true or sk.isDraggingSkill == true or sk.skillClickMode == true
@@ -185,4 +183,50 @@ script UIAudio extends Logic
             end
         end
     end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsQuietMobileControl(Entity entity)
+        -- 전투 입력 버튼만 UI 클릭음을 생략하며 실제 스킬 사운드는 유지한다.
+        if not _MobileUIManager:IsMobile() then return false end
+        local path=entity.Path
+        return string.find(path,"/Combat/",1,true)~=nil or string.find(path,"/Skills/Slot",1,true)~=nil
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void Play(string name)
+        if _GameAudio.muted then return end
+        local now = _UtilLogic.ElapsedSeconds
+        if name == "MenuUp" or name == "WorldmapOpen" or name == "DlgNotice" then
+            self._T.windowCueAt = now
+            self._T.clickDue = nil
+            if self._T.pending then self._T.pending.BtMouseClick = nil end
+        elseif name == "BtMouseClick" then
+            -- 창 상태 감지가 끝난 뒤 클릭음을 재생하여 콜백 순서에 관계없이 중복을 막는다.
+            if now - (self._T.windowCueAt or -10) >= 0.08 then
+                self._T.clickDue = self._T.clickDue or (now + 0.05)
+            end
+            return
+        end
+        self:PlayNow(name)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FlushCues()
+        local now = _UtilLogic.ElapsedSeconds
+        if _GameAudio.muted then
+            self._T.clickDue = nil self._T.pending = {} return
+        end
+        if self._T.clickDue ~= nil and now >= self._T.clickDue then
+            self._T.clickDue = nil
+            if now - (self._T.windowCueAt or -10) >= 0.08 then self:PlayNow("BtMouseClick") end
+        end
+        for name, deadline in pairs(self._T.pending or {}) do
+            local e = _EntityService:GetEntityByPath("/ui/GameSystem/Audio/" .. name)
+            if isvalid(e) and e.SoundComponent:IsAudioClipLoaded() then
+                self._T.pending[name] = nil _GameAudio:PlayCue(name)
+            elseif now > deadline then self._T.pending[name] = nil end
+        end
+    end
+
 end

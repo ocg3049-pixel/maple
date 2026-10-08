@@ -94,6 +94,12 @@ script SpecialEquipment extends Logic
         return p
     end
 
+    method number StarProbabilityAtLeast(integer minimum, boolean premium)
+        local total = 0
+        for stars = math.max(0, minimum), 30 do total += self:StarProbability(stars, premium) end
+        return total
+    end
+
     method integer RollStars(number roll, boolean premium)
         -- Cumulative probabilities sum to one, including the final 30-star tail.
         local sum=0
@@ -126,7 +132,7 @@ script SpecialEquipment extends Logic
     method number Bonus(string kind)
         -- Drop chance, meso quantity and regeneration are independent additive bonuses.
         local sum=0
-        for _,slot in ipairs({10,11,12,13,14,15,26,27}) do
+        for _,slot in ipairs({10,11,12,13,14,15,26,27,29}) do
             local item=_UIEquipInventoryManager:GetEquip(slot)
             local key=self:Kind(item)
             local star=_UIEquipInventoryManager:ParseStars(item)
@@ -158,7 +164,7 @@ script SpecialEquipment extends Logic
 
     method table Slots()
         -- These existing locked positions become functional equipment slots.
-        return {{10,"SlotRing","반지"},{15,"SlotPendant","펜던트"},{26,"SlotFaceAccessory","얼굴장식"},{27,"SlotEyeAccessory","눈장식"}}
+        return {{10,"SlotRing","반지 1"},{11,"SlotRing2","반지 2"},{12,"SlotRing3","반지 3"},{13,"SlotRing4","반지 4"},{15,"SlotPendant","펜던트 1"},{29,"SlotPendant2","펜던트 2"},{26,"SlotFaceAccessory","얼굴장식"},{27,"SlotEyeAccessory","눈장식"}}
     end
 
     @ExecSpace("ClientOnly")
@@ -181,6 +187,13 @@ script SpecialEquipment extends Logic
     method void OnBeginPlay()
         -- Standard inventory handling provides double-click equip and unequip.
         self._T.links={}
+        for i=1,4 do
+            local choice=i local e=_EntityService:GetEntityByPath("/ui/AccessoryChoice/Modal/Panel/Choice"..tostring(i))
+            local h=e:ConnectEvent(ButtonClickEvent,function() self:ChooseReplacement(choice) end)
+            table.insert(self._T.links,{entity=e,connection=h})
+        end
+        local cancel=_EntityService:GetEntityByPath("/ui/AccessoryChoice/Modal/Panel/Cancel")
+        table.insert(self._T.links,{entity=cancel,connection=cancel:ConnectEvent(ButtonClickEvent,function() self:CloseReplacement() end)})
         for _,row in ipairs(self:Slots()) do
             local index=row[1]
             local slot=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/"..row[2])
@@ -209,7 +222,7 @@ script SpecialEquipment extends Logic
         "요원C의 낡은 수신기 → 5성: 티타늄 수신기","수신기는 5성에 메소 획득량 +10% 추가","",
         "아이스바 외형 (0~5성 순서)","수박 → 초코 → 메론 → 포도 → 레몬 → 딸기","안경 외형 (0~5성 순서)","금이 간 → 드래곤 → 고고학자 → 미카엘","→ 오닉스 드래곤 → 켄타의 물안경","아이스바·안경은 5성에 메소 획득량 +10% 추가","",
         "드롭률 보너스는 기본 확률에 곱해집니다.","예: 기본 5% × (1 + 20%) = 6%","메소 보너스는 획득 금액에 적용됩니다.","",
-        "장비 상자 / 고급 장비 상자","원하는 부위를 선택하고 강화된 장비를 뽑습니다.","고급 상자: 각 5성 이상 확률이 일반의 10배","0성: 일반 "..string.format("%.4g%%",100*self:StarProbability(0,false)).." / 고급 "..string.format("%.4g%%",100*self:StarProbability(0,true)),"5성 이상 합계: 일반 3.75% / 고급 37.5%"}
+        "장비 상자 / 고급 장비 상자","원하는 부위를 선택하고 강화된 장비를 뽑습니다.","고급 상자: 각 5성 이상 확률이 일반의 10배","0성: 일반 "..string.format("%.4g%%",100*self:StarProbability(0,false)).." / 고급 "..string.format("%.4g%%",100*self:StarProbability(0,true)),"5성 이상 합계: 일반 "..string.format("%.4g%%",100*self:StarProbabilityAtLeast(5,false)).." / 고급 "..string.format("%.4g%%",100*self:StarProbabilityAtLeast(5,true))}
         for star=0,30 do table.insert(lines,tostring(star).."성: 일반 "..string.format("%.10g%%",100*self:StarProbability(star,false)).." / 고급 "..string.format("%.10g%%",100*self:StarProbability(star,true))) end
         return lines
     end
@@ -241,4 +254,47 @@ script SpecialEquipment extends Logic
         _UIToast:ShowMessage("투명 치장 아이템 6개를 획득했습니다.")
     end
 
+
+    @ExecSpace("ClientOnly")
+    method integer EquipDestination(integer index, string item, integer category)
+        -- Fill empty rings from the bottom, and ask before replacing a full accessory set.
+        local slots=category==10 and {13,12,11,10} or {29,15}
+        local chosen=self._T.chosenSlot self._T.chosenSlot=nil
+        for _,slot in ipairs(slots) do if slot==chosen then return slot end end
+        for _,slot in ipairs(slots) do if _UIEquipInventoryManager:GetEquip(slot)=="" then return slot end end
+        local cl=_CharacterPersistence._T.cl
+        self._T.replacement={index=index,item=item,slots=slots,id=_EventRewards._T.id}
+        local modal=_EntityService:GetEntityByPath("/ui/AccessoryChoice/Modal") modal.Enable=true
+        for i=1,4 do
+            local row=modal:GetChildByName("Panel"):GetChildByName("Choice"..tostring(i))
+            row.Enable=slots[i]~=nil
+            if slots[i] then
+                local old=_UIEquipInventoryManager:GetEquip(slots[i])
+                row.TextGUIRendererComponent.Text=tostring(i)..". ".._UIEquipInventoryManager:ParseName(old).." ("..tostring(_UIEquipInventoryManager:ParseStars(old)).."성)"
+                row:GetChildByName("Icon").SpriteGUIRendererComponent.ImageRUID=DataRef(_UIEquipInventoryManager:ItemIconRUID(old))
+            end
+        end
+        return 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ChooseReplacement(integer choice)
+        -- Revalidate the inventory and character before swapping anything.
+        local r=self._T.replacement local cl=_CharacterPersistence._T.cl
+        self:CloseReplacement()
+        if r==nil or r.slots[choice]==nil or cl==nil or _EventRewards._T.id~=r.id or not cl.entered then return end
+        local inv=_UIEquipInventoryManager
+        if inv._T.activeTab~="equip" or inv:GetTabItem("equip",r.index)~=r.item then return end
+        self._T.chosenSlot=r.slots[choice]
+        inv:MoveInvenToEquip(r.index)
+        self._T.chosenSlot=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseReplacement()
+        -- Cancel only dismisses the choice; inventory stays unchanged.
+        self._T.replacement=nil self._T.chosenSlot=nil
+        local modal=_EntityService:GetEntityByPath("/ui/AccessoryChoice/Modal")
+        if isvalid(modal) then modal.Enable=false end
+    end
 end

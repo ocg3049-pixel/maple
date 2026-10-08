@@ -10,6 +10,8 @@ script UIClickArbiter extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean BlocksWorldClick(Vector2 touchPoint)
+        if _SkillManager:BlocksAmountInput() then return true end
+        if _MobileUIManager:BlocksPoint(touchPoint) then return true end
 		-- NPC의 TouchEvent는 UI 클릭과 함께 발생하므로 월드 동작 전에 차단한다.
 		if _UIItemDiscardManager:BlocksInput() then return true end
 		if self:GetTopmostWindowAt(touchPoint) ~= "" then return true end
@@ -23,10 +25,13 @@ script UIClickArbiter extends Logic
 		-- 체계와 같은 세트. TooltipPanel은 클릭을 받지 않는 표시 전용이라 제외한다
 		-- (툴팁 아래를 클릭하면 그 밑의 창으로 통과되어야 한다).
 		return {
-			"/ui/DefaultGroup/Board",
+			"/ui/DefaultGroup/ItemActionPopup",
+            "/ui/DefaultGroup/Board",
             "/ui/DefaultGroup/Book",
             "/ui/DefaultGroup/MonsterCodexWindow",
             "/ui/DefaultGroup/PlayerContext",
+            "/ui/SocialWindow/Window",
+            "/ui/SocialWindow/PlayerContext",
             "/ui/DefaultGroup/PlayerInspect",
 			"/ui/DefaultGroup/InvenWindow",
 			"/ui/DefaultGroup/CashShopWindow",
@@ -76,20 +81,60 @@ script UIClickArbiter extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method boolean ContainsScreenPoint(Entity win, Vector2 point)
+		-- Use the actual screen transform, including resolution, anchors and parent scale.
+		if not isvalid(win) or not win.EnabledInHierarchy or not win.VisibleInHierarchy then return false end
+		local tr = win.UITransformComponent
+		if not isvalid(tr) then return false end
+		local p = _UICursorManager:ScreenToElementPoint(win, point)
+		local sz, pv = tr.RectSize, tr.Pivot
+		if p.x >= -pv.x * sz.x and p.x <= (1 - pv.x) * sz.x
+			and p.y >= -pv.y * sz.y and p.y <= (1 - pv.y) * sz.y then return true end
+		if win.Name == "EnhanceWindow" and not _StarforceMini.minimized then
+			return self:ContainsScreenPoint(win:GetChildByName("AutoPanel"), point) or self:ContainsScreenPoint(win:GetChildByName("EquipmentPicker"), point)
+		end
+		return false
+	end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanUseNoticeButton(Entity button)
+        -- Native touch clicks must not depend on the desktop cursor position.
+        if not isvalid(button) or not button.EnabledInHierarchy then return false end
+        local point=_InputService:GetCursorPosition()
+        if _MobileUIManager:IsMobile() then
+            local tr=button.UITransformComponent
+            local center=Vector2((0.5-tr.Pivot.x)*tr.RectSize.x,(0.5-tr.Pivot.y)*tr.RectSize.y)
+            point=_UILogic:WorldToScreenPosition(_UILogic:LocalUIToWorldPosition(center,tr))
+            for _,path in ipairs({"MenuPanel","SkillBook","WorldMap","QuickslotPicker"}) do
+                if self:ContainsScreenPoint(_MobileUIManager:UI(path),point) then return false end
+            end
+        end
+        if self:GetTopmostWindowAt(point)~=button.Parent.Path then return false end
+        _MobileUIManager:EndChatForAction(button)
+        return true
+    end
+
+	@ExecSpace("ClientOnly")
 	method string GetTopmostWindowAt(Vector2 touchPoint)
+        if _SkillManager:BlocksAmountInput() then return "/ui/SkillPointDialog/Modal" end
+        if _SpecialEquipment._T.replacement~=nil then return "/ui/AccessoryChoice/Modal" end
+        if _MobileNumberPad:BlocksInput() then return "/ui/MobileNumberPad/Modal" end
 		if _CosmeticExchange:BlocksInput() then return "/ui/CosmeticExchangeGroup/Modal" end
         if _AppearanceColorPicker:BlocksInput() then return "/ui/AppearanceColorGroup/Modal" end
+        if _BossStageManager:BlocksInput() then return _BossStageManager._T.result and "/ui/BossStage/Result" or _BossStageManager._T.destination and "/ui/BossStage/Cover" or "/ui/BossStage/Modal" end
+        if _RewardCenter:BlocksInput() then return "/ui/RewardCenter/Modal" end
+        if _EventRewards:BlocksInput() then return "/ui/EventGroup/Modal" end
 		if _UIItemDiscardManager.pending then return "/ui/ItemDiscardGroup/Modal" end
-		-- touchPoint(1920×1080 좌하단 원점 스크린 좌표 - UITouchDownEvent/ScreenTouchEvent 공통)를
+		-- 실제 화면 픽셀 좌표(UITouchDownEvent/ScreenTouchEvent 공통)를
 		-- 덮고 있는 "표시 중" 창들 중 형제 순서가 가장 높은(가장 앞에 그려지는) 창 경로를 반환한다.
 		-- 어떤 창도 덮지 않으면 빈 문자열.
-		local ux = touchPoint.x - 960
-		local uy = touchPoint.y - 540
 		local bestPath = ""
 		local bestIdx = -1
 		for _, p in ipairs(self:GetWindowPaths()) do
 			local w = _EntityService:GetEntityByPath(p)
-			if isvalid(w) and w.EnabledInHierarchy and w.Visible and self:ContainsUIPoint(w, ux, uy) then
+            local picker=p=="/ui/DefaultGroup/EnhanceWindow" and _MobileUIManager:UI("EquipmentPicker") or nil
+            local pickerHit=isvalid(picker) and picker.EnabledInHierarchy and self:ContainsScreenPoint(picker,touchPoint)
+			if isvalid(w) and w.EnabledInHierarchy and w.Visible and (self:ContainsScreenPoint(w, touchPoint) or pickerHit) then
 				local idx = _UILogic:GetSiblingIndex(w.UITransformComponent)
 				-- (요청 2026-08-14) DefaultGroup 밖의 창은 전용 그룹(양수 GroupOrder)이라 **항상 위**에
 				-- 그려진다. 형제 인덱스는 자기 그룹 안에서만 의미가 있어(보통 0) 그대로 비교하면
@@ -103,13 +148,25 @@ script UIClickArbiter extends Logic
 				end
 			end
 		end
+        if bestPath=="" then
+            for _,path in ipairs({"/ui/MapleTutorial/FirstGoal","/ui/MapleTutorial/Guide","/ui/SkillPointNotice/Notice"}) do
+                local notice=_EntityService:GetEntityByPath(path)
+                if self:ContainsScreenPoint(notice,touchPoint) then return path end
+            end
+        end
 		return bestPath
 	end
 
 	@ExecSpace("ClientOnly")
 	method string GetKeyboardWindow()
+        if _SkillManager:BlocksAmountInput() then return "/ui/SkillPointDialog/Modal" end
+        if _SpecialEquipment._T.replacement~=nil then return "/ui/AccessoryChoice/Modal" end
+        if _MobileNumberPad:BlocksInput() then return "/ui/MobileNumberPad/Modal" end
 		if _CosmeticExchange:BlocksInput() then return "/ui/CosmeticExchangeGroup/Modal" end
         if _AppearanceColorPicker:BlocksInput() then return "/ui/AppearanceColorGroup/Modal" end
+        if _BossStageManager:BlocksInput() then return _BossStageManager._T.result and "/ui/BossStage/Result" or _BossStageManager._T.destination and "/ui/BossStage/Cover" or "/ui/BossStage/Modal" end
+        if _RewardCenter:BlocksInput() then return "/ui/RewardCenter/Modal" end
+        if _EventRewards:BlocksInput() then return "/ui/EventGroup/Modal" end
 		-- 좌표가 없는 Tab/Space 입력도 실제로 맨 앞에 표시되는 창 하나만 처리한다.
 		if _UIItemDiscardManager:BlocksInput() then return "/ui/ItemDiscardGroup/Modal" end
 		local bestPath = ""
@@ -127,6 +184,7 @@ script UIClickArbiter extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean IsTopmostAt(string winPath, Vector2 touchPoint)
+        if _SkillManager:BlocksAmountInput() then return winPath=="/ui/SkillPointDialog/Modal" end
 		-- 클릭 지점의 최상단 창이 winPath일 때만 true. 어떤 창도 그 지점을 덮지 않으면
 		-- true(차단할 겹침이 없음) - 그래서 목록에 없는 대상(SkillBar 등 HUD)도 자기 경로를
 		-- 넘기면 "창에 가려졌는가"만 검사된다.
@@ -145,10 +203,15 @@ script UIClickArbiter extends Logic
 		-- 전역 화면 터치에서 클릭 지점의 최상단 창을 올려준다. 요소 클릭은 AcceptClickAt이
 		-- 이미 올려주지만 같은 창을 다시 올리는 것은 무해하다.
 		self.screenTouchHandler = _InputService:ConnectEvent(ScreenTouchEvent, self.OnGlobalScreenTouch)
+        self:WatchWindowChanges()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+        for _,link in ipairs(self._T.windowLinks or {}) do
+            if isvalid(link.entity) then link.entity:DisconnectEvent(EntityEnabledInHierarchyChangedEvent,link.callbackId) end
+        end
+        self._T.windowLinks={}
 		if self.screenTouchHandler ~= nil then
 			_InputService:DisconnectEvent(ScreenTouchEvent, self.screenTouchHandler)
 			self.screenTouchHandler = nil
@@ -200,5 +263,36 @@ script UIClickArbiter extends Logic
 			end
 		end
 	end
+
+    @ExecSpace("ClientOnly")
+    method void ClearTransientOverlays()
+        if self._T.clearingOverlays then return end
+        self._T.clearingOverlays=true
+        _UIEquipInventoryManager:HideTooltip()
+        _SkillManager:HideSkillTooltip()
+        _UIEquipInventoryManager:CancelInvenDrag()
+        _UIEquipInventoryManager:CancelEquipDrag()
+        _UIEquipInventoryManager:ConsumeEnhancePick()
+        for _,path in ipairs({"/ui/DefaultGroup/DragGhost","/ui/DefaultGroup/SkillDragGhost"}) do
+            local entity=_EntityService:GetEntityByPath(path)
+            if isvalid(entity) then entity.Enable=false end
+        end
+        self._T.clearingOverlays=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void WatchWindowChanges()
+        self._T.windowLinks={}
+        local ui=_EntityService:GetEntityByPath("/ui")
+        if not isvalid(ui) then return end
+        for _,transform in ipairs(ui:GetChildComponentsByTypeName("MOD.Core.UITransformComponent",true)) do
+            local entity=transform.Entity
+            local name=string.lower(entity.Name)
+            if string.find(name,"window",1,true) or string.find(name,"popup",1,true) or name=="modal" or name=="worldmapgroup" or name=="book" then
+                local callbackId=entity:ConnectEvent(EntityEnabledInHierarchyChangedEvent,function() self:ClearTransientOverlays() end)
+                table.insert(self._T.windowLinks,{entity=entity,callbackId=callbackId})
+            end
+        end
+    end
 
 end

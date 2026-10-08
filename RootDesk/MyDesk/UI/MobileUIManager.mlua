@@ -1,0 +1,1816 @@
+@Logic
+script MobileUIManager extends Logic
+    property string mode = "pc"
+    property string device = "pc"
+    property integer skillPage = 1
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- Keep persistent controls below popup groups; quickslot assignment has its own layer.
+        self._T.uiCache=self._T.uiCache or {}
+        local e=self._T.uiCache[path]
+        if not isvalid(e) and string.sub(path,1,15)=="EquipmentPicker" and isvalid(self._T.equipmentPicker) then
+            e=self._T.equipmentPicker
+            for part in string.gmatch(string.sub(path,17),"[^/]+") do e=e:GetChildByName(part) end
+            self._T.uiCache[path]=e
+        end
+        if not isvalid(e) then
+            local head=string.match(path,"^[^/]+") or ""
+            local group=head=="WorldMap" and "WorldMapTouch" or (head=="Status" or head=="Event" or head=="Boss" or head=="Menu" or head=="Skill" or head=="Enhance" or head=="Auto" or head=="Reward" or head=="Inventory" or head=="Map" or head=="Chat" or head=="Combat") and "MobileBase" or (head=="Skills" and "MobileQuickslots" or "MobileHUD")
+            e=_EntityService:GetEntityByPath(path=="DeviceOptions" and "/ui/MobileHUD/DeviceOptions" or ("/ui/"..group.."/HUD"..(path=="" and "" or "/"..path)))
+            self._T.uiCache[path]=e
+        end
+        return e
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsMobile()
+        return self.mode == "mobile"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self.device = Environment:IsMobilePlatform() and "mobile" or "pc"
+        self.mode = self.device
+        self._T.links = {} self._T.touches = {} self._T.saved = {} self._T.fitted = {}
+        self._T.nextRefresh = 0 self._T.nextLoad = 0
+        self._T.touchFeedbackPressed={} self._T.touchFeedback={} self._T.touchFeedbackSerial=0
+        _ResourceService:PreloadAsync({"df49dd4cb3294d34abd25e8d60c13e10"},function() log("[MobileTouch] clip ready") end)
+        self._T.uiPreferencesLoaded = false
+        self._T.equipmentPicker=self:UI("EquipmentPicker")
+        self._T.equipmentPicker:AttachTo(_EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow"))
+        self._T.equipmentPicker.UITransformComponent.anchoredPosition=Vector2(-690,0)
+        for _,path in ipairs({"/ui/DefaultGroup/EnhanceWindow/AutoPanel/Title","/ui/DefaultGroup/EnhanceWindow/EquipmentPicker/Title"}) do
+            local title=_EntityService:GetEntityByPath(path)
+            if isvalid(title) then
+                local listener=title:ConnectEvent(UITouchDownEvent,function(event)
+                    if self:IsMobile() then return end
+                    if not _UIEquipInventoryManager:AcceptWindowClick(event,"/ui/DefaultGroup/EnhanceWindow") then return end
+                    _UIEquipInventoryManager:StartWindowDrag("/ui/DefaultGroup/EnhanceWindow")
+                end)
+                table.insert(self._T.links,{entity=title,kind=UITouchDownEvent,listener=listener})
+            end
+        end
+        self:BindMobilePanels()
+        self:BindQuickslotPicker()
+        self:BindLayoutEditor()
+        self:BindMobileWorldMap()
+        self:BindTouchLists()
+        for _,groupName in ipairs({"MobileHUD","MobileBase","MobileQuickslots","WorldMapTouch"}) do
+            local group=_EntityService:GetEntityByPath("/ui/"..groupName)
+            if isvalid(group) then for _,button in ipairs(group:GetChildComponentsByTypeName("MOD.Core.ButtonComponent",true)) do self:BindPressFeedback(button.Entity) end end
+        end
+        for _,name in ipairs({"HP","MP","NameBanner"}) do _UILogic:SetSiblingIndex(self:UI("Status/"..name).UITransformComponent,1000) end
+        self:Bind("DeviceOptions",function() self:ReleaseControls() _GameSystemMenu:Open("settings") end)
+        self:Bind("Menu", function() self:ToggleMenu() end)
+        self:Bind("Event",function() self:OpenMenuAction("Event") end)
+        self:Bind("Boss",function() self:OpenMenuAction("Boss") end)
+        self:Bind("Auto", function() if not _GameSystemMenu:BlocksInput() then self:ReleaseControls() _AutoHuntManager:Toggle() end end)
+        self:Bind("Skill", function() self:OpenMenuAction("Skill") end)
+        self:Bind("Enhance", function() self:OpenMenuAction("Enhance") end)
+        self:Bind("Inventory",function() self:OpenMenuAction("Inventory") end)
+        self:Bind("Map",function() self:OpenMenuAction("Map") end)
+        self:Bind("Chat", function() self:ToggleChat() end)
+        for i=7,8 do local index=i self:Bind(self:ButtonPath(i),function() if not self:SkillClickWasHandled(index) then self:PressSkill(index) end end) end
+        for i=1,4 do local page=i self:Bind("Skills/Page"..tostring(i),function() self:ReleaseControls() self.skillPage=page self:RefreshSkills() end) end
+        self:Bind("Skills/Edit",function() self:ReleaseControls() self._T.quickEditing=not self._T.quickEditing self:RefreshSkills() end)
+        for i = 1, 6 do local index = i self:Bind("Skills/Slot" .. tostring(i), function() if not self:SkillClickWasHandled(index) then self:PressSkill(index) end end) end
+        for _, key in ipairs({"Inventory","Equip","Skill","Enhance","Map","Codex","Shop","Cash","Character","Social","Deco","Info","Event","Boss","Battle","Hunt","Settings","Close"}) do
+            local action = key self:Bind("MenuPanel/" .. key, function() self:OpenMenuAction(action) end)
+        end
+        for _, action in ipairs({"Use","Enhance","Color","Lock","Sell","Cancel"}) do local selected=action self:Bind("ItemActions/"..action,function() self:ItemAction(selected) end) end
+        self:Bind("ChatActions/Close",function() _MapleHUDManager:FinishChatInput() end)
+        self:Bind("ChatActions/Send",function() local input=_MapleHUDManager._T.chatInput if isvalid(input) then _MapleHUDManager:SubmitChat(input.TextGUIRendererInputComponent.Text) end end)
+        for _, entry in ipairs({{name="All",mode="map"},{name="Friend",mode="friend"},{name="Party",mode="party"}}) do local channel=entry.mode self:Bind("ChatActions/"..entry.name,function() _SocialManager:SelectChat(channel) _MapleHUDManager:FocusChat() end) end
+        self:Bind("WindowTools/SkillsPrev",function() self:ScrollSkills(-1) end)
+        self:Bind("WindowTools/SkillsNext",function() self:ScrollSkills(1) end)
+        self:Bind("WindowTools/Move",function() local id=_WorldMapManager._T.mobileDestination if id~=nil then _WorldMapManager:FadeAndTeleport(id) else self:ShowNotice("이동할 사냥터를 먼저 누르세요.") end end)
+        self:Bind("WindowTools/Close", function() self:CloseWindow() end)
+        -- UI 위 터치는 화면 입력과 별도로 받아 누름부터 해제까지 유지한다.
+        for i=1,8 do
+            local index=i local button=self:UI(self:ButtonPath(i))
+            self:BindPressFeedback(button)
+            local downUI=button:ConnectEvent(UITouchDownEvent,function(e)
+                if not self:CanAct() then return end
+                self:SetPressFeedback(button,true)
+                local key=self:MobileKey(index) local slot=self:GetMobileSlot(key)
+                local existing=self._T.touches[e.TouchId]
+                self._T.touches[e.TouchId]={name="Skill",index=index,key=key,path=self:ButtonPath(index),func=slot.func,seen=_UtilLogic.ElapsedSeconds,uiHeld=true}
+                _SkillManager._T.heldSkillKeys[key]=slot.func=="" and slot.name~="" and not self._T.quickEditing
+                if existing==nil then self:PressSkill(index) end
+            end)
+            local upUI=button:ConnectEvent(UITouchUpEvent,function(e) self:SetPressFeedback(button,false) self:TouchUp(e.TouchId) end)
+            table.insert(self._T.links,{entity=button,kind=UITouchDownEvent,listener=downUI})
+            table.insert(self._T.links,{entity=button,kind=UITouchUpEvent,listener=upUI})
+        end
+        local down = _InputService:ConnectEvent(ScreenTouchEvent, function(event) self:TouchDown(event) end)
+        local hold = _InputService:ConnectEvent(ScreenTouchHoldEvent, function(event) self:TouchHold(event) end)
+        local up = _InputService:ConnectEvent(ScreenTouchReleaseEvent, function(event) self:TouchUp(event.TouchId) end)
+        table.insert(self._T.links, {entity=_InputService, kind=ScreenTouchEvent, listener=down})
+        table.insert(self._T.links, {entity=_InputService, kind=ScreenTouchHoldEvent, listener=hold})
+        table.insert(self._T.links, {entity=_InputService, kind=ScreenTouchReleaseEvent, listener=up})
+        log("[MobileUI] initialized device=" .. self.device)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        local e = self:UI(path)
+        if not isvalid(e) then return end
+        local listener = e:ConnectEvent(ButtonClickEvent, function(event)
+            if _SkillManager:BlocksAmountInput() then return end
+            if self._T.layoutEditing and string.sub(path,1,13)~="LayoutEditor/" then return end
+            self:EndChatForAction(e)
+            callback(event)
+        end)
+        table.insert(self._T.links, {entity=e, kind=ButtonClickEvent, listener=listener})
+        self:BindPressFeedback(e)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EndChatForAction(Entity entity)
+        if not self:IsMobile() or not isvalid(entity) or not _MapleHUDManager:IsChatTyping() then return end
+        local path=entity.Path
+        if path=="/ui/MobileBase/HUD/Chat" or (string.find(path,"/ChatBox",1,true) and entity.Name~="BtnSettings") or string.find(path,"/ChatActions",1,true) then return end
+        if string.find(path,"/SocialWindow/Whisper/",1,true) or string.find(path,"/SocialWindow/ChatModes/",1,true) then return end
+        _MapleHUDManager:FinishChatInput()
+        log("[MobileUI] chat ended for "..path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReceivePreferences(string pcMode, string mobileMode)
+        self._T.uiPreferencesLoaded = true
+        if self._T.pendingMode ~= nil then
+            _CharacterPersistence:RequestSetUIMode(self.device, self._T.pendingMode)
+        else
+            local selected = self.device == "pc" and pcMode or mobileMode
+            if selected ~= "pc" and selected ~= "mobile" then selected = self.device end
+            self:ApplyMode(selected)
+        end
+        log("[MobileUI] preferences loaded mode=" .. self.mode .. " device=" .. self.device)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectMode(string selected)
+        if selected ~= "pc" and selected ~= "mobile" then return end
+        self._T.pendingMode = selected self._T.saveFailed = false
+        self:ApplyMode(selected)
+        if self._T.uiPreferencesLoaded then _CharacterPersistence:RequestSetUIMode(self.device, selected) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PreferenceSaved(string platform, string selected, boolean saved)
+        if platform ~= self.device or selected ~= self._T.pendingMode then return end
+        if saved then self._T.pendingMode = nil else self._T.saveFailed = true end
+        self:DrawSettings()
+        log("[MobileUI] preference saved=" .. tostring(saved) .. " device=" .. platform .. " mode=" .. selected)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSettings()
+        local base = "/ui/GameSystem/Overlay/Settings/"
+        for _, entry in ipairs({{name="PC", value="pc"}, {name="Mobile", value="mobile"}}) do
+            local e = _EntityService:GetEntityByPath(base .. "UIMode" .. entry.name)
+            if isvalid(e) then
+                e.TextGUIRendererComponent.Text = (self.mode == entry.value and "✓ " or "") .. (entry.value == "pc" and "PC UI" or "모바일 UI")
+                e.SpriteGUIRendererComponent.Color = self.mode == entry.value and Color(0.7,0.86,0.52,1) or Color(0.84,0.78,0.67,1)
+            end
+        end
+        local status = _EntityService:GetEntityByPath(base .. "UIModeStatus")
+        if isvalid(status) then
+            local suffix = self._T.pendingMode ~= nil and " · 저장 중" or " · 재접속 후에도 유지"
+            if self._T.saveFailed then suffix = " · 저장 재시도 중" end
+            status.TextGUIRendererComponent.Text = (self.device == "pc" and "PC에서 사용할 UI" or "모바일에서 사용할 UI") .. suffix
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyMode(string selected)
+        _MobileNumberPad:Close()
+        self:ResetPressFeedback()
+        self:ReleaseControls()
+        self._T.selectedItem=nil self._T.closeHiddenWindow=nil
+        _WorldMapManager:CloseAll()
+        self:UI("SkillAmount").Enable=false self:UI("SkillBook").Enable=false self:UI("EquipmentPicker").Enable=false self:UI("QuickslotPicker").Enable=false self._T.quickEditing=false
+        self.mode = selected self.skillPage = 1
+        _AutoHuntManager._T.roleCacheUntil=0
+        self:UI("Combat/Attack/AssignedIcon").UITransformComponent.UIScale=Vector3(0.6,0.6,1)
+        self:UI("Combat/Stick/Ring").TextGUIRendererComponent.FontColor=Color(0,0,0,0.5)
+        self:UI("Combat/Stick/Inset").TextGUIRendererComponent.FontColor=Color(0,0,0,0.25)
+        local menu = self:UI("MenuPanel") if isvalid(menu) then menu.Enable = false end
+        self._T.layoutEditing=false self:UI("LayoutEditor").Enable=false
+        _SkillManager:ClearSkillSelection()
+        _UIEquipInventoryManager:HideTooltip()
+        _UIEquipInventoryManager:CancelInvenDrag()
+        if not self:IsMobile() then self:RestoreLayout() end
+        self._T.nextRefresh = 0
+        self:DrawSettings()
+        if _GameSystemMenu.opened then _GameSystemMenu:ShowPage(_GameSystemMenu.page) end
+        _MapleHUDManager:RefreshChatLayout()
+        _MapleIslandTutorial._T.drawnStep=nil
+        log("[MobileUI] applied " .. selected)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Remember(Entity e)
+        if not isvalid(e) or self._T.saved[e.Path] ~= nil then return end
+        local t = e.UITransformComponent
+        self._T.saved[e.Path] = {entity=e, enabled=e.Enable, pos=t.anchoredPosition, scale=t.UIScale, size=t.RectSize, pivot=t.Pivot, min=t.AnchorsMin, max=t.AnchorsMax, alignment=t.AlignmentOption}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestoreLayout()
+        for _, v in pairs(self._T.saved or {}) do
+            if isvalid(v.entity) then
+                local t = v.entity.UITransformComponent
+                t.AlignmentOption=v.alignment t.AnchorsMin=v.min t.AnchorsMax=v.max t.Pivot=v.pivot
+                if v.entity==_MapleHUDManager.chatBox then t.RectSize=v.size end
+                t.anchoredPosition=v.pos t.UIScale=v.scale
+                if v.hidden then v.entity.Enable=v.enabled end
+            end
+        end
+        self:RestoreButtonStyles()
+        self._T.saved = {} self._T.fitted = {}
+        local hud=self:UI("") if isvalid(hud) then hud.Enable=false end
+        for _,group in ipairs({"MobileBase","MobileQuickslots"}) do local e=_EntityService:GetEntityByPath("/ui/"..group.."/HUD") if isvalid(e) then e.Enable=false end end
+        _MapleHUDManager:RefreshChatLayout()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HidePC(Entity e)
+        if not isvalid(e) then return end
+        self:Remember(e) self._T.saved[e.Path].hidden=true e.Enable=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FitWindow(string path)
+        -- Resize dialog contents only; their modal roots keep the full-screen dimmer unscaled.
+        if path=="/ui/DefaultGroup/BoxQuantityPopup" or path=="/ui/DefaultGroup/ItemTypeSelectPopup" then
+            path=path.."/Dialog"
+        end
+        if path=="/ui/SocialWindow/PlayerContext" or path=="/ui/DefaultGroup/PlayerContext" then return end
+        local e = _EntityService:GetEntityByPath(path)
+        if not isvalid(e) or not e.EnabledInHierarchy then self._T.fitted[path]=nil return end
+        if path=="/ui/DefaultGroup/BattleStatsWindow" or path=="/ui/BattleStatsDetailWindow/Window" then
+            if self._T.fitted[path] then return end
+            self._T.fitted[path]=tostring(e.UITransformComponent.RectSize)
+            self:Remember(e) local t=e.UITransformComponent
+            t.AlignmentOption=AlignmentType.TopCenter t.Pivot=Vector2(0.5,1)
+            t.anchoredPosition=Vector2(0,-120) local scale=path=="/ui/DefaultGroup/BattleStatsWindow" and 0.8 or 0.85 t.UIScale=Vector3(scale,scale,1) return
+        end
+        local signature=tostring(e.UITransformComponent.RectSize)
+        if self._T.fitted[path]==signature then return end
+        self:Remember(e) self:StyleWindowButtons(e)
+        local t=e.UITransformComponent
+        local scale=math.min(1.45, 1560 / math.max(1,t.RectSize.x), 760 / math.max(1,t.RectSize.y))
+        -- Enhancement effects share an unscaled overlay; preserve their coordinate system.
+        if path=="/ui/DefaultGroup/EnhanceWindow" then scale=1 end
+        t.AlignmentOption=AlignmentType.Center t.AnchorsMin=Vector2(0.5,0.5) t.AnchorsMax=Vector2(0.5,0.5) t.Pivot=Vector2(0.5,0.5)
+        if path=="/ui/DefaultGroup/EnhanceWindow" and _StarforceMini.minimized then
+            t.anchoredPosition=Vector2(0,340) t.UIScale=Vector3.one
+        else
+            t.anchoredPosition=Vector2(path=="/ui/DefaultGroup/EnhanceWindow" and 65 or 0,25) t.UIScale=Vector3(scale,scale,1)
+        end
+        if path=="/ui/SocialWindow/Window" or path=="/ui/CosmeticExchangeGroup/Modal/Panel" then
+            local close=e:GetChildByName("Close")
+            if isvalid(close) then
+                self:Remember(close) close.Enable=true
+                local ct=close.UITransformComponent
+                ct.AlignmentOption=AlignmentType.TopRight ct.Pivot=Vector2(1,1)
+                ct.anchoredPosition=Vector2(-6,-6) ct.RectSize=Vector2(88/scale,88/scale)
+            end
+        end
+        self._T.fitted[path]=signature
+    end
+
+    @ExecSpace("ClientOnly")
+    method string CurrentWindow()
+        if _RewardCenter.opened then return "/ui/RewardCenter/Modal" end
+        if _SkillManager:IsAmountOpen() then return "skillAmount" end
+        if self:IsMobile() and self:UI("SkillAmount").Enable then return "skillAmount" end
+        if self._T.layoutEditing then return "mobileLayout" end
+        if self:UI("WorldMap").Enable then return "map" end
+        if _GameSystemMenu.opened then return "settings" end
+        if self:IsMobile() and self:UI("QuickslotPicker").Enable then return "mobileQuickslot" end
+        if self:IsMobile() and self:UI("SkillBook").Enable then return "mobileSkills" end
+        if _CosmeticExchange:BlocksInput() then return "/ui/CosmeticExchangeGroup/Modal" end
+        if _SocialManager:IsOpen() then return "/ui/SocialWindow/Window" end
+        local world = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        if isvalid(world) and world.Enable then return "map" end
+        local current=_UIClickArbiter:GetKeyboardWindow()
+        if current=="/ui/DefaultGroup/EnhanceWindow" and _StarforceMini.minimized then
+            local best="" local order=-1
+            for _,path in ipairs(_UIClickArbiter:GetWindowPaths()) do
+                local e=_EntityService:GetEntityByPath(path)
+                if path~=current and path~="/ui/DefaultGroup/Board" and isvalid(e) and e.EnabledInHierarchy then
+                    local value=_UILogic:GetSiblingIndex(e.UITransformComponent)
+                    if value>order then order=value best=path end
+                end
+            end
+            return best
+        end
+        return current
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanAct()
+        if _AutoHuntPowerSave.active then return false end
+        if _MobileNumberPad:BlocksInput() or self._T.layoutEditing or _KeySettingManager._T.uiHidden then return false end
+        if not self:IsMobile() or not _LoginFlow:IsInGame() or _GameSystemMenu:BlocksInput() or _MapleHUDManager:IsChatTyping() then return false end
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 or p.PlayerComponent:IsDead() then return false end
+        if self:UI("MenuPanel").Enable or self:CurrentWindow() ~= "" then return false end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Hit(string path, Vector2 point)
+        local e=self:UI(path)
+        return isvalid(e) and e.EnabledInHierarchy and _UICursorManager:Hit(e,point)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksPoint(Vector2 point)
+        if _MobileNumberPad:BlocksInput() then return true end
+        if self:Hit("WorldMap",point) or self:Hit("DeviceOptions",point) then return true end
+        if not self:IsMobile() or not _LoginFlow:IsInGame() then return false end
+        for _, path in ipairs({"Status","Menu","Event","Boss","Reward","Auto","Skill","Enhance","Inventory","Map","Chat","WorldMap","MenuPanel","LayoutEditor","QuickslotPicker","Skills/Slot1","Skills/Slot2","Skills/Slot3","Skills/Slot4","Skills/Slot5","Skills/Slot6","Skills/Page1","Skills/Page2","Skills/Page3","Skills/Page4","Skills/Edit","WindowTools","ItemActions","ChatActions","SkillBook","EquipmentPicker"}) do
+            if self:Hit(path,point) then return true end
+        end
+        for _, name in ipairs({"Stick","Jump","Attack"}) do
+            if self:Hit("Combat/"..name,point) then return true end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlayTouchFeedback(integer touchId, Vector2 point)
+        -- One native animation per gesture, including touches on modal buttons and the joystick.
+        if not self:IsMobile() then return end
+        self._T.touchFeedbackPressed=self._T.touchFeedbackPressed or {}
+        if self._T.touchFeedbackPressed[touchId] then return end
+        self._T.touchFeedbackPressed[touchId]=true
+        local template=_EntityService:GetEntityByPath("/ui/MobileTouchFeedback/Template")
+        if not isvalid(template) then return end
+        self._T.touchFeedbackSerial=(self._T.touchFeedbackSerial or 0)+1
+        local serial=self._T.touchFeedbackSerial
+        local effect=template:Clone("Touch"..tostring(serial))
+        effect.UITransformComponent.anchoredPosition=_UILogic:ScreenToLocalUIPosition(point,effect.Parent.UITransformComponent)
+        effect.SpriteGUIRendererComponent.AnimClipPlayType=SpriteAnimClipPlayType.Onetime
+        effect.SpriteGUIRendererComponent.PlayRate=2
+        local listener=effect:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function() self:ClearTouchFeedback(serial) end)
+        self._T.touchFeedback=self._T.touchFeedback or {}
+        self._T.touchFeedback[serial]={entity=effect,listener=listener,untilTime=_UtilLogic.ElapsedSeconds+5}
+        effect.Enable=true
+        if serial<=3 then log("[MobileTouch] start once id="..tostring(serial).." rate="..tostring(effect.SpriteGUIRendererComponent.PlayRate).." point="..tostring(point)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearTouchFeedback(integer serial)
+        -- Release the short-lived sprite and its event handler together.
+        local entry=(self._T.touchFeedback or {})[serial]
+        if entry==nil then return end
+        self._T.touchFeedback[serial]=nil
+        if isvalid(entry.entity) then entry.entity:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,entry.listener) entry.entity:Destroy() end
+        if serial<=3 then log("[MobileTouch] ended id="..tostring(serial)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateTouchFeedback()
+        -- An unloaded clip has a deadline; switching to PC clears every transient touch effect.
+        local mobile=self:IsMobile()
+        if not mobile then self._T.touchFeedbackPressed={} end
+        for serial,entry in pairs(self._T.touchFeedback or {}) do
+            if not mobile or _UtilLogic.ElapsedSeconds>=entry.untilTime then self:ClearTouchFeedback(serial) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TouchDown(any event)
+        self:PlayTouchFeedback(event.TouchId,event.TouchPoint)
+        if _SkillManager:BlocksAmountInput() or _MobileNumberPad:BlocksInput() then return end
+        if self._T.layoutEditing then
+            if self:Hit("LayoutEditor",event.TouchPoint) then return end
+            for _,entry in ipairs(self:LayoutTargets()) do
+                if self:Hit(entry.path,event.TouchPoint) then
+                    self._T.layoutDrag={id=event.TouchId,path=entry.path,last=_UILogic:ScreenToUIPosition(event.TouchPoint)}
+                    self:UI("LayoutEditor/Hint").TextGUIRendererComponent.Text=entry.label.." 위치 조정 중" return
+                end
+            end
+            return
+        end
+        if self:BeginWindowTouch(event) then return end
+        if not self:CanAct() then return end
+        if self._T.touches[event.TouchId]~=nil then return end
+        if self:Hit("Combat/Stick",event.TouchPoint) then
+            if _AutoHuntManager.autoOn then _AutoHuntManager:Toggle() end
+            if self._T.stickId~=nil then return end
+            self._T.stickId=event.TouchId
+            self._T.touches[event.TouchId]={name="Stick",seen=_UtilLogic.ElapsedSeconds}
+            self:MoveStick(event.TouchPoint) return
+        end
+        for i=1,8 do
+            local path=self:ButtonPath(i)
+            if self:Hit(path,event.TouchPoint) then
+                local key=self:MobileKey(i) local slot=self:GetMobileSlot(key)
+                self._T.touches[event.TouchId]={name="Skill",index=i,key=key,path=path,func=slot.func,seen=_UtilLogic.ElapsedSeconds}
+                _SkillManager._T.heldSkillKeys[key]=slot.func=="" and slot.name~="" and not self._T.quickEditing
+                self:PressSkill(i) return
+            end
+        end
+        for _, name in ipairs({"Left","Right","Up","Down"}) do
+            if self:Hit("Combat/"..name,event.TouchPoint) then
+                if _AutoHuntManager.autoOn then _AutoHuntManager:Toggle() end
+                self._T.touches[event.TouchId]={name=name, seen=_UtilLogic.ElapsedSeconds}
+                _MapleIslandTutorial:OnMobileAction(name)
+                if name == "Attack" then self:Attack() end
+                return
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TouchHold(any event)
+        local wd=self._T.windowDrag
+        if wd and wd.id==event.TouchId then
+            if not isvalid(wd.entity) or not wd.entity.EnabledInHierarchy then self._T.windowDrag=nil return end
+            local point=_UILogic:ScreenToLocalUIPosition(event.TouchPoint,wd.entity.Parent.UITransformComponent)
+            local d=point-wd.start
+            if math.abs(d.x)+math.abs(d.y)>8 then
+                local p=wd.position+d
+                wd.entity.UITransformComponent.anchoredPosition=Vector2(math.max(-800,math.min(800,p.x)),math.max(-440,math.min(440,p.y)))
+            end
+            return
+        end
+        if self._T.layoutEditing then
+            local drag=self._T.layoutDrag
+            if drag~=nil and drag.id==event.TouchId then
+                local point=_UILogic:ScreenToUIPosition(event.TouchPoint) local delta=point-drag.last drag.last=point
+                local offset=self._T.layoutOffsets[drag.path] or {x=0,y=0}
+                offset.x=math.max(-1700,math.min(1700,offset.x+delta.x)) offset.y=math.max(-900,math.min(900,offset.y+delta.y))
+                self._T.layoutOffsets[drag.path]=offset self:ApplyHUDPositions()
+            end return
+        end
+        local v=self._T.touches[event.TouchId]
+        if v == nil then return end
+        if v.name=="Stick" then v.seen=_UtilLogic.ElapsedSeconds self:MoveStick(event.TouchPoint) return end
+        if not self:Hit(v.path or ("Combat/"..v.name),event.TouchPoint) then self:TouchUp(event.TouchId) else v.seen=_UtilLogic.ElapsedSeconds end
+    end
+
+    @ExecSpace("ClientOnly")
+    method number Horizontal()
+        -- Use the captured joystick finger independently from skill/jump touches.
+        return self._T.stickX or 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReleaseControls()
+        for _,touch in pairs(self._T.touches or {}) do if touch.index~=nil then self:SetPressFeedback(self:UI(self:ButtonPath(touch.index)),false) end end
+        for _,v in pairs(self._T.touches or {}) do if v.key~=nil and _SkillManager._T.heldSkillKeys~=nil then _SkillManager:ReleaseSkillKey(v.key) end end
+        self._T.touches={} self._T.stickId=nil self._T.stickX=0 self._T.stickY=0 self._T.portalUpLatched=false
+        local knob=self:UI("Combat/Stick/Knob") if isvalid(knob) then self:SetStickKnob(Vector2.zero) end
+        local p=_UserService.LocalPlayer
+        if self._T.ownsMovement and isvalid(p) then
+            p.MovementComponent:Stop()
+            if p.StateComponent.CurrentStateName=="MOVE" then p.StateComponent:ChangeState("IDLE") end
+            -- Only return the controller we borrowed, and never override a menu or skill lock.
+            if p.PlayerComponent.Hp>0 and not p.PlayerComponent:IsDead() and self._T.controllerWasEnabled and not _GameSystemMenu.opened and not _AutoHuntManager.autoOn and not (_SkillManager._T.actionLock == true) then p.PlayerControllerComponent.Enable=true end
+        end
+        self._T.ownsMovement=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Attack()
+        if not self:CanAct() then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now < (self._T.nextAttack or 0) then return end
+        self._T.nextAttack=now+0.15
+        local p=_UserService.LocalPlayer
+        if _SkillManager:IsClawEquipped() then
+            local attack=p:GetComponent("script.PlayerAttack")
+            if isvalid(attack) then attack:CastClawBasicAttack() end
+        elseif _SkillManager:IsArcherJob() then _SkillManager:DoArcherBasicAttack()
+        else p.PlayerControllerComponent:ActionAttack() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PressSkill(integer index)
+        local key=self:MobileKey(index) if key=="" then return end
+        if _SkillManager:IsClickMode() then
+            self._T.quickTarget=key
+            self:AssignQuickslot({name=_SkillManager._T.clickModeName,ruid=_SkillManager._T.clickModeRUID})
+            _SkillManager:ClearSkillSelection() return
+        end
+        if not self:CanAct() then return end
+        local button=self:UI(self:ButtonPath(index))
+        self:SetPressFeedback(button,true)
+        local feedback=self._T.pressVisuals[button.Id]
+        if feedback~=nil then
+            feedback.slotIndex=index feedback.pressed=false
+            feedback.minimumUntil=_UtilLogic.ElapsedSeconds+0.12
+        end
+        local slot=self:GetMobileSlot(key)
+        if self._T.quickEditing or (slot.name=="" and slot.func=="") then self:OpenQuickslotPicker(index) return end
+        if slot.func~="" then self:UseFunction(slot.func) else _SkillManager:UseSkillInSlot(key) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshSkills()
+        for page=1,4 do
+            local button=self:UI("Skills/Page"..tostring(page).."/Symbol")
+            button.TextGUIRendererComponent.FontColor=page==self.skillPage and Color(1,0.83,0.36,1) or Color(1,1,1,1)
+        end
+        local gearColor=self._T.quickEditing and Color(1,0.83,0.36,1) or Color(1,1,1,1)
+        self:UI("Skills/Edit/Gear/Body").TextGUIRendererComponent.FontColor=gearColor
+        for tooth=0,7 do self:UI("Skills/Edit/Gear/Tooth"..tostring(tooth)).SpriteGUIRendererComponent.Color=gearColor end
+        for i=1,8 do
+            local path=self:ButtonPath(i) local slot=self:GetMobileSlot(self:MobileKey(i))
+            local ruid=slot.func~="" and _KeySettingManager:GetFuncIconRUID(slot.func) or slot.ruid
+            local icon=self:UI(path.."/AssignedIcon")
+            icon.Enable=ruid~=""
+            if icon.Enable then self:SetIcon(icon,ruid,i==7 and 84 or (i==8 and 44 or 62)) end
+            self:UI(path.."/Empty").Enable=slot.name=="" and slot.func==""
+            self:UI(path.."/Empty").TextGUIRendererComponent.FontColor=self._T.quickEditing and Color(1,0.83,0.25,1) or Color.white
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenMenuAction(string action)
+        self:ReleaseControls() self:UI("MenuPanel").Enable=false
+        if action=="Inventory" then _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/InvenWindow")
+        elseif action=="Equip" then _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/EquipWindow")
+        elseif action=="Skill" then self:ToggleSkillBook()
+        elseif action=="Enhance" then
+            local path="/ui/DefaultGroup/EnhanceWindow"
+            if _EnhancementManager:IsWindowOpen() and (_AutoStarforce.running or self:CurrentWindow()~=path) then
+                _UIEquipInventoryManager:BringWindowToFront(path)
+            else _EnhancementManager:ToggleWindow() end
+        elseif action=="Hunt" then _WorldMapManager:TravelRandomHunt()
+        elseif action=="Map" then _WorldMapManager:OnMKey()
+        elseif action=="Codex" then _MonsterCodex:Toggle()
+        elseif action=="Shop" then _CosmeticExchange:Open()
+        elseif action=="Cash" then _CashShopManager:ToggleWindow()
+        elseif action=="Character" then _UIEquipInventoryManager:ToggleWin("/ui/DefaultGroup/CharInfoWindow")
+        elseif action=="Social" then _SocialManager:Open("party")
+        elseif action=="Deco" then _DecoWindowManager:SwitchToDeco()
+        elseif action=="Info" then _InformationBook:Toggle()
+        elseif action=="Reward" then _RewardCenter:Toggle()
+        elseif action=="Event" then _EventRewards:Toggle()
+        elseif action=="Boss" then _BossStageManager:Toggle()
+        elseif action=="Battle" then _BattleStatsManager:ToggleWindow()
+        
+        elseif action=="Settings" then _GameSystemMenu:Open("settings") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseWindow()
+        if _MobileNumberPad:BlocksInput() then _MobileNumberPad:Close() return end
+        local path=self:CurrentWindow()
+        _SkillManager:ClearSkillSelection() _SkillManager:HideSkillTooltip() _UIEquipInventoryManager:HideTooltip()
+        if path=="skillAmount" then _SkillManager:CloseSkillAmount() self:UI("SkillAmount").Enable=false
+        elseif path=="mobileLayout" then self:FinishLayoutEditor(false)
+        elseif path=="mobileQuickslot" then self:UI("QuickslotPicker").Enable=false
+        elseif path=="mobileSkills" then self:UI("SkillBook").Enable=false
+        elseif path=="/ui/RewardCenter/Modal" then _RewardCenter:Close()
+        elseif path=="settings" then _GameSystemMenu:Close()
+        elseif path=="map" then _WorldMapManager:CloseAll()
+        elseif path=="/ui/DefaultGroup/EnhanceWindow" then _StarforceMini:Close()
+        elseif path=="/ui/DefaultGroup/CashShopWindow" then _CashShopManager:SetOpen(false)
+        elseif path=="/ui/CosmeticExchangeGroup/Modal" then _CosmeticExchange:Close()
+        else local e=_EntityService:GetEntityByPath(path) if isvalid(e) then e.Enable=false end _UIEquipInventoryManager:RemoveWin(path) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleChat()
+        self:ReleaseControls()
+        if _MapleHUDManager:IsChatTyping() then _MapleHUDManager:FinishChatInput() else
+            local box=_MapleHUDManager.chatBox
+            if isvalid(box) then self:Remember(box) box.Enable=true end
+            _MapleHUDManager:FocusChat()
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        self:UpdateTouchFeedback()
+        if _AutoHuntPowerSave.active then return end
+        self:UpdatePressFeedback(delta)
+        local now=_UtilLogic.ElapsedSeconds
+        if not self._T.uiPreferencesLoaded and now >= (self._T.nextLoad or 0) and isvalid(_UserService.LocalPlayer) then
+            self._T.nextLoad=now+10 _CharacterPersistence:RequestUIPreferences()
+        elseif self._T.saveFailed and now >= (self._T.nextLoad or 0) and self._T.pendingMode~=nil then
+            self._T.nextLoad=now+10 _CharacterPersistence:RequestSetUIMode(self.device,self._T.pendingMode)
+        end
+        self:UI("DeviceOptions").Enable=self.device=="mobile" and not self:IsMobile() and _LoginFlow:IsInGame() and not _GameSystemMenu.opened
+        if not self:IsMobile() then
+            if now >= (self._T.nextPCPicker or 0) then self._T.nextPCPicker=now+0.15 self:RefreshMobilePanels() end
+            return
+        end
+        local player=_UserService.LocalPlayer
+        local map=isvalid(player) and player.CurrentMap or nil
+        if self._T.lastMap~=map then self._T.windowDrag=nil self:ReleaseControls() self._T.lastMap=map end
+        local active=_LoginFlow:IsInGame()
+        self:UI("").Enable=active
+        _EntityService:GetEntityByPath("/ui/MobileBase/HUD").Enable=active
+        _EntityService:GetEntityByPath("/ui/MobileQuickslots/HUD").Enable=active
+        if not active then self:ReleaseControls() return end
+        if not self:CanAct() then self:ReleaseControls() else
+            local x=self:Horizontal() local y=self._T.stickY or 0 local attacking=false
+            for id,v in pairs(self._T.touches) do
+                if not v.uiHeld and now-v.seen>1 then self:TouchUp(id)
+                elseif v.name=="Up" then y=1 elseif v.name=="Down" then y=-1 elseif v.func=="attack" then attacking=true end
+            end
+            if y>0 and not self._T.portalUpLatched and now>=(self._T.nextPortalTry or 0) and not _SkillManager._T.actionLock then
+                self._T.nextPortalTry=now+0.3
+                if _MapPortalSystem:TryNearbyPortal() then
+                    self._T.portalUpLatched=true
+                    log("[MobileUI] joystick up portal request")
+                end
+            end
+            local p=_UserService.LocalPlayer
+            if (x~=0 or y~=0) and not _SkillManager._T.actionLock then
+                if not self._T.ownsMovement then self._T.controllerWasEnabled=p.PlayerControllerComponent.Enable self._T.ownsMovement=true end
+                p.PlayerControllerComponent.Enable=false
+                if x~=0 then p.PlayerControllerComponent.LookDirectionX=x end
+                local sc=p.StateComponent local rb=p.RigidbodyComponent
+                local climbing=sc.CurrentStateName=="CLIMB" or sc.CurrentStateName=="LADDER"
+                p.MovementComponent:MoveToDirection(Vector2(x,y),delta)
+                if y~=0 and not climbing then p.PlayerControllerComponent:ActionClimb(Vector2(0,y*0.05),p.MovementComponent:GetClimbableHeight()) end
+                if not climbing and rb:IsOnGround() and x~=0 and (sc.CurrentStateName=="IDLE" or sc.CurrentStateName=="FALL" or sc.CurrentStateName=="JUMP") then sc:ChangeState("MOVE")
+                elseif not climbing and not rb:IsOnGround() and sc.CurrentStateName=="MOVE" then sc:ChangeState("FALL") end
+            elseif self._T.ownsMovement then
+                p.MovementComponent:Stop()
+                if p.StateComponent.CurrentStateName=="MOVE" then p.StateComponent:ChangeState("IDLE") end
+                if not _SkillManager._T.actionLock then p.PlayerControllerComponent.Enable=self._T.controllerWasEnabled and p.PlayerComponent.Hp>0 and not p.PlayerComponent:IsDead() self._T.ownsMovement=false end
+            end
+            if attacking then self:Attack() end
+        end
+        if now < (self._T.nextRefresh or 0) then return end self._T.nextRefresh=now+0.15
+        for _, name in ipairs({"BtnEvent","BtnBoss","BtnReward","BtnAutoHunt","BtnCashShop","BtnCharInfo","BtnCodex","BtnEnhance","BtnEquip","BtnInven","BtnKeySetting","BtnMap","BtnShop","BtnSkill"}) do self:HidePC(_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..name)) end
+        self:HidePC(_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar"))
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) then return end
+        local pc=p.PlayerComponent
+        -- The portrait HUD is hidden; avoid rebuilding its unused stats.
+        self:UI("Auto/Label").TextGUIRendererComponent.Text=_AutoHuntManager.autoOn and "자동 중지" or "자동사냥"
+        if not self._T.systemSkinned then local system=_EntityService:GetEntityByPath("/ui/GameSystem/Overlay") if isvalid(system) then self:StyleWindowButtons(system) self._T.systemSkinned=true end end
+        local path=self:CurrentWindow() local menu=self:UI("MenuPanel").Enable
+        local free=path=="" and not menu and not _MapleHUDManager:IsChatTyping()
+        self:UI("Combat").Enable=true
+        self:UI("Skills").Enable=true
+        local assigning=(_SkillManager:IsClickMode() and path=="mobileSkills") or self._T.layoutEditing==true
+        local quickRoot=_EntityService:GetEntityByPath("/ui/MobileQuickslots")
+        if self._T.quickAssigning~=assigning then
+            quickRoot.UIGroupComponent.GroupType=assigning and UIGroupType.UIType or UIGroupType.DefaultType
+            quickRoot.UIGroupComponent.GroupOrder=assigning and 27 or -1
+            _UILogic:SetSiblingIndex(quickRoot.UITransformComponent,assigning and 1000 or 0)
+            -- 공격/점프도 등록 대상이므로 같은 선택 레이어로 올린다.
+            local combat=self:UI("Combat")
+            combat:AttachTo(assigning and _EntityService:GetEntityByPath("/ui/MobileQuickslots/HUD") or _EntityService:GetEntityByPath("/ui/MobileBase/HUD"))
+            _UILogic:SetSiblingIndex(combat.UITransformComponent,10000)
+            self._T.quickAssigning=assigning
+        end
+        self:UI("WindowTools").Enable=path~="" and path~="map" and path~="settings" and path~="mobileLayout" and path~="mobileQuickslot" and path~="mobileSkills" and path~="skillAmount" and path~="/ui/DefaultGroup/EnhanceWindow" and path~="/ui/SocialWindow/Window" and path~="/ui/CosmeticExchangeGroup/Modal" and not _MobileNumberPad:BlocksInput() and not _EventRewards:BlocksInput() and not _RewardCenter:BlocksInput() and self._T.selectedItem==nil
+        self:UI("WindowTools/Move").Enable=false
+        self:UI("WindowTools/SkillsPrev").Enable=path=="/ui/DefaultGroup/SkillWindow"
+        self:UI("WindowTools/SkillsNext").Enable=path=="/ui/DefaultGroup/SkillWindow"
+        self:UI("Skills").UITransformComponent.anchoredPosition=Vector2(-24,24)
+        self:UI("Status").Enable=false
+        self:UI("Auto").Enable=true self:UI("Skill").Enable=true self:UI("Enhance").Enable=true
+        self:UI("Chat").Enable=true
+        self:UI("Menu").Enable=true self:UI("Event").Enable=true self:UI("Boss").Enable=true
+        self:UI("ChatActions").Enable=false
+        self:RefreshSelectedItem()
+        if now>(self._T.noticeUntil or 0) then self:UI("Notice").TextGUIRendererComponent.Text="" end
+        for _, window in ipairs(_UIClickArbiter:GetWindowPaths()) do if window~="/ui/DefaultGroup/Board" and window~="/ui/DefaultGroup/ItemActionPopup" then self:FitWindow(window) end end
+        self:FitWindow("/ui/BattleStatsDetailWindow/Window")
+        self:FitWindow("/ui/SocialWindow/Window")
+        self:FitWindow("/ui/CosmeticExchangeGroup/Modal/Panel")
+        local board=_EntityService:GetEntityByPath("/ui/DefaultGroup/Board")
+        if isvalid(board) then self:Remember(board) board.UITransformComponent.UIScale=Vector3(1.05,1.05,1) board.UITransformComponent.AlignmentOption=0 board.UITransformComponent.AnchorsMin=Vector2(0,1) board.UITransformComponent.AnchorsMax=Vector2(0,1) board.UITransformComponent.Pivot=Vector2(0,1) board.UITransformComponent.anchoredPosition=Vector2(0,0) end
+        
+        local box=_MapleHUDManager.chatBox
+        if isvalid(box) then
+            self:Remember(box) self._T.saved[box.Path].hidden=true box.Enable=true
+            
+        end
+        local plate=_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/LevelPlate")
+        local hp=_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/HpBar")
+        if isvalid(plate) and isvalid(hp) then
+            self:Remember(plate)
+            local ht=hp.UITransformComponent local pt=plate.UITransformComponent
+            pt.AlignmentOption=AlignmentType.BottomCenter pt.Pivot=Vector2(0,0)
+            pt.anchoredPosition=Vector2(ht.anchoredPosition.x-ht.RectSize.x*ht.Pivot.x,ht.anchoredPosition.y+ht.RectSize.y*(1-ht.Pivot.y)+6)
+        end
+        self:RefreshSkills() self:RefreshMobilePanels() self:ApplyHUDPositions()
+        self:PositionWindowClose()
+        self:OrderMobileLayers()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for serial,_ in pairs(self._T.touchFeedback or {}) do self:ClearTouchFeedback(serial) end
+        self._T.touchFeedbackPressed={}
+        self:ResetPressFeedback()
+        self:ReleaseControls()
+        for _, v in ipairs(self._T.links or {}) do if isvalid(v.entity) then v.entity:DisconnectEvent(v.kind,v.listener) end end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowNotice(string message)
+        local e=self:UI("Notice") if isvalid(e) then e.TextGUIRendererComponent.Text=message end
+        self._T.noticeUntil=_UtilLogic.ElapsedSeconds+4
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method string SelectedItemValue(string source, number index, string tab)
+        -- Resolve the same slot for selection, validation and the color picker.
+        if source=="deco" then return _DecoWindowManager:GetDecoItem(_DecoWindowManager:SlotUIKeys()[index]) end
+        if source=="equip" then return _UIEquipInventoryManager:GetEquip(index) end
+        return _UIEquipInventoryManager:GetTabItem(tab,index)
+    end
+
+    @ExecSpace("ClientOnly")
+    method string SelectedItemWindow(string source)
+        -- Equipped cosmetics have their own window.
+        if source=="deco" then return "/ui/DefaultGroup/DecoWindow" end
+        if source=="equip" then return "/ui/DefaultGroup/EquipWindow" end
+        return "/ui/DefaultGroup/InvenWindow"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectItem(string source, number index)
+        local inv=_UIEquipInventoryManager
+        local item=self:SelectedItemValue(source,index,inv._T.activeTab)
+        if item=="" then return end
+        inv:CancelEquipDrag() inv:CancelInvenDrag() inv:ConsumeEnhancePick()
+        self._T.selectedItem={source=source,index=index,item=item,tab=inv._T.activeTab}
+        self:UI("ItemActions").Enable=true
+        self:UI("ItemActions/Color").Enable=inv:GetField(item,3)=="deco" or inv:IsHairOrFaceItem(item)
+        self:UI("ItemActions/Enhance").Enable=not self:UI("ItemActions/Color").Enable and source~="deco" and _EnhancementManager:IsEnhanceableSlot(inv:ParseSlotIdx(item)) and not _AvatarTicketManager:IsTicket(item)
+        self:UI("ItemActions/Lock").Enable=source=="inven"
+        self:UI("ItemActions/Sell").Enable=source=="inven"
+        self:UI("ItemActions/Use").TextGUIRendererComponent.Text=source~="inven" and "장착 해제" or "사용 / 장착"
+        inv.tooltipSource=source
+        local win=self:SelectedItemWindow(source)
+        inv:ShowTooltipFromStr(item,source=="equip",win,win)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshSelectedItem()
+        local request=self._T.selectedItem
+        if request==nil then self:UI("ItemActions").Enable=false return end
+        local inv=_UIEquipInventoryManager
+        local win=_EntityService:GetEntityByPath(self:SelectedItemWindow(request.source))
+        local item=self:SelectedItemValue(request.source,request.index,request.tab)
+        if not isvalid(win) or not win.EnabledInHierarchy or self:CurrentWindow()~=win.Path or item~=request.item or (request.source=="inven" and inv._T.activeTab~=request.tab) then
+            self._T.selectedItem=nil self:UI("ItemActions").Enable=false inv:HideTooltip() return
+        end
+        local tip=_EntityService:GetEntityByPath("/ui/DefaultGroup/TooltipPanel")
+        if isvalid(tip) and not tip.Enable then inv.tooltipSource=request.source inv:ShowTooltipFromStr(item,request.source=="equip",win.Path,win.Path) end
+        if isvalid(tip) and tip.Enable then
+            self:Remember(tip)
+            local scale=math.min(1.1,740/math.max(1,inv._T.tooltipMainHeight or 400,inv._T.tooltipCompareHeight or 0))
+            tip.UITransformComponent.UIScale=Vector3(scale,scale,1)
+            local cmp=tip:GetChildByName("Cmp")
+            tip.UITransformComponent.anchoredPosition=Vector2(740-340*scale,25)
+            if isvalid(cmp) and cmp.Enable then cmp.UITransformComponent.anchoredPosition=Vector2(-348,((inv._T.tooltipMainHeight or 0)-(inv._T.tooltipCompareHeight or 0))/2) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ItemAction(string action)
+        local request=self._T.selectedItem
+        if request==nil then return end
+        local inv=_UIEquipInventoryManager
+        local item=self:SelectedItemValue(request.source,request.index,request.tab)
+        self._T.selectedItem=nil self:UI("ItemActions").Enable=false inv:HideTooltip()
+        if action=="Cancel" then return end
+        if action=="Sell" then
+            _CosmeticExchange:Open() _CosmeticExchange:SetMode("sell")
+            log("[MobileUI] inventory opened equipment sales") return
+        end
+        if item~=request.item or (request.source=="inven" and inv._T.activeTab~=request.tab) then return end
+        if action=="Color" then
+            if inv:GetField(item,3)=="deco" or inv:IsHairOrFaceItem(item) then
+                self:ReleaseControls()
+                _AppearanceColorPicker:Open(request.source,request.index,request.tab)
+                log("[MobileUI] appearance color source="..request.source)
+            end
+            return
+        end
+        if request.source=="deco" then
+            if action=="Use" then _DecoWindowManager:UnequipDeco(_DecoWindowManager:SlotUIKeys()[request.index]) end
+            return
+        end
+        if action=="Enhance" then _EnhancementManager:OpenEquipmentFromRightClick(request.source,request.index) return end
+        if action=="Lock" then inv:ToggleItemLock(request.index) return end
+        self._T.itemActionBypass=true
+        if request.source=="equip" then inv:MoveEquipToInven(request.index)
+        elseif inv:ParseSlotIdx(item)>=1 then inv:MoveInvenToEquip(request.index)
+        else
+            inv.lastInvenSlot=request.index inv.lastInvenTime=_UtilLogic.ElapsedSeconds
+            inv:OnSlotClick("inven",request.index)
+        end
+        self._T.itemActionBypass=false
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void TouchUp(integer id)
+        if self._T.touchFeedbackPressed then self._T.touchFeedbackPressed[id]=nil end
+        if self._T.windowDrag and self._T.windowDrag.id==id then self._T.windowDrag=nil return end
+        if self._T.layoutDrag~=nil and self._T.layoutDrag.id==id then self._T.layoutDrag=nil return end
+        local v=self._T.touches[id]
+        if v~=nil and v.index~=nil then self:SetPressFeedback(self:UI(self:ButtonPath(v.index)),false) end
+        if v~=nil and v.key~=nil then
+            _SkillManager:ReleaseSkillKey(v.key)
+            self._T.skillReleaseTimes=self._T.skillReleaseTimes or {}
+            self._T.skillReleaseTimes[v.index]=_UtilLogic.ElapsedSeconds
+        end
+        if id==self._T.stickId then self._T.stickId=nil self._T.stickX=0 self._T.stickY=0 self:SetStickKnob(Vector2.zero) end
+        self._T.touches[id]=nil
+        if next(self._T.touches)==nil then self:ReleaseControls() end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method boolean HasControlAt(Entity e, Vector2 point)
+        -- Blank window surfaces drag; buttons, item cells, inputs and scroll areas retain their input.
+        for _,child in ipairs(e.Children:ToTable()) do
+            if child.EnabledInHierarchy and child.VisibleInHierarchy then
+                local control=isvalid(child.ButtonComponent) or isvalid(child.TextGUIRendererInputComponent) or isvalid(child.TextInputComponent) or isvalid(child.ScrollLayoutGroupComponent) or isvalid(child.GridViewComponent)
+                if isvalid(child.UITouchReceiveComponent) and not string.find(child.Path,"/Title",1,true) then control=true end
+                if control and _UIClickArbiter:ContainsScreenPoint(child,point) then return true end
+                if self:HasControlAt(child,point) then return true end
+            end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BeginWindowTouch(any event)
+        -- Track the initiating finger in the window parent's coordinates.
+        if not self:IsMobile() or not _LoginFlow:IsInGame() then return false end
+        local path=_UIClickArbiter:GetTopmostWindowAt(event.TouchPoint)
+        if path=="/ui/EventGroup/Modal" or path=="/ui/AppearanceColorGroup/Modal" or path=="/ui/CosmeticExchangeGroup/Modal" then path=path.."/Panel" end
+        for _,p in ipairs({"/ui/OfflineRestGroup/Modal/Panel","/ui/MobileHUD/HUD/SkillBook"}) do
+            local candidate=_EntityService:GetEntityByPath(p)
+            if isvalid(candidate) and candidate.EnabledInHierarchy and _UIClickArbiter:ContainsScreenPoint(candidate,event.TouchPoint) then path=p end
+        end
+        if path=="" then return false end
+        local e=_EntityService:GetEntityByPath(path)
+        if not isvalid(e) or not _UIClickArbiter:ContainsScreenPoint(e,event.TouchPoint) or self:HasControlAt(e,event.TouchPoint) then return false end
+        if string.find(path,"Modal",1,true) and not string.find(path,"Panel",1,true) then return false end
+        if string.find(path,"/ui/DefaultGroup/EnhanceWindow/",1,true)==1 then
+            e=_EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+        end
+        if self._T.windowDrag then return true end
+        self._T.windowDrag={id=event.TouchId,entity=e,start=_UILogic:ScreenToLocalUIPosition(event.TouchPoint,e.Parent.UITransformComponent),position=e.UITransformComponent.anchoredPosition}
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ScrollSkills(integer direction)
+        local skills=_SkillManager:GetTabSkills(_SkillManager._T.activeSkillTab)
+        local maxRow=math.max(0,math.ceil(#skills/2)-5)
+        _SkillManager._T.skillScrollRow=math.max(0,math.min(maxRow,_SkillManager._T.skillScrollRow+direction))
+        _SkillManager:ClearSkillSelection() _SkillManager:HideSkillTooltip()
+        _SkillManager:UpdateSkillViewport()
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void UseFunction(string func)
+        local actions={inven="Inventory",equip="Equip",skill="Skill",enhance="Enhance",worldmap="Map",codex="Codex",shop="Shop",cashshop="Cash",character="Character",information="Info",event="Event",reward="Reward",boss="Boss",battlestats="Battle"}
+        if func=="uivisibility" then _KeySettingManager:SetUIHidden(not _KeySettingManager._T.uiHidden)
+        elseif func=="party" then _SocialManager:Open("party")
+        elseif func=="friend" then _SocialManager:Open("friend")
+        elseif func=="menu" then _GameSystemMenu:Open("menu")
+        elseif actions[func]~=nil then self:OpenMenuAction(actions[func])
+        elseif func=="interact" then _BossStageManager:TryToggleTarget()
+        elseif func=="autohunt" then self:ReleaseControls() _AutoHuntManager:Toggle()
+        elseif func=="attack" then self:Attack()
+        elseif func=="jump" then
+            _MapleIslandTutorial:OnMobileAction("Jump")
+            local controller=_UserService.LocalPlayer.PlayerControllerComponent
+            if (self._T.stickY or 0)<0 then controller:ActionDownJump(self:Horizontal())
+            else controller:ActionJump(self:Horizontal()) end
+        elseif func=="mute" then _GameSystemMenu:ToggleMute()
+        elseif func=="quickslot" then self.skillPage=self.skillPage%4+1 self:RefreshSkills()
+        elseif func=="chat_all" or func=="chat_friend" or func=="chat_party" then
+            local mode=func=="chat_friend" and "friend" or (func=="chat_party" and "party" or "map")
+            _SocialManager:SelectChat(mode) self:ToggleChat()
+        end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method boolean SkillClickWasHandled(integer index)
+        for _,v in pairs(self._T.touches or {}) do if v.index==index then return true end end
+        local released=(self._T.skillReleaseTimes or {})[index] or -10
+        return _UtilLogic.ElapsedSeconds-released<0.3
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void MoveStick(Vector2 point)
+        -- Keep control captured outside the base; a dead zone prevents accidental turns.
+        local t=self:UI("Combat/Stick").UITransformComponent
+        local q=_UILogic:ScreenToLocalUIPosition(point,t)
+        local dx=q.x-125 local dy=q.y-125
+        if dy<35 then self._T.portalUpLatched=false end
+        local distance=math.sqrt(dx*dx+dy*dy)
+        local factor=distance>78 and 78/distance or 1
+        self:SetStickKnob(Vector2(dx*factor,dy*factor))
+        self._T.stickX=math.abs(dx)<24 and 0 or (dx>0 and 1 or -1)
+        self._T.stickY=math.abs(dy)<45 and 0 or (dy>0 and 1 or -1)
+        if self._T.stickX~=0 then _MapleIslandTutorial:OnMobileAction(self._T.stickX>0 and "Right" or "Left") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindMobilePanels()
+        self:UI("EquipmentPicker/Enhance").Enable=false
+        self:UI("EquipmentPicker/Wear").UITransformComponent.anchoredPosition=Vector2(0,self:UI("EquipmentPicker/Wear").UITransformComponent.anchoredPosition.y)
+        self:Bind("EquipmentPicker/Wear",function() self:EquipmentAction(true) end)
+        -- Bind native click events once; selection never depends on hover or pointer offsets.
+        self._T.bookPage=1 self._T.bookIndex=1 self._T.pickPage=1 self._T.pickSource="inven"
+        self:Bind("SkillBook/Close",function() self:CloseWindow() end)
+        for i=0,5 do local tab=tostring(i) self:Bind("SkillBook/Tab"..tab,function() _SkillManager:SwitchSkillTab(tab) self._T.bookPage=1 self._T.bookIndex=1 self:DrawSkillBook() end) end
+        for i=1,6 do local index=i
+            self:Bind("SkillBook/Card"..tostring(i),function() _SkillManager:ClearSkillSelection() self._T.bookIndex=(self._T.bookPage-1)*6+index self:DrawSkillBook() end)
+            self:Bind("EquipmentPicker/Item"..tostring(i),function() self:PickEquipment(index) end)
+        end
+        for _,entry in ipairs({{name="Prev",delta=-1},{name="Next",delta=1}}) do local d=entry.delta
+            self:Bind("SkillBook/"..entry.name,function() self._T.bookPage=math.max(1,math.min(self._T.bookPages or 1,self._T.bookPage+d)) self._T.bookIndex=(self._T.bookPage-1)*6+1 _SkillManager:ClearSkillSelection() self:DrawSkillBook() end)
+            self:Bind("EquipmentPicker/"..entry.name,function() self._T.pickedEquipment=nil self._T.pickPage=math.max(1,math.min(self._T.pickPages or 1,self._T.pickPage+d)) self:DrawEquipmentPicker() end)
+        end
+        self:Bind("SkillBook/Plus",function() self:AllocateMobileSkill(true) end)
+        self:Bind("SkillBook/Minus",function() self:AllocateMobileSkill(false) end)
+        self:Bind("SkillBook/Register",function()
+            local skill=_SkillManager:GetTabSkills(_SkillManager._T.activeSkillTab)[self._T.bookIndex]
+            if skill==nil then return end
+            if _SkillManager:IsPassiveSkillName(skill.name) then self:ShowNotice("패시브 스킬은 분배 즉시 적용됩니다.") return end
+            if not _SkillManager:IsSkillUsableByInvestment(skill.name) then self:ShowNotice("먼저 스킬 포인트를 분배하세요.") return end
+            _SkillManager:EnterClickMode(skill.ruid,skill.name,"window") local ghost=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillDragGhost") if isvalid(ghost) then ghost.Enable=false end
+            _UILogic:SetSiblingIndex(self:UI("Skills").UITransformComponent,10000)
+            self:ShowNotice("오른쪽 퀵슬롯을 눌러 등록하세요.") self:DrawSkillBook()
+        end)
+        self:Bind("EquipmentPicker/Inven",function() self._T.pickedEquipment=nil self._T.pickSource="inven" self._T.pickPage=1 self:DrawEquipmentPicker() end)
+        self:Bind("EquipmentPicker/Equip",function() self._T.pickedEquipment=nil self._T.pickSource="equip" self._T.pickPage=1 self:DrawEquipmentPicker() end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleSkillBook()
+        -- The mobile book reuses the same skills, point pools and quickslot mappings.
+        local book=self:UI("SkillBook") book.Enable=not book.Enable
+        book.UITransformComponent.UIScale=Vector3(1.08,1.08,1)
+        self:ReleaseControls() _SkillManager:ClearSkillSelection() _SkillManager:HideSkillTooltip()
+        local old=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillWindow") if isvalid(old) then old.Enable=false end
+        if book.Enable then
+            _SkillManager:SwitchSkillTab(_SkillManager:DefaultSkillTab()) self._T.bookPage=1 self._T.bookIndex=1
+            self:DrawSkillBook()
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSkillBook()
+        -- Rebuild only six visible rows and a fixed detail panel, with no floating tooltip.
+        local sm=_SkillManager local list=sm:GetTabSkills(sm._T.activeSkillTab)
+        local balances=sm:GetSkillPointBalances()
+        local keys={tostring(sm._T.activeSkillTab),tostring(self._T.bookPage),tostring(self._T.bookIndex),tostring(sm:IsClickMode()),tostring(balances.beginnerAvailable)}
+        for tier=1,5 do keys[#keys+1]=tostring(balances.remaining[tier] or 0) end
+        for _,skill in ipairs(list) do keys[#keys+1]=skill.name..":"..tostring(skill.level or 0)..":"..tostring(skill.maxLevel or 0) end
+        local signature=table.concat(keys,"|")
+        if self._T.bookDrawSignature==signature then return end
+        self._T.bookDrawSignature=signature
+        self._T.bookPages=math.max(1,math.ceil(#list/6))
+        self._T.bookPage=math.min(self._T.bookPage,self._T.bookPages)
+        local grid=self:UI("SkillBook/List").GridViewComponent
+        local reset=self._T.listTab~=sm._T.activeSkillTab
+        self._T.listTab=sm._T.activeSkillTab
+        if reset or grid.TotalCount~=#list then
+            grid.TotalCount=#list grid:Refresh(true,true)
+        else
+            -- 선택/분배는 현재 행만 갱신한다. GridView를 재배치하지 않아 스크롤과 위치가 유지된다.
+            for _,cell in pairs(self._T.listCells or {}) do
+                if cell.kind=="skill" and isvalid(cell.entity) and cell.entity.EnabledInHierarchy then
+                    self:DrawTouchListRow("skill",cell.index,cell.entity)
+                end
+            end
+        end
+        for i=0,5 do self:UI("SkillBook/Tab"..tostring(i)).SpriteGUIRendererComponent.Color=sm._T.activeSkillTab==tostring(i) and Color(0.63,0.84,0.72,1) or Color(0.96,0.89,0.74,1) end
+        local skill=list[self._T.bookIndex]
+        self:UI("SkillBook/Page").TextGUIRendererComponent.Text=tostring(self._T.bookPage).." / "..tostring(self._T.bookPages)
+        self:UI("SkillBook/Name").TextGUIRendererComponent.Text=skill~=nil and skill.name or "등록된 스킬이 없습니다."
+        self:UI("SkillBook/SelectedIcon").Enable=skill~=nil
+        if skill~=nil then self:SetIcon(self:UI("SkillBook/SelectedIcon"),skill.ruid,64) end
+        self:UI("SkillBook/Description").TextGUIRendererComponent.Text=skill~=nil and ((skill.desc or "").."\n"..sm:SkillPrerequisiteText(skill.name)) or ""
+        self:UI("SkillBook/Effects").TextGUIRendererComponent.Text=skill~=nil and sm:GetSkillTooltipEffects(skill,skill.maxLevel or 20) or ""
+        local tier=skill~=nil and sm:GetSkillTier(skill.name) or 0
+        local points=skill~=nil and sm:IsBeginnerSkill(skill.name) and balances.beginnerAvailable or (balances.remaining[tier] or 0)
+        self:UI("SkillBook/Points").TextGUIRendererComponent.Text="남은 스킬 포인트  "..tostring(points)
+        self:UI("SkillBook/Plus").ButtonComponent.Enable=skill~=nil and skill.spendable==true and points>0 and (skill.level or 0)<(skill.maxLevel or 20)
+        self:UI("SkillBook/Minus").ButtonComponent.Enable=skill~=nil and skill.spendable==true and (skill.level or 0)>0
+        self:UI("SkillBook/Register").Enable=not sm:IsClickMode()
+        self:UI("SkillBook/Points").Enable=not sm:IsClickMode()
+        self:UI("SkillBook/Description").Enable=not sm:IsClickMode()
+        self:UI("SkillBook/Effects").Enable=not sm:IsClickMode()
+        self:UI("SkillBook/Plus").Enable=not sm:IsClickMode() self:UI("SkillBook/Minus").Enable=not sm:IsClickMode()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AllocateMobileSkill(boolean increase)
+        _SkillManager:OpenSkillAmount(self._T.bookIndex,increase)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawEquipmentPicker()
+        -- Read actual equipment slots, including sparse inventory indices and locked items.
+        local inv=_UIEquipInventoryManager local items={}
+        local keys={self._T.pickSource or "",tostring(self._T.pickPage or 1)}
+        if self._T.pickSource=="equip" then for i=1,29 do keys[#keys+1]=inv:GetEquip(i) or "" end
+        else local tab=(inv._T.tabData or {}).equip or {} for i=1,128 do keys[#keys+1]=tab[i] or "" end end
+        local signature=table.concat(keys,"\n")
+        if self._T.pickDrawSignature==signature then return end
+        self._T.pickDrawSignature=signature
+        if self._T.pickSource=="equip" then
+            for i=1,29 do local item=inv:GetEquip(i) if item~="" and _EnhancementManager:IsEnhanceableSlot(inv:ParseSlotIdx(item)) then table.insert(items,{index=i,item=item}) end end
+        else
+            for i,item in pairs((inv._T.tabData or {}).equip or {}) do if item~="" and _EnhancementManager:IsEnhanceableSlot(inv:ParseSlotIdx(item)) then table.insert(items,{index=i,item=item}) end end
+            table.sort(items,function(a,b) return a.index<b.index end)
+        end
+        self._T.pickItems=items self._T.pickPages=math.max(1,math.ceil(#items/6)) self._T.pickPage=math.min(self._T.pickPage,self._T.pickPages)
+        for i=1,6 do local record=items[(self._T.pickPage-1)*6+i] local path="EquipmentPicker/Item"..tostring(i)
+            self:UI(path).Enable=record~=nil
+            if record~=nil then
+                self:SetIcon(self:UI(path.."/Icon"),inv:ItemIconRUID(record.item),64)
+                self:UI(path.."/Name").TextGUIRendererComponent.Text=inv:ParseName(record.item).."\n"..tostring(inv:ParseStars(record.item)).."성"..(inv:IsItemLocked(record.item) and " · 잠금" or "")
+            end
+        end
+        self:UI("EquipmentPicker/Page").TextGUIRendererComponent.Text=tostring(self._T.pickPage).." / "..tostring(self._T.pickPages).."  ("..tostring(#items)..")"
+        for _,v in ipairs({{name="Inven",source="inven"},{name="Equip",source="equip"}}) do self:UI("EquipmentPicker/"..v.name).SpriteGUIRendererComponent.Color=self._T.pickSource==v.source and Color(0.63,0.84,0.72,1) or Color(0.96,0.89,0.74,1) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PickEquipment(integer index)
+        -- Reject stale rows and route through the normal lock/busy/cube validation path.
+        local record=(self._T.pickItems or {})[(self._T.pickPage-1)*6+index] if record==nil then return end
+        local inv=_UIEquipInventoryManager
+        local current=self._T.pickSource=="equip" and inv:GetEquip(record.index) or inv:GetTabItem("equip",record.index)
+        if current~=record.item then self:DrawEquipmentPicker() return end
+        if _AutoStarforce.running or _StarforcePresentation.busy then self:ShowNotice("진행 중인 강화를 중지한 뒤 장비를 선택하세요.") return end
+        self._T.pickedEquipment={index=record.index,item=record.item,source=self._T.pickSource}
+        self:EquipmentAction(false)
+        self:UI("EquipmentPicker/Wear").TextGUIRendererComponent.Text=self._T.pickSource=="equip" and "장착 해제" or "장착"
+        for i=1,6 do self:UI("EquipmentPicker/Item"..tostring(i)).SpriteGUIRendererComponent.Color=i==index and Color(0.9,0.77,0.4,1) or Color(0.96,0.89,0.74,1) end
+
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EquipmentAction(boolean wear)
+        if wear and _EnhancementManager:BlockEquipmentChange() then return end
+        -- Selection never mutates equipment; only an explicit action does.
+        local r=self._T.pickedEquipment if r==nil then self:ShowNotice("먼저 장비를 선택하세요.") return end
+        local inv=_UIEquipInventoryManager
+        local current=r.source=="equip" and inv:GetEquip(r.index) or inv:GetTabItem("equip",r.index)
+        if current~=r.item or self._T.pickSource~=r.source then self._T.pickedEquipment=nil self:DrawEquipmentPicker() return end
+        if (not wear and (_AutoStarforce.running or _StarforcePresentation.busy)) or _EnhancementManager:RequireCubeChoice() then return end
+        if r.source=="inven" then inv:OnTabSwitch("equip") end
+        if wear then
+            if r.source=="equip" then inv:MoveEquipToInven(r.index) else inv:MoveInvenToEquip(r.index) end
+        else _EnhancementManager:OpenEquipmentFromRightClick(r.source,r.index) end
+        if wear then self._T.pickedEquipment=nil end
+        self._T.pickDrawSignature=nil self:DrawEquipmentPicker()
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsEnhancementBehindWindow()
+        -- Keep enhancement alive while its picker and overlay yield to the foreground menu.
+        if not self:IsMobile() then return false end
+        return self:UI("MenuPanel").Enable or self:CurrentWindow()~="/ui/DefaultGroup/EnhanceWindow"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshMobilePanels()
+        -- Show equipment selection beside the original enhancement controller and effects.
+        local enhance=_EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+        local opened=_LoginFlow:IsInGame() and isvalid(enhance) and enhance.EnabledInHierarchy and not _StarforceMini.minimized and not self:IsEnhancementBehindWindow()
+        self:UI("EquipmentPicker").Enable=opened
+        if opened then
+            self:DrawEquipmentPicker()
+            -- Keep equipment and inventory open while the enhancement picker is visible.
+        end
+        if self:UI("SkillBook").Enable then self:DrawSkillBook() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshPortrait()
+        -- Update the avatar only when its costume snapshot changes; HP/MP bars are independent.
+        local player=_UserService.LocalPlayer if not isvalid(player) then return end
+        local pc=player.PlayerComponent
+        self:UI("Status/HPFill").UITransformComponent.RectSize=Vector2(342*math.max(0,math.min(1,pc.Hp/math.max(1,pc.MaxHp))),9)
+        self:UI("Status/MPFill").UITransformComponent.RectSize=Vector2(342*math.max(0,math.min(1,_MpManager:GetCurrentMp()/math.max(1,_MpManager:GetMaxMp()))),9)
+        local finals=_AvatarTicketManager._T.localFinals
+        local signature=tostring(finals)..tostring(_AvatarTicketManager:Equipped())
+        if finals~=nil and self._T.portraitSignature~=signature then
+            self._T.portraitSignature=signature
+            _AvatarTicketManager:Apply(self:UI("Status/Portrait/Avatar").CostumeManagerComponent,pc.UserId,finals,_AvatarTicketManager:Equipped())
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsMoving()
+        -- Yield attack-facing locks only after skill movement lock has ended.
+        return self:IsMobile() and self._T.ownsMovement==true and self:Horizontal()~=0 and not _SkillManager._T.actionLock
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetIcon(Entity icon, string ruid, number size)
+        -- Use the UI rectangle center rather than the resource's world pivot.
+        local renderer=icon.SpriteGUIRendererComponent
+        renderer.Color=Color.white renderer.Type=ImageType.Simple renderer.PreserveSprite=string.sub(ruid,1,12)=="thumbnail://" and PreserveSpriteType.AspectOnly or PreserveSpriteType.None
+        renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
+        self._T.iconKeys=self._T.iconKeys or {}
+        local key=ruid..":"..tostring(size)
+        if self._T.iconKeys[icon.Id]==key then return end
+        self._T.iconKeys[icon.Id]=key renderer.ImageRUID=DataRef(ruid) icon.UITransformComponent.RectSize=Vector2(size,size)
+        if string.sub(ruid,1,12)=="thumbnail://" then renderer.PreserveSprite=PreserveSpriteType.AspectOnly return end
+        _ResourceService:PreloadAsync({ruid},function()
+            if not isvalid(icon) or self._T.iconKeys[icon.Id]~=key then return end
+            local kind=_ResourceService:GetTypeAndWait(ruid)
+            local sprite=nil
+            if kind==ResourceType.Sprite then sprite=_ResourceService:LoadSpriteAndWait(ruid)
+            elseif kind==ResourceType.AnimationClip then
+                local clip=_ResourceService:LoadAnimationClipAndWait(ruid)
+                local area=0
+                if clip~=nil then for _,frame in ipairs(clip.Frames:ToTable()) do local candidate=frame.FrameSprite if candidate~=nil and candidate.Width*candidate.Height>area then sprite=candidate area=candidate.Width*candidate.Height end end end
+                if sprite~=nil and self._T.iconKeys[icon.Id]==key then renderer.ImageRUID=DataRef(sprite.RUID) end
+            end
+            if sprite~=nil and sprite.Width>0 and sprite.Height>0 and self._T.iconKeys[icon.Id]==key then
+                local scale=math.min(size/sprite.Width,size/sprite.Height)
+                icon.UITransformComponent.RectSize=Vector2(sprite.Width*scale,sprite.Height*scale)
+            end
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StyleWindowButtons(Entity window)
+        -- Existing windows keep their actions while sharing the mobile button skin.
+        self._T.buttonSkins=self._T.buttonSkins or {}
+        for _,button in ipairs(window:GetChildComponentsByTypeName("MOD.Core.ButtonComponent",true)) do
+            local e=button.Entity local sprite=e.SpriteGUIRendererComponent local t=e.UITransformComponent
+            self:BindPressFeedback(e)
+            if isvalid(sprite) and t.RectSize.x>=70 and t.RectSize.y>=32 and sprite.Color.a>=0.5 and self._T.buttonSkins[e.Id]==nil then
+                local text=e.TextGUIRendererComponent if not isvalid(text) then text=e.TextComponent end
+                self._T.buttonSkins[e.Id]={entity=e,image=sprite.ImageRUID,imageType=sprite.Type,color=sprite.Color,preserve=sprite.PreserveSprite,shadow=sprite.DropShadow,outline=sprite.Outline,outlineColor=sprite.OutlineColor,outlineWidth=sprite.OutlineWidth,text=text,textColor=isvalid(text) and text.FontColor or nil}
+                sprite.ImageRUID=DataRef("2860136c06ab075439721c027de365af") sprite.Type=ImageType.Sliced sprite.PreserveSprite=PreserveSpriteType.None
+                sprite.DropShadow=true sprite.Outline=true sprite.OutlineColor=Color(0.55,0.42,0.25,1) sprite.OutlineWidth=1
+                if e.Name=="DetailToggleBtn" then sprite.Outline=false sprite.DropShadow=false end
+                -- Retain action-specific text/background contrast, including disabled states.
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestoreButtonStyles()
+        -- Return the original PC art without changing enabled/disabled button states.
+        for _,v in pairs(self._T.buttonSkins or {}) do if isvalid(v.entity) then
+            local sprite=v.entity.SpriteGUIRendererComponent
+            sprite.ImageRUID=v.image sprite.Type=v.imageType sprite.Color=v.color sprite.PreserveSprite=v.preserve sprite.DropShadow=v.shadow sprite.Outline=v.outline sprite.OutlineColor=v.outlineColor sprite.OutlineWidth=v.outlineWidth
+            if isvalid(v.text) then v.text.FontColor=v.textColor end
+        end end
+        self._T.buttonSkins={} self._T.systemSkinned=false
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void BindQuickslotPicker()
+        -- Bind the picker once and share the existing hotkey save path.
+        self:Bind("QuickslotPicker/Close",function() self:UI("QuickslotPicker").Enable=false end)
+        self:Bind("QuickslotPicker/Skills",function() self._T.quickCategory="skills" self._T.quickPage=1 self:DrawQuickslotPicker() end)
+        self:Bind("QuickslotPicker/Potions",function() self._T.quickCategory="potions" self._T.quickPage=1 self:DrawQuickslotPicker() end)
+        self:Bind("QuickslotPicker/Windows",function() self._T.quickCategory="windows" self._T.quickPage=1 self:DrawQuickslotPicker() end)
+        self:Bind("QuickslotPicker/Previous",function() self._T.quickPage=math.max(1,self._T.quickPage-1) self:DrawQuickslotPicker() end)
+        self:Bind("QuickslotPicker/Next",function() self._T.quickPage=math.min(self._T.quickPages,self._T.quickPage+1) self:DrawQuickslotPicker() end)
+        self:Bind("QuickslotPicker/Clear",function() self:AssignQuickslot(nil) end)
+        for i=1,8 do local row=i self:Bind("QuickslotPicker/Row"..tostring(i),function() self:AssignQuickslot((self._T.quickEntries or {})[(self._T.quickPage-1)*8+row]) end) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenQuickslotPicker(integer index)
+        self:ReleaseControls()
+        self._T.quickTarget=self:MobileKey(index)
+        if self._T.quickTarget=="" then return end
+        self._T.quickCategory="skills" self._T.quickPage=1
+        local label=index==7 and "큰 버튼" or (index==8 and "오른쪽 위 버튼" or tostring(self.skillPage).."페이지 · "..tostring(index).."번")
+        self:UI("QuickslotPicker/Title").TextGUIRendererComponent.Text=label.." 등록"
+        self:UI("QuickslotPicker").Enable=true self:DrawQuickslotPicker()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawQuickslotPicker()
+        -- Mobile assignments are separate from keyboard bindings.
+        local entries={} local seen={}
+        if self._T.quickCategory=="skills" then
+            for tab=0,5 do
+                for _,skill in ipairs(_SkillManager:GetTabSkills(tostring(tab))) do
+                    if not seen[skill.name] and not _SkillManager:IsPassiveSkillName(skill.name) and _SkillManager:IsSkillUsableByInvestment(skill.name) then
+                        seen[skill.name]=true table.insert(entries,{name=skill.name,ruid=skill.ruid})
+                    end
+                end
+            end
+        elseif self._T.quickCategory=="potions" then
+            entries=_RecoveryPotionManager:QuickslotPotions()
+        else
+            for _,def in ipairs(_KeySettingManager:GetFuncDefs()) do
+                if def.id~="quickslot" and def.id~="keysetting" then table.insert(entries,{name=def.label,ruid=_KeySettingManager:GetFuncIconRUID(def.id),func=def.id}) end
+            end
+        end
+        self._T.quickEntries=entries self._T.quickPages=math.max(1,math.ceil(#entries/8))
+        self._T.quickPage=math.min(self._T.quickPage,self._T.quickPages)
+        for i=1,8 do
+            local entry=entries[(self._T.quickPage-1)*8+i] local path="QuickslotPicker/Row"..tostring(i)
+            self:UI(path).Enable=entry~=nil
+            if entry~=nil then self:UI(path.."/Name").TextGUIRendererComponent.Text=entry.name..(entry.count~=nil and "  ×"..tostring(entry.count) or "") self:UI(path.."/Icon").Enable=entry.ruid~=nil and entry.ruid~="" if entry.ruid~=nil and entry.ruid~="" then self:SetIcon(self:UI(path.."/Icon"),entry.ruid,56) end end
+        end
+        self:UI("QuickslotPicker/Page").TextGUIRendererComponent.Text=tostring(self._T.quickPage).." / "..tostring(self._T.quickPages)
+        self:UI("QuickslotPicker/Hint").TextGUIRendererComponent.Text=#entries==0 and (self._T.quickCategory=="potions" and "인벤토리에 등록할 수 있는 포션이 없습니다." or "등록 가능한 액티브 스킬이 없습니다.") or "원하는 항목을 누르면 바로 등록됩니다."
+        for _,kind in ipairs({"Skills","Potions","Windows"}) do self:UI("QuickslotPicker/"..kind).SpriteGUIRendererComponent.Color=string.lower(kind)==self._T.quickCategory and Color(0.63,0.84,0.72,1) or Color(0.96,0.89,0.74,1) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AutoAssignLearnedSkill(string skillName, string ruid)
+        -- Keep existing mobile bindings; search the current page, then the other pages, right to left.
+        if _SkillManager:IsPassiveSkillName(skillName) then return end
+        self:GetMobileSlot("mobile:attack")
+        for _,slot in pairs(self._T.mobileSlots) do
+            if slot.name==skillName and tostring(slot.func or "")=="" then self:RefreshSkills() return end
+        end
+        local order={}
+        for index=1,6 do
+            local entity=self:UI("Skills/Slot"..tostring(index))
+            if isvalid(entity) then
+                local point=entity.UITransformComponent.anchoredPosition
+                table.insert(order,{index=index,x=point.x,y=point.y})
+            end
+        end
+        table.sort(order,function(a,b) if a.x~=b.x then return a.x>b.x end if a.y~=b.y then return a.y>b.y end return a.index<b.index end)
+        for offset=0,3 do
+            local page=((self.skillPage-1+offset)%4)+1
+            for _,position in ipairs(order) do
+                local key="mobile:"..tostring(page)..":"..tostring(position.index)
+                local slot=self:GetMobileSlot(key)
+                if slot.name=="" and slot.func=="" and slot.ruid=="" then
+                    self._T.mobileSlots[key]={name=skillName,ruid=ruid,func=""}
+                    _AutoHuntManager._T.roleCacheUntil=0
+                    _CharacterPersistence:MarkDirty("mobileQuickslot")
+                    self:RefreshSkills()
+                    log("[SkillAutoSlot] mobile ["..key.."] "..skillName)
+                    return
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AssignQuickslot(any entry)
+        local key=self._T.quickTarget if key==nil or key=="" then return end
+        if entry~=nil and (entry.func==nil or entry.func=="") and (not _SkillManager:IsSkillUsableByInvestment(entry.name) or _SkillManager:IsPassiveSkillName(entry.name)) then self:DrawQuickslotPicker() return end
+        self:GetMobileSlot(key)
+        if entry~=nil and tostring(entry.func or "")=="" then
+            for oldKey,slot in pairs(self._T.mobileSlots) do
+                if oldKey~=key and tostring(slot.func or "")=="" and slot.name==entry.name then
+                    self._T.mobileSlots[oldKey]=nil
+                    log("[MobileQuickslot] moved "..oldKey.." → "..key.." "..entry.name)
+                end
+            end
+        end
+        self._T.mobileSlots[key]=entry~=nil and {name=entry.name or "",ruid=entry.ruid or "",func=entry.func or ""} or nil
+        _AutoHuntManager._T.roleCacheUntil=0
+        _CharacterPersistence:MarkDirty("mobileQuickslot")
+        self:UI("QuickslotPicker").Enable=false self._T.quickEditing=false self:RefreshSkills()
+        log("[MobileQuickslot] assigned "..key.." name="..(entry~=nil and entry.name or "empty"))
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method table LayoutTargets()
+        -- 작은 버튼을 먼저 검사하여 퀵슬롯 전체 영역이 터치를 가로채지 않게 한다.
+        return {{path="Combat/Attack",label="공격",x=-140,y=74},{path="Combat/Jump",label="점프",x=-28,y=224},
+        {path="Skills/Slot1",label="퀵슬롯 1",x=80,y=15},{path="Skills/Slot2",label="퀵슬롯 2",x=-45,y=-57},{path="Skills/Slot3",label="퀵슬롯 3",x=-94,y=-192},
+        {path="Skills/Slot4",label="퀵슬롯 4",x=116,y=158},{path="Skills/Slot5",label="퀵슬롯 5",x=-59,y=111},{path="Skills/Slot6",label="퀵슬롯 6",x=-187,y=-17},
+        {path="Chat",label="채팅",x=342,y=24},{path="Reward",label="보상",x=-846,y=-258},{path="Auto",label="자동사냥",x=-696,y=-258},{path="Skill",label="스킬",x=-546,y=-258},{path="Enhance",label="강화",x=-396,y=-258},{path="Inventory",label="아이템",x=-246,y=-258},{path="Map",label="맵",x=-96,y=-258},{path="Menu",label="메뉴",x=454,y=24},{path="Event",label="이벤트",x=566,y=24},{path="Boss",label="보스",x=678,y=24},{path="Combat/Stick",label="이동",x=78,y=72},
+        {path="Skills",label="퀵슬롯 묶음",x=-24,y=24}}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindLayoutEditor()
+        -- Existing UI mode settings lead to direct on-screen repositioning.
+        self._T.layoutOffsets={}
+        self:Bind("LayoutEditor/Save",function() self:FinishLayoutEditor(true) end)
+        self:Bind("LayoutEditor/Cancel",function() self:FinishLayoutEditor(false) end)
+        self:Bind("LayoutEditor/Reset",function() self._T.layoutOffsets={} self:ApplyHUDPositions() end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenLayoutEditor()
+        -- Keep the HUD visible while dragging; gameplay inputs are disabled by CanAct.
+        if not self:IsMobile() then self:ShowNotice("모바일 UI를 선택한 뒤 위치를 조정하세요.") return end
+        _GameSystemMenu:Close() self:ReleaseControls() _MapleHUDManager:FinishChatInput()
+        if _AutoHuntManager.autoOn then _AutoHuntManager:Toggle() end
+        self:UI("MenuPanel").Enable=false self:UI("SkillBook").Enable=false self:UI("QuickslotPicker").Enable=false
+        self:UI("WorldMap").Enable=false self:UI("SkillAmount").Enable=false
+        self._T.layoutBefore={}
+        for key,value in pairs(self._T.layoutOffsets or {}) do self._T.layoutBefore[key]={x=value.x,y=value.y} end
+        self._T.layoutEditing=true self:UI("LayoutEditor").Enable=true
+        self:UI("LayoutEditor/Hint").TextGUIRendererComponent.Text="이동할 버튼이나 창을 손가락으로 끌어 놓으세요."
+        log("[MobileLayout] editor opened")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyHUDPositions()
+        -- 저장된 묶음 위치를 먼저 적용하고 개별 버튼은 실제 화면 가장자리 안으로 제한한다.
+        if not self:IsMobile() then return end
+        local group=self:UI("Skills").UITransformComponent
+        local old=(self._T.layoutOffsets or {})["Skills"] or {x=0,y=0}
+        group.anchoredPosition=Vector2(math.max(-1268,math.min(-12,-24+old.x)),math.max(12,math.min(408,24+old.y)))
+        for _,entry in ipairs(self:LayoutTargets()) do
+            if entry.path~="Skills" then
+                local offset=(self._T.layoutOffsets or {})[entry.path] or {x=0,y=0}
+                local tr=self:UI(entry.path).UITransformComponent
+                local w,h=tr.RectSize.x,tr.RectSize.y local a,p=tr.AnchorsMin,tr.Pivot
+                local originX=(a.x-0.5)*1920 local originY=(a.y-0.5)*1080
+                if string.sub(entry.path,1,11)=="Skills/Slot" then
+                    originX=960+group.anchoredPosition.x-group.RectSize.x*0.5
+                    originY=-540+group.anchoredPosition.y+group.RectSize.y*0.5
+                end
+                local x=math.max(-948+p.x*w-originX,math.min(948-(1-p.x)*w-originX,entry.x+offset.x))
+                local y=math.max(-528+p.y*h-originY,math.min(528-(1-p.y)*h-originY,entry.y+offset.y))
+                tr.anchoredPosition=Vector2(x,y)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FinishLayoutEditor(boolean save)
+        -- Persist only on explicit Save; cancellation restores the opening snapshot.
+        self._T.layoutDrag=nil
+        if save then
+            self:UI("LayoutEditor/Hint").TextGUIRendererComponent.Text="위치를 저장하고 있습니다."
+            local raw=_HttpService:JSONEncode(self._T.layoutOffsets or {})
+            _CharacterPersistence:RequestSaveMobileLayout(raw~="" and raw or "{}") return
+        end
+        self._T.layoutOffsets={}
+        for key,value in pairs(self._T.layoutBefore or {}) do self._T.layoutOffsets[key]={x=value.x,y=value.y} end
+        self._T.layoutEditing=false self:UI("LayoutEditor").Enable=false self:ApplyHUDPositions()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReceiveMobileLayout(string raw, boolean saved)
+        -- Failed writes leave the editor open so its layout can be retried.
+        if not saved then self:UI("LayoutEditor/Hint").TextGUIRendererComponent.Text="저장하지 못했습니다. 저장을 다시 눌러주세요." return end
+        if raw~="" and raw~="-" then self._T.layoutOffsets=_HttpService:JSONDecode(raw) or {} else self._T.layoutOffsets={} end
+        self._T.layoutEditing=false self:UI("LayoutEditor").Enable=false self:ApplyHUDPositions()
+        log("[MobileLayout] layout loaded/saved")
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method string MobileKey(integer index)
+        if index==7 then return "mobile:attack" end
+        if index==8 then return "mobile:jump" end
+        if index<1 or index>6 then return "" end
+        return "mobile:"..tostring(self.skillPage)..":"..tostring(index)
+    end
+
+    @ExecSpace("ClientOnly")
+    method string ButtonPath(integer index)
+        if index==7 then return "Combat/Attack" end
+        if index==8 then return "Combat/Jump" end
+        return "Skills/Slot"..tostring(index)
+    end
+
+    @ExecSpace("ClientOnly")
+    method table GetMobileSlot(string key)
+        if self._T.mobileSlots==nil then self:ImportMobileSlots(nil) end
+        return self._T.mobileSlots[key] or {ruid="",name="",func=""}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ImportMobileSlots(any slots)
+        self:ReleaseControls()
+        self._T.mobileSlots={}
+        if slots==nil then
+            self._T.mobileSlots["mobile:attack"]={ruid="",name="공격",func="attack"}
+            self._T.mobileSlots["mobile:jump"]={ruid="",name="점프",func="jump"}
+        else
+            for key,entry in pairs(slots) do
+                local valid=key=="mobile:attack" or key=="mobile:jump" or string.match(key,"^mobile:[1-4]:[1-6]$")~=nil
+                if valid and type(entry)=="table" then
+                    local name=tostring(entry.name or "") local func=tostring(entry.func or "")
+                    if func~="keysetting" and (func~="" or not _SkillManager:IsPassiveSkillName(name)) then
+                        self._T.mobileSlots[key]={ruid=tostring(entry.ruid or ""),name=name,func=func}
+                    end
+                end
+            end
+        end
+        local attack=self._T.mobileSlots["mobile:attack"]
+        if attack==nil or (attack.name=="" and attack.func=="") then self._T.mobileSlots["mobile:attack"]={ruid="",name="공격",func="attack"} end
+        local jump=self._T.mobileSlots["mobile:jump"]
+        if jump==nil then self._T.mobileSlots["mobile:jump"]={ruid="",name="점프",func="jump"} end
+        self._T.quickEditing=false self.skillPage=1
+        _AutoHuntManager._T.roleCacheUntil=0
+    end
+
+    @ExecSpace("ClientOnly")
+    method table ExportMobileSlots()
+        self:GetMobileSlot("mobile:attack")
+        local copy={}
+        for key,slot in pairs(self._T.mobileSlots) do copy[key]={ruid=slot.ruid,name=slot.name,func=slot.func} end
+        return copy
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method table ExportMobileSkills()
+        local result={} local seen={}
+        local keys={"mobile:attack","mobile:jump"}
+        for page=1,4 do for index=1,6 do table.insert(keys,"mobile:"..tostring(page)..":"..tostring(index)) end end
+        for _,key in ipairs(keys) do
+            local slot=self:GetMobileSlot(key)
+            if slot.func=="" and slot.name~="" and not seen[slot.name] and not _SkillManager:IsPassiveSkillName(slot.name) and _SkillManager:IsSkillUsableByInvestment(slot.name) then
+                result[key]={name=slot.name,ruid=slot.ruid} seen[slot.name]=true
+            end
+        end
+        return result
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void SetStickKnob(Vector2 position)
+        self:UI("Combat/Stick/Knob").UITransformComponent.anchoredPosition=position
+        for _,part in ipairs({{name="Stem",x=0,y=-14},{name="Center",x=0,y=8},{name="Left",x=-12,y=6},{name="Right",x=12,y=6},{name="LowLeft",x=-12,y=-5},{name="LowRight",x=12,y=-5}}) do
+            local e=self:UI("Combat/Stick/Thumb"..part.name)
+            if isvalid(e) then e.UITransformComponent.anchoredPosition=position+Vector2(part.x,part.y) end
+        end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void BindMobileWorldMap()
+        -- Native touch buttons use the same destination catalog and server travel validation.
+        self._T.mobileRegions={{"world","전체 지역"},{"victoria","빅토리아"},{"sleepywood","슬리피우드"},{"elnath","엘나스"},{"minar","미나르"},{"ludus","루더스"},{"nautilus","노틸러스"},{"ellinel","엘리넬"},{"goldbeach","골드비치"},{"mushroom","버섯의 성"},{"kerningtower","커닝타워"},{"ellodin","엘로딘"},{"deadmine","폐광"},{"worldtree","세계수"}}
+        for _,v in ipairs({{name="RegionPrev",step=-1},{name="RegionNext",step=1}}) do
+            local step=v.step self:Bind("WorldMap/"..v.name,function()
+                self._T.mobileRegion=((self._T.mobileRegion or 1)-1+step+#self._T.mobileRegions)%#self._T.mobileRegions+1
+                self._T.mobileMapPage=1 self:DrawMobileWorldMap()
+            end)
+        end
+        for _,v in ipairs({{name="Prev",step=-1},{name="Next",step=1}}) do
+            local step=v.step self:Bind("WorldMap/"..v.name,function() self._T.mobileMapPage=math.max(1,math.min(self._T.mobileMapPages or 1,(self._T.mobileMapPage or 1)+step)) self:DrawMobileWorldMap() end)
+        end
+        for _,v in ipairs({{name="MonstersPrev",step=-1},{name="MonstersNext",step=1}}) do
+            local step=v.step self:Bind("WorldMap/"..v.name,function() self._T.mobileMonsterPage=math.max(1,math.min(self._T.mobileMonsterPages or 1,(self._T.mobileMonsterPage or 1)+step)) self:DrawMobileMapDetails() end)
+        end
+        for i=1,6 do local index=i self:Bind("WorldMap/Map"..tostring(i),function()
+            local entry=(self._T.mobileMapEntries or {})[((self._T.mobileMapPage or 1)-1)*6+index]
+            if entry~=nil then self._T.mobileMapSelected=entry self._T.mobileMonsterPage=1 self:DrawMobileWorldMap() end
+        end) end
+        self:Bind("WorldMap/OnlyHunt",function() self._T.mobileOnlyHunt=not self._T.mobileOnlyHunt self._T.mobileMapPage=1 self:DrawMobileWorldMap() end)
+        self:Bind("WorldMap/Recommended",function() self._T.mobileRecommended=not self._T.mobileRecommended self._T.mobileMapPage=1 self:DrawMobileWorldMap() end)
+        self:Bind("WorldMap/Close",function() _WorldMapManager:CloseAll() end)
+        self:Bind("WorldMap/Hunt",function() _WorldMapManager:TravelRandomHunt() end)
+        self:Bind("WorldMap/Move",function() local entry=self._T.mobileMapSelected if entry~=nil then _WorldMapManager:FadeAndTeleport(entry.id) end end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleMobileWorldMap()
+        -- Show a persistent touch detail panel instead of relying on mouse hover.
+        if not _LoginFlow:IsInGame() then return end
+        if self:UI("WorldMap").Enable then _WorldMapManager:CloseAll() return end
+        _WorldMapManager:CloseAll()
+        self:ReleaseControls() self:UI("MenuPanel").Enable=false
+        local player=_UserService.LocalPlayer
+        local id=isvalid(player) and _ChannelManager:BaseName(player.CurrentMap.Name) or ""
+        local page=_WorldMapManager:GetPageForMap(id)
+        if not self:IsMobile() then _WorldMapManager:ShowMapPage(page) return end
+        self._T.mobileRegion=1
+        for i,v in ipairs(self._T.mobileRegions) do if v[1]==page then self._T.mobileRegion=i end end
+        self._T.mobileMapPage=1 self._T.mobileMapSelected=nil self._T.mobileMonsterPage=1
+        self._T.mobileOnlyHunt=true self._T.mobileRecommended=false
+        self:UI("WorldMap").Enable=true
+        self:ApplyWorldMapLayout()
+        self:DrawMobileWorldMap()
+        _MapleIslandTutorial:Notify("worldmap")
+        log("[MobileMap] opened")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawMobileWorldMap()
+        -- Rebuild on selection/filter/page actions only, never in OnUpdate.
+        local wm=_WorldMapManager local region=self._T.mobileRegions[self._T.mobileRegion or 1]
+        if not self:IsMobile() and wm._T.mapPage~=region[1] then wm:ShowMapPage(region[1]) return end
+        local level=_UIMyInfoManager.DisplayLevel local entries={}
+        for _,entry in ipairs(wm._T.regionDestinations or {}) do
+            if (region[1]=="world" or wm:IsPageWithin(entry.page,region[1])) and (self:IsMobile() or wm._T.regionMapFilter==nil or wm._T.regionMapFilter[entry.id]) then
+                local monsters=wm:GetMapMonsters(entry.id)
+                local eligible=not self._T.mobileRecommended
+                if not eligible then for _,monster in ipairs(monsters) do if monster.level>=level-10 and monster.level<=level-2 then eligible=true break end end end
+                if eligible and (not self._T.mobileOnlyHunt or #monsters>0) then table.insert(entries,entry) end
+            end
+        end
+        self._T.mobileMapEntries=entries self._T.mobileMapPages=math.max(1,math.ceil(#entries/6))
+        self._T.mobileMapPage=math.min(self._T.mobileMapPage or 1,self._T.mobileMapPages)
+        local selected=self._T.mobileMapSelected local found=false
+        for _,entry in ipairs(entries) do if selected~=nil and selected.id==entry.id then found=true break end end
+        if not found then self._T.mobileMapSelected=entries[(self._T.mobileMapPage-1)*6+1] self._T.mobileMonsterPage=1 end
+        local signature=tostring(self._T.mobileRegion)..":"..tostring(self._T.mobileOnlyHunt)..":"..tostring(self._T.mobileRecommended)
+        local grid=self:UI(self:IsMobile() and "WorldMap/List" or "WorldMap/PCList").GridViewComponent
+        grid.TotalCount=#entries grid:Refresh(self._T.mapListFilter~=signature,true)
+        self._T.mapListFilter=signature
+        self:UI("WorldMap/Region").TextGUIRendererComponent.Text=region[2]
+        self:UI("WorldMap/Page").TextGUIRendererComponent.Text=tostring(self._T.mobileMapPage).." / "..tostring(self._T.mobileMapPages)
+        self:UI("WorldMap/OnlyHunt").TextGUIRendererComponent.Text=self._T.mobileOnlyHunt and "사냥터만 ✓" or "모든 지역"
+        self:UI("WorldMap/Recommended").TextGUIRendererComponent.Text=self._T.mobileRecommended and "내 레벨 ✓" or "내 레벨"
+        for _,entry in ipairs({{"OnlyHunt",self._T.mobileOnlyHunt},{"Recommended",self._T.mobileRecommended}}) do
+            local button=self:UI("WorldMap/"..entry[1])
+            button.SpriteGUIRendererComponent.Color=entry[2] and Color(0.18,0.39,0.32,1) or Color(0.85,0.76,0.59,1)
+            button.TextGUIRendererComponent.FontColor=entry[2] and Color.white or Color(0.17,0.2,0.18,1)
+        end
+        local player=_UserService.LocalPlayer local current=isvalid(player) and wm:GetMapDisplayName(_ChannelManager:BaseName(player.CurrentMap.Name)) or ""
+        self:UI("WorldMap/Current").TextGUIRendererComponent.Text="현재 위치: "..current.."   ·   지역을 터치하면 출현 몬스터를 확인할 수 있습니다."
+        self:DrawMobileMapDetails()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawMobileMapDetails()
+        -- Monster pages remain visible until the player selects another destination.
+        local entry=self._T.mobileMapSelected
+        local monsters=entry~=nil and _WorldMapManager:GetMapMonsters(entry.id) or {}
+        self._T.mobileMonsterPages=math.max(1,math.ceil(#monsters/6))
+        self._T.mobileMonsterPage=math.min(self._T.mobileMonsterPage or 1,self._T.mobileMonsterPages)
+        self:UI("WorldMap/Details/Name").TextGUIRendererComponent.Text=entry~=nil and entry.title or "조건에 맞는 지역이 없습니다."
+        for i=1,6 do local mob=monsters[(self._T.mobileMonsterPage-1)*6+i]
+            self:UI("WorldMap/Details/Monster"..tostring(i)).TextGUIRendererComponent.Text=mob~=nil and ("Lv."..tostring(mob.level).."   "..mob.name) or (i==1 and #monsters==0 and "출현 몬스터 없음" or "")
+        end
+        self:UI("WorldMap/MonsterPage").TextGUIRendererComponent.Text=tostring(#monsters).."종  ·  "..tostring(self._T.mobileMonsterPage).." / "..tostring(self._T.mobileMonsterPages)
+        self:UI("WorldMap/Move").ButtonComponent.Enable=entry~=nil
+        self:UI("WorldMap/MonstersPrev").Enable=self._T.mobileMonsterPages>1
+        self:UI("WorldMap/MonstersNext").Enable=self._T.mobileMonsterPages>1
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void PositionWindowClose()
+        -- Follow the transformed corner so scaling and top-aligned windows remain correct.
+        local tools=self:UI("WindowTools") if not tools.Enable then return end
+        local window=_EntityService:GetEntityByPath(self:CurrentWindow())
+        if not isvalid(window) then tools.Enable=false return end
+        if window.Path=="/ui/CosmeticExchangeGroup/Modal" then local panel=window:GetChildByName("Panel") if isvalid(panel) then window=panel end end
+        local t=window.UITransformComponent
+        local sx=math.max(0.01,t.UIScale.x) local sy=math.max(0.01,t.UIScale.y)
+        local parentSize=window.Parent.UITransformComponent.RectSize
+        local anchor=t.AnchorsMax
+        local position=t.anchoredPosition+Vector2((anchor.x-0.5)*parentSize.x,(anchor.y-0.5)*parentSize.y)
+        local insetX=46 local insetY=46
+        local dark=window.Name=="InvenWindow" or window.Name=="EquipWindow" or window.Name=="DecoWindow" or window.Name=="BattleStatsWindow" or window.Name=="CashShopWindow"
+        self:UI("WindowTools/Close").TextGUIRendererComponent.FontColor=dark and Color(1,1,1,1) or Color(0.27,0.2,0.14,1)
+        if window.Name=="MonsterCodexWindow" then insetX=96 end
+        if window.Name=="Book" then insetX=90 insetY=70 end
+        tools.UITransformComponent.anchoredPosition=position+Vector2((1-t.Pivot.x)*t.RectSize.x*sx-insetX,(1-t.Pivot.y)*t.RectSize.y*sy-insetY)
+        if self._T.closeHiddenWindow~=window then
+            for _,rect in ipairs(window:GetChildComponentsByTypeName("MOD.Core.UITransformComponent",true)) do
+                if string.find(string.lower(rect.Entity.Name),"close",1,true)~=nil then self:HidePC(rect.Entity) end
+            end
+            self._T.closeHiddenWindow=window
+        end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void ToggleMenu()
+        -- 전투분석은 계속 표시하며 나머지 창은 정식 닫기 경로를 이용한다.
+        self:ReleaseControls()
+        if self:UI("MenuPanel").Enable then self:UI("MenuPanel").Enable=false return end
+        _SkillManager:ClearSkillSelection() _SkillManager:HideSkillTooltip()
+        _UIEquipInventoryManager:HideTooltip() _UIEquipInventoryManager:CancelInvenDrag()
+        _WorldMapManager:CloseAll()
+        _GameSystemMenu:Close()
+        if _CosmeticExchange:BlocksInput() then _CosmeticExchange:Close() end
+        _CashShopManager:SetOpen(false)
+        local enhancement=_EntityService:GetEntityByPath("/ui/DefaultGroup/EnhanceWindow")
+        local preserveEnhancement=isvalid(enhancement) and enhancement.Enable and _AutoStarforce.running
+        if preserveEnhancement then
+            _UILogic:SetSiblingIndex(enhancement.UITransformComponent,1)
+        elseif isvalid(enhancement) and enhancement.Enable then _StarforceMini:Close() end
+        for _,path in ipairs(_UIClickArbiter:GetWindowPaths()) do
+            if not string.find(path,"BattleStats",1,true) and path~="/ui/DefaultGroup/Board" and not (preserveEnhancement and path=="/ui/DefaultGroup/EnhanceWindow") then
+                local e=_EntityService:GetEntityByPath(path)
+                if isvalid(e) then e.Enable=false end
+                _UIEquipInventoryManager:RemoveWin(path)
+            end
+        end
+        for _,name in ipairs({"SkillBook","QuickslotPicker","EquipmentPicker","ItemActions","SkillAmount"}) do self:UI(name).Enable=false end
+        self._T.selectedItem=nil
+        self:UI("MenuPanel").Enable=true
+        log("[MobileUI] menu opened; automatic enhancement preserved="..tostring(preserveEnhancement))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OrderMobileLayers()
+        -- HUD는 창보다 아래, 등록 중인 버튼만 창보다 위에 배치한다.
+        local base=_EntityService:GetEntityByPath("/ui/MobileBase")
+        local quick=_EntityService:GetEntityByPath("/ui/MobileQuickslots")
+        local main=_EntityService:GetEntityByPath("/ui/DefaultGroup")
+        _UILogic:SetSiblingIndex(base.UITransformComponent,0)
+        if not self._T.quickAssigning then _UILogic:SetSiblingIndex(quick.UITransformComponent,0) end
+        if self._T.layerMain~=main then
+            self._T.layerMain=main
+            log("[MobileUI] persistent HUD ordered below game windows")
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindTouchLists()
+        -- GridView가 화면에 보이는 행만 재사용하므로 긴 목록도 터치로 스크롤한다.
+        self._T.listCells={}
+        local skills=self:UI("SkillBook/List").GridViewComponent
+        skills.ItemEntity=self:UI("SkillBook/Card1")
+        skills.OnRefresh=function(index,entity) self:DrawTouchListRow("skill",index,entity) end
+        local maps=self:UI("WorldMap/List").GridViewComponent
+        maps.ItemEntity=self:UI("WorldMap/Map1")
+        maps.OnRefresh=function(index,entity) self:DrawTouchListRow("map",index,entity) end
+        local pcMaps=self:UI("WorldMap/PCList").GridViewComponent
+        pcMaps.ItemEntity=self:UI("WorldMap/PCMapRow")
+        pcMaps.OnRefresh=function(index,entity) self:DrawTouchListRow("map",index,entity) end
+        self:Bind("SkillAmount/Panel/Cancel",function() self:UI("SkillAmount").Enable=false end)
+        self:Bind("SkillAmount/Panel/Confirm",function() self:ConfirmSkillAmount() end)
+        local input=self:UI("SkillAmount/Panel/Input")
+        local h=input:ConnectEvent(TextInputSubmitEvent,function() self:ConfirmSkillAmount() end)
+        table.insert(self._T.links,{entity=input,kind=TextInputSubmitEvent,listener=h})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawTouchListRow(string kind, integer index, Entity entity)
+        -- 클릭 이벤트는 행마다 한 번 연결하고 재사용 시 현재 인덱스를 갱신한다.
+        local record=self._T.listCells[entity.Id]
+        if record==nil then
+            record={kind=kind,index=index,entity=entity} self._T.listCells[entity.Id]=record
+            self:BindPressFeedback(entity)
+            local h=entity:ConnectEvent(ButtonClickEvent,function()
+                if record.kind=="skill" then
+                    _SkillManager:ClearSkillSelection() self._T.bookIndex=record.index+1 self:DrawSkillBook()
+                else
+                    local entry=(self._T.mobileMapEntries or {})[record.index+1]
+                    if entry~=nil then
+                        local now=_UtilLogic.ElapsedSeconds
+                        local double=not self:IsMobile() and self._T.mapClickId==entry.id and now-(self._T.mapClickAt or -10)<=0.65
+                        self._T.mapClickId=entry.id self._T.mapClickAt=now
+                        self._T.mobileMapSelected=entry self._T.mobileMonsterPage=1 self:DrawMobileWorldMap()
+                        if double then self._T.mapClickId=nil _WorldMapManager:FadeAndTeleport(entry.id) end
+                    end
+                end
+            end)
+            table.insert(self._T.links,{entity=entity,kind=ButtonClickEvent,listener=h})
+        end
+        record.index=index record.kind=kind
+        if kind=="map" then entity.TextGUIRendererComponent.BestFit=false entity.UITransformComponent.RectSize=self:IsMobile() and Vector2(742,88) or Vector2(458,36) entity.TextGUIRendererComponent.FontSize=self:IsMobile() and 26 or 16 end
+        if kind=="skill" then
+            local skill=_SkillManager:GetTabSkills(_SkillManager._T.activeSkillTab)[index+1]
+            if skill==nil then return end
+            entity.SpriteGUIRendererComponent.Color=index+1==self._T.bookIndex and Color(0.63,0.84,0.72,1) or Color(0.96,0.89,0.74,1)
+            self:SetIcon(entity:GetChildByName("Icon"),skill.ruid,54)
+            entity:GetChildByName("Name").TextGUIRendererComponent.Text=skill.name
+            entity:GetChildByName("Level").TextGUIRendererComponent.Text=skill.spendable==true and (tostring(skill.level or 0).." / "..tostring(skill.maxLevel or 20)) or "기본"
+        else
+            local entry=(self._T.mobileMapEntries or {})[index+1]
+            if entry==nil then return end
+            local mobs=_WorldMapManager:GetMapMonsters(entry.id) local lo=999 local hi=0
+            for _,mob in ipairs(mobs) do lo=math.min(lo,mob.level) hi=math.max(hi,mob.level) end
+            entity.TextGUIRendererComponent.Text=entry.title..(#mobs>0 and ("  (Lv."..tostring(lo)..(lo~=hi and ("~"..tostring(hi)) or "")..")") or " · 마을")
+            entity.SpriteGUIRendererComponent.Color=self._T.mobileMapSelected~=nil and self._T.mobileMapSelected.id==entry.id and Color(0.68,0.84,0.65,1) or Color(1,0.945,0.84,1)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ConfirmSkillAmount()
+        -- 입력 중 탭/선택이 바뀌었으면 다른 스킬에 잘못 적용하지 않는다.
+        if not self:UI("SkillAmount").Enable then return end
+        local request=self._T.skillAmount local sm=_SkillManager
+        if request==nil or request.tab~=sm._T.activeSkillTab then self:UI("SkillAmount").Enable=false return end
+        local skill=sm:GetTabSkills(request.tab)[request.index]
+        if skill==nil or skill.name~=request.name then self:UI("SkillAmount").Enable=false return end
+        local count=tonumber(self:UI("SkillAmount/Panel/Input").TextGUIRendererInputComponent.Text)
+        if count==nil or count~=math.floor(count) or count<1 or count>request.maximum then
+            self:UI("SkillAmount/Panel/Hint").TextGUIRendererComponent.Text="1~"..tostring(request.maximum).." 사이의 정수를 입력하세요." return
+        end
+        self:UI("SkillAmount").Enable=false
+        local row=sm._T.skillScrollRow sm._T.skillScrollRow=0
+        sm._T.mobileAllocationCount=count
+        if request.increase then sm:SpendSkillPointOnCard(request.index) else sm:RefundSkillPointOnCard(request.index) end
+        sm._T.mobileAllocationCount=nil sm._T.skillScrollRow=row
+        self._T.bookDrawSignature=nil self:DrawSkillBook() self:RefreshSkills()
+        log("[MobileUI] skill amount confirmed count="..tostring(count))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyWorldMapLayout()
+        -- Preserve the mobile layout and adapt the same controls to a 500 x 590 PC sidebar.
+        local mobile=self:IsMobile()
+        local layout={
+            {"",526,0,500,590}, {"Header",0,263,484,46}, {"Title",-20,263,360,38,22}, {"Close",221,263,44,44,30},
+            {"Current",0,0,450,24,14}, {"Region",0,216,330,38,20}, {"RegionPrev",-205,216,70,50}, {"RegionNext",205,216,70,50},
+            {"OnlyHunt",-120,170,226,36,16}, {"Recommended",120,170,226,36,16},
+            {"List",0,65,478,166}, {"Details",0,-117,478,174}, {"Details/Name",0,68,450,30,18}, {"Details/Caption",0,44,450,20,14},
+            {"MonsterPage",0,-218,300,24,13}, {"MonstersPrev",-210,-218,46,26,16}, {"MonstersNext",210,-218,46,26,16},
+            {"Hunt",-120,-260,226,46,16}, {"Move",120,-260,226,46,16}
+        }
+        for i=1,6 do table.insert(layout,{"Details/Monster"..tostring(i),0,24-(i-1)*19,450,19,14}) end
+        self._T.mapMobileLayout=self._T.mapMobileLayout or {}
+        for _,v in ipairs(layout) do
+            local e=self:UI("WorldMap"..(v[1]=="" and "" or "/"..v[1])) local t=e.UITransformComponent local text=e.TextGUIRendererComponent
+            if self._T.mapMobileLayout[v[1]]==nil then self._T.mapMobileLayout[v[1]]={pos=t.anchoredPosition,size=t.RectSize,scale=t.UIScale,font=isvalid(text) and text.FontSize or 0} end
+            local old=self._T.mapMobileLayout[v[1]]
+            if v[1]=="" then t.UIScale=mobile and old.scale or Vector3(1.3,1.3,1) end
+            t.anchoredPosition=mobile and old.pos or Vector2(v[2],v[3]) t.RectSize=mobile and old.size or Vector2(v[4],v[5])
+            if isvalid(text) then text.FontSize=mobile and old.font or (v[6] or old.font) end
+        end
+        self:UI("WorldMap/Current").Enable=mobile
+        self:UI("WorldMap/List").Enable=mobile
+        self:UI("WorldMap/PCList").Enable=not mobile
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void BindPressFeedback(Entity button)
+        -- 기존 스킨을 그대로 이용해 눌린 색상과 아이콘 축소 상태를 만든다.
+        if not isvalid(button) then return end
+        self._T.pressBound=self._T.pressBound or {}
+        if self._T.pressBound[button.Id] then return end
+        self._T.pressBound[button.Id]=true
+        local listener=button:ConnectEvent(ButtonStateChangeEvent,function(event)
+            self:SetPressFeedback(button,event.state==ButtonState.Pressed)
+        end)
+        table.insert(self._T.links,{entity=button,kind=ButtonStateChangeEvent,listener=listener})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetPressFeedback(Entity button, boolean pressed)
+        -- 누른 순간의 아이콘 배율을 보관하여 기본공격의 60% 크기도 정확히 복원한다.
+        if not isvalid(button) then return end
+        self._T.pressVisuals=self._T.pressVisuals or {}
+        local entry=self._T.pressVisuals[button.Id]
+        if not pressed then
+            if entry~=nil then entry.pressed=false end
+            return
+        end
+        if not self:IsMobile() or self._T.layoutEditing or not button.EnabledInHierarchy then return end
+        if entry~=nil then entry.pressed=true return end
+        entry={entity=button,pressed=true,amount=0,icons={}}
+        for _,name in ipairs({"AssignedIcon","Empty","Symbol","MenuIcon","Gear","Icon","Label","Text"}) do
+            local child=button:GetChildByName(name,false)
+            if isvalid(child) then table.insert(entry.icons,{entity=child,scale=child.UITransformComponent.UIScale}) end
+        end
+        local circle=button:GetChildByName("Circle",false)
+        if isvalid(circle) and isvalid(circle.TextGUIRendererComponent) then
+            entry.circle=circle entry.circleColor=circle.TextGUIRendererComponent.FontColor
+        end
+        local text=button.TextGUIRendererComponent
+        if isvalid(text) then entry.text=text entry.fontSize=text.FontSize end
+        self._T.pressVisuals[button.Id]=entry
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePressFeedback(number delta)
+        -- 누를 때 60ms, 뗄 때 100ms로 보간하며 클릭 영역은 움직이지 않는다.
+        for id,entry in pairs(self._T.pressVisuals or {}) do
+            local held=false
+            if entry.slotIndex~=nil then
+                for _,touch in pairs(self._T.touches or {}) do if touch.index==entry.slotIndex then held=true break end end
+            end
+            local down=entry.pressed or held or _UtilLogic.ElapsedSeconds<(entry.minimumUntil or 0)
+            local target=down and self:IsMobile() and isvalid(entry.entity) and entry.entity.EnabledInHierarchy and 1 or 0
+            local step=delta/(target==1 and 0.06 or 0.10)
+            entry.amount=target==1 and math.min(1,entry.amount+step) or math.max(0,entry.amount-step)
+            local scale=1-entry.amount*0.14
+            for _,icon in ipairs(entry.icons) do
+                if isvalid(icon.entity) then icon.entity.UITransformComponent.UIScale=Vector3(icon.scale.x*scale,icon.scale.y*scale,icon.scale.z) end
+            end
+            if isvalid(entry.circle) then
+                local c=entry.circleColor
+                entry.circle.TextGUIRendererComponent.FontColor=Color(c.r+0.12*entry.amount,c.g+0.10*entry.amount,c.b+0.05*entry.amount,math.min(1,c.a+0.2*entry.amount))
+            end
+            if isvalid(entry.text) then entry.text.FontSize=entry.fontSize*(1-0.06*entry.amount) end
+            if target==0 and entry.amount==0 then self._T.pressVisuals[id]=nil end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetPressFeedback()
+        -- 메뉴 열기, 페이지 전환, UI 모드 변경 시 눌림 잔상을 남기지 않는다.
+        for _,entry in pairs(self._T.pressVisuals or {}) do entry.pressed=false entry.slotIndex=nil entry.minimumUntil=0 end
+        self:UpdatePressFeedback(1)
+    end
+
+end

@@ -1,0 +1,222 @@
+@Logic
+script MobileNumberPad extends Logic
+    property boolean opened = false
+    property string digits = "0"
+    property boolean replaceNext = true
+    property number slide = 0
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- Resolve the independent modal above every game window.
+        return _EntityService:GetEntityByPath("/ui/MobileNumberPad/Modal" .. (path == "" and "" or "/" .. path))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean UsesPad()
+        -- Also suppress the phone keyboard when a phone uses the PC layout.
+        return Environment:IsMobilePlatform() or _MobileUIManager:IsMobile()
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        -- Keep the releasing tap/key from activating the window underneath.
+        return self.opened or _UtilLogic.ElapsedSeconds < (self._T.releaseUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method any Input(Entity field)
+        -- Support the equipment box's legacy input as well as GUI inputs.
+        if not isvalid(field) then return nil end
+        local input = field.TextGUIRendererInputComponent
+        if not isvalid(input) then input = field.TextInputComponent end
+        return input
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Register(string path, string title, integer minimum, integer maximum)
+        -- Reusable entry point for later quantity fields; bounds are checked on confirmation.
+        self._T.fields = self._T.fields or {}
+        if self._T.fields[path] ~= nil then return end
+        local field = _EntityService:GetEntityByPath(path)
+        local input = self:Input(field)
+        if not isvalid(input) then return end
+        local button = field:GetChildByName("NumberPadButton")
+        if not isvalid(button) then return end
+        local renderer=field.TextGUIRendererComponent
+        if not isvalid(renderer) then renderer=field.TextComponent end
+        self._T.fields[path] = {field=field, input=input, button=button, title=title, minimum=minimum, maximum=maximum, nativeEnabled=input.Enable, renderer=renderer, textEnabled=isvalid(renderer) and renderer.Enable}
+        self:Bind(button, function() self:Focus(field) end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(Entity entity, any action)
+        -- Retain and release every event subscription once per session.
+        if not isvalid(entity) then return end
+        local listener = entity:ConnectEvent(ButtonClickEvent, function() _UIAudio:Play("BtMouseClick") action() end)
+        table.insert(self._T.links, {entity=entity, listener=listener})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Register all authored numeric fields before the user can focus them.
+        self._T.links = {} self._T.fields = {} self._T.releaseUntil = 0
+        self.opened = false self:UI("").Enable = false
+        self:Register("/ui/DefaultGroup/BoxQuantityPopup/Dialog/QuantityInput", "장비상자 수량", 1, 128)
+        self:Register("/ui/MobileHUD/HUD/SkillAmount/Panel/Input", "스킬 포인트", 1, 999)
+        self:Register("/ui/SkillPointDialog/Modal/Panel/Input", "스킬 포인트", 1, 9999)
+        self:Register("/ui/DefaultGroup/CashPurchase/Overlay/Panel/Quantity", "구매 수량", 1, 999)
+        self:Register("/ui/CosmeticExchangeGroup/Modal/Panel/Quantity", "구매 수량", 1, 999)
+        self:Register("/ui/CosmeticExchangeGroup/Modal/Panel/Confirmation/Quantity", "구매 수량", 1, 999)
+        self:Register("/ui/CosmeticExchangeGroup/Modal/Panel/SellTools/MaxStars", "판매할 장비의 최대 강화", 0, 50)
+        self:Register("/ui/DefaultGroup/EnhanceWindow/AutoPanel/Goal", "목표 강화", 1, 50)
+        self:Register("/ui/DefaultGroup/EnhanceWindow/MiniPanel/Goal", "목표 강화", 1, 50)
+        self:Register("/ui/ItemDiscardGroup/Modal/Dialog/Quantity", "버릴 수량", 1, 999999999)
+        for i=0,9 do local digit=tostring(i) self:Bind(self:UI("Panel/Key"..digit), function() self:Press(digit) end) end
+        for _,key in ipairs({"Min", "Max", "Delete", "Clear"}) do local action=key self:Bind(self:UI("Panel/"..key), function() self:Press(action) end) end
+        self:Bind(self:UI("Panel/Confirm"), function() self:Confirm() end)
+        self:Bind(self:UI("Panel/Close"), function() self:Close() end)
+        self:Bind(self:UI("Dimmer"), function() self:Close() end)
+        self._T.keyListener = _InputService:ConnectEvent(KeyDownEvent, function(e)
+            if not self.opened then return end
+            if e.key == KeyboardKey.Escape then self:Close()
+            elseif e.key == KeyboardKey.Return or e.key == KeyboardKey.KeypadEnter then self:Confirm()
+            elseif e.key == KeyboardKey.Backspace then self:Press("Delete") end
+        end)
+        self:SyncFields()
+        log("[NumberPad] ready: 9 numeric fields")
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer Maximum(string path)
+        -- Read current limits, not values captured when the UI was first constructed.
+        if string.find(path,"BoxQuantityPopup",1,true) then return _UIEquipInventoryManager._T.boxMaxQty or 0 end
+        if string.find(path,"SkillPointDialog",1,true) then local r=_SkillManager._T.amountRequest return r~=nil and r.maximum or 0 end
+        if string.find(path,"SkillAmount",1,true) then local r=_MobileUIManager._T.skillAmount return r~=nil and r.maximum or 0 end
+        if string.find(path,"CashPurchase",1,true) then return _CashShopManager._T.purchaseMax or 1 end
+        if string.find(path,"ItemDiscardGroup",1,true) then return _UIItemDiscardManager.maximum end
+        if string.find(path,"EnhanceWindow",1,true) then return _CashShopManager:GetMaxStars(_EnhancementManager.enhanceTargetItemStr or "") end
+        local spec=self._T.fields[path]
+        return spec~=nil and spec.maximum or 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Focus(Entity field)
+        -- The same call preserves physical keyboard editing on desktop.
+        local input=self:Input(field)
+        if not isvalid(input) then return end
+        if not self:UsesPad() then input:ActivateInputField() return end
+        local spec=(self._T.fields or {})[field.Path]
+        if spec==nil or not field.EnabledInHierarchy then return end
+        if string.find(field.Path,"EnhanceWindow",1,true) and _AutoStarforce.running then return end
+        local maximum=self:Maximum(field.Path)
+        if maximum<spec.minimum then _UIToast:ShowMessage("입력할 수 있는 수량이 없습니다.") return end
+        _MobileUIManager:ReleaseControls()
+        input.Enable=false
+        self._T.target=spec self._T.sourceMap=isvalid(_UserService.LocalPlayer) and _UserService.LocalPlayer.CurrentMap or nil
+        self.digits=string.find(field.Path,"SkillPointDialog",1,true) and tostring(maximum) or string.find(field.Path,"BoxQuantityPopup",1,true) and "1" or ""
+        input.Text=self.digits spec.button.TextGUIRendererComponent.Text=self.digits
+        self.replaceNext=true self.slide=0 self.opened=true
+        self:UI("Panel/Title").TextGUIRendererComponent.Text=spec.title
+        self:UI("Panel").UITransformComponent.anchoredPosition=Vector2(460,0)
+        self:UI("Dimmer").Enable=string.find(field.Path,"SkillPointDialog",1,true)==nil
+        self:UI("").Enable=true
+        self:Draw()
+        log("[NumberPad] opened "..field.Path.." max="..tostring(maximum))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Keep the entered value and legal range visible while editing.
+        local spec=self._T.target if spec==nil then return end
+        self:UI("Panel/Value").TextGUIRendererComponent.Text=self.digits
+        self:UI("Panel/Range").TextGUIRendererComponent.Text=tostring(spec.minimum).." ~ "..tostring(self:Maximum(spec.field.Path))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Press(string key)
+        -- Min/Max replace the number; the bottom-center zero is a normal digit.
+        if not self.opened or self._T.target==nil then return end
+        local spec=self._T.target local maximum=self:Maximum(spec.field.Path)
+        if key=="Min" then self.digits=tostring(spec.minimum) self.replaceNext=true
+        elseif key=="Max" then self.digits=tostring(maximum) self.replaceNext=true
+        elseif key=="Clear" then self.digits="" self.replaceNext=true
+        elseif key=="Delete" then self.digits=string.sub(self.digits,1,-2) self.replaceNext=false
+        else
+            local nextText=(self.replaceNext or self.digits=="0") and key or (self.digits..key)
+            self.digits=tostring(math.min(maximum,tonumber(nextText) or 0)) self.replaceNext=false
+        end
+        spec.input.Text=self.digits
+        spec.button.TextGUIRendererComponent.Text=self.digits
+        spec.field:SendEvent(TextInputValueChangeEvent(self.digits))
+        if string.find(spec.field.Path,"CashPurchase",1,true) then _CashShopManager:UpdatePurchaseTotal() end
+        if string.find(spec.field.Path,"Confirmation/Quantity",1,true) then _CosmeticExchange:UpdatePurchaseConfirmation() end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Confirm()
+        -- Only apply an integer; purchase/discard still requires the original confirmation.
+        local spec=self._T.target
+        if not self.opened or spec==nil then return end
+        if not isvalid(spec.field) or not spec.field.EnabledInHierarchy then self:Close() return end
+        local value=tonumber(self.digits) local maximum=self:Maximum(spec.field.Path)
+        if value==nil or value<spec.minimum or value>maximum or value~=math.floor(value) then
+            self:UI("Panel/Range").TextGUIRendererComponent.Text=tostring(spec.minimum).." ~ "..tostring(maximum).." 사이로 입력하세요." return
+        end
+        spec.input.Text=tostring(value)
+        spec.button.TextGUIRendererComponent.Text=tostring(value)
+        local path=spec.field.Path
+        self:Close()
+        spec.field:SendEvent(TextInputValueChangeEvent(tostring(value)))
+        if string.find(path,"SkillPointDialog",1,true) then _SkillManager._T.amountReplace=false _SkillManager:ConfirmSkillAmount() end
+        if string.find(path,"BoxQuantityPopup",1,true) then _UIEquipInventoryManager:OnBoxQuantityConfirm() end
+        if string.find(path,"CashPurchase",1,true) then _CashShopManager:UpdatePurchaseTotal() end
+        if string.find(path,"Confirmation/Quantity",1,true) then _CosmeticExchange:UpdatePurchaseConfirmation() end
+        log("[NumberPad] applied "..path.." value="..tostring(value))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        -- Closing keeps the value already applied to the field; it never consumes an item.
+        self.opened=false self._T.target=nil self._T.releaseUntil=_UtilLogic.ElapsedSeconds+0.2
+        local modal=self:UI("") if isvalid(modal) then modal.Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SyncFields()
+        -- Disable native focus before a tap, and mirror values changed by existing scripts.
+        local mobile=self:UsesPad()
+        for _,spec in pairs(self._T.fields or {}) do
+            if isvalid(spec.field) then
+                spec.input.Enable=not mobile and spec.nativeEnabled
+                spec.button.Enable=mobile
+                if isvalid(spec.renderer) then spec.renderer.Enable=not mobile and spec.textEnabled end
+                if mobile and spec.field.EnabledInHierarchy then
+                    spec.button.TextGUIRendererComponent.Text=spec.input.Text~="" and spec.input.Text or spec.input.PlaceHolder
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Ease in from the right and cancel stale targets on close, map change or layout change.
+        self:SyncFields()
+        if not self.opened then return end
+        local spec=self._T.target local player=_UserService.LocalPlayer
+        if not self:UsesPad() or spec==nil or not isvalid(spec.field) or not spec.field.EnabledInHierarchy or not _LoginFlow:IsInGame() or (isvalid(player) and player.CurrentMap~=self._T.sourceMap) then self:Close() return end
+        self.slide=math.min(1,self.slide+delta/0.2)
+        local ease=1-(1-self.slide)^3
+        self:UI("Panel").UITransformComponent.anchoredPosition=Vector2(460-484*ease,0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Restore desktop inputs and release references across Maker sessions.
+        self:Close()
+        for _,link in ipairs(self._T.links or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent,link.listener) end end
+        if self._T.keyListener~=nil then _InputService:DisconnectEvent(KeyDownEvent,self._T.keyListener) end
+        for _,spec in pairs(self._T.fields or {}) do if isvalid(spec.input) then spec.input.Enable=spec.nativeEnabled end if isvalid(spec.button) then spec.button.Enable=false end if isvalid(spec.renderer) then spec.renderer.Enable=spec.textEnabled end end
+        self._T.links={} self._T.fields={}
+    end
+end

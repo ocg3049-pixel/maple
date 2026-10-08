@@ -48,8 +48,10 @@ script MiniMapUIManager extends Component
 			self._T.fhPool[i] = board:GetChildByName("FH_" .. tostring(i), false)
 		end
 		self._T.mobPool = {}
+		self._T.mobSizes = {}
 		for i = 1, self.MobPool do
 			self._T.mobPool[i] = board:GetChildByName("MOB_" .. tostring(i), false)
+			if isvalid(self._T.mobPool[i]) then self._T.mobSizes[i]=self._T.mobPool[i].UITransformComponent.RectSize end
 		end
 		self._T.sumPool = {}
 		for i = 1, self.SumPool do
@@ -371,10 +373,16 @@ script MiniMapUIManager extends Component
 		local state = self._T.captureState
 		if state ~= nil then
 			if isvalid(state.camera) then
-				for key, value in pairs(state.cameraValues or {}) do state.camera[key] = value end
+				-- ZoomRatio와 허용 여부는 순서가 중요하므로 일반 속성과 따로 복원한다.
+				for key, value in pairs(state.cameraValues or {}) do
+					if key ~= "ZoomRatio" and key ~= "IsAllowZoomInOut" then state.camera[key] = value end
+				end
 				if state.actualZoom ~= nil then
 					state.camera.IsAllowZoomInOut = true
-					_CameraService:ZoomTo(state.actualZoom, 0)
+					state.camera.ZoomRatio = state.actualZoom
+					if _CameraService:GetCurrentCameraComponent() == state.camera then
+						_CameraService:ZoomTo(state.actualZoom, 0)
+					end
 					state.camera.IsAllowZoomInOut = state.cameraValues.IsAllowZoomInOut
 				end
 			end
@@ -429,7 +437,7 @@ script MiniMapUIManager extends Component
 			if code ~= ScreenshotError.Success or not stillHere() or not isvalid(camera) then return end
 			cover:GetChildByName("Screen", false).RawImageGUIRendererComponent:SetRawImage(frozen)
 			cover.Enable = true
-			local state = {camera = camera, map = map, blend = _CameraService.TransitionBlendTime, actualZoom = _CameraService.currentZoomRatio, hidden = {}, backgrounds = {}, cameraValues = {}}
+			local state = {camera = camera, map = map, blend = _CameraService.TransitionBlendTime, actualZoom = math.max(_FieldCameraBounds:GetBaseZoom(), camera.ZoomRatio), hidden = {}, backgrounds = {}, cameraValues = {}}
 			for _, key in ipairs({"ConfineCameraArea", "UseCustomBound", "ScreenOffset", "CameraOffset", "Damping", "DeadZone", "SoftZone", "IsAllowZoomInOut", "ZoomRatio", "DutchAngle"}) do state.cameraValues[key] = camera[key] end
 			self._T.captureState = state
 			local backgrounds = map:GetChildComponentsByTypeName("MOD.Core.BackgroundComponent", true)
@@ -560,6 +568,7 @@ script MiniMapUIManager extends Component
 			else self._T.builtMap = nil end
 		end
 		self._T.capturing = false
+		log("[MiniMap] camera restored zoom=" .. tostring(_CameraService.currentZoomRatio))
 		if not success then log_warning("[MiniMap] capture failed: " .. tostring(reason)) end
 	end
 
@@ -578,6 +587,7 @@ script MiniMapUIManager extends Component
 		if string.match(rawName, "^0%d%d%d%d%d%d%d%d$") then region = "메이플 아일랜드" end
 		if rawName == "001010000" then displayName = "모험가 수련장 입구" end
 		if rawName == "map01" then displayName = "평온한 숲길" end
+        if _BossStageManager:IsArena(rawName) then region="보스 스테이지" displayName=(_BossStageManager._T.stage==2 and "스텀피의 돌풍 고원" or "마노의 초원") end
 		if isvalid(self._T.mapName) then
 			if isvalid(self._T.mapName.TextComponent) then self._T.mapName.TextComponent.Text = displayName
 			elseif isvalid(self._T.mapName.TextGUIRendererComponent) then self._T.mapName.TextGUIRendererComponent.Text = displayName end
@@ -623,7 +633,11 @@ script MiniMapUIManager extends Component
 		local bs = self._T.board.UITransformComponent.RectSize
 		local w = bs.x - 48
 		local h = bs.y - 144
-		minX, maxX, minY, maxY = minX - 0.5, maxX + 0.5, minY - 1.2, maxY + 0.7
+        -- Boss arenas frame the combat area above the foothold, not the underground tiles.
+        local bossArena=_BossStageManager:IsArena(map.Name)
+        if bossArena then minY=maxY end
+        minX, maxX, minY, maxY = minX - 0.5, maxX + 0.5, minY - (bossArena and 0.35 or 1.2), maxY + (bossArena and 2.1 or 0.7)
+        if bossArena then log("[BossStage] minimap bounds bottom="..tostring(minY).." top="..tostring(maxY)) end
 		self._T.previewBounds = {minX, maxX, minY, maxY}
 		local spanX = math.max(0.1, maxX - minX)
 		local spanY = math.max(0.1, maxY - minY)
@@ -745,7 +759,11 @@ script MiniMapUIManager extends Component
 		local oy = self._T.contentOffsetY or 0
 		-- 몬스터(빨강): 살아있는 것만.
 		if self._T.markerMap ~= map or (self._T.scanAcc or 0) >= 0.2 then
-			self._T.markerMobs = map:GetChildComponentsByTypeName("script.Monster", true)
+            self._T.markerMobs = map:GetChildComponentsByTypeName("script.Monster", true)
+            -- Reserve a marker for the boss even when summoned monsters fill the pool.
+            table.sort(self._T.markerMobs,function(a,b)
+                return isvalid(a) and a.IsStageBoss and (not isvalid(b) or not b.IsStageBoss)
+            end)
 			self._T.markerPlayers = map:GetChildComponentsByTypeName("MOD.Core.PlayerComponent", true)
 			self._T.markerMap = map
 			self._T.scanAcc = 0
@@ -763,7 +781,10 @@ script MiniMapUIManager extends Component
 				if mi > self.MobPool then break end
 				local e = self._T.mobPool[mi]
 				if isvalid(e) then
-					e.UITransformComponent.anchoredPosition = Vector2(x, y + oy)
+                    local size=self._T.mobSizes[mi]
+                    local factor=mc.IsStageBoss and 1.5 or 1
+                    e.UITransformComponent.RectSize=Vector2(size.x*factor,size.y*factor)
+                    e.UITransformComponent.anchoredPosition = Vector2(x, y + oy)
 					e.Enable = true
 				end
 			end

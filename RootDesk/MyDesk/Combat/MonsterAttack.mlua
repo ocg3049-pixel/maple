@@ -2,14 +2,12 @@
 script MonsterAttack extends AttackComponent
 
     property number AttackInterval = 1.0
+    property string BossOwner = ""
 
     @ExecSpace("ServerOnly")
     method void OnBeginPlay()
-        -- Start periodic attack timer
-        self._T.timerId = _TimerService:SetTimerRepeat(function()
-            self:AttackNear()
-        end, self.AttackInterval)
-        log("MonsterAttack: OnBeginPlay, interval=" .. tostring(self.AttackInterval))
+        -- Contact checks run only in a map with players.
+        self:SetMapActivity(_MonsterZoneRespawn:IsMapActive(self.Entity.CurrentMap))
     end
 
     @ExecSpace("ServerOnly")
@@ -22,10 +20,33 @@ script MonsterAttack extends AttackComponent
     end
 
     @ExecSpace("ServerOnly")
+    method void SetMapActivity(boolean active)
+        local boss = self.Entity:GetComponent("script.Monster")
+        if isvalid(boss) and boss.IsStageBoss then active = false end
+        -- Stop the timer itself, instead of waking thousands of empty-map callbacks.
+        if not active then
+            if self._T.timerId then _TimerService:ClearTimer(self._T.timerId) end
+            self._T.timerId = nil
+        elseif self._T.timerId == nil then
+            self._T.timerId = _TimerService:SetTimerRepeat(function() self:AttackNear() end, self.AttackInterval)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
     method void AttackNear()
+        if isvalid(self.Entity:GetComponent("script.StumpyFlyeye")) then return end
+        local boss = self.Entity:GetComponent("script.Monster")
+        if isvalid(boss) and boss.IsStageBoss then
+            local ai=self.Entity:GetComponent("script.ManoEncounter") or self.Entity:GetComponent("script.StumpyEncounter")
+            local r=isvalid(ai) and (_BossStageManager._T.runs or {})[ai.OwnerId] or nil
+            if r==nil or r.state~="active" or (r.elapsed or 0)<1.5 then return end
+        end
+        -- Disabled and empty-map monsters never run a collision query.
+        if not self.Entity.EnabledInHierarchy or not self.Enable then return end
+        if not _MonsterZoneRespawn:IsMapActive(self.Entity.CurrentMap) then return end
         -- Skip attack if monster is dead
         local monsterComp = self.Entity.Monster
-        if isvalid(monsterComp) and monsterComp.IsDead then return end
+        if isvalid(monsterComp) and (monsterComp.IsDead or monsterComp:IsSpawnProtected()) then return end
 
         -- 이미지에 맞춰 설정된 몬스터별 피격 박스를 접촉 공격에도 사용한다.
         local hit = self.Entity.HitComponent
@@ -39,11 +60,52 @@ script MonsterAttack extends AttackComponent
         local width = math.sqrt(axisX.x * axisX.x + axisX.y * axisX.y)
         local height = math.sqrt(axisY.x * axisY.x + axisY.y * axisY.y)
         if width <= 0 or height <= 0 then return end
+        local stumpy=self.Entity:GetComponent("script.StumpyEncounter")
+        if isvalid(stumpy) and stumpy._T.mode~="walk" and stumpy._T.mode~="pause" and stumpy._T.mode~="recover" then return end
+        local snail=self.Entity:GetComponent("script.ManoSnail")
+        local dash=isvalid(snail) and snail.Special and snail.Phase=="flight"
+        local current=Vector2(center.x,center.y)
+        local previous=dash and self._T.contactPrevious or nil
+        self._T.contactPrevious=dash and current or nil
+        -- Sweep the travelled segment so a fast crossing between frames is not lost.
+        if previous~=nil then
+            width=width+math.abs(current.x-previous.x)
+            height=height+math.abs(current.y-previous.y)
+            center=Vector3((current.x+previous.x)/2,(current.y+previous.y)/2,center.z)
+        end
         local shape = BoxShape(Vector2(center.x, center.y), Vector2(width, height), transform.WorldZRotation)
-        self:AttackFast(shape, nil, CollisionGroups.HitBox)
+        local tag=dash and "boss.mano.dash" or (isvalid(boss) and boss.IsStageBoss and "boss.mano.contact" or nil)
+        if isvalid(stumpy) then tag="boss.stumpy.contact" end
+        if isvalid(snail) and snail._T.shadow then tag="boss.stumpy.shadow" end
+        self:AttackFast(shape, tag, CollisionGroups.HitBox)
     end
 
     method boolean IsAttackTarget(Entity defender, string attackInfo)
+        -- Slam only hits grounded targets on the platform captured before Stumpy jumps.
+        if attackInfo=="boss.stumpy.slam" then
+            local encounter=self.Entity:GetComponent("script.StumpyEncounter")
+            if not isvalid(encounter) or not encounter:IsSlamTarget(defender) then return false end
+        end
+        if attackInfo=="boss.stumpy.bats" and isvalid(defender.StateComponent) and defender.StateComponent.CurrentStateName=="CROUCH" and isvalid(defender.RigidbodyComponent) and defender.RigidbodyComponent:IsOnGround() then return false end
+        -- Each Stumpy projectile/dash may hit a target only once.
+        if self._T.stumpyHits~=nil and self._T.stumpyHits[defender.Id] then return false end
+        -- Protection blocks contact damage before any defensive buff is consumed.
+        local snail=self.Entity:GetComponent("script.ManoSnail")
+        if isvalid(snail) and snail.Special and snail.Phase=="flight" and snail._T.flightHits~=nil and snail._T.flightHits[defender.Id] then return false end
+        local monster = self.Entity:GetComponent("script.Monster")
+        if isvalid(monster) and (monster.IsDead or monster:IsSpawnProtected()) then return false end
+        if isvalid(monster) and monster.IsStageBoss then
+            if not _BossStageManager:IsBossTarget(self.Entity, defender) then return false end
+        end
+        if self.BossOwner~="" then
+            local r=(_BossStageManager._T.runs or {})[self.BossOwner]
+            local owner=defender
+            if not isvalid(defender.PlayerComponent) then
+                if _BossStageManager:SummonMaxHp(defender)<=0 then return false end
+                owner=_BossStageManager:SummonOwner(defender)
+            end
+            if r==nil or r.state~="active" or not isvalid(owner) or not isvalid(owner.PlayerComponent) or owner.PlayerComponent.Hp<=0 or owner.PlayerComponent.UserId~=self.BossOwner or owner.CurrentMap~=self.Entity.CurrentMap or defender.CurrentMap~=self.Entity.CurrentMap then return false end
+        end
         -- Only target entities that have PlayerComponent
         if not isvalid(defender.PlayerComponent) then
             -- 용사 소환수(HeroSummon)도 공격 대상이다 - HP가 남아 있을 때만.
@@ -80,6 +142,22 @@ script MonsterAttack extends AttackComponent
 			end
             return false
         end
+        if defender.PlayerComponent.Hp<=0 then return false end
+        if _BossStageManager:IsStumpyParryInvincible(defender) then return false end
+        if _BossStageManager:TryStumpyParry(defender,self.Entity,attackInfo,self._T.stumpyImpactPosition) then
+            if self._T.stumpyHits~=nil then self._T.stumpyHits[defender.Id]=true end
+            local fly=self.Entity:GetComponent("script.StumpyFlyeye")
+            if isvalid(fly) then fly:Parried() end
+            return false
+        end
+        -- Filter repeat contact before the fixed-damage branch and before consuming defensive buffs.
+        local hit = defender:GetComponent("script.PlayerHit")
+        local dash=attackInfo=="boss.mano.dash" and isvalid(snail) and snail.Special and snail.Phase=="flight"
+        if isvalid(hit) and (hit._T.climbInvincible or ((hit.IsInvincible or hit._T.invincible) and not dash)) then return false end
+        -- Mano ignores damage-reduction buffs, but still respects the hit cooldown.
+        if isvalid(monster) and monster.IsStageBoss and attackInfo=="boss.mano.contact" then
+            return __base:IsAttackTarget(defender,attackInfo)
+        end
         -- (다크사이트) 은신 중에는 몬스터와 부딪혀도 피격되지 않는다(요청 2026-07-30).
         -- 이 컴포넌트의 AttackNear가 곧 "몸통 부딪힘" 판정이라, 여기서 걸러내면 접촉 피해만 정확히
         -- 무효가 된다(무적 판정을 공격자 쪽에서 걸러야 하는 이유는 바로 아래 주석 참고).
@@ -103,10 +181,6 @@ script MonsterAttack extends AttackComponent
         -- IsHitTarget은 이 공격 경로에서 전혀 호출되지 않고, 겹친 여러 몬스터의 피해가 OnHit 호출
         -- 횟수와 무관하게 한 번에 합산 적용되어(Enable=false로 즉시 꺼도 같은 틱 안의 피해는 그대로
         -- 들어옴) IsAttackTarget(공격자 쪽, 실제로 필터링이 반영됨)에서 무적 중인 대상을 걸러낸다.
-        local hit = defender.PlayerHit
-        if isvalid(hit) and hit.IsInvincible then
-            return false
-        end
         -- 가드(패링) 스킬: 패링 창(1초) 안이거나 패링 성공 무적(2초) 중이면 이번 공격을 통째로 무시한다
         -- (데미지 미적용 + 데미지 숫자도 안 뜸). 패링 창 안의 첫 공격이 2초 무적을 발동시킨다.
         if isvalid(hit) and hit:CheckGuardBlock() then
@@ -126,6 +200,32 @@ script MonsterAttack extends AttackComponent
     end
 
     method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+        local boss=self.Entity:GetComponent("script.Monster")
+        if isvalid(self.Entity:GetComponent("script.StumpyEncounter")) and string.sub(attackInfo or "",1,12)=="boss.stumpy." then
+            local rates={["boss.stumpy.slam"]=0.6,["boss.stumpy.ball"]=0.3,["boss.stumpy.dash"]=0.5,["boss.stumpy.contact"]=0.2,["boss.stumpy.bats"]=0.6}
+            local maxHp=isvalid(defender.PlayerComponent) and defender.PlayerComponent.MaxHp or _BossStageManager:SummonMaxHp(defender)/3
+            return math.max(1,math.floor(maxHp*(rates[attackInfo] or 0)))
+        end
+        local summonHp=0
+        if isvalid(self.Entity.CurrentMap) and _BossStageManager:IsArena(self.Entity.CurrentMap.Name) then
+            summonHp=_BossStageManager:SummonMaxHp(defender)
+        end
+        if summonHp>0 then
+            if attackInfo=="boss.mano.contact" and isvalid(boss) and boss.IsStageBoss then return math.max(1,math.floor(summonHp*0.1)) end
+            if self.BossOwner~="" then
+                local snail=self.Entity:GetComponent("script.ManoSnail")
+                local rate=isvalid(snail) and snail.Special and snail.Phase=="flight" and (0.8/3) or 0.1
+                return math.max(1,math.floor(summonHp*rate))
+            end
+        end
+        if attackInfo=="boss.mano.contact" and isvalid(boss) and boss.IsStageBoss and isvalid(defender.PlayerComponent) then
+            return math.max(1,math.floor(defender.PlayerComponent.MaxHp*0.5))
+        end
+        if self.BossOwner~="" and isvalid(defender.PlayerComponent) then
+            local snail=self.Entity:GetComponent("script.ManoSnail")
+            local rate=isvalid(snail) and snail.Special and snail.Phase=="flight" and 0.8 or 0.3
+            return math.max(1,math.floor(defender.PlayerComponent.MaxHp*rate))
+        end
         -- 같은 레벨 플레이어의 기본 최대 HP(50 + 3L)를 기준으로 7~13% 피해.
         -- 장비/HP 버프는 생존 이점으로 남기고, 피해 감소 버프는 아래에서 적용한다.
         local monster = self.Entity:GetComponent("script.Monster")
@@ -136,6 +236,7 @@ script MonsterAttack extends AttackComponent
         level = math.max(1, level)
         local damageRange = _RegionTierLogic:GetMonsterDamageRange(level)
         local dmg = _UtilLogic:RandomIntegerRange(damageRange.min, damageRange.max)
+        if isvalid(monster) and monster.IsStageBoss then dmg = math.floor(dmg * 2) end
         -- (팔라딘) 받는 피해 감소 버프 적용 - 가드 성공(10초 50%) / 아이언 월(2%/pt) 곱연산.
         if isvalid(defender) then
             ---@type PlayerHit
@@ -144,7 +245,18 @@ script MonsterAttack extends AttackComponent
                 dmg = hit:ApplyDamageReduction(dmg)
             end
         end
+        if summonHp>0 then dmg=math.max(1,math.floor(dmg/3)) end
         return dmg
+    end
+
+    method void OnAttack(Entity defender)
+        if self._T.stumpyHits~=nil then self._T.stumpyHits[defender.Id]=true end
+        -- A dash may hit each player or companion once, without shielding later targets.
+        local snail=self.Entity:GetComponent("script.ManoSnail")
+        if isvalid(snail) and snail.Special and snail.Phase=="flight" then
+            snail._T.flightHits=snail._T.flightHits or {}
+            snail._T.flightHits[defender.Id]=true
+        end
     end
 
     method int32 GetDisplayHitCount(string attackInfo)

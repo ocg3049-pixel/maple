@@ -10,6 +10,7 @@ script LoginFlow extends Logic
     method void OnInitialize()
         -- 플레이어가 사냥 맵에 먼저 생성되지 않도록 서버 초기 스폰을 분리한다.
         if self:IsServer() then
+            _LogService:SetShouldShowServerLog(false)
             _DefaultUserEnterLeaveLogic.StartPoint = "/maps/login"
             self._T.sessions = {}
         end
@@ -56,6 +57,10 @@ script LoginFlow extends Logic
         self._T.visibilityRestoreUntil = 0
         self:EnableUI("EntryFade", false)
         self._T.cameraY = 0
+        self._T.creationZoomProgress = 0
+        self._T.creationZoomElapsed = 0
+        self._T.creationZoomMobile = false
+        self._T.creationZoomExit = nil
         self._T.panTime = 0
         self._T.channels = {}
         -- Load selection-circle pixels before channel entry; each frame keeps its own ORI rect.
@@ -326,6 +331,16 @@ script LoginFlow extends Logic
     method void ShowPhase(string nextPhase, boolean animate)
         -- 단계 전환을 단일 경로로 수행해 HUD 노출과 잘못된 뒤로 가기를 막는다.
         if nextPhase == "intro" and self._T.introPlayed then return end
+        -- Keep the creation scene in place until its close-up has eased back out.
+        local leavingCreation = (self.phase == "create" or self.phase == "job") and nextPhase == "character"
+        if animate and leavingCreation and (self._T.creationZoomProgress or 0) > 0 then
+            if self._T.creationZoomExit == nil then
+                self._T.creationZoomExit = {elapsed=0, from=self._T.creationZoomProgress}
+                log("[LoginFlow] mobile creation zoom-out started before return pan")
+            end
+            return
+        end
+        self._T.creationZoomExit = nil
         self:EnableUI("IntroCover", nextPhase == "intro")
         local previousPhase = self.phase
         if nextPhase == "character" and previousPhase ~= "character" then
@@ -360,8 +375,8 @@ script LoginFlow extends Logic
         self:EnableUI("Stage/WorldGroup/Channels", nextPhase == "channel")
         self:EnableUI("Stage/CharacterSelectGroup", nextPhase == "character")
         self:EnableUI("Stage/CreateCharacter", nextPhase == "create" or nextPhase == "job")
-        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel", nextPhase == "create")
-        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/JobSelectPanel", nextPhase == "job")
+        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel", nextPhase == "create" or nextPhase == "job")
+        self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/JobSelectPanel", false)
         self:EnableUI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName", nextPhase == "create" or nextPhase == "job")
         self:EnableUI("Stage/Navigation", nextPhase ~= "login" and nextPhase ~= "ingame" and nextPhase ~= "intro")
         self:EnableUI("Stage/Navigation/StepCustom", nextPhase == "character" or nextPhase == "create" or nextPhase == "job")
@@ -378,13 +393,56 @@ script LoginFlow extends Logic
         self._T.cameraFrom = self._T.cameraY or 0
         self._T.cameraTo = heights[scenery]
         self._T.panTime = animate and math.abs(self._T.cameraTo - self._T.cameraFrom) > 1 and 1.2 or 0
+        if not sameCreate then
+            self._T.creationZoomProgress = 0
+            self._T.creationZoomElapsed = 0
+        end
         if self._T.panTime == 0 then self._T.cameraY = self._T.cameraTo end
         self:ApplyCamera()
         self:Text("Stage/Navigation/Title", nextPhase == "character" and "캐릭터 선택" or "캐릭터 만들기")
         self:Text("Stage/Navigation/Subtitle", nextPhase == "character" and "CHARACTER SELECT" or "CHARACTER CREATE")
         self:Text("Stage/Navigation/WorldValue", "스카니아\nCH." .. tostring(self.selectedChannel))
+        -- A mobile return defers this phase change until zoom-out finishes. Rebind
+        -- the selected character after resetting the scroll, not during that wait.
+        if nextPhase == "character" and previousPhase ~= "character" then
+            self:SelectionChanged()
+        end
         self:UpdatePresentation(0)
         log("[LoginFlow] phase=" .. nextPhase)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateCreationCamera(number delta)
+        local exiting = self._T.creationZoomExit
+        if exiting ~= nil then
+            exiting.elapsed = math.min(0.9, exiting.elapsed + delta)
+            self._T.creationZoomProgress = exiting.from * (1 - exiting.elapsed / 0.9)
+            self:ApplyCamera()
+            if exiting.elapsed >= 0.9 then
+                self._T.creationZoomExit = nil
+                self._T.creationZoomProgress = 0
+                log("[LoginFlow] mobile creation zoom-out complete; return pan started")
+                self:ShowPhase("character", true)
+            end
+            return
+        end
+        -- Finish the scene pan first, pause briefly, then ease into the mobile close-up.
+        local mobileCreate = (self.phase == "create" or self.phase == "job")
+        if self._T.creationZoomMobile ~= mobileCreate then
+            self._T.creationZoomMobile = mobileCreate
+            self._T.creationZoomElapsed = 0
+            self._T.creationZoomProgress = 0
+            self:ApplyCamera()
+        end
+        if not mobileCreate or (self._T.panTime or 0) > 0 then return end
+        if (self._T.creationZoomProgress or 0) >= 1 then return end
+        local previous = self._T.creationZoomProgress or 0
+        self._T.creationZoomElapsed = (self._T.creationZoomElapsed or 0) + delta
+        local progress = math.max(0, math.min(1, (self._T.creationZoomElapsed - 0.12) / 0.9))
+        self._T.creationZoomProgress = progress
+        self:ApplyCamera()
+        if previous == 0 and progress > 0 then log("[LoginFlow] mobile creation zoom started after scene pan") end
+        if progress == 1 then log("[LoginFlow] mobile creation zoom settled=1.45; preview facing left") end
     end
 
     @ExecSpace("ClientOnly")
@@ -393,7 +451,21 @@ script LoginFlow extends Logic
         -- 화면마다 그림을 교체하지 않고 간판과 선택 UI에도 같은 좌표 변환을 적용한다.
         -- 한 부모의 연속 좌표를 사용해 픽셀 반올림에 의한 계단식 움직임을 없앤다.
         local camera = self._T.cameraY or 0
-        self:UI("Stage/Scenery/Panorama").UITransformComponent.anchoredPosition = Vector2(0, -camera)
+        local mobileCreate = (self.phase == "create" or self.phase == "job")
+        local progress = mobileCreate and (self._T.creationZoomProgress or 0) or 0
+        local eased = progress * progress * (3 - 2 * progress)
+        local bookProgress = mobileCreate and (self._T.creationBookProgress or 0) or 0
+        local bookEase=bookProgress*bookProgress*(3-2*bookProgress)
+        local zoom = 1 + (0.45-0.45*bookEase) * eased
+        local focusX = 130 * eased
+        -- Keep the bottom action buttons clear of the viewport edge at full zoom.
+        local focusY = 0
+        local preview = self:UI("Stage/CreateCharacter/CreateCharacterBackground/PreviewAvatar")
+        if isvalid(preview) then preview.AvatarGUIRendererComponent.FlipX = false end
+        local panorama = self:UI("Stage/Scenery/Panorama").UITransformComponent
+        panorama.UIScale = Vector3(zoom, zoom, 1)
+        panorama.anchoredPosition = Vector2(-focusX * zoom, (-camera - focusY) * zoom)
+        self._T.creationZoom = zoom
         local rows = {
             { "Login", "LoginGroup", 0 },
             { "WorldScene", "WorldGroup", 600 },
@@ -408,7 +480,8 @@ script LoginFlow extends Logic
             end
             local controls = self:UI("Stage/" .. row[2])
             if isvalid(controls) then
-                controls.UITransformComponent.anchoredPosition = Vector2(0, offset)
+                controls.UITransformComponent.UIScale = Vector3(zoom, zoom, 1)
+                controls.UITransformComponent.anchoredPosition = Vector2(-focusX * zoom, (offset - focusY) * zoom)
                 controls.Enable = self.phase ~= "ingame" and (self.phase ~= "intro" or self._T.introRevealing) and math.abs(offset) < 600
             end
         end
@@ -462,6 +535,9 @@ script LoginFlow extends Logic
             self:ApplyCamera()
             if self._T.panTime == 0 then log("[LoginFlow] camera settled=" .. tostring(self._T.cameraY)) end
         end
+        self:UpdateCreationCamera(delta)
+        local setting=self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
+        if isvalid(setting) then setting.CharacterSettingComponent:UpdateCreation(delta) end
         -- 서버 입장 승인과 실제 필드 도착을 모두 확인한다. 시작/저장 맵은 캐릭터마다 다르다.
         local arrived = self._T.entryApproved and isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "login"
         self._T.entryArrivalElapsed = arrived and ((self._T.entryArrivalElapsed or 0) + delta) or 0
@@ -631,6 +707,7 @@ script LoginFlow extends Logic
 
     @ExecSpace("ClientOnly")
     method void Action(string action)
+        if _AppearanceColorPicker:BlocksInput() then return end
         -- 버튼·키보드가 같은 단계 검사를 거치므로 빠른 연타도 순서를 건너뛰지 않는다.
         if self.phase == "intro" then return end
         if action == "back" then action = "previous" end
@@ -668,7 +745,7 @@ script LoginFlow extends Logic
             local idx = (self.channelPage - 1) * 19 + (tonumber(string.sub(action, 9)) or 0)
             if self._T.channels[idx] == nil then return end
             local now = _UtilLogic.ElapsedSeconds
-            local double = self._T.channelClickIndex == idx and now - (self._T.channelClickAt or -10) <= 0.45
+            local double = self._T.channelClickIndex == idx and now - (self._T.channelClickAt or -10) <= 0.8
             self._T.channelClickIndex = idx
             self.selectedChannel = idx
             if double then
@@ -689,7 +766,7 @@ script LoginFlow extends Logic
             if not _CharacterPersistence:IsCharacterListReady() then self:Notice("캐릭터 목록을 불러오는 중입니다. 잠시 후 다시 시도해주세요.", "") return end
             local comp = self:SelectComponent()
             if comp == nil or comp:FirstEmptySlot() == 0 then self:Notice("캐릭터 슬롯이 가득 찼습니다.", "") return end
-            self:ShowPhase("job", true)
+            self:ShowPhase("create", true)
             local panel = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
             panel:GetComponent("script.CharacterSettingComponent"):Init()
             self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterName").TextGUIRendererInputComponent.Text = ""
@@ -705,7 +782,7 @@ script LoginFlow extends Logic
             local e = self:UI("Stage/CreateCharacter/CreateCharacterBackground/CreateCharacterok")
             e:GetComponent("script.CreateCharacterok"):Submit()
         elseif action == "cancelCreate" then
-            if self.phase == "create" then self:ShowPhase("job", false) else self:ShowCharacters() end
+            if self.phase == "create" or self.phase == "job" then self:ShowCharacters() end
         elseif action == "delete" and self.phase == "character" then
             local comp = self:SelectComponent()
             local data = comp:GetSlotData(comp.selectedSlot)
@@ -715,8 +792,7 @@ script LoginFlow extends Logic
         elseif action == "prevPage" and self.phase == "character" then self:SelectComponent():MovePage(-1)
         elseif action == "nextPage" and self.phase == "character" then self:SelectComponent():MovePage(1)
         elseif action == "previous" then
-            if self.phase == "create" then self:ShowPhase("job", false)
-            elseif self.phase == "job" then self:ShowCharacters()
+            if self.phase == "create" or self.phase == "job" then self:ShowCharacters()
             elseif self.phase == "character" then self:ShowPhase("channel", true) self:RequestChannels()
             elseif self.phase == "channel" then self:ShowPhase("world", false)
             elseif self.phase == "world" then self:ShowPhase("login", true) end
@@ -993,9 +1069,34 @@ script LoginFlow extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method void PrepareArrivalResources(Entity map)
+        -- Preload sprite and background art while the engine settles the destination terrain.
+        local ticket={} self._T.arrivalLoadTicket=ticket self._T.arrivalResourcesReady=false
+        local resources={} local seen={} local queue={map} local index=1
+        while index<=#queue do
+            local entity=queue[index] index=index+1
+            for _,child in ipairs(entity.Children:ToTable()) do table.insert(queue,child) end
+            local sprite=entity.SpriteRendererComponent local background=entity.BackgroundComponent
+            local ruid=isvalid(sprite) and sprite.SpriteRUID or isvalid(background) and background.SpriteRUID or ""
+            if ruid~="" and not seen[ruid] then seen[ruid]=true table.insert(resources,ruid) end
+
+        end
+        local pending=#resources>0 and 1 or 0
+        local finish=function()
+            if self._T.arrivalLoadTicket~=ticket then return end
+            pending=pending-1
+            if pending<=0 then self._T.arrivalResourcesReady=true log("[ScreenCover] destination resource loading finished "..map.Name) end
+        end
+        if pending==0 then self._T.arrivalResourcesReady=true return end
+        if #resources>0 then _ResourceService:PreloadAsync(resources,function(results) finish() end) end
+    end
+
+    @ExecSpace("ClientOnly")
     @EventSender("Service", "ScreenTransitionService")
     handler HandleEntryFadeIn(FadeInStartEvent event)
-        self._T.fullScreenFade = "in"
+        self._T.fullScreenFade = "loading"
+        self._T.arrivalStarted=_UtilLogic.ElapsedSeconds
+        self._T.arrivalStable=0 self._T.arrivalMap=nil self._T.arrivalResourcesReady=false self._T.arrivalLoadTicket=nil
         self._T.fullScreenFadeAlpha = 1
         self:UpdateFullScreenCover(0)
         -- 완전히 어두워진 경계에서만 책 화면을 내리고 도착 맵을 드러낸다.
@@ -1009,8 +1110,7 @@ script LoginFlow extends Logic
     @ExecSpace("ClientOnly")
     @EventSender("Service", "ScreenTransitionService")
     handler HandleEntryFadeEnd(FadeInEndEvent event)
-        self._T.fullScreenFade = nil
-        self._T.fullScreenFadeAlpha = 0
+        -- Native fading can finish before mobile resource spawning settles.
         self:UpdateFullScreenCover(0)
         -- 이후의 일반 맵 이동에는 로그인 전용 오버레이를 적용하지 않는다.
         if not self._T.entryTransition then return end
@@ -1051,6 +1151,7 @@ script LoginFlow extends Logic
 
     @ExecSpace("ClientOnly")
     method void UpdateFullScreenCover(number delta)
+        self:UpdateTransitionInput()
         local scene = _EntityService:GetEntityByPath("/ui/LoginScene")
         if isvalid(scene) then
             local a = _UILogic:ScreenToLocalUIPosition(Vector2.zero, scene.UITransformComponent)
@@ -1073,7 +1174,28 @@ script LoginFlow extends Logic
         if mode == nil then return end
         local alpha = self._T.fullScreenFadeAlpha or 0
         if mode == "out" then alpha = math.min(1,alpha+delta)
-        elseif mode == "in" then alpha = math.max(0,alpha-delta) end
+        elseif mode == "loading" then
+            alpha=1
+            local player=_UserService.LocalPlayer
+            local map=isvalid(player) and player.CurrentMap or nil
+            local ready=isvalid(map) and map.Name~="login" and isvalid(player.TransformComponent)
+            local childCount=ready and map.Children.Count or 0
+            if ready and self._T.arrivalMap==map and self._T.arrivalChildCount==childCount then self._T.arrivalStable=(self._T.arrivalStable or 0)+delta
+            else
+                local changed=self._T.arrivalMap~=map
+                self._T.arrivalMap=map self._T.arrivalStable=0 self._T.arrivalChildCount=childCount
+                if ready and changed then self:PrepareArrivalResources(map) end
+            end
+            local elapsed=_UtilLogic.ElapsedSeconds-(self._T.arrivalStarted or _UtilLogic.ElapsedSeconds)
+            local minimum=_MobileUIManager:IsMobile() and 1.5 or 0.75
+            if ready and self._T.arrivalResourcesReady and (self._T.arrivalStable or 0)>=minimum and (_FieldCameraBounds._T.map==map or elapsed>8) then
+                self._T.fullScreenFade="in"
+                log("[ScreenCover] destination settled; reveal "..map.Name)
+            elseif elapsed>12 then self._T.fullScreenFade="in" end
+        elseif mode == "in" then
+            alpha = math.max(0,alpha-delta/0.6)
+            if alpha==0 then self._T.fullScreenFade=nil cover.Enable=false end
+        end
         self._T.fullScreenFadeAlpha = alpha
         cover.CanvasGroupComponent.GroupAlpha = alpha
         local group = cover.Parent
@@ -1107,6 +1229,26 @@ script LoginFlow extends Logic
         renderer.Points:AddRange({Vector2(-x,-y),Vector2(x,-y),Vector2(x,y),Vector2(-x,y)})
         self._T.coverSizes[cover.Id]=signature
         log("[ScreenCover] solid bounds="..signature.." layer="..cover.Name)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateTransitionInput()
+        -- Native map fades end before our resource cover. Hold controls until both are gone.
+        local p=_UserService.LocalPlayer
+        local blocked=self._T.fullScreenFade~=nil or _BossStageManager._T.destination~=nil
+        if not isvalid(p) or not isvalid(p.PlayerControllerComponent) then return end
+        local ctrl=p.PlayerControllerComponent
+        if blocked then
+            if self._T.transitionPlayer~=p then
+                self._T.transitionPlayer=p self._T.transitionRestoreControl=ctrl.Enable
+                _MobileUIManager:ReleaseControls()
+            elseif ctrl.Enable then self._T.transitionRestoreControl=true end
+            ctrl.Enable=false
+            if isvalid(p.MovementComponent) then p.MovementComponent:Stop() end
+        elseif self._T.transitionPlayer~=nil then
+            if self._T.transitionPlayer==p and self._T.transitionRestoreControl and p.PlayerComponent.Hp>0 then ctrl.Enable=true end
+            self._T.transitionPlayer=nil self._T.transitionRestoreControl=nil
+        end
     end
 
 end

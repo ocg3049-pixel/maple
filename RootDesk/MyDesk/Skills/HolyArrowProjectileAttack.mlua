@@ -17,6 +17,13 @@ script HolyArrowProjectileAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+        if not isvalid(defender) then return false end
+        local planned = self._T.flyingDamage ~= nil and self._T.flyingDamage[defender.Id] or nil
+        if self._T.flyingDamage~=nil and planned==nil and string.find(attackInfo or "", ".blast",1,true)==nil then return false end
+        if planned ~= nil then
+            local mon = defender:GetComponent("script.Monster")
+            if not isvalid(mon) or mon.LifeSerial ~= planned.life then return false end
+        end
 		-- 화살은 관통하며 여러 몬스터를 맞힐 수 있지만, 같은 몬스터를 한 발로 중복 타격하지 않도록
 		-- HolyArrowProjectile에 기록된 명중 목록(이름 기준)으로 필터링하고, 최대 관통 수(6명)를 넘으면
 		-- 판정 자체를 막는다(엔젤레이와 동일한 구조).
@@ -46,16 +53,9 @@ script HolyArrowProjectileAttack extends AttackComponent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
-		-- 홀리 에로우(2차): 대상당 데미지는 **아이언 에로우와 완전히 같다**(요청 2026-08-08).
-		-- 고정 300%~400%가 아니라 화살에 새겨진 RateMin/RateMax를 쓴다 - 1레벨 150%~200%에서
-		-- 분배 1포인트당 최소·최대 각 +10%p(마스터 20에서 340%~390%).
-		-- 실제 명중이 확정된 시점(이 훅)에만 호출되므로 여기서 명중 기록.
-		-- 쉐도우 파트너의 "타수 2배"는 원본+보너스(원본의 투자 레벨별 50~79%) 합산·2줄 표시(엔젤레이와 동일).
-		---@type HolyArrowProjectile
 		local proj = self.Entity:GetComponent("script.HolyArrowProjectile")
 		local combatPower = 0
 		local echoOn = false
-		-- (2026-08-05 개편) 쉐도우 파트너 분신 몫 배율 - 투자 레벨별 0.50(1레벨)~0.79(마스터 30).
 		local echoRate = 0.5
 		local critRate = 0.5
 		local rateMin = 1.5
@@ -69,24 +69,11 @@ script HolyArrowProjectileAttack extends AttackComponent
 			rateMax = proj.RateMax or rateMax
 			proj:MarkHit(defender.Name)
 		end
-		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
-		local dmg = math.floor(combatPower * mult)
-		-- (백스탭) 뒤통수에서 쏜 발이면 추가 데미지를 얹는다(크리티컬 배율보다 앞에서 적용).
-		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
-		-- 크리티컬은 여기서 직접 굴리고 배율을 반환값에 바로 곱한다(아래 CalcCritical은 이중 적용 방지용 false).
-		local dmgIsCritical = _UtilLogic:RandomDouble() < critRate
-		if dmgIsCritical then
-			dmg = math.floor(dmg * 2.0)
-		end
-		local bonus = 0
-		local bonusIsCritical = false
-		if echoOn then
-			bonus = math.floor(dmg * echoRate)
-			bonusIsCritical = _UtilLogic:RandomDouble() < critRate
-			if bonusIsCritical then
-				bonus = math.floor(bonus * 2.0)
-			end
-		end
+        local pa = isvalid(self.OwnerEntity) and self.OwnerEntity:GetComponent("script.PlayerAttack") or nil
+        local roll
+        if isvalid(pa) then roll = pa:ResolveFlyingDamage(self, defender, attackInfo)
+        else roll = self:RollPlannedDamage(defender, attackInfo) end
+        local dmg, bonus, dmgIsCritical, bonusIsCritical = roll.dmg, roll.bonus, roll.critical, roll.bonusCritical
 		self:ShowHolyArrowDamageSkin(defender, dmg, bonus, dmgIsCritical, bonusIsCritical, self:GetProjectileDamageSkinId())
 		self:PlayHolyArrowHitEffect(defender)
 		self:PlayHolyArrowHitSound(defender)
@@ -106,17 +93,21 @@ script HolyArrowProjectileAttack extends AttackComponent
 	method void ShowHolyArrowDamageSkin(Entity target, integer damage, integer bonus, boolean damageIsCritical, boolean bonusIsCritical, string skinRuid)
 		-- 다른 스킬들과 동일한 기본 히트 데미지 스킨(RUID)을 재생해 룩앤필을 통일한다.
 		if not isvalid(target) then return end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, skinRuid, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, damageIsCritical,
 			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 		if bonus > 0 then
+			if not _AutoHuntPowerSave.active then
 			_DamageSkinService:Play(
 				target, skinRuid, 0,
 				{ bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
+			end
 		end
 	end
 
@@ -188,5 +179,52 @@ script HolyArrowProjectileAttack extends AttackComponent
 		-- 피해/MISS는 위 수동 표시에서 처리한다. 엔진의 숫자를 중복 출력하지 않는다.
 		return 0
 	end
+
+
+    @ExecSpace("ServerOnly")
+    method table RollPlannedDamage(Entity defender, string attackInfo)
+		local proj = self.Entity:GetComponent("script.HolyArrowProjectile")
+		local combatPower = 0
+		local echoOn = false
+		local echoRate = 0.5
+		local critRate = 0.5
+		local rateMin = 1.5
+		local rateMax = 2.0
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			echoOn = proj.ShadowEchoOn
+			echoRate = proj.ShadowEchoRate or 0.5
+			critRate = (proj.CritRate or 50) / 100
+			rateMin = proj.RateMin or rateMin
+			rateMax = proj.RateMax or rateMax
+
+		end
+		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
+		local dmg = math.floor(combatPower * mult)
+		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
+		local dmgIsCritical = _UtilLogic:RandomDouble() < critRate
+		if dmgIsCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+		local bonus = 0
+		local bonusIsCritical = false
+		if echoOn then
+			bonus = math.floor(dmg * echoRate)
+			bonusIsCritical = _UtilLogic:RandomDouble() < critRate
+			if bonusIsCritical then
+				bonus = math.floor(bonus * 2.0)
+			end
+		end
+        return {dmg=dmg,bonus=bonus,critical=dmgIsCritical,bonusCritical=bonusIsCritical}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        for _, roll in pairs(self._T.flyingDamage or {}) do
+            local mon = isvalid(roll.target) and roll.target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
+        end
+        self._T.flyingDamage = nil
+    end
 
 end

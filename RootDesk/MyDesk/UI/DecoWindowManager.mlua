@@ -21,6 +21,11 @@ script DecoWindowManager extends Logic
 
         local eBase = "/ui/DefaultGroup/EquipWindow/"
         local dBase = "/ui/DefaultGroup/DecoWindow/"
+        -- Apply the same readable size to equipment and cosmetic windows at runtime.
+        for _,path in ipairs({"/ui/DefaultGroup/EquipWindow","/ui/DefaultGroup/DecoWindow"}) do
+            local window=_EntityService:GetEntityByPath(path)
+            if isvalid(window) then window.UITransformComponent.UIScale=Vector3(1.3,1.3,1) end
+        end
 
         self:WireTouch(eBase .. "TabEquip/Touch", function() self:SetEquipTab("equip") end)
         self:WireTouch(eBase .. "TabPet/Touch", function() self:SetEquipTab("pet") end)
@@ -83,7 +88,7 @@ script DecoWindowManager extends Logic
         local h = e:ConnectEvent(UITouchDownEvent, function(evt)
             ---@type UITouchDownEvent
             local te = evt
-            if te.TouchId == -1 then
+            if te.TouchId == -1 or ((Environment:IsMobilePlatform() or _MobileUIManager:IsMobile()) and te.TouchId >= 0) then
                 -- 겹친 창 관통 방지: 이 요소가 속한 창이 클릭 지점의 최상단 창일 때만 실행한다.
                 local winRoot = string.match(capturedPath, "^(/ui/DefaultGroup/[^/]+)")
                 if winRoot ~= nil and not _UIClickArbiter:AcceptClickAt(winRoot, te.TouchPoint) then return end
@@ -106,7 +111,7 @@ script DecoWindowManager extends Logic
 
         local content = {
             "HeaderLabel","BtnDeco","Preview","GreySlots","HintText",
-            "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove","SlotEarring","SlotRing","SlotPendant","SlotFaceAccessory","SlotEyeAccessory","SlotTicket",
+            "SlotFace","SlotHair","SlotTop","SlotBottom","SlotShoes","SlotWeapon","SlotCap","SlotCape","SlotGlove","SlotEarring","SlotRing","SlotRing2","SlotRing3","SlotRing4","SlotPendant","SlotPendant2","SlotFaceAccessory","SlotEyeAccessory","SlotTicket",
         }
         for _, n in ipairs(content) do
             local e = _EntityService:GetEntityByPath(base .. n)
@@ -145,17 +150,17 @@ script DecoWindowManager extends Logic
         local bg = _EntityService:GetEntityByPath(path .. "/TabBG")
         if isvalid(bg) and isvalid(bg.SpriteGUIRendererComponent) then
             if active then
-                bg.SpriteGUIRendererComponent.Color = Color(0.18, 0.64, 0.78, 1)
+                bg.SpriteGUIRendererComponent.Color = Color(0.63,0.84,0.72,1)
             else
-                bg.SpriteGUIRendererComponent.Color = Color(0.23, 0.24, 0.29, 1)
+                bg.SpriteGUIRendererComponent.Color = Color(0.85,0.765,0.604,1)
             end
         end
         local lb = _EntityService:GetEntityByPath(path .. "/Label")
         if isvalid(lb) and isvalid(lb.TextComponent) then
             if active then
-                lb.TextComponent.FontColor = Color(1, 1, 1, 1)
+                lb.TextComponent.FontColor = Color(0.286,0.224,0.173,1)
             else
-                lb.TextComponent.FontColor = Color(0.62, 0.64, 0.7, 1)
+                lb.TextComponent.FontColor = Color(0.286,0.224,0.173,1)
             end
         end
     end
@@ -223,6 +228,13 @@ script DecoWindowManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnDecoSlotClick(string slotKey)
+        -- Mobile uses explicit actions so one tap can also open the dye picker.
+        if _MobileUIManager:IsMobile() then
+            for i,key in ipairs(self:SlotUIKeys()) do
+                if key==slotKey then _MobileUIManager:SelectItem("deco",i) return end
+            end
+            return
+        end
         -- 치장 슬롯 더블클릭 → 해제
         local t = _UtilLogic.ElapsedSeconds
         if self.lastDecoSlot == slotKey and t - self.lastDecoTime < 0.5 then
@@ -359,7 +371,7 @@ script DecoWindowManager extends Logic
         local eq = {}
         for i = 1, 27 do
             local s = _UIEquipInventoryManager:GetEquip(i)
-            eq[i] = { ruid = "", name = "" }
+            eq[i] = { ruid = "", name = "", item = s }
             if s ~= "" then
                 eq[i].ruid = _UIEquipInventoryManager:ParseRUID(s)
                 eq[i].name = _UIEquipInventoryManager:ParseName(s)
@@ -463,6 +475,7 @@ script DecoWindowManager extends Logic
         local keys={[1]="skin",[5]="cap",[6]="cape",[7]="coat",[9]="coat",[10]="pants",[8]="glove",[12]="shoes",[13]="weapon",[14]="weapon",[15]="subweapon",[16]="faceacc",[17]="eyeacc",[18]="earacc"}
         for _,f in ipairs(finals) do
             local item=deco[keys[f[1]] or ""] or ""
+            if f[1]==3 then item=eq[2].item or "" end
             local matches=_UIEquipInventoryManager:ParseRUID(item)==f[2]
             f[3]=matches and (string.match(item,"|dye:(%x%x%x%x%x%x)") or "FFFFFF") or "FFFFFF"
             f[4]=matches and math.floor(self:DyePower(item)*100+0.5) or 100
@@ -524,9 +537,12 @@ script DecoWindowManager extends Logic
             end
         end
         if self:IsClient() then
+            self._T.dyeSnapshots=self._T.dyeSnapshots or {}
+            local key=tostring(cm.Entity.Id)
+            self._T.dyeSnapshots[key]=finals
             self:ApplyDyes(cm,finals)
             _TimerService:SetTimerOnce(function()
-                if isvalid(cm) then self:ApplyDyes(cm,finals) end
+                if isvalid(cm) and self._T.dyeSnapshots[key]==finals then self:ApplyDyes(cm,finals) end
             end,0.4)
         end
 
@@ -590,7 +606,7 @@ script DecoWindowManager extends Logic
     end
 
     method Color DyeColor(string hex, number power)
-        -- Preserve HDR RGB above one to brighten the original sprite, not just darken it.
+        -- Logical dye color; normalize before native part tint and boost in the material.
         if not string.match(hex,"^%x%x%x%x%x%x$") then hex="FFFFFF" end
         local color=Color.FromHexCode("#"..hex)
         local gain=math.max(100,math.min(200,power))/100
@@ -604,20 +620,69 @@ script DecoWindowManager extends Logic
 
 
     @ExecSpace("ClientOnly")
+    method number ConfigureDyeMaterial(any renderer, boolean boosted)
+        -- A fixed shared gain avoids native part-color clamping without per-player material mutation.
+        local materialId = "dd19daf1-914b-4b1d-9732-4ff7525e42cc"
+        self._T.dyeMaterials = self._T.dyeMaterials or {}
+        local key = renderer.Entity.Id
+        if boosted then
+            if renderer.MaterialId ~= materialId then
+                self._T.dyeMaterials[key] = renderer.MaterialId or ""
+                renderer:ChangeMaterial(materialId)
+                log("[PrismBrightness] gain enabled entity=" .. tostring(key))
+            end
+            return 2
+        end
+        if renderer.MaterialId == materialId then
+            renderer:ChangeMaterial(self._T.dyeMaterials[key] or "")
+            log("[PrismBrightness] gain cleared entity=" .. tostring(key))
+        end
+        self._T.dyeMaterials[key] = nil
+        return 1
+    end
+
+    @ExecSpace("ClientOnly")
+    method number RendererDyeGain(any renderer)
+        -- Alpha-only weapon changes must preserve the inverse material gain too.
+        if isvalid(renderer) and renderer.MaterialId == "dd19daf1-914b-4b1d-9732-4ff7525e42cc" then return 2 end
+        return 1
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyDyeIcon(any renderer, string hex, number power)
+        -- Keep the item thumbnail consistent with the avatar preview and restore its prior material.
+        if not isvalid(renderer) then return end
+        local color = self:DyeColor(hex,power)
+        local gain = self:ConfigureDyeMaterial(renderer,math.max(color.r,color.g,color.b)>1)
+        renderer.Color = Color(color.r/gain,color.g/gain,color.b/gain,1)
+    end
+
+    @ExecSpace("ClientOnly")
     method void ApplyDyeTint(any cm, table finals, number brightness)
-        -- Set part colors after native avatar parts are rebuilt; reject stale snapshots.
-        if not isvalid(cm) or not cm.UseCustomEquipOnly then return end
+        -- Normalize every part, including head/skin, so only selected items receive extra brightness.
+        if not isvalid(cm) then return end
         local entity=cm.Entity
         local renderer=entity.AvatarGUIRendererComponent
         if not isvalid(renderer) then renderer=entity.AvatarRendererComponent end
         if not isvalid(renderer) then return end
+        if not cm.UseCustomEquipOnly then self:ConfigureDyeMaterial(renderer,false) return end
+        local boosted=false
+        for _,f in ipairs(finals) do
+            if f[2] ~= "" and cm:GetEquip(self:CatEnum(f[1]))==f[2] then
+                local color=self:DyeColor(tostring(f[3] or "FFFFFF"),tonumber(f[4]) or 100)
+                if math.max(color.r,color.g,color.b)*brightness>1 then boosted=true end
+            end
+        end
+        local gain=self:ConfigureDyeMaterial(renderer,boosted)
+        local base=brightness/gain
+        for cat=1,19 do
+            renderer:SetAvatarPartColor(MapleAvatarItemCategory.CastFrom(cat),base,base,base,1)
+        end
         for _,f in ipairs(finals) do
             local category=self:CatEnum(f[1])
             if cm:GetEquip(category)==f[2] then
-                local hex=tostring(f[3] or "FFFFFF")
-                if not string.match(hex,"^%x%x%x%x%x%x$") then hex="FFFFFF" end
-                local color=self:DyeColor(hex,tonumber(f[4]) or 100)
-                renderer:SetAvatarPartColor(category,color.r*brightness,color.g*brightness,color.b*brightness,1)
+                local color=self:DyeColor(tostring(f[3] or "FFFFFF"),tonumber(f[4]) or 100)
+                renderer:SetAvatarPartColor(category,color.r*base,color.g*base,color.b*base,1)
             end
         end
     end

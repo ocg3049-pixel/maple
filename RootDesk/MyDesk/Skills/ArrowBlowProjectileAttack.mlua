@@ -18,6 +18,13 @@ script ArrowBlowProjectileAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+        if not isvalid(defender) then return false end
+        local planned = self._T.flyingDamage ~= nil and self._T.flyingDamage[defender.Id] or nil
+        if self._T.flyingDamage~=nil and planned==nil and string.find(attackInfo or "", ".blast",1,true)==nil then return false end
+        if planned ~= nil then
+            local mon = defender:GetComponent("script.Monster")
+            if not isvalid(mon) or mon.LifeSerial ~= planned.life then return false end
+        end
 		-- 에로우 블로우는 화살 한 발이 적 "한 명"만 맞히는 단일 대상 스킬이다 - 이미 명중했으면 이후
 		-- 판정을 전부 막는다(같은 프레임에 여러 대상이 겹쳐 있어도 두 번째부터는 통과하지 못한다).
 		-- 강화 폭발의 추가 타격("skill.arrowblow.blast")은 이미 명중한 뒤에 나가는 별도 판정이므로
@@ -53,12 +60,6 @@ script ArrowBlowProjectileAttack extends AttackComponent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
-		-- (신궁 개편 2026-08-06) 고정 150%~200%가 아니라 화살에 새겨진 RateMin/RateMax를 쓴다 -
-		-- 슬래시블러스트 규격(50%~150%) + "에로우 블로우 강화" 투자분(각 +5%p/pt).
-		-- 실제 명중이 확정된 시점(이 훅)에만 호출되므로 여기서 명중을 기록해
-		-- 화살이 다음 프레임에 사라지도록 한다(강화 상태면 사라지는 대신 폭발이 시작된다).
-		-- 폭발의 추가 타격은 이미 명중이 끝난 뒤의 별도 판정이므로 명중 기록을 다시 하지 않는다.
-		---@type ArrowBlowProjectile
 		local proj = self.Entity:GetComponent("script.ArrowBlowProjectile")
 		local combatPower = 0
 		local critRate = 0.5
@@ -75,22 +76,12 @@ script ArrowBlowProjectileAttack extends AttackComponent
 				proj:MarkHit(defender)
 			end
 		end
-		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
-		local dmg = math.floor(combatPower * mult)
-		-- (백스탭) 뒤통수에서 쏜 발이면 추가 데미지를 얹는다(크리티컬 배율보다 앞에서 적용).
-		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
-		-- 크리티컬은 캐릭터 정보창의 확률로 여기서 직접 굴리고 배율을 반환값에 바로 곱한다(아래
-		-- CalcCritical은 엔진의 이중 배율 적용을 막기 위해 항상 false를 반환). math.random() 대신
-		-- _UtilLogic:RandomDouble()을 쓰는 이유는 PlayerAttack.mlua에 문서화된 "짧은 간격의 연속 호출에서
-		-- 같은 시퀀스를 반복 소비하는" 문제를 피하기 위함이다(다른 화살 스킬과 동일).
-		local isCritical = _UtilLogic:RandomDouble() < critRate
-		if isCritical then
-			dmg = math.floor(dmg * 2.0)
-		end
+        local pa = isvalid(self.OwnerEntity) and self.OwnerEntity:GetComponent("script.PlayerAttack") or nil
+        local roll
+        if isvalid(pa) then roll = pa:ResolveFlyingDamage(self, defender, attackInfo)
+        else roll = self:RollPlannedDamage(defender, attackInfo) end
+        local dmg, isCritical = roll.dmg, roll.critical
 		self:ShowArrowBlowDamageSkin(defender, dmg, isCritical, self:GetProjectileDamageSkinId())
-		-- (요청 2026-08-06) 폭발의 **주변 추가 타격**은 맞은 몬스터마다 적중 이펙트를 띄운다 -
-		-- 폭발 지점의 이펙트 3개는 "터진 자리"만 보여줄 뿐이라 멀리 있는 대상이 맞았는지 알 수 없었다.
-		-- 첫 명중(직격)은 강화 중이라면 그 자리에서 폭발 이펙트가 겹치므로 기존대로 생략한다.
 		if attackInfo == "skill.arrowblow.blast" or not enhanced then
 			self:PlayArrowBlowHitEffect(defender)
 		end
@@ -107,11 +98,13 @@ script ArrowBlowProjectileAttack extends AttackComponent
 	method void ShowArrowBlowDamageSkin(Entity target, integer damage, boolean isCritical, string skinRuid)
 		-- 다른 스킬들과 동일한 데미지 스킨(RUID)을 재생해 룩앤필을 통일한다.
 		if not isvalid(target) then return end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, skinRuid, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCritical,
 			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -187,5 +180,43 @@ script ArrowBlowProjectileAttack extends AttackComponent
 		-- 피해/MISS는 위 수동 표시에서 처리한다. 엔진의 숫자를 중복 출력하지 않는다.
 		return 0
 	end
+
+
+    @ExecSpace("ServerOnly")
+    method table RollPlannedDamage(Entity defender, string attackInfo)
+		local proj = self.Entity:GetComponent("script.ArrowBlowProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local enhanced = false
+		local rateMin = 0.5
+		local rateMax = 1.5
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			enhanced = proj.Enhanced
+			rateMin = proj.RateMin or rateMin
+			rateMax = proj.RateMax or rateMax
+			if attackInfo ~= "skill.arrowblow.blast" then
+
+			end
+		end
+		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
+		local dmg = math.floor(combatPower * mult)
+		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+        return {dmg=dmg,bonus=0,critical=isCritical,bonusCritical=false}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        for _, roll in pairs(self._T.flyingDamage or {}) do
+            local mon = isvalid(roll.target) and roll.target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
+        end
+        self._T.flyingDamage = nil
+    end
 
 end

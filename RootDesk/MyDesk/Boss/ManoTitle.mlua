@@ -1,0 +1,197 @@
+@Logic
+script ManoTitle extends Logic
+    property integer kills = 0
+    property boolean equipped = false
+    property string characterId = ""
+
+    method table Read(string raw)
+        -- Legacy repeated Mano kills count once; distinct cleared stages determine stars.
+        local mano=tonumber(string.match("\n"..(raw or ""),"\nMANO\t(%d+)")) or 0
+        local progress=tonumber(string.match("\n"..(raw or ""),"\nBOSS_V2\t(%d+)")) or 0
+        local count=mano>0 and math.max(1,math.min(2,progress)) or 0
+        return {kills=count,equipped=string.find("\n"..(raw or ""),"\nE\t22\t",1,true)~=nil}
+    end
+
+    method boolean IsTitle(string item)
+        -- Stable identity independent of name or upgrade level.
+        return string.find(item or "","|mano_title",1,true)~=nil
+    end
+
+    method string Item(integer count)
+        -- One permanent star per distinct boss clear, +1 all stats per star.
+        return "마노 정복자|e035bb90c053401b88de2159dfa230eb|22|"..tostring(count).."|0|0|0|0|보스 칭호|0|0|0|0|0|0|0|mano_title"
+    end
+
+    method boolean Owns(string raw)
+        -- Search only actual equipped/inventory records, never the progression ledger.
+        for line in string.gmatch(raw or "","[^\r\n]+") do
+            if (string.match(line,"^E\t22\t") or string.match(line,"^I\tequip\t%d+\t")) and self:IsTitle(line) then return true end
+        end
+        return false
+    end
+
+    method string Write(string raw, table state)
+        -- Canonicalize one existing title in place; progress alone never grants an item.
+        local lines={} local found=false local wearing=false
+        for line in string.gmatch(raw or "","[^\r\n]+") do
+            if self:IsTitle(line) then
+                local prefix=string.match(line,"^(E\t22\t)") or string.match(line,"^(I\tequip\t%d+\t)")
+                if prefix and not found and state.kills>0 then
+                    table.insert(lines,prefix..self:Item(state.kills)) found=true wearing=string.sub(prefix,1,1)=="E"
+                end
+            elseif string.sub(line,1,5)~="MANO\t" then table.insert(lines,line) end
+        end
+        table.insert(lines,"MANO\t"..tostring(state.kills).."\t"..(wearing and "1" or "0"))
+        return table.concat(lines,"\n")
+    end
+
+    method string Preserve(string authoritative, string incoming)
+        -- Client snapshots may move/discard an owned item, but may not forge an unclaimed one.
+        if not self:Owns(authoritative) then
+            local lines={} for line in string.gmatch(incoming or "","[^\r\n]+") do if not self:IsTitle(line) then table.insert(lines,line) end end
+            incoming=table.concat(lines,"\n")
+        end
+        return self:Write(incoming,self:Read(authoritative))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Grant(string uid, string character)
+        -- Called after the server updates distinct-stage progression.
+        local sv=_CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId~=character then return end
+        local raw=sv.saves[character] or ""
+        local state=self:Read(raw)
+        state.kills=math.max(1,tonumber(string.match("\n"..raw,"\nBOSS_V2\t(%d+)")) or 1)
+        sv.saves[character]=self:Write(raw,state) sv.dirtySaves[character]=true
+        self:Receive(character,state.kills,state.equipped,uid)
+        log("[BossTitle] progress stars="..tostring(state.kills).." owned="..tostring(self:Owns(raw)))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanClaim()
+        -- Reissue only when neither the equipped slot nor any equipment bag slot contains it.
+        if self.kills<=0 then return false end
+        local inv=_UIEquipInventoryManager
+        if self:IsTitle(inv:GetEquip(22)) then return false end
+        for i=1,128 do if self:IsTitle(inv:GetTabItem("equip",i)) then return false end end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Claim()
+        -- Send a current inventory snapshot before choosing a server-validated destination.
+        if self._T.pending or not self:CanClaim() then return false end
+        local inv=_UIEquipInventoryManager local free=false
+        for i=1,128 do if inv:GetTabItem("equip",i)=="" then free=true break end end
+        if not free then _UIToast:ShowMessage("칭호를 받을 장비 인벤토리 공간이 부족합니다.") return false end
+        self._T.pending=true
+        self:RequestClaim(self.characterId,_CharacterPersistence:BuildSaveString())
+        return true
+    end
+
+    @ExecSpace("Server")
+    method void RequestClaim(string character, string snapshot)
+        -- Serialize with the existing inventory snapshot acceptance rules.
+        local uid=senderUserId local sv=_CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId~=character then self:ClaimResult(character,0,0,false,uid) return end
+        if not _CharacterPersistence:AcceptCharacterSnapshot(uid,snapshot,"boss_title_claim") then self:ClaimResult(character,0,0,false,uid) return end
+        local raw=sv.saves[character] or "" local state=self:Read(raw)
+        if state.kills<=0 or self:Owns(raw) then self:ClaimResult(character,0,state.kills,false,uid) return end
+        local used={}
+        for line in string.gmatch(raw,"[^\r\n]+") do local slot=tonumber(string.match(line,"^I\tequip\t(%d+)\t")) if slot then used[slot]=true end end
+        local slot=0 for i=1,128 do if not used[i] then slot=i break end end
+        if slot==0 then self:ClaimResult(character,0,state.kills,false,uid) return end
+        sv.saves[character]=self:Write(raw.."\nI\tequip\t"..tostring(slot).."\t"..self:Item(state.kills),state)
+        sv.dirtySaves[character]=true _CharacterPersistence:WriteCharacterSaves(sv,false)
+        self:ClaimResult(character,slot,state.kills,true,uid)
+        log("[BossTitle] claimed slot="..tostring(slot).." stars="..tostring(state.kills))
+    end
+
+    @ExecSpace("Client")
+    method void ClaimResult(string character, integer slot, integer count, boolean ok)
+        -- Apply the title receipt, then release the reward-center queue.
+        if character~=self.characterId then return end
+        self._T.pending=false
+        if ok then
+            local inv=_UIEquipInventoryManager
+            if self:IsTitle(inv:GetEquip(22)) then slot=0
+            else
+                for i=1,128 do if self:IsTitle(inv:GetTabItem("equip",i)) then slot=i break end end
+                if slot>0 and inv:GetTabItem("equip",slot)~="" and not self:IsTitle(inv:GetTabItem("equip",slot)) then
+                    slot=0 for i=1,128 do if inv:GetTabItem("equip",i)=="" then slot=i break end end
+                    if slot==0 then
+                        self._T.receipt={character=character,count=count} self._T.pending=true
+                        _UIToast:ShowMessage("칭호 수령이 완료되었습니다. 장비 인벤토리 한 칸을 비우면 지급됩니다.") return
+                    end
+                end
+            end
+            self._T.receipt=nil self.kills=count
+            if slot==0 then inv:SetEquipStr(22,self:Item(count)) else inv:SetTabItem("equip",slot,self:Item(count)) end
+            _UIEquipInventoryManager:RefreshUI() _CharacterPersistence:MarkDirty("boss_title")
+            _UIToast:ShowMessage("마노 정복자 칭호 ★"..tostring(count).." 획득! 장비 인벤토리에서 장착하세요.")
+        else _UIToast:ShowMessage("칭호 보유 상태와 인벤토리 공간을 확인해주세요.") end
+        _RewardCenter:OnClaimResult("title",ok)
+        if _BossStageManager.opened then _BossStageManager:Draw() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Keep a confirmed receipt until a free slot exists; never overwrite another item.
+        local receipt=self._T.receipt
+        if receipt==nil then return end
+        for i=1,128 do
+            if _UIEquipInventoryManager:GetTabItem("equip",i)=="" then self:ClaimResult(receipt.character,i,receipt.count,true) return end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RequestToggle()
+        -- Compatibility entry point for the old title button: now claim/reissue only.
+        self:Claim()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string character, string raw)
+        -- Inventory is restored first; retain its equipped/bag location.
+        self.characterId=character self._T.pending=false self._T.receipt=nil
+        local state=self:Read(raw) self:Receive(character,state.kills,state.equipped)
+    end
+
+    @ExecSpace("Client")
+    method void Receive(string character, integer count, boolean wearing)
+        -- Upgrade any owned title in place without issuing another item.
+        if character~=self.characterId then return end
+        self.kills=count local inv=_UIEquipInventoryManager
+        self.equipped=self:IsTitle(inv:GetEquip(22))
+        if self.equipped then inv:SetEquipStr(22,self:Item(count)) end
+        for i=1,128 do if self:IsTitle(inv:GetTabItem("equip",i)) then inv:SetTabItem("equip",i,self:Item(count)) end end
+        inv:RefreshUI() _CharInfoManager:RefreshCharInfo()
+        if _BossStageManager.opened then _BossStageManager:Draw() end
+        _RewardCenter:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Empty title slot offers the same initial claim/reissue action.
+        local e=_EntityService:GetEntityByPath("/ui/DefaultGroup/EquipWindow/SlotTitle")
+        if not isvalid(e) then return end
+        self._T.slot=e
+        self._T.click=e:ConnectEvent(ButtonClickEvent,function()
+            if not _UIClickArbiter:AcceptClickAt("/ui/DefaultGroup/EquipWindow",_InputService:GetCursorPosition()) then return end
+            if self:CanClaim() then self:Claim()
+            elseif self:IsTitle(_UIEquipInventoryManager:GetEquip(22)) then _UIEquipInventoryManager:OnSlotClick("equip",22) end
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Release the listener at session shutdown.
+        if isvalid(self._T.slot) and self._T.click then self._T.slot:DisconnectEvent(ButtonClickEvent,self._T.click) end
+    end
+
+    method table Stats(integer count)
+        -- Distinct boss progress, independent of weekly repeat clears.
+        count=math.max(0,math.min(2,count))
+        return {str=count,dex=count,int=count,luk=count,atk=0}
+    end
+end

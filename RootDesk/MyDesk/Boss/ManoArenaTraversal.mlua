@@ -1,0 +1,142 @@
+@Component
+script ManoArenaTraversal extends Component
+    property string OwnerId = ""
+
+    @ExecSpace("ServerOnly")
+    method void Setup(string owner)
+        -- Ropes provide a route above Mano; low footholds between every pair are consumed by landing.
+        if self._T.initialized then return end
+        self._T.initialized=true self.OwnerId=owner self._T.platforms={} self._T.ropes={}
+        for i,x in ipairs({-6,-4,-2,0,2,4,6}) do
+            local rope=_SpawnService:SpawnByModelId("manorope","ManoRope"..tostring(i),Vector3(x,0.1,0),self.Entity)
+            if isvalid(rope) then table.insert(self._T.ropes,rope) end
+        end
+        for i,x in ipairs({-5,-3,-1,1,3,5}) do
+            local slot={index=i,x=x,gone=true,respawnRemaining=5}
+            table.insert(self._T.platforms,slot)
+            self:SpawnPlatform(slot)
+        end
+        log("[BossStage] traversal ready ropes="..tostring(#self._T.ropes).." platforms="..tostring(#self._T.platforms))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SpawnPlatform(table slot)
+        -- Reuse one slot per gap; each replacement starts at a fresh low height and fades in.
+        if isvalid(slot.entity) then return end
+        local height=slot.height or (0.35+_UtilLogic:RandomDouble()*0.65)
+        local offset=self._T.stumpy and 0.34 or 0.174
+        local e=_SpawnService:SpawnByModelId(self._T.stumpy and "stumpyfadingplatform" or "manofadingplatform","ManoPlatform"..tostring(slot.index),Vector3(slot.x,height-offset,0),self.Entity)
+        if not isvalid(e) then slot.respawnRemaining=5 return end
+        e.SpriteRendererComponent.Color=Color(1,1,1,0)
+        local f=e.CustomFootholdComponent
+        f.edgeLists:Clear()
+        if self._T.stumpy then f.edgeLists:Add({Vector2(-0.685588,0.37),Vector2(0.685588,0.37)})
+        else f.edgeLists:Add({Vector2(-1.08,0.29),Vector2(1.08,0.29)}) end
+        slot.surfaceOffset=offset
+        slot.entity=e slot.age=0 slot.steppedAt=nil slot.gone=false
+        slot.disabled=false slot.alpha=0 slot.respawnRemaining=0
+        log("[BossStage] platform spawned "..e.Name.." height="..tostring(height))
+    end
+
+    method void OnUpdate(number delta)
+        -- Local foothold reports cover client-authoritative landings; the server owns all platform lifetimes.
+        if self:IsClient() then self:CheckClientLanding(delta) return end
+        local r=(_BossStageManager._T.runs or {})[self.OwnerId]
+        if not _BossStageManager:IsEncounterVisible(r) then return end
+        local p=_UserService:GetUserEntityByUserId(self.OwnerId)
+        if not isvalid(p) or p.CurrentMap~=self.Entity then return end
+        local foot=p.RigidbodyComponent:GetCurrentFoothold()
+        local grounded=r.state=="active" and p.PlayerComponent.Hp>0 and p.RigidbodyComponent:IsOnGround()
+        for _,v in ipairs(self._T.platforms or {}) do
+            if v.gone then
+                v.respawnRemaining=v.respawnRemaining-delta
+                if v.respawnRemaining<=0 then self:SpawnPlatform(v) end
+                continue
+            end
+            local e=v.entity
+            if isvalid(e) and not v.gone then
+                v.age=v.age+delta
+                if v.steppedAt==nil and grounded and foot~=nil and foot.OwnerId==e.Id then
+                    v.steppedAt=v.age
+                    log("[BossStage] platform stepped "..e.Name)
+                end
+                local alpha=math.min(1,v.age/0.6)
+                if v.steppedAt~=nil and v.age>=v.steppedAt+2 then
+                    alpha=math.max(0,1-(v.age-v.steppedAt-2)/0.6)
+                    -- Keep supporting the player throughout the fade; remove collision only at zero alpha.
+                    if alpha<=0 then
+                        v.disabled=true e.CustomFootholdComponent.Enable=false
+                        v.gone=true v.respawnRemaining=5
+                        log("[BossStage] platform disabled after fade "..e.Name)
+                        e:Destroy()
+                    end
+                end
+                -- Do not resend an unchanged opaque color on every server frame.
+                if isvalid(e) and v.alpha~=alpha then
+                    v.alpha=alpha e.SpriteRendererComponent.Color=Color(1,1,1,alpha)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CheckClientLanding(number delta)
+        -- Sample native local footholds at 10 Hz; retry reports slowly until replicated positions catch up.
+        self._T.landingCheck=(self._T.landingCheck or 0)-delta
+        if self._T.landingCheck>0 then return end
+        self._T.landingCheck=0.1
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.CurrentMap~=self.Entity then return end
+        local rb=p.RigidbodyComponent
+        local foot=rb:GetCurrentFoothold()
+        if not rb:IsOnGround() or foot==nil then self._T.reportedPlatform=nil return end
+        local e=_EntityService:GetEntity(foot.OwnerId)
+        if not isvalid(e) or string.sub(e.Name,1,12)~="ManoPlatform" then self._T.reportedPlatform=nil return end
+        self._T.reportRetry=(self._T.reportRetry or 0)-0.1
+        if self._T.reportedPlatform==e.Id and self._T.reportRetry>0 then return end
+        self._T.reportedPlatform=e.Id self._T.reportRetry=0.5
+        self:ReportLanding(e.Id)
+    end
+
+    @ExecSpace("Server")
+    method void ReportLanding(string platformId)
+        -- Accept only this arena's owner, a live platform, and a player actually at its surface.
+        if senderUserId~=self.OwnerId then return end
+        local r=(_BossStageManager._T.runs or {})[self.OwnerId]
+        local p=_UserService:GetUserEntityByUserId(self.OwnerId)
+        if r==nil or r.state~="active" or not isvalid(p) or p.CurrentMap~=self.Entity then return end
+        local pos=p.TransformComponent.WorldPosition
+        for _,v in ipairs(self._T.platforms or {}) do
+            local e=v.entity
+            if not v.gone and v.steppedAt==nil and isvalid(e) and e.Id==platformId then
+                local surface=e.TransformComponent.WorldPosition
+                if math.abs(pos.x-surface.x)<=0.75 and math.abs(pos.y-surface.y-(v.surfaceOffset or 0.174))<=0.3 then
+                    v.steppedAt=v.age
+                    log("[BossStage] platform stepped "..e.Name)
+                end
+                return
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- Dynamic-map destruction owns the traversal lifetime.
+        for _,v in ipairs(self._T.platforms or {}) do if isvalid(v.entity) then v.entity:Destroy() end end
+        for _,e in ipairs(self._T.ropes or {}) do if isvalid(e) then e:Destroy() end end
+        self._T.platforms={} self._T.ropes={}
+    end
+    @ExecSpace("ServerOnly")
+    method void SetupStumpy(string owner)
+        -- Perion-colored platforms reuse the proven landing, fade and respawn lifecycle.
+        if self._T.initialized then return end
+        self._T.initialized=true self._T.stumpy=true self.OwnerId=owner self._T.platforms={} self._T.ropes={}
+        for i,x in ipairs({-5.8,-3.4,-1.1,1.5,3.8,6}) do
+            -- Keep the 1.36-unit artwork width; shrink only each clear gap to two thirds.
+            local closerX=0.1+(x-0.1)*2/3+(i-3.5)*1.36/3
+            local slot={index=i,x=closerX,height=i%2==0 and 1.25 or 0.75,gone=true,respawnRemaining=5}
+            table.insert(self._T.platforms,slot) self:SpawnPlatform(slot)
+        end
+        log("[Stumpy] traversal ready platforms="..tostring(#self._T.platforms))
+    end
+end

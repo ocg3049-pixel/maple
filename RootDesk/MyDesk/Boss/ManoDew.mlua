@@ -1,0 +1,151 @@
+@Component
+script ManoDew extends Component
+    property Entity Boss = nil
+    property string Kind = ""
+    property boolean Claimed = false
+    @Sync property number ExpiresAt = 0
+    @Sync property number FloatBaseY = 0.18
+    @Sync property number SpawnedAt = -1
+    @Sync property number FadeOutAt = -1
+    @Sync property number FadeFromAlpha = 1
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- Each drop owns a full two-minute lifetime, independent of later spawns.
+        self.SpawnedAt=_UtilLogic.ServerElapsedSeconds
+        self.ExpiresAt=self.SpawnedAt+120
+        self.Entity.SpriteRendererComponent.Color=Color(1,1,1,0)
+        self.FloatBaseY=self.Entity.TransformComponent.Position.y
+    end
+
+    method void OnUpdate(number delta)
+        -- Animate only on clients; the server keeps contact and expiry authoritative.
+        if self:IsClient() then
+            local now=_UtilLogic.ElapsedSeconds
+            if now>=(self._T.nextVisual or 0) then
+                self._T.nextVisual=now+(_GameSystemMenu.lowSpecMode and 0.1 or 0)
+                self:UpdateVisual()
+            end
+            return
+        end
+        if self.Claimed then
+            if self.FadeOutAt>=0 and _UtilLogic.ServerElapsedSeconds>=self.FadeOutAt+0.5 then self.Entity:Destroy() end
+            return
+        end
+        if self.ExpiresAt>0 and _UtilLogic.ServerElapsedSeconds>=self.ExpiresAt then
+            self.Claimed=true
+            log("[BossStage] dew expired "..self.Kind)
+            self.Entity:Destroy()
+        end
+    end
+
+
+    method number VisualAlpha(number now)
+        -- Shared clock keeps spawn, pickup and expiry fades continuous.
+        if self.SpawnedAt<0 then return 0 end
+        if self.FadeOutAt>=0 then return self.FadeFromAlpha*math.max(0,1-(now-self.FadeOutAt)/0.5) end
+        local fadeIn=math.max(0,math.min(1,(now-self.SpawnedAt)/0.5))
+        local fadeOut=self.ExpiresAt>0 and math.max(0,math.min(1,(self.ExpiresAt-now)/2)) or 1
+        return fadeIn*fadeOut
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginDisappear()
+        -- Claim immediately; retain only the fading image for half a second.
+        if self.Claimed then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        self.FadeFromAlpha=self:VisualAlpha(now)
+        self.Claimed=true self.FadeOutAt=now
+        self.Entity.TriggerComponent.Enable=false
+        log("[BossStage] dew fade out "..self.Kind)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateVisual()
+        -- Match field potion bobbing and center the same aura on the dew sprite.
+        local sprite=self.Entity.SpriteRendererComponent
+        local p=self.Entity.TransformComponent.Position
+        self.Entity.TransformComponent.Position=Vector3(p.x,self.FloatBaseY+math.sin(_UtilLogic.ElapsedSeconds*1.8)*0.04,p.z)
+        local alpha=self:VisualAlpha(_UtilLogic.ServerElapsedSeconds)
+        sprite.Color=Color(1,1,1,alpha)
+        local aura=self._T.aura
+        if _GameSystemMenu.lowSpecMode then
+            if isvalid(aura) then aura:Destroy() end
+            self._T.aura=nil
+            return
+        end
+        if not isvalid(aura) and _UtilLogic.ElapsedSeconds>=(self._T.auraRetryAt or 0) then
+            self._T.auraRetryAt=_UtilLogic.ElapsedSeconds+1
+            aura=_SpawnService:SpawnByModelId("spearburstfadingeffect","ManoDewAura",self.Entity.TransformComponent.WorldPosition,self.Entity.CurrentMap)
+            if not isvalid(self.Entity) then if isvalid(aura) then aura:Destroy() end return end
+            self._T.aura=aura
+            if isvalid(aura) then
+                local renderer=aura.SpriteRendererComponent
+                renderer.SpriteRUID="cb4b8f3451bb4f0dab53327cce29c873"
+                renderer.SortingLayer=sprite.SortingLayer
+                renderer.OrderInLayer=math.min(32767,sprite.OrderInLayer+1)
+                renderer.IgnoreMapLayerCheck=true
+                renderer.DrawMode=SpriteDrawMode.Simple
+                renderer.StartFrameIndex=0 renderer.EndFrameIndex=2147483647 renderer.PlayRate=1
+                log("[BossStage] dew aura created")
+            end
+        end
+        if isvalid(aura) then
+            local centers=_FieldRecoveryDrops._T.recoveryVisualCenters
+            local center=centers and centers[sprite.SpriteRUID]
+            local auraCenter=_FieldRecoveryDrops._T.recoveryAuraCenter
+            aura.Enable=center~=nil and auraCenter~=nil
+            if center~=nil and auraCenter~=nil then
+                local scale=self.Entity.TransformComponent.Scale
+                local offset=Vector3(center.x*scale.x-auraCenter.x,center.y*scale.y-auraCenter.y,0)
+                aura.TransformComponent.WorldPosition=self.Entity.TransformComponent.WorldPosition+offset
+            end
+            aura.SpriteRendererComponent.Color=Color(1,1,1,alpha)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Remove the local aura on pickup, expiry, or leaving the boss map.
+        if isvalid(self._T.aura) then self._T.aura:Destroy() end
+        self._T.aura=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    @EventSender("Self")
+    handler HandleEnter(TriggerEnterEvent event)
+        -- Actual trigger contact determines the first consumer on the server.
+        self:TryConsume(event.TriggerBodyEntity)
+    end
+
+    @ExecSpace("ServerOnly")
+    @EventSender("Self")
+    handler HandleStay(TriggerStayEvent event)
+        -- Also handle actors already touching when the script was attached.
+        self:TryConsume(event.TriggerBodyEntity)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TryConsume(Entity actor)
+        -- Claim before applying effects so concurrent callbacks cannot double consume.
+        if self.Claimed or not isvalid(self.Boss) or not isvalid(actor) then return end
+        if self.ExpiresAt>0 and _UtilLogic.ServerElapsedSeconds>=self.ExpiresAt then
+            self.Claimed=true self.Entity:Destroy() return
+        end
+        local ai=self.Boss:GetComponent("script.ManoEncounter")
+        if not isvalid(ai) then return end
+        local r=(_BossStageManager._T.runs or {})[ai.OwnerId]
+        if r==nil or r.state~="active" or r.boss~=self.Boss or actor.CurrentMap~=self.Entity.CurrentMap then return end
+        if actor~=self.Boss and (not isvalid(actor.PlayerComponent) or actor.PlayerComponent.UserId~=ai.OwnerId or actor.PlayerComponent.Hp<=0) then return end
+        if actor==self.Boss and not ai:CanDrink() then return end
+        self:BeginDisappear()
+        if actor==self.Boss then ai:Consume(self.Kind)
+        elseif self.Kind=="dusk" then
+            local pc=actor.PlayerComponent
+            local healed=math.max(0,pc.MaxHp-pc.Hp)
+            pc.Hp=pc.MaxHp
+            _BossStageManager:RestoreDewHp(r.id,r.map,healed,ai.OwnerId)
+            log("[BossStage] player consumed dusk healed="..tostring(healed))
+        else _BossStageManager:RestoreDewMp(r.id,r.map,ai.OwnerId) log("[BossStage] player consumed "..self.Kind) end
+    end
+end

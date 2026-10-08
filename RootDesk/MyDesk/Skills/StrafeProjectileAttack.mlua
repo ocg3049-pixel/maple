@@ -18,6 +18,13 @@ script StrafeProjectileAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+        if not isvalid(defender) then return false end
+        local planned = self._T.flyingDamage ~= nil and self._T.flyingDamage[defender.Id] or nil
+        if self._T.flyingDamage~=nil and planned==nil and string.find(attackInfo or "", ".blast",1,true)==nil then return false end
+        if planned ~= nil then
+            local mon = defender:GetComponent("script.Monster")
+            if not isvalid(mon) or mon.LifeSerial ~= planned.life then return false end
+        end
 		-- 화살 한 발은 적 "한 명"만 맞힌다 - 이미 명중했으면 이후 판정을 전부 막는다.
 		-- (4발이 같은 직선을 따라 날아가므로, 보통은 맨 앞의 같은 대상에게 4줄의 데미지가 뜬다.)
 		if isvalid(defender.PlayerComponent) then return false end
@@ -45,11 +52,6 @@ script StrafeProjectileAttack extends AttackComponent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
-		-- (신궁 개편 2026-08-06) 고정 200%~250%가 아니라 화살에 새겨진 RateMin/RateMax를 쓴다 -
-		-- 1레벨 300%~350%에서 분배 1포인트당 최소·최대 각 +15%p(마스터 30에서 735%~785%).
-		-- ⚠ 확정 히트 경로(PlayerAttack의 skill.strafe.lock)와 **같은 수치**를 유지해야 한다.
-		-- 실제 명중이 확정된 시점(이 훅)에만 호출되므로 여기서 명중을 기록해 화살이 다음 프레임에 사라지도록 한다.
-		---@type StrafeProjectile
 		local proj = self.Entity:GetComponent("script.StrafeProjectile")
 		local combatPower = 0
 		local critRate = 0.5
@@ -64,18 +66,11 @@ script StrafeProjectileAttack extends AttackComponent
 			rateMax = proj.RateMax or rateMax
 			proj:MarkHit()
 		end
-		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
-		local dmg = math.floor(combatPower * mult)
-		-- (백스탭) 뒤통수에서 쏜 발이면 추가 데미지를 얹는다(크리티컬 배율보다 앞에서 적용).
-		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
-		-- 크리티컬은 화살 한 발마다 캐릭터 정보창의 확률로 독립적으로 굴리고 배율을 반환값에 바로 곱한다
-		-- (아래 CalcCritical은 엔진의 이중 배율 적용을 막기 위해 항상 false를 반환). math.random() 대신
-		-- _UtilLogic:RandomDouble()을 쓰는 이유는 네 발이 짧은 간격으로 잇따라 호출되어 math.random()이
-		-- 같은 시퀀스를 반복 소비할 위험이 크기 때문이다(PlayerAttack.mlua에 문서화된 버그).
-		local isCritical = _UtilLogic:RandomDouble() < critRate
-		if isCritical then
-			dmg = math.floor(dmg * 2.0)
-		end
+        local pa = isvalid(self.OwnerEntity) and self.OwnerEntity:GetComponent("script.PlayerAttack") or nil
+        local roll
+        if isvalid(pa) then roll = pa:ResolveFlyingDamage(self, defender, attackInfo)
+        else roll = self:RollPlannedDamage(defender, attackInfo) end
+        local dmg, isCritical = roll.dmg, roll.critical
 		self:ShowStrafeDamageSkin(defender, dmg, hitIndex, isCritical, self:GetProjectileDamageSkinId())
 		self:PlayStrafeHitEffect(defender)
 		return dmg
@@ -92,11 +87,13 @@ script StrafeProjectileAttack extends AttackComponent
 		-- 영상처럼 네 발의 데미지를 서로 겹치지 않는 4줄로 나눠 표시한다(1발째가 맨 아래, 4발째가 맨 위).
 		if not isvalid(target) then return end
 		local offsetY = -0.2 + (hitIndex - 1) * 0.2
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, skinRuid, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 		log("[Strafe] ShowDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(isCritical))
 	end
 
@@ -130,5 +127,41 @@ script StrafeProjectileAttack extends AttackComponent
 		-- 피해/MISS는 위 수동 표시에서 처리한다. 엔진의 숫자를 중복 출력하지 않는다.
 		return 0
 	end
+
+
+    @ExecSpace("ServerOnly")
+    method table RollPlannedDamage(Entity defender, string attackInfo)
+		local proj = self.Entity:GetComponent("script.StrafeProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local hitIndex = 1
+		local rateMin = 0.8
+		local rateMax = 0.8666666667
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			hitIndex = proj.HitIndex
+			rateMin = proj.RateMin or rateMin
+			rateMax = proj.RateMax or rateMax
+
+		end
+		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
+		local dmg = math.floor(combatPower * mult)
+		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+        return {dmg=dmg,bonus=0,critical=isCritical,bonusCritical=false}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        for _, roll in pairs(self._T.flyingDamage or {}) do
+            local mon = isvalid(roll.target) and roll.target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
+        end
+        self._T.flyingDamage = nil
+    end
 
 end

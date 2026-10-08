@@ -1,0 +1,781 @@
+@Logic
+script OfflineRestRewards extends Logic
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        local modal = self:UI("Modal")
+        return (isvalid(modal) and modal.EnabledInHierarchy) or _UtilLogic.ElapsedSeconds < (self._T.inputUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        self:UI("Modal").Enable = false
+        self._T.inputUntil = _UtilLogic.ElapsedSeconds + 0.2
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        local modal = self:UI("Modal")
+        if not isvalid(modal) or not modal.EnabledInHierarchy then return end
+        if event.key == KeyboardKey.Escape then
+            self:Close()
+        elseif event.key == KeyboardKey.Return or event.key == KeyboardKey.KeypadEnter then
+            self._T.inputUntil = _UtilLogic.ElapsedSeconds + 0.2
+            self:Claim()
+        end
+    end
+
+    method number Now()
+        -- Server UTC milliseconds, independent of the device clock.
+        return DateTime.UtcNow.Elapsed
+    end
+
+    method integer Week(number now)
+        -- Monday 00:00 KST; use a DateTime anchor rather than assuming its epoch.
+        local monday = DateTime(2026,9,28).Elapsed - 9*3600000
+        return math.floor((now-monday)/604800000)
+    end
+
+    method table ReadState(string snapshot)
+        -- One versioned record shares the inventory's atomic character save.
+        local raw=string.match("\n"..(snapshot or ""),"\nREST\t([^\r\n]+)")
+        if raw then
+            local ok,data=pcall(function() return _HttpService:JSONDecode(raw) end)
+            if ok and type(data)=="table" and data.v==1 then
+                data.items=data.items or {}
+                if data.pending then data.pending.items=data.pending.items or {} end
+                if data.claim then data.claim.items=data.claim.items or {} end
+                return data
+            end
+            return nil
+        end
+        return {v=1,bank=0,carry=0,week=-999999,rev=0,seq=0,last=0,seconds=0,meso=0,items={}}
+    end
+
+    method table JsonTable(table source)
+        -- MSW JSONEncode cannot infer empty tables; omit them and restore defaults on read.
+        local out={}
+        for key,value in pairs(source) do
+            if type(value)=="table" then
+                local child=self:JsonTable(value)
+                if next(child)~=nil then out[key]=child end
+            else out[key]=value end
+        end
+        return out
+    end
+
+    method string Encode(table state)
+        -- Normalize optional maps without mutating the live reward state.
+        return _HttpService:JSONEncode(self:JsonTable(state))
+    end
+
+    @ExecSpace("ServerOnly")
+    method string ClientState(table state)
+        -- Send a server-clock anchor so the bulb updates exactly at the week boundary.
+        local data=self:JsonTable(state)
+        data.serverNow=self:Now()
+        return self:Encode(data)
+    end
+
+    method boolean GrantWeekly(table state, number now)
+        -- A pure mutation allows week rollover and repeated claims to be verified directly.
+        local week=self:Week(now)
+        if state.week>=week then return false end
+        state.bank=state.bank+72000 state.week=week
+        return true
+    end
+
+    method string WriteState(string snapshot, table state)
+        -- Replace only our record; preserve all unrelated character domains.
+        local lines={}
+        for line in string.gmatch(snapshot or "","[^\r\n]+") do
+            if string.sub(line,1,5)~="REST\t" then table.insert(lines,line) end
+        end
+        table.insert(lines,"REST\t"..self:Encode(state))
+        return table.concat(lines,"\n")
+    end
+
+    method integer RandomCount(number mean)
+        -- Poisson loot sampling: exact for rare rewards, bounded work for large means.
+        if mean<=0 then return 0 end
+        if mean<30 then
+            local limit=math.exp(-mean)
+            local product,count=1,0
+            repeat product=product*math.max(0.000000001,_UtilLogic:RandomDouble()) count=count+1 until product<=limit
+            return count-1
+        end
+        local u=math.max(0.000000001,_UtilLogic:RandomDouble())
+        local normal=math.sqrt(-2*math.log(u))*math.cos(2*math.pi*_UtilLogic:RandomDouble())
+        return math.max(0,math.floor(mean+math.sqrt(mean)*normal+0.5))
+    end
+
+    method number OfflineSeconds(table state, number now)
+        -- Do not spend unmeasured time; backwards clocks cannot produce rewards.
+        if state.last<=0 or state.seconds<60 or state.meso<=0 then return 0 end
+        return math.max(0,math.min(state.bank,math.floor((now-state.last)/1000)))
+    end
+
+    method void Settle(table state, number now)
+        -- Fix a single randomized batch and debit its time before entry is allowed.
+        local seconds=self:OfflineSeconds(state,now)
+        state.last=now
+        if seconds<=0 then return end
+        local pending=state.pending or {seconds=0,meso=0,items={}}
+        local factor=seconds/state.seconds*0.7
+        pending.seconds=pending.seconds+seconds
+        pending.meso=pending.meso+math.floor(state.meso*factor*(0.9+0.2*_UtilLogic:RandomDouble())+_UtilLogic:RandomDouble())
+        for item,expected in pairs(state.items) do
+            local count=self:RandomCount(expected*factor)
+            if count>0 then pending.items[item]=(pending.items[item] or 0)+count end
+        end
+        state.bank=state.bank-seconds
+        state.seq=state.seq+1
+        pending.id=state.seq
+        state.pending=pending
+        log("[OfflineRest] settled seconds="..tostring(seconds).." meso="..tostring(pending.meso))
+    end
+
+    @ExecSpace("ServerOnly")
+    method table PrepareEntry(table sv, string id, string snapshot)
+        -- The ledger is authoritative; character REST keeps the inventory receipt revision.
+        local account=sv.restAccount
+        if account==nil then return {error="휴식 보상 데이터를 불러오지 못했습니다."} end
+        local state=account.characters[id]
+        if state==nil then state=self:ReadState(snapshot) account.characters[id]=state end
+        if state==nil then return {error="휴식 보상 데이터를 확인하지 못했습니다."} end
+        state.character=id
+        sv.rest=state sv.restId=id sv.restPaused=false sv.restTick=_UtilLogic.ElapsedSeconds sv.restHunting=false
+        if snapshot~="" then sv.saves[id]=self:WriteState(snapshot,state) sv.dirtySaves[id]=true end
+        if not _CharacterPersistence:WriteCharacterSaves(sv,true) then return {error="휴식 보상을 저장하지 못했습니다. 다시 시도해주세요."} end
+        return {snapshot=snapshot=="" and "" or sv.saves[id]}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Capture(table sv)
+        -- Contribute to the existing debounced writer; never open a second storage.
+        if sv==nil then return end
+        if sv.restAccount and not sv.restOffline then sv.restAccount.last=self:Now() end
+        if sv.rest==nil or sv.restId==nil then return end
+        local id=sv.restId
+        local raw=sv.saves[id]
+        if raw==nil or raw=="" then return end
+        if not sv.restPaused and sv.activeId==id then sv.rest.last=self:Now() end
+        local updated=self:WriteState(raw,sv.rest)
+        if updated~=raw then sv.saves[id]=updated sv.dirtySaves[id]=true end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Pause(table sv)
+        -- Stamp the actual exit, and prevent periodic writers extending that time.
+        if sv==nil or sv.rest==nil then return end
+        sv.rest.last=self:Now() sv.restPaused=true sv.restHunting=false
+        self:Capture(sv)
+    end
+
+    method void Accumulate(table state, number seconds)
+        -- Preserve fractional minutes; one full hunting minute grants two full rest minutes.
+        state.carry=state.carry+seconds
+        local earned=math.floor(state.carry/60)*60
+        state.bank=state.bank+earned*2 state.carry=state.carry-earned
+        state.seconds=state.seconds+seconds
+        if state.seconds>1800 then
+            local scale=1800/state.seconds
+            state.seconds=1800 state.meso=state.meso*scale
+            for item,value in pairs(state.items) do state.items[item]=value*scale end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Hunting(Entity player, table sv)
+        -- Server-owned auto-hunt state and death checks exclude paused/dead time.
+        if sv==nil or sv.rest==nil or sv.restPaused or sv.activeId~=sv.restId then return false end
+        if not isvalid(player) or not isvalid(player.PlayerComponent) or player.PlayerComponent:IsDead() then return false end
+        local attack=player:GetComponent("script.PlayerAttack")
+        return isvalid(attack) and attack._T.autoHuntActive==true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickUser(string uid, table sv)
+        -- Sample elapsed server time in memory; storage runs on the existing flush cadence.
+        if sv.restAccount and not sv.restOffline then sv.restAccount.last=self:Now() end
+        if sv.rest==nil or sv.restPaused or sv.activeId~=sv.restId then return end
+        local now=_UtilLogic.ElapsedSeconds
+        local delta=math.max(0,math.min(5,now-(sv.restTick or now)))
+        sv.restTick=now
+        local player=_UserService:GetUserEntityByUserId(uid)
+        if sv.restHunting and self:Hunting(player,sv) then
+            sv.rest.carry=sv.restAccount.carry or 0
+            self:Accumulate(sv.rest,delta)
+            sv.restAccount.bank=sv.restAccount.bank+sv.rest.bank
+            sv.restAccount.carry=sv.rest.carry
+            sv.rest.bank=0 sv.rest.carry=0
+        end
+        sv.restHunting=self:Hunting(player,sv)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ObserveKill(Entity player, number levelRate, number dropMult, number mesoAmount)
+        -- Use expected drop rates, not lucky observed rare drops, to estimate earnings.
+        if not isvalid(player) or not isvalid(player.PlayerComponent) then return end
+        local uid=player.PlayerComponent.UserId
+        local sv=_CharacterPersistence._T.sv[uid]
+        if not self:Hunting(player,sv) then return end
+        local state=sv.rest
+        state.meso=state.meso+mesoAmount*_MonsterDropRules:GetMesoDropChance(levelRate)
+        for _,drop in ipairs(_MonsterDropRules:GetItems()) do
+            local chance=_MonsterDropRules:CalculateItemChance(drop.rate,drop.fixedRate==true,dropMult,levelRate)
+            if drop.type=="cosmetic_roll" then
+                local categories=_CosmeticBoxCatalog:DropCategories()
+                for _,category in ipairs(categories) do
+                    local item=_CosmeticBoxCatalog:BoxItem("cosmetic:"..category.key,1)
+                    state.items[item]=(state.items[item] or 0)+chance/#categories
+                end
+            else
+                local item=drop.name.."|"..drop.ruid.."|0|0|0|0|1"
+                state.items[item]=(state.items[item] or 0)+chance
+            end
+        end
+    end
+
+    method table MergeSnapshot(table state, string incoming)
+        -- A receipt revision prevents older inventory snapshots undoing a claimed reward.
+        local client=self:ReadState(incoming)
+        if client==nil or client.rev<state.rev then return {ok=false} end
+        if state.character~=nil and client.character~=state.character then return {ok=false} end
+        if client.rev>state.rev then
+            local claim=client.claim
+            local pending=state.pending
+            if client.rev~=state.rev+1 or claim==nil or pending==nil or claim.id~=pending.id then return {ok=false} end
+            if type(claim.meso)~="number" or claim.meso<0 or claim.meso>pending.meso or claim.meso~=math.floor(claim.meso) then return {ok=false} end
+            if type(claim.items)~="table" then return {ok=false} end
+            for item,count in pairs(claim.items) do
+                if type(count)~="number" or count<0 or count~=math.floor(count) or count>(pending.items[item] or 0) then return {ok=false} end
+            end
+            pending.meso=pending.meso-claim.meso
+            for item,count in pairs(claim.items) do
+                pending.items[item]=pending.items[item]-count
+                if pending.items[item]==0 then pending.items[item]=nil end
+            end
+            state.rev=client.rev
+            if pending.meso==0 and next(pending.items)==nil then state.pending=nil
+            else state.seq=state.seq+1 pending.id=state.seq end
+        end
+        return {ok=true,snapshot=self:WriteState(incoming,state)}
+    end
+
+    @ExecSpace("Server")
+    method void RequestStatus(string id)
+        -- Reply from the loaded account cache, never a storage read per UI refresh.
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or sv.activeId~=id or sv.restId~=id then return end
+        self:SendStatus(sv,senderUserId,"",true)
+    end
+
+    @ExecSpace("Server")
+    method void RequestWeekly(string id)
+        -- A single account week and bank prevent alternate-character weekly claims.
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or sv.activeId~=id or sv.restId~=id or sv.restBusy then return end
+        sv.restBusy=true
+        self:GrantWeekly(sv.restAccount,self:Now())
+        local ok=_CharacterPersistence:WriteCharacterSaves(sv,true)
+        sv.restBusy=false self:SendStatus(sv,senderUserId,"weekly",ok)
+        log("[OfflineRest] account weekly saved="..tostring(ok))
+    end
+
+    @ExecSpace("Server")
+    method void RequestClaim(string id, string snapshot, integer revision)
+        -- Items and their receipt are one save, including partial inventory delivery.
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or sv.activeId~=id or sv.restId~=id or sv.restBusy then return end
+        sv.restBusy=true
+        local accepted=_CharacterPersistence:AcceptCharacterSnapshot(senderUserId,snapshot,"offline_rest_claim")
+        local ok=accepted and sv.rest.rev==revision and _CharacterPersistence:WriteCharacterSaves(sv,true)
+        sv.restBusy=false
+        self:SendStatus(sv,senderUserId,"claim",ok)
+        log("[OfflineRest] claim revision="..tostring(revision).." saved="..tostring(ok))
+    end
+
+    method void OnBeginPlay()
+        -- Global manager survives map changes; each side owns only its own resources.
+        if self:IsServer() then
+            self._T.timer=_TimerService:SetTimerRepeat(function()
+                for uid,sv in pairs(_CharacterPersistence._T.sv or {}) do self:TickUser(uid,sv) end
+            end,1)
+            log("[OfflineRest] server ready")
+            return
+        end
+        self._T.links={}
+        self:Bind("Modal/Panel/Confirm",function() self:Claim() end)
+        self:Bind("Modal/Panel/Cancel",function() self:Close() end)
+        self._T.key = _InputService:ConnectEvent(KeyDownEvent, self.OnKey)
+        self:Bind("Modal/Panel/Weekly",function() self:Weekly() end)
+        self:Bind("Modal/Panel/Prev",function() self:Page(-1) end)
+        self:Bind("Modal/Panel/Next",function() self:Page(1) end)
+        self:UI("Modal").Enable=false
+        log("[OfflineRest] client ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- Keep all reward widgets in one separately ordered UIGroup.
+        return _EntityService:GetEntityByPath("/ui/OfflineRestGroup/"..path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        -- Retain event subscriptions for symmetric cleanup.
+        local entity=self:UI(path)
+        table.insert(self._T.links,{entity=entity,listener=entity:ConnectEvent(ButtonClickEvent,callback)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string snapshot, string id)
+        -- Never carry an old character's pending claim into a newly selected character.
+        self._T.id=id self._T.view=self:ReadState(snapshot) self._T.busy=false
+        self._T.fromCenter=false self._T.page=1 self._T.autoOpen=false self._T.nextStatus=0 self._T.week=nil
+        self._T.account=nil self._T.retryAction=nil
+        self:UI("Modal").Enable=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Export()
+        -- Only revision/receipt are client-authored; the server preserves time and samples.
+        local state=self._T.view or self:ReadState("")
+        return "REST\t"..self:Encode({v=1,rev=state.rev,claim=state.claim,character=self._T.id})
+    end
+
+    @ExecSpace("Client")
+    method void Status(string id, string raw, integer week, string action, boolean ok)
+        -- Reject late RPCs and do not overwrite a locally applied, unconfirmed receipt.
+        if self._T.id~=id then return end
+        local data=self:ReadState("REST\t"..raw)
+        local view=self._T.view
+        if (action=="" and self._T.retryAction==nil) or (action~="" and ok) then self._T.account=data end
+        if action~="" then
+            if ok then self._T.retryAction=nil else self._T.retryAction=action end
+        end
+        for _,ch in ipairs(data.characters or {}) do if ch.pending then ch.pending.items=ch.pending.items or {} end end
+        if view==nil or (data.rev>=view.rev and (view.claim==nil or action=="claim" and ok)) then self._T.view=data end
+        self._T.week=week
+        self._T.serverNow=data.serverNow self._T.serverAnchor=_UtilLogic.ElapsedSeconds
+        if action~="" then
+            self._T.busy=false
+            if ok then
+                if action=="weekly" then _UIToast:ShowMessage("계정 공용 휴식 시간 20시간을 받았습니다.")
+                elseif action=="prepare" then self:Claim() return
+                else self:UI("Modal").Enable=false end
+                _GameAudio:PlayCue("Quest")
+            else _UIToast:ShowMessage("저장을 완료하지 못했습니다. 버튼을 다시 눌러 재시도해주세요.") end
+        end
+        if self:UI("Modal").Enable then self:Draw() end
+        if action~="" and self._T.fromCenter then
+            self._T.fromCenter=false
+            _RewardCenter:OnClaimResult(action=="weekly" and "weekly" or "rest",ok)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Low-frequency HUD/status updates; no DataStorage is used by the client.
+        self._T.tick=(self._T.tick or 0)+delta
+        if self._T.tick<0.5 then return end
+        self._T.tick=0
+        local cl=_CharacterPersistence._T.cl
+        local ready=cl~=nil and cl.entered and _LoginFlow:IsInGame() and self._T.view~=nil
+        if not ready then self:UI("Modal").Enable=false return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now>=(self._T.nextStatus or 0) and not self._T.busy and self._T.retryAction==nil then
+            self._T.nextStatus=now+30 self:RequestStatus(self._T.id)
+        end
+        if self._T.serverNow then self._T.week=self:Week(self._T.serverNow+(now-self._T.serverAnchor)*1000) end
+        if self._T.busy and now>(self._T.deadline or now+1) then self._T.busy=false self:Draw() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Duration(number seconds)
+        -- Display seconds too so short offline sessions never appear to have used zero time.
+        seconds=math.floor(seconds or 0)
+        return string.format("%d시간 %02d분 %02d초",math.floor(seconds/3600),math.floor(seconds/60)%60,seconds%60)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open()
+        -- A pending reward is shown once on login; the bulb allows retrying overflow later.
+        if self._T.view==nil then return end
+        self._T.page=1 self._T.autoOpen=false
+        self:RequestStatus(self._T.id)
+        self:UI("Modal").Enable=true
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Page(integer delta)
+        -- Bounded pages keep the complete reward list legible on mobile.
+        self._T.page=math.max(1,(self._T.page or 1)+delta)
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Fit the dimmer to the real viewport, independently of the dialog bounds.
+        local modal=self:UI("Modal")
+        local tr=modal.Parent.UITransformComponent
+        local a=_UILogic:ScreenToLocalUIPosition(Vector2.zero,tr)
+        local b=_UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight),tr)
+        modal.UITransformComponent.RectSize=Vector2(math.abs(b.x-a.x)+4,math.abs(b.y-a.y)+4)
+        modal.UITransformComponent.anchoredPosition=(a+b)*0.5
+        local panel=self:UI("Modal/Panel")
+        local scale=math.min(1,(math.abs(b.x-a.x)-40)/1000,(math.abs(b.y-a.y)-40)/900)
+        panel.UITransformComponent.UIScale=Vector3(scale,scale,1)
+        local account=self._T.account or self._T.view
+        local view=self:DisplayCharacter()
+        local pending=view.pending
+        local weekly=self._T.week~=nil and account.week<self._T.week
+        self:UI("Modal/Panel/Weekly").Enable=weekly
+        local summary="남은 공용 휴식 시간  "..self:Duration(account.shared or 0)
+        summary=summary.."\n주간 지급: 20시간  |  자동사냥 1분 → 휴식 2분\n현재 캐릭터의 사냥 기록에 따라 보상이 계산됩니다."
+        self:UI("Modal/Panel/Summary").TextGUIRendererComponent.Text=summary
+        self:UI("Modal/Panel/Recipient").TextGUIRendererComponent.Text=view.name.."의 보상"
+        self:UI("Modal/Panel/Details").TextGUIRendererComponent.Text=pending and ("휴식 "..self:Duration(pending.seconds).." · 평균 효율 70%") or ((view.seconds or 0)<60 and "자동사냥 1분 이상 기록이 필요합니다." or "받을 보상이 없습니다. 접속 중에는 휴식 시간이 소모되지 않습니다.")
+        self:UI("Modal/Panel/Confirm").TextGUIRendererComponent.Text=pending and "보상 받기" or "확인"
+        local rows={}
+        if pending then
+            table.insert(rows,{name="메소",icon="02a489cccff24a139a6c3582a5871f58",count=pending.meso})
+            for item,count in pairs(pending.items) do
+                local name=string.match(item,"^([^|]+)")
+                local icon=string.match(item,"^[^|]+|([^|]+)")
+                local boxId=_CosmeticBoxCatalog:BoxId(item)
+                if boxId~="" then local box=_CosmeticBoxCatalog:Box(boxId) if box then icon=_CosmeticBoxCatalog:BoxIcon(box.key) end
+                elseif icon=="47841bc4d3554cf0a68bd05f19de1f18" then icon="90d3412612004466b328850446cb1d68" end
+                table.insert(rows,{name=name,icon=icon,count=count})
+            end
+            table.sort(rows,function(x,y) if x.name=="메소" then return y.name~="메소" end if y.name=="메소" then return false end return x.name<y.name end)
+        end
+        local pages=math.max(1,math.ceil(#rows/5))
+        self._T.page=math.min(self._T.page or 1,pages)
+        for i=1,5 do
+            local row=rows[(self._T.page-1)*5+i]
+            local path="Modal/Panel/Row"..tostring(i)
+            self:UI(path).Enable=row~=nil
+            if row then
+                self:UI(path.."/Icon").SpriteGUIRendererComponent.ImageRUID=DataRef(row.icon)
+                _RecoveryPotionManager:FitIcon(self:UI(path.."/Icon"),row.icon,44,44)
+                self:UI(path.."/Name").TextGUIRendererComponent.Text=row.name
+                self:UI(path.."/Count").TextGUIRendererComponent.Text="× "..string.format("%.0f",row.count)
+            end
+        end
+        self:UI("Modal/Panel/Pages").TextGUIRendererComponent.Text=tostring(self._T.page).." / "..tostring(pages)
+        self:UI("Modal/Panel/Prev").Enable=pages>1 self:UI("Modal/Panel/Next").Enable=pages>1
+        self:UI("Modal/Panel/Hint").TextGUIRendererComponent.Text=self._T.busy and "변경 사항을 안전하게 저장하고 있습니다…" or "현재 플레이 중인 캐릭터에게 바로 지급됩니다.\n인벤토리에 들어가지 못한 보상은 보관됩니다."
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Weekly()
+        -- Disable repeat requests until the server confirms the weekly save.
+        if self._T.busy then return end
+        self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
+        self:RequestWeekly(self._T.id) self:Draw()
+    end
+
+    method table PlanGrant(table slots, table pending)
+        -- Fill compatible stacks first, retain every item that does not fit.
+        local inv=_UIEquipInventoryManager
+        local result={slots={},items={},meso=pending.meso}
+        for i=1,128 do result.slots[i]=slots[i] or "" end
+        local keys={}
+        for item,_ in pairs(pending.items) do table.insert(keys,item) end
+        table.sort(keys)
+        for _,item in ipairs(keys) do
+            local left=pending.items[item]
+            local maxStack=inv:GetItemMaxStack(_RecoveryManager:Fields(item)[2] or "")
+            local key=_RecoveryManager:Identity(item)
+            for i=1,128 do
+                local current=result.slots[i]
+                if current~="" and key~="" and _RecoveryManager:Identity(current)==key and not inv:IsItemLocked(current) then
+                    local count=_RecoveryManager:Count(current)
+                    local add=math.min(left,math.max(0,maxStack-count))
+                    if add>0 then result.slots[i]=self:WithCount(current,count+add) left=left-add end
+                end
+                if left==0 then break end
+            end
+            for i=1,128 do
+                if left==0 then break end
+                if result.slots[i]=="" then
+                    local add=math.min(left,maxStack)
+                    result.slots[i]=self:WithCount(item,add) left=left-add
+                end
+            end
+            if left<pending.items[item] then result.items[item]=pending.items[item]-left end
+        end
+        return result
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Claim()
+        -- Collection applies its receipt and inventory without a yield.
+        local cl=_CharacterPersistence._T.cl
+        if self._T.busy or cl==nil or not cl.entered or cl.flushing then return end
+        local recipient=self:DisplayCharacter()
+        local view=self._T.view
+        if recipient.pending and recipient.pending.preview and view.claim==nil then
+            self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
+            self:RequestPrepareClaim(self._T.id,recipient.pending.id) self:Draw() return
+        end
+        if view.claim==nil then
+            local pending=view.pending
+            if pending==nil then self:UI("Modal").Enable=false return end
+            local inv=_UIEquipInventoryManager
+            local before={}
+            for i=1,128 do before[i]=inv:GetTabItem("consume",i) end
+            local plan=self:PlanGrant(before,pending)
+            plan.meso=math.min(plan.meso,math.max(0,9000000000000000-inv.meso))
+            if plan.meso==0 and next(plan.items)==nil and (pending.meso>0 or next(pending.items)~=nil) then
+                self:UI("Modal").Enable=false
+                _UIToast:ShowMessage("보상을 보관했습니다. 인벤토리를 비운 뒤 보상창에서 다시 받아주세요.")
+                return
+            end
+            for i=1,128 do if inv:GetTabItem("consume",i)~=before[i] then return end end
+            for i=1,128 do inv:SetTabItem("consume",i,plan.slots[i]) end
+            inv.meso=inv.meso+plan.meso
+            self._T.lastReceipt={seconds=pending.seconds,meso=plan.meso,items=plan.items}
+            view.rev=view.rev+1 view.claim={id=pending.id,meso=plan.meso,items=plan.items}
+            _CharacterPersistence:MarkDirty("offline_rest_claim")
+            inv:RefreshUI()
+            inv:UpdateMesoUI()
+        end
+        self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
+        self:RequestClaim(self._T.id,_CharacterPersistence:BuildSaveString(),view.rev)
+        self:Draw()
+    end
+
+    method void OnEndPlay()
+        -- Release both the server timer and client click listeners across Maker reloads.
+        if self._T.timer then _TimerService:ClearTimer(self._T.timer) self._T.timer=nil end
+        if self:IsClient() then
+            if self._T.key then _InputService:DisconnectEvent(KeyDownEvent, self._T.key) self._T.key=nil end
+            for _,link in ipairs(self._T.links or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent,link.listener) end end
+        end
+    end
+    @ExecSpace("ServerOnly")
+    method boolean LoadAccount(table sv)
+        -- Load the account ledger once; a read failure never becomes an empty balance.
+        local ec,raw=sv.storage:GetAndWait("offline_rest_v2")
+        if ec~=0 and ec~=1000002 then return false end
+        local account=nil
+        if raw~=nil and raw~="" then
+            local ok,data=pcall(function() return _HttpService:JSONDecode(raw) end)
+            if not ok or type(data)~="table" or (data.v~=2 and data.v~=3 and data.v~=4) then return false end
+            account=data account.characters=account.characters or {}
+            for _,state in pairs(account.characters) do
+                state.items=state.items or {}
+                if state.pending then state.pending.items=state.pending.items or {} end
+            end
+            sv.restSaved=raw
+        else
+            account={v=3,bank=0,carry=0,week=-999999,target=sv.lastId or "",last=0,characters={}}
+            local keys={}
+            for _,ch in ipairs(sv.list) do table.insert(keys,"save_"..ch.id) end
+            for _,ch in ipairs(sv.trash) do table.insert(keys,"save_"..ch.id) end
+            local loaded={}
+            if #keys>0 then
+                local code,pages=sv.storage:BatchGetAndWait(keys)
+                if code~=0 then return false end
+                while true do
+                    for _,entry in ipairs(pages:GetCurrentPageDatas() or {}) do loaded[entry.KeyInfo.Key]=entry.Value end
+                    if pages.IsLastPage then break end
+                    if pages:LoadNextPageAndWait()~=0 then return false end
+                    pages:MoveToNextPageAndWait()
+                end
+            end
+            for _,ch in ipairs(sv.list) do
+                local state=self:ReadState(loaded["save_"..ch.id] or "")
+                if state==nil then return false end
+                state.character=ch.id account.characters[ch.id]=state
+                account.week=math.max(account.week,state.week or -999999)
+            end
+            for _,ch in ipairs(sv.trash) do
+                local state=self:ReadState(loaded["save_"..ch.id] or "")
+                if state then account.week=math.max(account.week,state.week or -999999) end
+            end
+            if not account.characters[account.target] then account.target=sv.list[1] and sv.list[1].id or "" end
+            local chosen=account.characters[account.target]
+            account.last=chosen and chosen.last or 0
+            log("[OfflineRest] migrated legacy time without removing balances")
+        end
+        self:ShareTime(account)
+        sv.restAccount=account sv.restOffline=false
+        self:SettleAccount(account,sv.list,self:Now())
+        return true
+    end
+
+    method boolean Owns(table list, string id)
+        -- Only live characters belonging to this account may be selected or paid.
+        for _,ch in ipairs(list) do if ch.id==id then return true end end
+        return false
+    end
+
+    method void SettleAccount(table account, table list, number now)
+        -- Spend offline time once; the recipient is chosen only when collecting.
+        local seconds=0
+        if (account.last or 0)>0 then seconds=math.max(0,math.min(account.bank,math.floor((now-account.last)/1000))) end
+        account.last=now
+        if seconds<=0 then return end
+        account.bank=account.bank-seconds
+        account.batchSeq=(account.batchSeq or 0)+1
+        local waiting=account.waiting
+        account.waiting={id=-account.batchSeq,seconds=seconds+(waiting and waiting.seconds or 0),previews={}}
+        log("[OfflineRest] shared offline seconds="..tostring(account.waiting.seconds))
+    end
+
+    method table PreviewReward(table account, string id)
+        -- Cache each recipient's measured rewards; browsing never rerolls a batch.
+        local state=account.characters[id]
+        if state==nil then return nil end
+        if state.pending then return state.pending end
+        local waiting=account.waiting
+        if waiting==nil or state.seconds<60 or state.meso<=0 then return nil end
+        waiting.previews=waiting.previews or {}
+        local pending=waiting.previews[id]
+        if pending==nil then
+            local factor=waiting.seconds/state.seconds*0.7
+            pending={id=waiting.id,preview=true,seconds=waiting.seconds,meso=math.floor(state.meso*factor),items={}}
+            for item,expected in pairs(state.items) do
+                local count=self:RandomCount(expected*factor)
+                if count>0 then pending.items[item]=count end
+            end
+            waiting.previews[id]=pending
+        end
+        pending.items=pending.items or {}
+        return pending
+    end
+
+    method boolean ReserveReward(table account, string id, integer batchId)
+        -- A shared batch can be assigned exactly once, with idempotent retries.
+        local state=account.characters[id]
+        if state==nil then return false end
+        if state.pending then return state.pending.id==batchId or state.pending.sourceBatch==batchId end
+        if account.waiting==nil or account.waiting.id~=batchId then return false end
+        local preview=self:PreviewReward(account,id)
+        if preview==nil then return false end
+        state.seq=state.seq+1
+        preview.sourceBatch=batchId preview.id=state.seq preview.preview=nil
+        state.pending=preview account.waiting=nil
+        log("[OfflineRest] reserved recipient="..id.." batch="..tostring(batchId))
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void MarkOffline(table sv)
+        -- Character selection remains online; only leaving the world starts rest.
+        if sv==nil then return end
+        self:Pause(sv)
+        if sv.restAccount then sv.restAccount.last=self:Now() end
+        sv.restOffline=true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendStatus(table sv, string uid, string action, boolean ok)
+        -- Active inventory receipt and account-wide display data travel independently.
+        local account=sv.restAccount
+        local data=self:JsonTable(sv.rest)
+        data.serverNow=self:Now() data.shared=account.bank data.week=account.week data.waitingSeconds=account.waiting and account.waiting.seconds or 0
+        data.characters={}
+        for _,ch in ipairs(sv.list) do
+            local state=account.characters[ch.id] or self:ReadState("")
+            table.insert(data.characters,{id=ch.id,name=string.match(ch.data,"^([^|]+)") or "캐릭터",bank=state.bank,seconds=state.seconds,meso=state.meso,pending=self:PreviewReward(account,ch.id)})
+        end
+        self:Status(sv.activeId,self:Encode(data),self:Week(self:Now()),action,ok,uid)
+    end
+
+    @ExecSpace("Server")
+    method void RequestPrepareClaim(string activeId, integer batchId)
+        -- Persist assignment before the active client applies an inventory receipt.
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or sv.activeId~=activeId or sv.restId~=activeId or sv.restBusy or sv.recoveryApplying then return end
+        sv.restBusy=true
+        local reserved=self:ReserveReward(sv.restAccount,activeId,batchId)
+        local ok=reserved and _CharacterPersistence:WriteCharacterSaves(sv,true)
+        sv.restBusy=false self:SendStatus(sv,senderUserId,"prepare",ok)
+    end
+
+    @ExecSpace("Server")
+    method void RequestRemoteClaim(string activeId, string recipientId, integer batchId)
+        -- An inactive character's inventory and reward receipt commit atomically.
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or sv.activeId~=activeId or recipientId==activeId or sv.restBusy or sv.recoveryApplying or not self:Owns(sv.list,recipientId) then return end
+        sv.restBusy=true
+        local state=sv.restAccount.characters[recipientId]
+        local ok=false
+        local reserved=self:ReserveReward(sv.restAccount,recipientId,batchId)
+        if reserved and state~=nil and state.pending~=nil then
+            local raw=sv.saves[recipientId]
+            if raw==nil then
+                local ec,value=sv.storage:GetAndWait("save_"..recipientId)
+                if ec==0 then raw=value end
+            end
+            if raw~=nil and raw~="" then
+                local result=self:GrantSnapshot(raw,state)
+                if result.ok then
+                    sv.saves[recipientId]=result.snapshot sv.dirtySaves[recipientId]=true
+                    ok=_CharacterPersistence:WriteCharacterSaves(sv,true)
+                end
+            end
+        elseif state~=nil and (state.pending==nil or state.pending.id~=batchId) then
+            -- A retry after a lost reply only flushes the already-applied receipt.
+            ok=_CharacterPersistence:WriteCharacterSaves(sv,true)
+        end
+        sv.restBusy=false self:SendStatus(sv,senderUserId,"claim",ok)
+        log("[OfflineRest] remote claim saved="..tostring(ok))
+    end
+
+    method table GrantSnapshot(string snapshot, table state)
+        -- Preserve every unrelated save line and retain overflow in the pending batch.
+        local slots={} local lines={}
+        local meso=tonumber(string.match(snapshot,"^M\t(%d+)"))
+        if meso==nil or state.pending==nil then return {ok=false} end
+        for line in string.gmatch(snapshot,"[^\r\n]+") do
+            local fields={string.match(line,"^I\tconsume\t(%d+)\t(.+)$")}
+            local index,item=fields[1],fields[2]
+            if index then slots[tonumber(index)]=item
+            elseif string.sub(line,1,2)~="M\t" then table.insert(lines,line) end
+        end
+        local plan=self:PlanGrant(slots,state.pending)
+        plan.meso=math.min(plan.meso,math.max(0,9000000000000000-meso))
+        local receipt={v=1,rev=state.rev+1,character=state.character,claim={id=state.pending.id,meso=plan.meso,items=plan.items}}
+        table.insert(lines,1,"M\t"..string.format("%.0f",meso+plan.meso))
+        for i=1,128 do if plan.slots[i]~="" then table.insert(lines,"I\tconsume\t"..tostring(i).."\t"..plan.slots[i]) end end
+        return self:MergeSnapshot(state,self:WriteState(table.concat(lines,"\n"),receipt))
+    end
+
+    method string WithCount(string item, number count)
+        -- Shared server/client stack serialization preserves extension fields.
+        local f=_RecoveryManager:Fields(item)
+        while #f<7 do table.insert(f,"0") end
+        f[7]=tostring(count)
+        return table.concat(f,"|")
+    end
+
+    @ExecSpace("ClientOnly")
+    method table DisplayCharacter()
+        -- Claim with the active character; no separate recipient selection is needed.
+        for _,ch in ipairs((self._T.account or {}).characters or {}) do
+            if ch.id==self._T.id then return ch end
+        end
+        local view=self._T.view or self:ReadState("")
+        return {id=self._T.id,name="현재 캐릭터",seconds=view.seconds,pending=view.pending}
+    end
+
+    method void ShareTime(table account)
+        -- Merge legacy balances once; zeroing their source makes retries idempotent.
+        account.carry=account.carry or 0
+        for _,state in pairs(account.characters) do
+            account.bank=account.bank+(state.bank or 0)
+            account.carry=account.carry+(state.carry or 0)
+            state.bank=0 state.carry=0
+        end
+        local earned=math.floor(account.carry/60)*60
+        account.bank=account.bank+earned account.carry=account.carry-earned account.v=4
+        account.target=nil account.batchSeq=account.batchSeq or 0
+    end
+
+end

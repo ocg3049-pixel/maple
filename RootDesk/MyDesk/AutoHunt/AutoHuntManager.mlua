@@ -33,6 +33,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnKeyDown(KeyDownEvent event)
+        if _SkillManager:BlocksAmountInput() then return end
 		-- 자동사냥 토글 키는 키설정창(기능 "autohunt", 기본 F7)에서 바꿀 수 있다 - 강화창과 동일한 기능 매핑 판정.
 		if _KeySettingManager:IsCapturingKey() then return end
 		if _KeySettingManager:GetFuncForKeyEnum(event.key) ~= "autohunt" then return end
@@ -59,6 +60,10 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void Toggle()
+		self._T.partyHealUid = nil
+		self._T.partyHealMap = nil
+		self._T.partyHealCasts = 0
+		self._T.partyHealRestUntil = 0
 		-- 시작할 때만 현재 맵의 생존 몬스터를 검사한다. 진행 중 전멸은 기존 리젠 대기를 유지한다.
 		if not self.autoOn and not self:HasLivingMonsterInCurrentMap() then
 			_UIToast:ShowMessage("현재 맵에 몬스터가 없어 자동사냥을 시작할 수 없습니다.")
@@ -340,7 +345,7 @@ script AutoHuntManager extends Logic
 		ctrl.Enable = false
 		rb.MoveVelocity = Vector2(direction * mv.InputSpeed, 0)
 		ctrl.LookDirectionX = face
-		if not mv:Jump() then
+		if not self:StartVisibleJump(player) then
 			self._T.combatJump = nil
 			self._T.holdMoveUntil = nil
 			self:StopMoving()
@@ -546,7 +551,7 @@ script AutoHuntManager extends Logic
 		local teleports, recoveryauras = {}, {}
 		-- (히어로 3차 2026-08-09) 코마 = 구슬 비례 범위 다수기 / 패닉 = 탱커 전용 단일기.
 		local comas, panics = {}, {}
-		local hotkeys = _SkillManager:ExportHotkeys()
+		local hotkeys = _MobileUIManager:IsMobile() and _MobileUIManager:ExportMobileSkills() or _SkillManager:ExportHotkeys()
 		for key, slot in pairs(hotkeys) do
 			if slot ~= nil and slot.name ~= nil and slot.name ~= "" then
 				local role = self:GetSkillRole(slot.name)
@@ -613,8 +618,15 @@ script AutoHuntManager extends Logic
         -- 다른 맵에서는 이전 목표/이동 예약을 이어가지 않는다.
         local mapPlayer = _UserService.LocalPlayer
         if self.autoOn and isvalid(mapPlayer) and mapPlayer.CurrentMap ~= self._T.huntMap then
-            self:Toggle()
-            log("[AutoHunt] stopped on map change")
+            self:StopMoving() self:ReleaseCliffGuard()
+            self._T.huntMap=mapPlayer.CurrentMap
+            self._T.target=nil self._T.chaseSample=nil self._T.attackProbe=nil self._T.rangeCorrection=nil
+            self._T.combatJump=nil self._T.combatJumpSample=nil self._T.intermediateMap=nil
+            self._T.noTargetSince=nil self._T.platformScanMap=nil self._T.ropeMap=nil
+            self._T.lastKillAt=_UtilLogic.ElapsedSeconds self._T.chaseStart=_UtilLogic.ElapsedSeconds
+            self:ClearRopeState(mapPlayer,"map change",true)
+            self._T.holdMoveUntil=_UtilLogic.ElapsedSeconds+1.2
+            log("[AutoHunt] preserved on map change; navigation reset")
             return
         end
 		-- (신고 2026-08-04) 수동 조작 중에도 지형 턱/발판 이음매에 끼어 좌우 이동이 안 먹는 경우가
@@ -628,9 +640,10 @@ script AutoHuntManager extends Logic
 		end
 		local player = _UserService.LocalPlayer
 		if not isvalid(player) then return end
+        if not _LoginFlow:IsInGame() or _LoginFlow._T.fullScreenFade~=nil then self:StopMoving() return end
 		-- 사망 중에는 일시정지 (부활하면 자동 재개)
 		local sc = player.StateComponent
-		if isvalid(sc) and sc.CurrentStateName == "DEAD" then
+		if player.PlayerComponent.Hp<=0 or player.PlayerComponent:IsDead() then
 			self:StopMoving()
 			return
 		end
@@ -641,6 +654,7 @@ script AutoHuntManager extends Logic
         if now - (self._T.lastKillAt or now) >= 30 then
             if self:ReturnToSpawn(now,player,"30초 미처치") then self._T.lastKillAt=now return end
         end
+        if self:EscapeNarrowPlatform(now,player) then return end
         self:ResolveJumpAttack(now)
         self:UpdateChaseAim(now, player)
 
@@ -964,7 +978,7 @@ script AutoHuntManager extends Logic
 		-- 조준하므로 **제자리에서 거의 다 닿는다** - 굳이 걸어가지 않고 그 자리에서 계속 던진다.
 		-- 표창 스킬이 하나도 배정돼 있지 않으면(근접 위주 구성) 평소처럼 접근한다.
 		if self:IsAwakeningOn() and self:HasStarThrowSlot()
-			and math.abs(dx) <= 15.0 and math.abs(dy) <= 7.5 then
+			and math.abs(dx) <= _ShurikenLibrary:GetSkillReach(true).x and math.abs(dy) <= _ShurikenLibrary:GetSkillReach(true).y then
 			if self._T.moving then self:StopMoving() end
 			self._T.chaseStart = now
 			if math.abs(dx) > 0.05 then
@@ -1294,7 +1308,7 @@ script AutoHuntManager extends Logic
 				and self:GetHasteJumpReach() >= dy then
 				self._T.nextJump = now + 1.0
 				self._T.jumpedAt = now
-				player.MovementComponent:Jump()
+				self:StartVisibleJump(player)
 				if isvalid(sc) then sc:ChangeState("JUMP") end
 				log("[AutoHunt] 헤이스트 점프 보정으로 위 발판 추적 (dy=" .. string.format("%.2f", dy)
 					.. " 사거리=" .. string.format("%.2f", self:GetHasteJumpReach()) .. ")")
@@ -1322,7 +1336,7 @@ script AutoHuntManager extends Logic
 					-- 올라간 직후 되돌아 내려가지 않게 하강을 1.2초 보류 + 3초간 올라온 층 고정(신고 2026-08-10).
 					self._T.noDownJumpUntil = now + 1.2
 					self._T.layerHoldUntil = now + 3.0
-					player.MovementComponent:Jump()
+					self:StartVisibleJump(player)
 					if isvalid(sc) then sc:ChangeState("JUMP") end
 					log("[AutoHunt] 앞점프로 위 발판 등반 (dy=" .. string.format("%.2f", dy)
 						.. " 사거리=" .. string.format("%.2f", plainReach) .. ")")
@@ -1555,7 +1569,7 @@ script AutoHuntManager extends Logic
 			end
 		end
 		-- 전방 점프로 턱 넘기 (착지 복귀는 OnUpdate 상단의 jumpedAt 처리)
-		player.MovementComponent:Jump()
+		self:StartVisibleJump(player)
 		self._T.jumpedAt = now
 		local sc = player.StateComponent
 		if isvalid(sc) then sc:ChangeState("JUMP") end
@@ -1568,6 +1582,7 @@ script AutoHuntManager extends Logic
 	-- 비활성) 중이나 공중에서는 판정하지 않는다.
 	@ExecSpace("ClientOnly")
 	method void ManualStuckTick(Entity player)
+        if player.PlayerComponent.Hp<=0 or player.PlayerComponent:IsDead() then self._T.mStuckLastX=nil return end
 		local now = _UtilLogic.ElapsedSeconds
 		local pcc = player.PlayerControllerComponent
 		if not isvalid(pcc) or not pcc.Enable then
@@ -1600,7 +1615,7 @@ script AutoHuntManager extends Logic
 		local rb = player.RigidbodyComponent
 		if not isvalid(rb) or not rb:IsOnGround() then return end
 		if math.abs(pp.x - lastX) >= 0.08 or math.abs(pp.y - lastY) >= 0.3 then return end
-		player.MovementComponent:Jump()
+		self:StartVisibleJump(player)
 		local sc = player.StateComponent
 		if isvalid(sc) and (sc.CurrentStateName == "IDLE" or sc.CurrentStateName == "MOVE") then
 			sc:ChangeState("JUMP")
@@ -1678,7 +1693,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean TryHealSummonTick(number now, Entity player, number delta)
-		-- 본인과 회복 가능한 내 소환수가 80% 이하이면 공격보다 회복을 우선한다.
+		-- 본인/파티원/내 소환수가 80% 이하이면 회복을 우선한다. 파티원은 최대 4회 연속 지원한다.
 		if self._T.slotHeals == nil or #self._T.slotHeals == 0 then return false end
 		if (self._T.nextSummonHeal or 0) > now then return false end
 		if _SkillManager._T.skillOnCooldown or (_SkillManager._T.actionLockUntil or 0) > now then return false end
@@ -1690,10 +1705,50 @@ script AutoHuntManager extends Logic
 		local pp = player.TransformComponent.WorldPosition
 		local worst = nil
 		local worstRatio = 0.800001
+		local partyUid = nil
+		if self._T.partyHealMap ~= map then
+			self._T.partyHealMap = map
+			self._T.partyHealUid = nil
+			self._T.partyHealRestUntil = 0
+		end
 		local pc = player.PlayerComponent
 		if isvalid(pc) and pc.MaxHp > 0 and pc.Hp > 0 and pc.Hp / pc.MaxHp <= 0.8 then
 			worst = player
 			worstRatio = pc.Hp / pc.MaxHp
+		end
+		-- 대상은 매번 현재 파티 명단과 실제 엔티티로 검증한다(탈퇴/사망/맵 이동 제외).
+		if worst == nil and (self._T.partyHealRestUntil or 0) <= now then
+			local selected = nil
+			local selectedUid = nil
+			local selectedRatio = 0.800001
+			for _, row in ipairs(_SocialManager.partyRows or {}) do
+				if row.online ~= false and row.same == true then
+					local partyPlayer = _UserService:GetUserEntityByUserId(row.uid or "")
+					if isvalid(partyPlayer) and partyPlayer ~= player and partyPlayer.CurrentMap == map then
+						local hp = partyPlayer.PlayerComponent
+						if isvalid(hp) and hp.Hp > 0 and hp.MaxHp > 0 and not hp:IsDead() then
+							local ratio = hp.Hp / hp.MaxHp
+							local continuing = row.uid == self._T.partyHealUid and ratio < 1
+							if continuing or ((selected == nil or selectedUid ~= self._T.partyHealUid) and ratio < selectedRatio) then
+								selected = partyPlayer; selectedUid = row.uid; selectedRatio = ratio
+							end
+						end
+					end
+				end
+			end
+			if selected ~= nil then
+				if self._T.partyHealUid ~= selectedUid then
+					self._T.partyHealUid = selectedUid
+					self._T.partyHealCasts = 0
+					self._T.partyHealUntil = now + 12
+				end
+				if now < (self._T.partyHealUntil or 0) and (self._T.partyHealCasts or 0) < 4 then
+					worst = selected; worstRatio = selectedRatio; partyUid = selectedUid
+				else
+					self._T.partyHealUid = nil
+					self._T.partyHealRestUntil = now + 2
+				end
+			else self._T.partyHealUid = nil end
 		end
 		-- 본인 회복이 필요하면 멀리 있는 소환수까지 걷지 않고 그 자리에서 먼저 시전한다.
 		if worst == nil then
@@ -1726,8 +1781,27 @@ script AutoHuntManager extends Logic
 			self._T.holdMoveUntil = now + interval
 			self._T.nextAtk = now + interval
 			_SkillManager:UseSkillInSlot(self._T.slotHeals[1].key)
-			log("[AutoHunt] 우선 힐: " .. (worst == player and "본인" or "소환수") .. " HP " .. tostring(math.floor(worstRatio * 100)) .. "%")
+			if partyUid ~= nil and _SkillManager._T.skillOnCooldown then
+				self._T.partyHealCasts = (self._T.partyHealCasts or 0) + 1
+			end
+			log("[AutoHunt] 우선 힐: " .. (worst == player and "본인" or (partyUid ~= nil and "파티원 " .. tostring(self._T.partyHealCasts or 0) .. "/4" or "소환수")) .. " HP " .. tostring(math.floor(worstRatio * 100)) .. "%")
 			return true
+		end
+		if partyUid ~= nil then
+			-- 파티원을 따라가되 연결되지 않은 발판/절벽으로 무작정 걷지 않는다.
+			local dir = dx > 0 and 1 or -1
+			if math.abs(dx) > 0.3 and self:IsWalkConnectedToTarget(player, pp, tp)
+				and self:HasSafeGroundAhead(player, pp, dir) then
+				local ctrl = player.PlayerControllerComponent
+				if isvalid(ctrl) then ctrl.Enable = false; ctrl.LookDirectionX = dir end
+				player.MovementComponent:MoveToDirection(Vector2(dir, 0), delta)
+				self._T.moving = true
+				return true
+			end
+			self:StopMoving()
+			self._T.partyHealUid = nil
+			self._T.partyHealRestUntil = now + 2
+			return false
 		end
 		if self._T.healChaseUntil == nil then self._T.healChaseUntil = now + 4 end
 		if now > self._T.healChaseUntil then
@@ -2061,23 +2135,7 @@ script AutoHuntManager extends Logic
 			end
 			return false
 		end
-		-- (나이트로드) 토글 스킬 자동 ON 주기 체크.
-		-- ⚠ (2026-08-07) 마크 오브 어쌔신 자동 ON은 스킬이 "트레이닝"(순수 공격력 패시브)으로
-		--   바뀌면서 제거했다 - 이제 켤 것이 없으므로 표창 분산만 남는다.
-		if (self._T.nextMarkCheck or 0) <= now then
-			self._T.nextMarkCheck = now + 5.0
-			-- (나이트로드, 요청 2026-08-07) 표창 분산도 같은 주기에 켠다 - 사냥은 다수 대상이 기본이라
-			-- 분산이 항상 이득이고(적이 발 수만큼 있으면 총 출력 1.2~2.4배), 단일 대상에서만 손해다.
-			-- ⚠ (버그 수정 2026-08-12) **직업 확인 필수.** 스킬 투자 레벨은 직업이 바뀌어도 데이터에
-			--   남아서, 레벨만 보면 히어로/다크나이트로 사냥하는 중에도 나이트로드 전용 토글이 켜진다
-			--   (신고: 자동사냥 중 버프바에 표창 계열 아이콘이 떴다 - 실측 로그 `표창 분산 자동 ON`).
-			if not _SkillManager:IsStarSpreadEnabled()
-				and _SkillManager:IsSkillInCurrentJob("표창 분산")
-				and _SkillManager:GetHeroSkillLevelByName("표창 분산") >= 1 then
-				_SkillManager:SetStarSpreadEnabled(true)
-				log("[AutoHunt] 표창 분산 자동 ON")
-			end
-		end
+        -- 표창 분산은 서버가 매 시전의 실제 대상과 남은 체력으로 선택한다.
 		-- (나이트로드, 요청 2026-08-06) 표창+ 주기 교체: 표창이 2종 이상 열려 있으면 10초~3분 랜덤
 		-- 주기로 갈아끼우며 사냥한다. (요청 보강 2026-08-06) **가능한 높은 등급 우선** - 재고가
 		-- 넉넉한(40개↑) 2번 이상 표창만 후보로, 번호가 높을수록 가중 2배씩(최고 등급 위주 + 약간의
@@ -2394,7 +2452,8 @@ script AutoHuntManager extends Logic
 			and ((self:HasBlizzardSlot() and _SkillManager:IsBlizzardReady())
 				or (self:HasMeteorSlot() and _SkillManager:IsMeteorReady()))
 		if awakeningOn and self:HasStarThrowSlot() then
-			if math.abs(cdx) > 15.0 or math.abs(cdy) > 7.5 then return end
+			local reach = _ShurikenLibrary:GetSkillReach(true)
+            if math.abs(cdx) > reach.x or math.abs(cdy) > reach.y then return end
 		elseif self:ShouldSnipeWithAssassinate(cdx, cdy) then
 			-- 연막 중 암살 사거리(9유닛) 안이면 붙지 않고 그대로 시전한다.
 			smokeSniping = math.sqrt(cdx * cdx + cdy * cdy) > 1.3
@@ -2488,8 +2547,8 @@ script AutoHuntManager extends Logic
 			and self._T.slotDrainShots ~= nil and #self._T.slotDrainShots > 0
 			and (self._T.nextDrainShot or 0) <= now then
 			local pcDS = player.PlayerComponent
-			if isvalid(pcDS) and (pcDS.MaxHp or 0) > 0 and (pcDS.Hp / pcDS.MaxHp) < 0.90 then
-				self._T.nextDrainShot = now + 5.5
+			if isvalid(pcDS) and (pcDS.MaxHp or 0) > 0 and pcDS.Hp < pcDS.MaxHp and self:IsAttackSkillReady("드레인 샷") then
+				self._T.nextDrainShot = now + 0.5
 				self._T.holdMoveUntil = now + 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()
 				_SkillManager:UseSkillInSlot(self._T.slotDrainShots[1].key)
 				log("[AutoHunt] 드레인 샷 (HP 보충)")
@@ -3479,6 +3538,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method Entity FindCurrentPlatformTarget(Entity player)
+        if isvalid(player.CurrentMap) and _BossStageManager:IsArena(player.CurrentMap.Name) then return self:FindBossArenaTarget(player) end
 		-- 높이가 아닌 발판 연결로 같은 길을 판단한다. 경사로 위 목표도 유지한다.
 		local rb = player.RigidbodyComponent
 		if not isvalid(rb) or not rb:IsOnGround() then return nil end
@@ -3548,6 +3608,7 @@ script AutoHuntManager extends Logic
 
 	@ExecSpace("ClientOnly")
 	method Entity FindTarget(Entity player)
+        if isvalid(player.CurrentMap) and _BossStageManager:IsArena(player.CurrentMap.Name) then return self:FindBossArenaTarget(player) end
 		-- 현재 맵에서 살아있는 최근접 몬스터. 같은 높이(|dy|<1.5)를 우선하고,
 		-- 추적 타임아웃으로 제외된 대상은 제외 시간이 지날 때까지 건너뛴다.
 		local comps = self:GetMonsterComps(player)
@@ -3646,8 +3707,21 @@ script AutoHuntManager extends Logic
 				centroidDir = (cxAll > pp.x) and 1 or -1
 			end
 		end
-		local best = nil
-		local bestScore = 0
+		-- Exact spatial buckets preserve the capped neighbor score without scanning every monster per candidate.
+        local neighborCells={}
+        for _,neighbor in ipairs(comps) do
+            if isvalid(neighbor) and neighbor.IsDead~=true and not neighbor:IsDeathPending() then
+                local entity=neighbor.Entity
+                if isvalid(entity) and entity.Visible~=false then
+                    local position=entity.TransformComponent.WorldPosition
+                    local key=tostring(math.floor(position.x/2))..":"..tostring(math.floor(position.y/1.2))
+                    neighborCells[key]=neighborCells[key] or {}
+                    table.insert(neighborCells[key],{entity=entity,x=position.x,y=position.y})
+                end
+            end
+        end
+        local best = nil
+        local bestScore = 0
 		for _, comp in ipairs(comps) do
 			if isvalid(comp) and comp.IsDead ~= true and not comp:IsDeathPending() then
 				local e = comp.Entity
@@ -3701,19 +3775,17 @@ script AutoHuntManager extends Logic
 						-- 점수를 깎는다(최대 3마리 × 0.6) - 거리가 비슷하면 뭉친 곳을 골라, 도착해서
 						-- 광역 로테이션으로 대상과 주변까지 한 번에 정리한다(요청: "대상 지점 + 주변
 						-- 몬스터를 잡고").
-						local nbrCnt = 0
-						for _, compN in ipairs(comps) do
-							if isvalid(compN) and compN.IsDead ~= true and not compN:IsDeathPending() then
-								local eN = compN.Entity
-								if isvalid(eN) and eN ~= e and eN.Visible ~= false then
-									local wpN = eN.TransformComponent.WorldPosition
-									if math.abs(wpN.x - wp.x) <= 2.0 and math.abs(wpN.y - wp.y) <= 1.2 then
-										nbrCnt += 1
-									end
-								end
-							end
-						end
-						if nbrCnt > 3 then nbrCnt = 3 end
+                        local nbrCnt=0
+                        local cellX=math.floor(wp.x/2) local cellY=math.floor(wp.y/1.2)
+                        for bx=cellX-1,cellX+1 do
+                            for by=cellY-1,cellY+1 do
+                                for _,neighbor in ipairs(neighborCells[tostring(bx)..":"..tostring(by)] or {}) do
+                                    if neighbor.entity~=e and math.abs(neighbor.x-wp.x)<=2 and math.abs(neighbor.y-wp.y)<=1.2 then nbrCnt+=1 if nbrCnt>=3 then break end end
+                                end
+                                if nbrCnt>=3 then break end
+                            end
+                            if nbrCnt>=3 then break end
+                        end
 						score = score - nbrCnt * 0.6
 						-- (요청 2026-08-10) 동선 연속 가중: 남은 적들의 무게중심과 같은 쪽 후보를
 						-- 0.8 우선한다 - "그다음 어디로 갈지"를 미리 보고 가는 길목의 적부터 잡아
@@ -3746,6 +3818,30 @@ script AutoHuntManager extends Logic
 		end
 		return best
 	end
+
+    @ExecSpace("ClientOnly")
+    method boolean EscapeNarrowPlatform(number now, Entity player)
+        -- Leave tiny empty ledges promptly; never drop without a foothold below.
+        local rb=player.RigidbodyComponent
+        if not isvalid(rb) or not rb:IsOnGround() or (self._T.ropeState or "")~="" then self._T.narrowSince=nil return false end
+        if rb:PredictFootholdEnd(0.6,true) or rb:PredictFootholdEnd(0.6,false) then self._T.narrowSince=nil return false end
+        local p=player.TransformComponent.WorldPosition
+        local target=self._T.target
+        if isvalid(target) then
+            local t=target.TransformComponent.WorldPosition
+            if math.abs(t.y-p.y)<0.8 and math.abs(t.x-p.x)<2 then self._T.narrowSince=nil return false end
+        end
+        if self._T.narrowMap~=player.CurrentMap then self._T.narrowMap=player.CurrentMap self._T.narrowSince=nil end
+        self._T.narrowSince=self._T.narrowSince or now
+        if now-self._T.narrowSince<1.2 or now<(self._T.narrowCooldown or 0) then return false end
+        self._T.narrowCooldown=now+1.5
+        if self:GetFootholdIdBelow(player,p.x,p.y-0.35,8)==0 then return false end
+        self:ReleaseCliffGuard()
+        player.MovementComponent:DownJump()
+        self._T.target=nil self._T.nextScan=0 self._T.narrowSince=nil
+        log("[AutoHunt] escaped narrow ledge with landing foothold")
+        return true
+    end
 
 	@ExecSpace("ClientOnly")
 	method boolean TryNoTargetReturn(number now, Entity player)
@@ -4059,9 +4155,12 @@ script AutoHuntManager extends Logic
 		local tp = target.TransformComponent.WorldPosition
 		local dx, dy = math.abs(tp.x - pp.x), tp.y - pp.y
         dx = dx + self:GetChaseRangeInset(player, target, 0.65)
-		if name == "럭키세븐" or name == "트리플 스로우" or name == "쿼드러플 스로우" or name == "드레인 샷" then
-			if self:IsAwakeningOn() then return dx <= 15 and math.abs(dy) <= 7.5 end
-			return dx <= 7.6 and math.abs(dy) <= 0.9
+		if name == "럭키세븐" or name == "트리플 스로우" or name == "쿼드러플 스로우" then
+            local reach=_ShurikenLibrary:GetSkillReach(self:IsAwakeningOn())
+            return dx<=reach.x-0.2 and _ShurikenLibrary:InVerticalReach(dy,self:IsAwakeningOn())
+        end
+        if name == "드레인 샷" then
+			return dx <= _ShurikenLibrary:GetSkillReach(self:IsAwakeningOn()).x-0.2 and _ShurikenLibrary:InVerticalReach(dy,self:IsAwakeningOn())
 		end
 		if name == "암살" then
 			if self:ShouldSnipeWithAssassinate(tp.x-pp.x, dy) then return true end
@@ -4082,7 +4181,7 @@ script AutoHuntManager extends Logic
 				["더블샷"]={5.1,-0.35,1.0}, ["에로우 블로우"]={5.1,-0.35,1.0},
 				["에로우 봄"]={5.1,-0.35,1.0}, ["속사"]={5.6,-0.35,1.0}, ["폭풍의 시"]={5.6,-0.35,1.0},
 				["스트레이프"]={4.7,-0.35,1.0}, ["아이스 샷"]={4.6,-1.0,1.7}, ["파이어 샷"]={4.6,-1.0,1.7},
-				["아이언 에로우"]={6.5,-3.5,3.5}, ["어벤져"]={5.6,-0.6,0.6},
+				["아이언 에로우"]={6.5,-3.5,3.5}, ["어벤져"]={4.4,-0.6,0.6},
 				["힐"]={3.2,-2.56,2.56}, ["매직클로"]={3.2,-0.9,0.9}, ["썬더볼트"]={2.8,-0.9,0.9},
 				["매직 미사일"]={5.5,-2.8,2.8}, ["파이어에로우"]={7.5,-0.6,0.6},
 				["홀리 에로우"]={8.5,-0.5,0.5}, ["엔젤레이"]={8.5,-0.5,0.5},
@@ -4454,7 +4553,7 @@ script AutoHuntManager extends Logic
 		-- 턱을 넘은 직후 곧바로 도로 내려가지 않게: 하강 1.2초 보류 + 3초간 올라온 층 고정(신고 2026-08-10).
 		self._T.noDownJumpUntil = now + 1.2
 		self._T.layerHoldUntil = now + 3.0
-		player.MovementComponent:Jump()
+		self:StartVisibleJump(player)
 		local sc = player.StateComponent
 		if isvalid(sc) then sc:ChangeState("JUMP") end
 		log("[AutoHunt] 벽 앞점프 등반 (턱 높이=" .. string.format("%.2f", stepUp)
@@ -4555,7 +4654,7 @@ script AutoHuntManager extends Logic
 		-- 공격 틱 위상(0.5초)이 상승 구간(0.5초)과 어긋나면 도약을 통째로 흘려보낸다 - 창을 여는
 		-- 순간 틱을 초기화해 공중 훅이 조준한 첫 순간에 바로 쏠 수 있게 한다.
 		self._T.nextAtk = 0
-		player.MovementComponent:Jump()
+		self:StartVisibleJump(player)
 		if isvalid(sc) then sc:ChangeState("JUMP") end
 		log("[AutoHunt] 점프 공격 도약 (dy=" .. string.format("%.2f", dy)
 			.. " dx=" .. string.format("%.2f", dx)
@@ -4904,7 +5003,7 @@ script AutoHuntManager extends Logic
 			-- ⚠ 컨트롤러가 꺼져 있으면 ChangeState가 먹지 않아 점프 모션이 안 나온다(다운점프와 같은 원인).
 			--   StopMoving이 컨트롤러를 켜주므로 그 뒤에 점프시켜야 모션이 보인다 - 부착 시점에 다시 끈다.
 			self:StopMoving()
-			player.MovementComponent:Jump()
+			self:StartVisibleJump(player)
 			local scJ = player.StateComponent
 			if isvalid(scJ) then scJ:ChangeState("JUMP") end
 			self._T.jumpedAt = now
@@ -5150,7 +5249,7 @@ script AutoHuntManager extends Logic
 			if isvalid(controller) then controller.Enable = false end
 			local jumpDir = hop.x >= pp.x and 1 or -1
 			if math.abs(hop.x-pp.x) > 0.1 then player.MovementComponent:MoveToDirection(Vector2(jumpDir,0),delta) end
-			player.MovementComponent:Jump()
+			self:StartVisibleJump(player)
 			self._T.intermediateHop = hop
 			self._T.intermediateMap = player.CurrentMap
 			self._T.intermediateUntil = now+1.4
@@ -5218,7 +5317,7 @@ script AutoHuntManager extends Logic
 		self._T.holdMoveUntil = now + 0.34
 		local pcc = player.PlayerControllerComponent
 		if isvalid(pcc) then pcc.LookDirectionX = dirX end
-		player.MovementComponent:Jump()
+		self:StartVisibleJump(player)
 		local sc = player.StateComponent
 		if isvalid(sc) then sc:ChangeState("JUMP") end
 		-- 예약 취소용 세대 번호 - 그 사이 자동사냥이 꺼지거나 다시 도약하면 옛 예약은 무시한다.
@@ -5279,7 +5378,7 @@ script AutoHuntManager extends Logic
 		self._T.holdMoveUntil = now + 0.34
 		local pcc = player.PlayerControllerComponent
 		if isvalid(pcc) then pcc.LookDirectionX = dirX end
-		player.MovementComponent:Jump()
+		self:StartVisibleJump(player)
 		local sc = player.StateComponent
 		if isvalid(sc) then sc:ChangeState("JUMP") end
 		-- 예약 취소용 세대 번호 - 그 사이 자동사냥이 꺼지거나 다시 도약하면 옛 예약은 무시한다.
@@ -5299,41 +5398,59 @@ script AutoHuntManager extends Logic
 		return true
 	end
 
-	-- ── (신궁) 체인샷 = 자동사냥 이동기 ───────────────────────────────────
-	-- 8방향으로 체인을 쏴 지형에 박고, 0.4초 뒤 같은 키를 한 번 더 눌러 그 각도로 당겨져 날아간다.
-	-- 섬광과 같은 자리(위아래로 떨어진 대상 추적 / 같은 층 먼 대상 가속)에서 쓴다.
-	-- ⚠ 두 번째 입력이 "당기기"가 되려면 첫 발사에서 체인이 실제로 박혀야 한다 - 허공이면 당기기가
-	--   무시되고 그냥 새 체인이 나가므로, 실패해도 안전하다(자체 쿨 2초가 남발을 막는다).
+    @ExecSpace("ClientOnly")
+    method boolean TryChainShotMove(number now, Entity player, number dirX, number dirY, string reason)
+        -- Fire once, then wait for the server's anchor acknowledgement before the pull input.
+        if self._T.slotChainShots == nil or #self._T.slotChainShots == 0 then return false end
+        if (self._T.nextChainShot or 0) > now then return false end
+        if not _SkillManager:CanAffordSkillCost("체인샷") then return false end
+        local key = self._T.slotChainShots[1].key
+        self._T.aimDirX = dirX
+        self._T.aimDirY = dirY
+        local controller = player.PlayerControllerComponent
+        if isvalid(controller) and dirX ~= 0 then controller.LookDirectionX = dirX > 0 and 1 or -1 end
+        local previousFire = _SkillManager._T.chainFiredAt
+        _SkillManager:UseSkillInSlot(key)
+        local firedAt = _SkillManager._T.chainFiredAt
+        if firedAt == nil or firedAt == previousFire then return false end
+        self._T.nextChainShot = now + 6.0
+        self._T.holdMoveUntil = now + 1.2
+        self._T.csGen = (self._T.csGen or 0) + 1
+        local generation = self._T.csGen
+        local castMap = player.CurrentMap
+        _TimerService:SetTimerOnce(function()
+            self:ContinueChainShotPull(generation, player, castMap, key, firedAt, now + 3.0)
+        end, 0.1)
+        log("[AutoHunt] 체인샷 발사 후 고정 대기 - " .. reason)
+        return true
+    end
 
-	@ExecSpace("ClientOnly")
-	method boolean TryChainShotMove(number now, Entity player, number dirX, number dirY, string reason)
-		if self._T.slotChainShots == nil or #self._T.slotChainShots == 0 then return false end
-		if (self._T.nextChainShot or 0) > now then return false end
-		-- (요청 2026-08-13) 체인샷이 MP 10을 쓰게 됐다 - 못 내면 이동 잠금(1.2초)을 걸기 전에 물러난다.
-		if not _SkillManager:CanAffordSkillCost("체인샷") then return false end
-		-- (요청 2026-08-13) 체인샷 쿨타임은 **당겨져 날아간 시점부터** 5초다 - 자동사냥은 발사 0.4초 뒤에
-		-- 당기므로 실제로 다시 쓸 수 있는 건 발사 +5.4초다. 6.0초 간격이면 그 뒤에 오므로 그대로 둔다.
-		self._T.nextChainShot = now + 6.0
-		local key = self._T.slotChainShots[1].key
-		-- 조준은 8방향이라 자동사냥 조준값(GetAimDirX/Y)을 그대로 쓴다 - 체인샷 시전 분기가
-		-- 방향키 입력이 없을 때 이 값을 읽는다.
-		self._T.aimDirX = dirX
-		self._T.aimDirY = dirY
-		self._T.holdMoveUntil = now + 1.2
-		local pccC = player.PlayerControllerComponent
-		if isvalid(pccC) then pccC.LookDirectionX = dirX end
-		_SkillManager:UseSkillInSlot(key)   -- ① 체인 발사
-		-- ② 0.4초 뒤 같은 키를 한 번 더 - 박혔으면 그 각도로 당겨져 날아간다.
-		self._T.csGen = (self._T.csGen or 0) + 1
-		local csGenNow = self._T.csGen
-		_TimerService:SetTimerOnce(function()
-			if self._T.csGen ~= csGenNow then return end
-			if self.autoOn ~= true then return end
-			_SkillManager:UseSkillInSlot(key)
-		end, 0.4)
-		log("[AutoHunt] 체인샷 이동 - " .. reason)
-		return true
-	end
+    @ExecSpace("ClientOnly")
+    method void ContinueChainShotPull(integer generation, Entity player, Entity castMap, string key, number firedAt, number deadline)
+        -- Retry only the same anchored shot; never turn a late second input into another paid shot.
+        if self._T.csGen ~= generation or not self.autoOn or not isvalid(player) then return end
+        if player ~= _UserService.LocalPlayer or player.CurrentMap ~= castMap then return end
+        if player.StateComponent.CurrentStateName == "DEAD" then return end
+        local skill = _SkillManager
+        local now = _UtilLogic.ElapsedSeconds
+        if skill._T.chainFiredAt ~= firedAt or skill._T.chainCooldownCharged == true then return end
+        if now >= deadline then log("[AutoHunt] 체인샷 후속 이동 대기 만료") return end
+        local slot = skill:GetSkillOnKey(key)
+        if slot == nil or slot.name ~= "체인샷" then return end
+        if (skill._T.chainAnchoredUntil or 0) > now and (skill._T.chainPullReadyAt or 0) <= now then
+            skill:UseSkillInSlot(key)
+            if (skill._T.chainAnchoredUntil or 0) == 0 and skill._T.chainCooldownCharged == true then
+                self._T.holdMoveUntil = now + 1.2
+                self._T.nextChainShot = now + skill:GetChainShotCooldown() + 0.2
+                log("[AutoHunt] 체인샷 고정 확인 후 두 번째 동작 실행")
+                return
+            end
+        end
+        self._T.holdMoveUntil = math.max(self._T.holdMoveUntil or 0, now + 0.2)
+        _TimerService:SetTimerOnce(function()
+            self:ContinueChainShotPull(generation, player, castMap, key, firedAt, deadline)
+        end, 0.1)
+    end
 
 	-- ── (히어로 3차, 요청 2026-08-09) 코마 = 구슬을 모아서 넓게 쓰는 다수기 ──
 	-- 요청 요지
@@ -5581,7 +5698,9 @@ script AutoHuntManager extends Logic
 		if not isvalid(target) then return 0 end
 		local mon = target:GetComponent("script.Monster")
 		if mon == nil then return 0 end
-		return math.max(0, mon.Hp or 0)
+        if mon.NeverDie then return math.max(0,mon.Hp) end
+		local incoming = mon.IncomingHitExpires > _UtilLogic.ServerElapsedSeconds and mon.IncomingHitDamage or 0
+        return math.max(0, (mon.Hp or 0) - incoming)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -5759,7 +5878,7 @@ script AutoHuntManager extends Logic
 		local player = _UserService.LocalPlayer
 		if isvalid(player) then
 			local pcc = player.PlayerControllerComponent
-			if isvalid(pcc) and not pcc.Enable then pcc.Enable = true end
+			if isvalid(pcc) then pcc.Enable=player.PlayerComponent.Hp>0 and not player.PlayerComponent:IsDead() end
 			if self._T.moving == true then
 				if isvalid(player.MovementComponent) then
 					player.MovementComponent:Stop()
@@ -5898,4 +6017,34 @@ script AutoHuntManager extends Logic
             probe.hit = true
         end
     end
+	@ExecSpace("ClientOnly")
+	method boolean StartVisibleJump(Entity player)
+		-- Physics may jump with the controller disabled; explicitly start the body animation too.
+		if not isvalid(player) or not isvalid(player.MovementComponent) then return false end
+		if not player.MovementComponent:Jump() then return false end
+		local sc=player.StateComponent
+		if isvalid(sc) then sc:ChangeState("JUMP") end
+		local attack=player:GetComponent("script.PlayerAttack")
+		if not isvalid(attack) or not attack:IsSwingMotionActive() then
+			player:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Fall))
+		end
+		self._T.jumpedAt=_UtilLogic.ElapsedSeconds
+		return true
+	end
+    @ExecSpace("ClientOnly")
+    method Entity FindBossArenaTarget(Entity player)
+        local attack=player:GetComponent("script.PlayerAttack")
+        if not isvalid(attack) then return nil end
+        local pos=player.TransformComponent.WorldPosition
+        local best=nil local bestDistance=100000
+        for _,m in ipairs(self:GetMonsterComps(player) or {}) do
+            if isvalid(m) and not m.IsDead and m.Hp>0 and not m:IsDeathPending() and isvalid(m.Entity) and m.Entity.CurrentMap==player.CurrentMap then
+                local p=m.Entity.TransformComponent.WorldPosition
+                local d=(p.x-pos.x)^2+(p.y-pos.y)^2
+                if best==nil or attack:PreferMonster(m.Entity,d,best,bestDistance) then best=m.Entity bestDistance=d end
+            end
+        end
+        return best
+    end
+
 end

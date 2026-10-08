@@ -62,6 +62,13 @@ script MapleHUDManager extends Logic
         if isvalid(codex) then
             self:ConnectMenuButton(codex.ButtonComponent, function() _MonsterCodex:Toggle() end)
         end
+        local autoHunt = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnAutoHunt")
+        if isvalid(autoHunt) then
+            self:ConnectMenuButton(autoHunt.ButtonComponent, function()
+                _AutoHuntManager:Toggle()
+                self:RefreshAutoHuntButton()
+            end)
+        end
         self:WireChatWindow()
         self:WireSimpleChatMessages()
         self:SendLevelFadeBehindText()
@@ -79,7 +86,21 @@ script MapleHUDManager extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method void RefreshAutoHuntButton()
+        -- Reflect both hotkey and HUD toggles using the existing auto-hunt state.
+        local button = _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnAutoHunt")
+        if not isvalid(button) then return end
+        local active = _AutoHuntManager:IsActive()
+        local label = button:GetChildByName("Label")
+        local icon = button:GetChildByName("Icon")
+        if isvalid(label) then label.TextGUIRendererComponent.Text = active and "사냥중지" or "자동사냥" end
+        if isvalid(icon) then icon.SpriteGUIRendererComponent.Color = active and Color(0.55,1,0.55,1) or Color.white end
+    end
+
+    @ExecSpace("ClientOnly")
     method void RefreshBars()
+        if _AutoHuntPowerSave.active then return end
+        self:RefreshAutoHuntButton()
         -- HP/MP 바 전용 최소 갱신. UpdateHUD와 **독립**으로 돌아 한쪽이 죽어도 수치 표시는 살아남는다.
         -- HUD가 숨겨진 상태(로그인/캐릭터선택)에서는 건드릴 것이 없으므로 건너뛴다.
         if not isvalid(self.hudRoot) or not self.hudRoot.Enable then return end
@@ -87,7 +108,7 @@ script MapleHUDManager extends Logic
         if not isvalid(playerEntity) then return end
         local pc = playerEntity.PlayerComponent
         if not isvalid(pc) then return end
-        local hp = math.floor(pc.Hp or 0)
+        local hp = math.max(0, math.floor(pc.Hp or 0))
         local maxHp = math.floor(pc.MaxHp or 0)
         if isvalid(self.hpFill) then
             if maxHp > 0 then
@@ -103,7 +124,10 @@ script MapleHUDManager extends Logic
     end
 
     method void OnEndPlay()
-		if self:IsClient() then _UICursorManager:ReleaseForcedCursor() end
+		if self:IsClient() then
+            _UICursorManager:ReleaseForcedCursor()
+            self:StopRecoveryFlash("hp") self:StopRecoveryFlash("mp")
+        end
         -- 타이머/이벤트 해제
         if self.updateTimer ~= 0 then
             _TimerService:ClearTimer(self.updateTimer)
@@ -216,9 +240,11 @@ script MapleHUDManager extends Logic
                 ---@type UITouchDragEvent
                 local e = evt
                 local tf = self.chatBox.UITransformComponent
-                local nextHeight = math.max(120, math.min(520, tf.RectSize.y + e.TouchDelta.y))
+                local point = _UILogic:ScreenToLocalUIPosition(e.TouchPoint, tf)
+                local previous = _UILogic:ScreenToLocalUIPosition(e.TouchPoint-e.TouchDelta, tf)
+                local nextHeight = math.max(120, math.min(520, tf.RectSize.y + point.y-previous.y))
                 tf.RectSize = Vector2(tf.RectSize.x, nextHeight)
-                self._T.chatExpandedHeight = nextHeight
+                if _MobileUIManager:IsMobile() then self._T.mobileChatHeight=nextHeight else self._T.chatExpandedHeight=nextHeight end
                 self:RefreshChatGripWidth()
 				self:RefreshChatLayout()
             end)
@@ -236,6 +262,13 @@ script MapleHUDManager extends Logic
                 local tf = self.chatBox.UITransformComponent
                 local p = tf.anchoredPosition
                 -- 왼쪽/위쪽은 여백 없이, 아래쪽은 기존 HUD 보호 영역을 유지한다.
+                if _MobileUIManager:IsMobile() then
+                    local current=_UILogic:ScreenToLocalUIPosition(e.TouchPoint,self.chatBox.Parent.UITransformComponent)
+                    local previous=_UILogic:ScreenToLocalUIPosition(e.TouchPoint-e.TouchDelta,self.chatBox.Parent.UITransformComponent)
+                    self._T.mobileChatX=math.max(0,math.min(1920-tf.RectSize.x*1.2,p.x+current.x-previous.x))
+                    self._T.mobileChatY=math.max(52,math.min(1080-tf.RectSize.y*1.2,p.y+current.y-previous.y))
+                    self:RefreshChatLayout() return
+                end
                 local maxX = math.max(0, 1920 - tf.RectSize.x - 8)
                 local maxY = math.max(52, 1080 - tf.RectSize.y)
                 tf.anchoredPosition = Vector2(
@@ -244,7 +277,35 @@ script MapleHUDManager extends Logic
             end)
             table.insert(self._T.dragHandlers, { entity = moveGrip, eventType = UITouchDragEvent, eventHandler = h })
         end
-        log("[MapleHUD] 채팅창 이동/세로 리사이즈 핸들 연결")
+        local sideGrip=self.chatBox:GetChildByName("WidthGrip",false)
+        if isvalid(sideGrip) then
+            local resize=sideGrip:ConnectEvent(UITouchDragEvent,function(evt)
+                local tf=self.chatBox.UITransformComponent
+                local point=_UILogic:ScreenToLocalUIPosition(evt.TouchPoint,tf)
+                local previous=_UILogic:ScreenToLocalUIPosition(evt.TouchPoint-evt.TouchDelta,tf)
+                local width=math.max(_MobileUIManager:IsMobile() and 280 or 380,math.min(_MobileUIManager:IsMobile() and 1200 or 1500,tf.RectSize.x+point.x-previous.x))
+                tf.RectSize=Vector2(width,tf.RectSize.y)
+                if _MobileUIManager:IsMobile() then self._T.mobileChatWidth=width end
+                self:RefreshChatLayout()
+            end)
+            table.insert(self._T.dragHandlers,{entity=sideGrip,eventType=UITouchDragEvent,eventHandler=resize})
+        end
+        local area=self.chatBox:GetChildByName("MobileDragArea",false)
+        if isvalid(area) then
+            local drag=area:ConnectEvent(UITouchDragEvent,function(e)
+                if not _MobileUIManager:IsMobile() then return end
+                local tf=self.chatBox.UITransformComponent
+                local parent=self.chatBox.Parent.UITransformComponent
+                local current=_UILogic:ScreenToLocalUIPosition(e.TouchPoint,parent)
+                local previous=_UILogic:ScreenToLocalUIPosition(e.TouchPoint-e.TouchDelta,parent)
+                self._T.mobileChatX=tf.anchoredPosition.x+current.x-previous.x
+                self._T.mobileChatY=tf.anchoredPosition.y+current.y-previous.y
+                self:RefreshChatLayout()
+                self._T.mobileChatX=tf.anchoredPosition.x self._T.mobileChatY=tf.anchoredPosition.y
+            end)
+            table.insert(self._T.dragHandlers,{entity=area,eventType=UITouchDragEvent,eventHandler=drag})
+        end
+        log("[MapleHUD] 채팅창 이동/가로·세로 리사이즈 핸들 연결")
     end
 
     @ExecSpace("ClientOnly")
@@ -252,9 +313,10 @@ script MapleHUDManager extends Logic
         -- 접기 버튼과 이동 영역이 겹치지 않도록 제목줄의 오른쪽 여백을 둔다.
         if not isvalid(self.chatBox) then return end
         local width = self.chatBox.UITransformComponent.RectSize.x
+        local mobile=_MobileUIManager:IsMobile()
         local resizeGrip = self.chatBox:GetChildByName("ResizeGrip", false)
         local moveGrip = self.chatBox:GetChildByName("MoveGrip", false)
-        if isvalid(resizeGrip) then resizeGrip.UITransformComponent.RectSize = Vector2(width, 5) end
+        if isvalid(resizeGrip) then resizeGrip.UITransformComponent.RectSize = Vector2(width - (mobile and 60 or 36), mobile and 24 or 8) end
         if isvalid(moveGrip) then moveGrip.UITransformComponent.RectSize = Vector2(width - 48, 24) end
     end
 
@@ -263,15 +325,23 @@ script MapleHUDManager extends Logic
 		-- 한 줄 접기 / 최소 두 줄 펼치기와 사용자 지정 높이를 같은 레이아웃으로 처리한다.
 		if not isvalid(self.chatBox) then return end
 		local box = self.chatBox
-		local collapsed = self._T.chatCollapsed == true
+        local mobile=_MobileUIManager:IsMobile()
+        if mobile then
+            _MobileUIManager:Remember(box)
+            box.UITransformComponent.RectSize=Vector2(self._T.mobileChatWidth or 520,self._T.mobileChatHeight or 150)
+            box.UITransformComponent.UIScale=Vector3(1.2,1.2,1)
+            box.UITransformComponent.anchoredPosition=Vector2(self._T.mobileChatX or (1920-box.UITransformComponent.RectSize.x*1.2)/2,self._T.mobileChatY or (1080-box.UITransformComponent.RectSize.y*1.2))
+        end
+		local reading = mobile and self._T.chatTyping ~= true
+        local collapsed = self._T.chatCollapsed == true and not mobile
 		local size = box.UITransformComponent.RectSize
 		-- Default 20px 폰트의 한글 한 줄은 약 30px이다. 32px를 확보해 잘림을 막는다.
-		local height = collapsed and 68 or math.max(120, self._T.chatExpandedHeight or size.y)
+		local height = mobile and (self._T.mobileChatHeight or 150) or (collapsed and 68 or math.max(120, self._T.chatExpandedHeight or size.y))
 		box.UITransformComponent.RectSize = Vector2(size.x, height)
 		local pos = box.UITransformComponent.anchoredPosition
 		box.UITransformComponent.anchoredPosition = Vector2(
-			math.max(0, math.min(1920 - size.x - 8, pos.x)),
-			math.max(52, math.min(1080 - height, pos.y)))
+			mobile and math.max(0,math.min(1920-size.x*1.2,pos.x)) or math.max(0, math.min(1920 - size.x - 8, pos.x)),
+			math.max(52, math.min(1080 - height * (mobile and 1.2 or 1), pos.y)))
 		local bg = box:GetChildByName("SimpleChatBG", false)
 		if isvalid(bg) then
 			bg.Enable = true
@@ -287,17 +357,29 @@ script MapleHUDManager extends Logic
 		local input = self._T.chatInput
 		if isvalid(input) then
 			-- 포커스 해제 중에도 입력란 배경은 계속 남겨 깜빡이지 않게 한다.
-			input.Enable = true
-			input.UITransformComponent.RectSize = Vector2(size.x - 134, 26)
+			input.Enable = not reading
+			input.UITransformComponent.RectSize = Vector2(size.x - 164, mobile and 44 or 26)
             input.UITransformComponent.anchoredPosition = Vector2(124, 3)
 		end
 		local view = box:GetChildByName("Messages", false)
 		if isvalid(view) then
 			view.Enable = true
-			view.UITransformComponent.RectSize = Vector2(size.x - (collapsed and 52 or 24), collapsed and 32 or height - 56)
-			view.UITransformComponent.anchoredPosition = Vector2(12, 32)
+			view.UITransformComponent.RectSize = Vector2(size.x - (collapsed and 52 or 48), collapsed and 32 or height - (reading and 24 or (mobile and 84 or 56)))
+			view.UITransformComponent.anchoredPosition = Vector2(12, reading and 12 or (mobile and 60 or 32))
 		end
-		self:RefreshChatGripWidth()
+        local area=box:GetChildByName("MobileDragArea",false)
+        if isvalid(area) then
+            area.Enable=mobile
+            if mobile and isvalid(view) then
+                area.UITransformComponent.RectSize=view.UITransformComponent.RectSize
+                area.UITransformComponent.anchoredPosition=view.UITransformComponent.anchoredPosition
+            end
+        end
+        self:RefreshChatGripWidth()
+        for _,name in ipairs({"Title","MoveGrip","ResizeGrip","WidthGrip","BtnSettings","BtnCollapse","Recipient"}) do
+            local control=box:GetChildByName(name,false)
+            if isvalid(control) then control.Enable=(mobile and name=="MoveGrip") or (not reading and (not collapsed or name=="BtnCollapse" or name=="BtnSettings" or name=="Recipient")) end
+        end
 		self:RenderSimpleChatMessages()
 	end
 
@@ -321,6 +403,8 @@ script MapleHUDManager extends Logic
             end)
             table.insert(self._T.dragHandlers, {entity=input, eventType=TextInputSubmitEvent, eventHandler=submit})
             local finish = input:ConnectEvent(TextInputEndEditEvent, function()
+                if self._T.chatRefocusPending and not self._T.chatClosing then return end
+                if _MobileUIManager:IsMobile() and not self._T.chatClosing then return end
                 self._T.chatTyping = false
                 self:RefreshChatLayout()
             end)
@@ -335,6 +419,16 @@ script MapleHUDManager extends Logic
             ---@type KeyDownEvent
             local event = evt
             if _GameSystemMenu:BlocksInput() then return end
+            if not self:IsChatTyping() and not self:HasOpenChatBlockingWindow() then
+                local action=_KeySettingManager:GetFuncForKeyEnum(event.key)
+                local mode=({chat_all="map",chat_friend="friend",chat_party="party"})[action]
+                if mode~=nil then
+                    _SocialManager:SelectChat(mode)
+                    self:FocusChat()
+                    return
+                end
+            end
+            if _SkillManager:BlocksAmountInput() then return end
             if event.key == KeyboardKey.Return or event.key == KeyboardKey.KeypadEnter then
                 if not self:IsChatTyping() and not self:HasOpenChatBlockingWindow() then self:FocusChat() end
             elseif event.key == KeyboardKey.Escape and self:IsChatTyping() then
@@ -346,47 +440,45 @@ script MapleHUDManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void RenderSimpleChatMessages()
-        -- 별도 말풍선 없이 흰색 '닉네임 : 내용'을 표시한다. 히스토리는 80개로 제한한다.
+        -- 메시지를 분리해 색상 태그와 이전 대화가 한꺼번에 필터링되지 않게 한다.
         if not isvalid(self.chatBox) then return end
-        for i = 1, 18 do
-            local line = self.chatBox:GetChildByName("SimpleLine" .. tostring(i), false)
-            if isvalid(line) then line.Enable = false end
+        for i=1,18 do
+            local old=self.chatBox:GetChildByName("SimpleLine"..tostring(i),false)
+            if isvalid(old) then old.Enable=false end
         end
-        local view = self.chatBox:GetChildByName("Messages", false)
+        local view=self.chatBox:GetChildByName("Messages",false)
         if not isvalid(view) then return end
-        local label = view:GetChildByName("Log", false)
-        if not isvalid(label) then return end
-        local messages = self._T.chatMessages or {}
-        local rendered = {}
-        local labels = {map="모두",party="파티",friend="친구",whisper="귓속말"}
-        for _, message in ipairs(messages) do
-            local body = self:FormatChatMessage(message)
-            body = string.gsub(body, "<", "＜")
-            body = string.gsub(body, ">", "＞")
-            body = string.gsub(body, "＜＜", "<<")
-            body = string.gsub(body, "＞＞", ">>")
-            local mode = type(message) == "table" and message.mode or "map"
-            table.insert(rendered, "<color=" .. _GameSystemMenu:GetChatHex(mode) .. ">" .. body .. "</color>")
+        local oldLog=view:GetChildByName("Log",false)
+        if isvalid(oldLog) then oldLog.Enable=false end
+        local messages=self._T.chatMessages or {}
+        local collapsed=self._T.chatCollapsed and not _MobileUIManager:IsMobile()
+        local width=view.UITransformComponent.RectSize.x
+        local bottom=0
+        for i=1,80 do
+            local label=view:GetChildByName("Message"..tostring(i),false)
+            if isvalid(label) then
+                local message=messages[#messages-i+1]
+                label.Enable=message~=nil and (not collapsed or i==1)
+                if label.Enable then
+                    local body=self:FormatChatMessage(message)
+                    local mode=type(message)=="table" and message.mode or "map"
+                    local tc=label.TextGUIRendererComponent
+                    tc.IsRichText=false tc.BestFit=false tc.FontSize=_GameSystemMenu.chatSize
+                    tc.FontColor=Color.FromHexCode(mode=="notice" and "#FF785A" or _GameSystemMenu:GetChatHex(mode))
+                    if tc.Text~=body then tc.Text=body end
+                    local height=math.max(32,math.ceil(tc:GetPreferredHeight(body,width))+2)
+                    label.UITransformComponent.RectSize=Vector2(width,height)
+                    label.UITransformComponent.anchoredPosition=Vector2(0,bottom)
+                    bottom=bottom+height
+                end
+            end
         end
-        local text = table.concat(rendered, "\n")
-        if self._T.chatCollapsed then text = rendered[#rendered] or "" end
-        local width = view.UITransformComponent.RectSize.x
-        local tc = label.TextGUIRendererComponent
-        tc.FontSize = _GameSystemMenu.chatSize
-        tc.BestFit = false
-        tc.FontColor = Color.white
-        tc.IsRichText = true
-        local bg = self.chatBox:GetChildByName("SimpleChatBG", false)
-        if isvalid(bg) then bg.SpriteGUIRendererComponent.Color = Color(0.08,0.09,0.11,_GameSystemMenu.chatOpacity / 100) end
-        tc.Text = text
-        local height = 32
-        if not self._T.chatCollapsed and text ~= "" then height = math.max(32, math.ceil(tc:GetPreferredHeight(text, width)) + 2) end
-        label.UITransformComponent.RectSize = Vector2(width, height)
     end
 
     method string FormatChatMessage(any message)
         -- Direction is stamped by the server; only the counterpart's name is shown.
         if type(message)~="table" then return tostring(message) end
+        if message.mode=="notice" then return message.text end
         if message.mode=="whisper" then
             return (message.sent and message.target or message.name)..(message.sent and " << " or " >> ")..message.text
         end
@@ -408,7 +500,7 @@ script MapleHUDManager extends Logic
             local win = _EntityService:GetEntityByPath(path)
             if path ~= "/ui/DefaultGroup/Board" and isvalid(win) and win.EnabledInHierarchy and win.Visible then return true end
         end
-        for _, path in ipairs({"/ui/DefaultGroup/CommandInputBar", "/ui/DefaultGroup/QuickSlotDialog", "/ui/DefaultGroup/MapSelectGroup", "/ui/WorldMapGroup", "/ui/ShopGroup/ShopPopup", "/ui/PopupGroup/PopupBack"}) do
+        for _, path in ipairs({"/ui/DefaultGroup/QuickSlotDialog", "/ui/DefaultGroup/MapSelectGroup", "/ui/WorldMapGroup", "/ui/ShopGroup/ShopPopup", "/ui/PopupGroup/PopupBack"}) do
             local win = _EntityService:GetEntityByPath(path)
             if isvalid(win) and win.EnabledInHierarchy then return true end
         end
@@ -427,6 +519,7 @@ script MapleHUDManager extends Logic
             self._T.chatFocusTimer = nil
             if isvalid(self._T.chatInput) and self._T.chatTyping then
                 self._T.chatInput.TextGUIRendererInputComponent:ActivateInputField()
+                self._T.chatRefocusPending=false
                 log("[MapleHUD] Enter requested chat focus")
             end
         end, 0.05)
@@ -437,6 +530,7 @@ script MapleHUDManager extends Logic
         -- 입력을 마치면 게임 키보드 제어를 돌려주고 접힌 상태를 유지한다.
         self._T.chatTyping = false
         self._T.chatClosing = true
+        self._T.chatRefocusPending = false
         self._T.chatClosedAt = _UtilLogic.ElapsedSeconds
         if self._T.chatFocusTimer ~= nil then
             _TimerService:ClearTimer(self._T.chatFocusTimer)
@@ -460,11 +554,19 @@ script MapleHUDManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void SubmitChat(string text)
-        -- 빈 메시지는 전송하지 않고 내용은 서버에서 사용자 식별/길이/빈도를 검증한다.
-        self:FinishChatInput()
         text = (string.gsub(text or "", "[%c]", " "))
         text = string.match(text, "^%s*(.-)%s*$") or ""
-        if text ~= "" then self:RequestChat(text, _SocialManager.chatMode, _SocialManager.whisperName) end
+        -- 빈 입력의 Enter는 채팅을 종료하고, 내용이 있으면 전송 후 계속 입력한다.
+        if text == "" then
+            self:FinishChatInput()
+            return
+        end
+        self:RequestChat(text, _SocialManager.chatMode, _SocialManager.whisperName)
+        if self._T.chatClosing or not isvalid(self._T.chatInput) then return end
+        self._T.chatInput.TextGUIRendererInputComponent.Text=""
+        self._T.chatRefocusPending=true
+        self._T.chatTyping=true
+        self:FocusChat()
     end
 
     @ExecSpace("Server")
@@ -524,6 +626,7 @@ script MapleHUDManager extends Logic
         -- 메뉴 아이콘 버튼 하나에 클릭 콜백을 연결하고 해제용으로 기록한다
         if not isvalid(btn) then return end
         local h = btn.Entity:ConnectEvent(ButtonClickEvent, function()
+            if _SkillManager:BlocksAmountInput() then return end
             callback()
         end)
         table.insert(self._T.buttonHandlers, { entity = btn.Entity, eventHandler = h })
@@ -543,16 +646,21 @@ script MapleHUDManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void UpdateHUD()
+        if _AutoHuntPowerSave.active then
+            local now = _UtilLogic.ElapsedSeconds
+            if now < (self._T.powerRefresh or 0) then return end
+            self._T.powerRefresh = now + 2
+        end
         -- 로그인/캐릭터선택/생성 화면에서는 HUD 전체 숨김, 인게임에서는 표시 + 수치 갱신
         if not isvalid(self.hudRoot) then return end
 
         local inMenu = not _LoginFlow:IsInGame()
         local countdown = _EntityService:GetEntityByPath("/ui/RespawnGroup/Window")
-        if isvalid(countdown) then countdown.Enable = false end
 
         local playerEntity = self:FindLocalPlayerEntity()
 
         if inMenu or not isvalid(playerEntity) then
+            if isvalid(countdown) and countdown.Enable then countdown.Enable = false end
             if self.hudRoot.Enable then self.hudRoot.Enable = false end
             return
         end
@@ -570,14 +678,27 @@ script MapleHUDManager extends Logic
 
         -- HP
         local pc = playerEntity.PlayerComponent
-        if pc:IsDead() and isvalid(countdown) then
-            local remaining = math.max(0, math.ceil(pc.RespawnTime - _UtilLogic.ServerElapsedSeconds))
-            countdown.Enable = true
-            countdown:GetChildByName("Time").TextGUIRendererComponent.Text = "부활까지 " .. tostring(remaining) .. "초"
-        elseif not pc:IsDead() then
+        local dead = pc:IsDead()
+        if isvalid(countdown) then
+            -- 매 갱신마다 창을 껐다 켜면 다른 UI의 호버와 입력 상태도 흔들린다.
+            local showCountdown = dead and not _BossStageManager:HidesFieldNotices()
+            if showCountdown then
+                local remaining = math.max(0, math.ceil(pc.RespawnTime - _UtilLogic.ServerElapsedSeconds))
+                local label = countdown:GetChildByName("Time")
+                local message = "부활까지 " .. tostring(remaining) .. "초"
+                if isvalid(label) and label.TextGUIRendererComponent.Text ~= message then
+                    label.TextGUIRendererComponent.Text = message
+                end
+            end
+            if countdown.Enable ~= showCountdown then
+                countdown.Enable = showCountdown
+                log("[MapleHUD] respawn countdown visible=" .. tostring(showCountdown))
+            end
+        end
+        if not dead then
             pc.RespawnDuration = math.max(1, _CharInfoManager:GetDisplayLevel())
         end
-        local hp = math.floor(pc.Hp or 0)
+        local hp = math.max(0, math.floor(pc.Hp or 0))
         local maxHp = math.floor(pc.MaxHp or 0)
         if isvalid(self.hpFill) then
             if maxHp > 0 then
@@ -611,6 +732,7 @@ script MapleHUDManager extends Logic
     -- MpManager가 직접 호출하는 즉시 갱신 두 경로가 이 메서드 하나를 공유한다.
     @ExecSpace("ClientOnly")
     method void UpdateMpBar()
+        if _AutoHuntPowerSave.active then return end
         -- ⚠ MpManager는 클라 전용 Logic이라 서버에서는 호출되지 않는다(HUD 자체가 클라 전용).
         local maxMp = _MpManager:GetMaxMp()
         local curMp = _MpManager:GetCurrentMp()
@@ -624,6 +746,41 @@ script MapleHUDManager extends Logic
         if isvalid(self.mpText) then
             self.mpText.Text = tostring(curMp) .. " / " .. tostring(maxMp)
         end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StopRecoveryFlash(string resource)
+        -- Cancel a previous pulse and restore the complete gauge group.
+        local flashes=self._T.recoveryFlashes
+        local rec=flashes and flashes[resource] or nil
+        if rec==nil then return end
+        if rec.timer~=nil then _TimerService:ClearTimer(rec.timer) end
+        if isvalid(rec.group) then rec.group.GroupAlpha=rec.alpha end
+        flashes[resource]=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FlashRecoveryBar(string resource)
+        -- Pulse only the recovered resource twice; concurrent HP and MP pulses are independent.
+        if resource~="hp" and resource~="mp" then return end
+        self:StopRecoveryFlash(resource)
+        local bar=_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..(resource=="hp" and "HpBar" or "MpBar"))
+        if not isvalid(bar) or not isvalid(bar.CanvasGroupComponent) then return end
+        self._T.recoveryFlashes=self._T.recoveryFlashes or {}
+        local rec={group=bar.CanvasGroupComponent,alpha=bar.CanvasGroupComponent.GroupAlpha,step=0}
+        self._T.recoveryFlashes[resource]=rec
+        rec.group.GroupAlpha=rec.alpha*0.25
+        rec.timer=_TimerService:SetTimerRepeat(function()
+            if not isvalid(rec.group) then self:StopRecoveryFlash(resource) return end
+            rec.step=rec.step+1
+            if rec.step>=3 then
+                self:StopRecoveryFlash(resource)
+                log("[BossStage] "..resource.." recovery UI blink completed twice")
+                return
+            end
+            rec.group.GroupAlpha=rec.step==1 and rec.alpha or rec.alpha*0.25
+        end,0.18,0.18)
+        log("[BossStage] "..resource.." recovery UI blink started")
     end
 
 end

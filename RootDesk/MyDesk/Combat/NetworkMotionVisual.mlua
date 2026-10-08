@@ -1,0 +1,146 @@
+@Logic
+script NetworkMotionVisual extends Logic
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.entries = self._T.entries or {}
+        log("[NetworkMotion] client visual interpolation ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity Register(Entity source)
+        if not isvalid(source) or not isvalid(source.CurrentMap) then return source end
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or source.CurrentMap ~= player.CurrentMap then return source end
+        self._T.entries = self._T.entries or {}
+        local old = self._T.entries[source.Id]
+        if old ~= nil and isvalid(old.visual) then return old.visual end
+        local p = source.TransformComponent.WorldPosition
+        local visual = _SpawnService:SpawnByModelId("networkmotionanchor", "Motion_" .. source.Id, p, source.CurrentMap)
+        if not isvalid(visual) then return source end
+        local sr = source.SpriteRendererComponent
+        local alpha = isvalid(sr) and sr.Color.a or 1
+        local monster = source:GetComponent("script.Monster")
+        local entry = {source=source, visual=visual, raw=p, from=p, target=p, elapsed=0, duration=0.016,
+            receivedAt=_UtilLogic.ElapsedSeconds, alpha=alpha, visible=false,
+            life=isvalid(monster) and monster.LifeSerial or 0}
+        self._T.entries[source.Id] = entry
+        self:CopyAppearance(entry)
+        return visual
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector3 Position(Entity source)
+        local entry = self._T.entries and self._T.entries[source.Id] or nil
+        if entry ~= nil and isvalid(entry.visual) then return entry.visual.TransformComponent.WorldPosition end
+        return source.TransformComponent.WorldPosition
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CopyAppearance(table entry)
+        local source, visual = entry.source, entry.visual
+        local st, vt = source.TransformComponent, visual.TransformComponent
+        if vt.Scale ~= st.Scale then vt.Scale = st.Scale end
+        if vt.WorldZRotation ~= st.WorldZRotation then vt.WorldZRotation = st.WorldZRotation end
+        local visible=source.VisibleInHierarchy and source.EnabledInHierarchy
+        if visual.Visible~=visible then visual.Visible=visible end
+        local sr, vr = source.SpriteRendererComponent, visual.SpriteRendererComponent
+        if not isvalid(sr) then vr.Enable = false; return end
+        if vr.Enable ~= sr.Enable then vr.Enable = sr.Enable end
+        if vr.SpriteRUID ~= sr.SpriteRUID then vr.SpriteRUID = sr.SpriteRUID end
+        if vr.FlipX ~= sr.FlipX then vr.FlipX = sr.FlipX end
+        if vr.FlipY ~= sr.FlipY then vr.FlipY = sr.FlipY end
+        if vr.PlayRate ~= sr.PlayRate then vr.PlayRate = sr.PlayRate end
+        if vr.StartFrameIndex ~= sr.StartFrameIndex then vr.StartFrameIndex = sr.StartFrameIndex end
+        if vr.EndFrameIndex ~= sr.EndFrameIndex then vr.EndFrameIndex = sr.EndFrameIndex end
+        if vr.SortingLayer ~= sr.SortingLayer then vr.SortingLayer = sr.SortingLayer end
+        if vr.OrderInLayer ~= sr.OrderInLayer then vr.OrderInLayer = sr.OrderInLayer end
+        if vr.IgnoreMapLayerCheck ~= sr.IgnoreMapLayerCheck then vr.IgnoreMapLayerCheck = sr.IgnoreMapLayerCheck end
+        if vr.MaterialID ~= sr.MaterialID then vr.MaterialID = sr.MaterialID end
+        local c = sr.Color
+        if c.a ~= 0 then entry.alpha = c.a end
+        local monster = source:GetComponent("script.Monster")
+        local fade = isvalid(monster) and monster:GetLifecycleAlpha() or 1
+        local alpha=entry.alpha*fade
+        if entry.r~=c.r or entry.g~=c.g or entry.b~=c.b or entry.fadeAlpha~=alpha then
+            vr.Color=Color(c.r,c.g,c.b,alpha) entry.r=c.r entry.g=c.g entry.b=c.b entry.fadeAlpha=alpha
+        end
+        -- The original entity remains authoritative for physics, attacks and targeting.
+        -- Hide only its sprite; animation state and tint changes still run on it.
+        if c.a ~= 0 then sr.Color = Color(c.r, c.g, c.b, 0) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Remove(string id)
+        local entry = self._T.entries[id]
+        if entry == nil then return end
+        if isvalid(entry.source) and isvalid(entry.source.SpriteRendererComponent) then
+            local sr = entry.source.SpriteRendererComponent
+            local c = sr.Color
+            if c.a == 0 then sr.Color = Color(c.r, c.g, c.b, entry.alpha) end
+        end
+        if isvalid(entry.visual) then entry.visual:Destroy() end
+        self._T.entries[id] = nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        local player = _UserService.LocalPlayer
+        local map = isvalid(player) and player.CurrentMap or nil
+        local now = _UtilLogic.ElapsedSeconds
+        for id, entry in pairs(self._T.entries or {}) do
+            local source, visual = entry.source, entry.visual
+            if not isvalid(source) or not isvalid(visual) or source.CurrentMap ~= map then
+                self:Remove(id)
+            else
+                local raw = source.TransformComponent.WorldPosition
+                local stumpy = source:GetComponent("script.StumpyEncounter")
+                local scriptedJump = isvalid(stumpy) and stumpy.SlamStarted >= 0
+                if scriptedJump then
+                    local phase=math.max(0,math.min(1,(_UtilLogic.ServerElapsedSeconds-stumpy.SlamStarted)/1.2))
+                    raw=stumpy.SlamOrigin+Vector3(0,6.8*phase*(1-phase),0)
+                end
+                if entry.impactUntil~=nil and now<entry.impactUntil then raw=entry.impactPosition end
+                local monster = source:GetComponent("script.Monster")
+                local life = isvalid(monster) and monster.LifeSerial or 0
+                local visible = source.EnabledInHierarchy and source.VisibleInHierarchy
+                local dx, dy = raw.x-entry.raw.x, raw.y-entry.raw.y
+                if visible and (not entry.visible or life ~= entry.life or dx*dx+dy*dy > 16) then
+                    -- Map arrival, respawn and real teleports must not glide across the map.
+                    entry.from=raw; entry.target=raw; entry.elapsed=0; entry.duration=0.016
+                    visual.TransformComponent.WorldPosition=raw
+                    entry.receivedAt=now
+                elseif dx*dx+dy*dy > 0.00000001 then
+                    entry.from=visual.TransformComponent.WorldPosition
+                    entry.target=raw
+                    entry.elapsed=0
+                    entry.duration=math.max(0.016, math.min(0.12, now-entry.receivedAt))
+                    entry.receivedAt=now
+                end
+                entry.raw=raw; entry.life=life; entry.visible=visible
+                entry.elapsed=entry.elapsed+delta
+                local t=math.min(1,entry.elapsed/entry.duration)
+                local a,b=entry.from,entry.target
+                visual.TransformComponent.WorldPosition=Vector3(a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,raw.z)
+                if scriptedJump then visual.TransformComponent.WorldPosition=raw end
+                self:CopyAppearance(entry)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for id, _ in pairs(self._T.entries or {}) do self:Remove(id) end
+        self._T.entries = nil
+    end
+    @ExecSpace("ClientOnly")
+    method void SnapImpact(Entity source, Vector3 position)
+        -- Land the visible body with the impact packet; suppress stale pre-landing sync briefly.
+        local entry=(self._T.entries or {})[source.Id]
+        if entry==nil or not isvalid(entry.visual) then return end
+        entry.raw=position entry.from=position entry.target=position entry.elapsed=0
+        entry.impactPosition=position entry.impactUntil=_UtilLogic.ElapsedSeconds+0.15
+        entry.visual.TransformComponent.WorldPosition=position
+        log("[Stumpy] visual landing synchronized y="..tostring(position.y))
+    end
+end

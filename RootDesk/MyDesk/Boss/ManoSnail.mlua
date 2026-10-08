@@ -1,0 +1,233 @@
+@Component
+script ManoSnail extends Component
+    property string OwnerId = ""
+    @Sync property boolean Special = false
+    @Sync property number HitAt = -10
+    property number ExpiresAt = 0
+    property string Phase = "walk"
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- Match the ordinary snail's native wander physics without its unrelated AI tree.
+        self.Entity.RigidbodyComponent.WalkSpeed=0.5
+        self.Entity.MovementComponent.InputSpeed=1
+        self._T.side=_UtilLogic:RandomDouble()<0.5 and -1 or 1
+        self._T.radius=0.55+_UtilLogic:RandomDouble()*0.5
+        self._T.restUntil=0
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        -- Cross the player's position, pause at a flank, then approach the opposite flank.
+        local m=self.Entity:GetComponent("script.Monster")
+        if not isvalid(m) then return end
+        if m.IsDead then
+            self.Entity.MovementComponent:Stop()
+            if self._T.deathAt and _UtilLogic.ServerElapsedSeconds>=self._T.deathAt+(self._T.deathDuration or 0) then
+                local last=self._T.deathLastFrame or 0
+                self.Entity.SpriteRendererComponent.StartFrameIndex=last
+                self.Entity.SpriteRendererComponent.EndFrameIndex=last
+                self.Entity.SpriteRendererComponent.PlayRate=0
+            end
+            return
+        end
+        local r=(_BossStageManager._T.runs or {})[self.OwnerId]
+        local p=_UserService:GetUserEntityByUserId(self.OwnerId)
+        if not _BossStageManager:IsEncounterVisible(r) or not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then self.Entity.MovementComponent:Stop() return end
+        if m:IsSpawnProtected() then self.Entity.MovementComponent:Stop() return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if self.ExpiresAt>0 and now>=self.ExpiresAt then self:Expire() return end
+        if self._T.appearance==nil then return end
+        if self.Special and self:TickSpecial(p,delta) then return end
+        local px=p.TransformComponent.WorldPosition.x
+        local x=self.Entity.TransformComponent.WorldPosition.x
+        if now<self._T.restUntil then
+            self.Entity.MovementComponent:Stop()
+            self.Entity.SpriteRendererComponent.SpriteRUID=now-self.HitAt<0.4 and self._T.appearance.hit or self._T.appearance.stand
+            return
+        end
+        if self._T.goalX==nil or math.abs(px-(self._T.anchorX or px))>2 then
+            self._T.anchorX=px
+            self._T.goalX=math.max(-7.3,math.min(7.3,px+self._T.side*self._T.radius))
+        end
+        local dx=self._T.goalX-x
+        if math.abs(dx)<0.12 then
+            self._T.side=-self._T.side
+            self._T.radius=0.55+_UtilLogic:RandomDouble()*0.5
+            self._T.goalX=nil self._T.restUntil=now+0.2+_UtilLogic:RandomDouble()*0.4
+            self.Entity.MovementComponent:Stop()
+            self.Entity.SpriteRendererComponent.SpriteRUID=now-self.HitAt<0.4 and self._T.appearance.hit or self._T.appearance.stand
+            return
+        end
+        local dir=dx>=0 and 1 or -1
+        self.Entity.MovementComponent:MoveToDirection(Vector2(dir,0),0)
+        self.Entity.TransformComponent.Scale=Vector3(-dir,1,1)
+        self.Entity.SpriteRendererComponent.SpriteRUID=now-self.HitAt<0.4 and self._T.appearance.hit or self._T.appearance.move
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Configure(boolean special, integer color, number lifetime)
+        -- Select the matching asset pack before the first movement tick.
+        self.Special=special self.Phase="loading"
+        self._T.appearance=_BossStageManager:SnailAppearance(special,color)
+        local a=self._T.appearance
+        self.Entity.SpriteRendererComponent.SpriteRUID=a.stand
+        local animation=self.Entity.StateAnimationComponent
+        if isvalid(animation) then animation.Enable=false end
+        local m=self.Entity:GetComponent("script.Monster")
+        m.Stationary=true m.MonsterDisplayName=a.name m:SetupMonsterNameTag()
+        if lifetime>0 then self.ExpiresAt=_UtilLogic.ServerElapsedSeconds+lifetime end
+        self._T.deathDuration=self:ClipDuration(a.die)
+        self._T.deathLastFrame=(_BossStageManager._T.snailClips[a.die] or {}).last or 0
+        if not isvalid(self.Entity) then return end
+        if special then
+            self.Entity.StateComponent:DisconnectHitEvent()
+            m.MaxHp=1000 m.Hp=1000
+            self._T.angryDuration=self:ClipDuration(a.angry)
+            if not isvalid(self.Entity) then return end
+            self._T.sleepDuration=self:ClipDuration(a.sleep)
+            if not isvalid(self.Entity) then return end
+            self._T.nextAttack=0
+        end
+        self.Phase="walk"
+        log("[BossStage] snail variant="..a.name.." special="..tostring(special))
+    end
+
+    @ExecSpace("ServerOnly")
+    method number ClipDuration(string ruid)
+        -- Cache native frame timing once per spawned special snail.
+        _BossStageManager._T.snailClips=_BossStageManager._T.snailClips or {}
+        local cached=_BossStageManager._T.snailClips[ruid]
+        if cached~=nil then return cached.duration end
+        local clip=_ResourceService:LoadAnimationClipAndWait(ruid)
+        local duration=0 local frames={}
+        if clip~=nil then frames=clip.Frames:ToTable() for _,frame in ipairs(frames) do duration=duration+frame.Delay end end
+        duration=math.max(0.1,duration)
+        _BossStageManager._T.snailClips[ruid]={duration=duration,last=math.max(0,#frames-1)}
+        return duration
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginPhase(string phase, number duration)
+        -- Each cast phase owns movement and animation until its deadline.
+        self.Phase=phase self._T.phaseUntil=_UtilLogic.ServerElapsedSeconds+duration
+        self.Entity.MovementComponent:Stop()
+        local a=self._T.appearance
+        self.Entity.SpriteRendererComponent.SpriteRUID=phase=="flight" and a.roll or phase=="sleep" and a.sleep or a.angry
+        log("[BossStage] special snail phase="..phase.." duration="..tostring(duration))
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean TickSpecial(Entity player, number delta)
+        -- Complete windup, fixed-direction flight and recovery in sequence.
+        local now=_UtilLogic.ServerElapsedSeconds
+        local pos=self.Entity.TransformComponent.WorldPosition
+        local rb=self.Entity.RigidbodyComponent
+        if self.Phase=="loading" then self.Entity.MovementComponent:Stop() return true end
+        if self.Phase=="walk" then
+            -- Magic Claw's current forward reach is 2 * 2.5 * (2/3) world units.
+            local target=player.TransformComponent.WorldPosition
+            if now>=(self._T.nextAttack or 0) and math.abs(target.x-pos.x)<=10/3*1.3 and math.abs(target.y-pos.y)<=1.5 then
+                self._T.direction=target.x>=pos.x and 1 or -1
+                self.Entity.TransformComponent.Scale=Vector3(-self._T.direction,1,1)
+                self:BeginPhase("angry",self._T.angryDuration)
+                return true
+            end
+            return false
+        end
+        if self.Phase=="flight" then
+            self.Entity:GetComponent("script.MonsterAttack"):AttackNear()
+            self.Entity.MovementComponent.Enable=true
+            self.Entity.MovementComponent.InputSpeed=1.875
+            self.Entity.SpriteRendererComponent.PlayRate=1
+            rb:SetForce(Vector2.zero)
+            local travelled=math.abs(pos.x-self._T.flightStart)
+            if travelled>=5 or now>=self._T.phaseUntil then
+                self.Entity.MovementComponent:Stop()
+                rb.KinematicMove=false rb:SetWorldPosition(Vector2(pos.x,pos.y))
+                self.Entity.MovementComponent.InputSpeed=1
+                self:BeginPhase("recover",self._T.angryDuration)
+            else
+                self.Entity.MovementComponent:MoveToDirection(Vector2(self._T.direction,0),0)
+            end
+            return true
+        end
+        self.Entity.MovementComponent:Stop()
+        if now<self._T.phaseUntil then return true end
+        if self.Phase=="angry" then self:BeginPhase("sleep",self._T.sleepDuration)
+        elseif self.Phase=="sleep" then
+            self._T.flightStart=pos.x
+            self:BeginPhase("flight",5/1.875)
+            self._T.flightHits={}
+            self.Entity:GetComponent("script.MonsterAttack")._T.contactPrevious=nil
+            self.Entity:GetComponent("script.MonsterAttack"):AttackNear()
+            self.Entity.StateComponent:ChangeState("IDLE")
+            self.Entity.MovementComponent.Enable=true
+            rb.KinematicMove=true rb:SetWorldPosition(Vector2(pos.x,pos.y))
+            rb.KinematicMoveAcceleration=Vector2(1,1)
+            -- 1.5 times the previous dash speed; retain the same five-unit travel distance.
+            self.Entity.MovementComponent.InputSpeed=1.875
+            self.Entity.MovementComponent:MoveToDirection(Vector2(self._T.direction,0),0)
+        else
+            self.Phase="walk" self._T.nextAttack=now+5+_UtilLogic:RandomDouble()*3
+            self._T.goalX=nil
+            self.Entity.SpriteRendererComponent.SpriteRUID=self._T.appearance.stand
+            log("[BossStage] special snail cooldown="..tostring(self._T.nextAttack-now))
+        end
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Expire()
+        -- Expiry is not a kill: no drop, collection, on-kill proc or reward.
+        local m=self.Entity:GetComponent("script.Monster")
+        if m.IsDead then return end
+        m.DeathFadeAlpha=m:GetLifecycleAlpha() m.DeathFadeStarted=_UtilLogic.ServerElapsedSeconds
+        m.IsDead=true m.HealthBarUntil=0
+        self:BeginDeathMotion()
+        self.Entity.HitComponent.Enable=false
+        self.Entity.MovementComponent:Stop()
+        local entity=self.Entity
+        _TimerService:SetTimerOnce(function() if isvalid(entity) then entity:Destroy() end end,(self._T.deathDuration or 0)+1)
+        log("[BossStage] summoned snail lifetime expired")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginDeathMotion()
+        -- Play the matching death/cry clip upright, then fade without rotating.
+        if self._T.appearance==nil then return end
+        self.Phase="dead" self._T.deathAt=_UtilLogic.ServerElapsedSeconds
+        self.Entity.TransformComponent.WorldZRotation=0
+        local m=self.Entity:GetComponent("script.Monster")
+        m.DeathFadeAlpha=1
+        m.DeathFadeStarted=self._T.deathAt+(self._T.deathDuration or 0)
+        m.DestroyDelay=(self._T.deathDuration or 0)+1
+        local p=self.Entity.TransformComponent.WorldPosition
+        self.Entity.MovementComponent:Stop()
+        self.Entity.RigidbodyComponent.KinematicMove=false
+        self.Entity.RigidbodyComponent:SetWorldPosition(Vector2(p.x,p.y))
+        self.Entity.SpriteRendererComponent.PlayRate=1
+        self.Entity.SpriteRendererComponent.SpriteRUID=self._T.appearance.die
+        self.Entity.HitComponent.Enable=false
+        log("[BossStage] snail death motion "..self._T.appearance.name)
+    end
+    @ExecSpace("ServerOnly")
+    method void ConfigureShadow(boolean axe)
+        self._T.shadow=true
+        -- Share Mano's flank chase, hit reaction and death lifecycle with Perion summons.
+        self.Special=false self.Phase="loading"
+        self._T.appearance=axe and {name="그림자 엑스텀프",stand="b1ad4e54249d4415aa21aabb3f8c4188",move="3e8a52ae0e4d43c7b7d52c8e299e3373",hit="35e7323d0fe74a4cb8ae7059b7c8c2aa",die="8cd517d140e443b7841a506adaee340f"} or {name="그림자 스텀프",stand="9ecfbf934fc242b89fb12bedfcf6da34",move="2eaeb65bcdab4350a2273e1e8bfd55d5",hit="6d20710bc80047d9a870a8a29d329614",die="d8efb8701dd24e0ab4dbf9633772facf"}
+        local a=self._T.appearance
+        local m=self.Entity:GetComponent("script.Monster")
+        m.Stationary=true m.MonsterDisplayName=a.name m.MaxHp=axe and 667 or 333 m.Hp=m.MaxHp
+        m.HitSoundRUID=axe and "ecbedff9237c46969ef08caec2fd7c11" or "de75204f3983452ba4be473ef505c425"
+        m.DeathSoundRUID="5a1056a232dd422d933f7e9714c24de5"
+        m:SetupMonsterNameTag()
+        self.Entity.SpriteRendererComponent.SpriteRUID=a.stand
+        self._T.deathDuration=self:ClipDuration(a.die)
+        if not isvalid(self.Entity) then return end
+        self._T.deathLastFrame=(_BossStageManager._T.snailClips[a.die] or {}).last or 0
+        self.Phase="walk"
+        log("[Stumpy] shadow summon="..a.name.." hp="..tostring(m.Hp))
+    end
+end

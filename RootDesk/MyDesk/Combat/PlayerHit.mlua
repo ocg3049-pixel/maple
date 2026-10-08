@@ -145,6 +145,7 @@ script PlayerHit extends HitComponent
 
     @ExecSpace("ServerOnly")
     method void ServerWatchdogTick()
+        self:EnsureRespawn()
         -- 무적이 비정상적으로 오래 지속되면(= 해제 타이머 유실) 강제로 되돌린다.
         if not isvalid(self.Entity) then return end
         -- 로프 등반 무적은 의도된 장기 무적이라 아래 강제 해제 대상이 아니다 - 대신 자체 상한을 둔다.
@@ -267,6 +268,10 @@ script PlayerHit extends HitComponent
         if not isvalid(localPlayer) or localPlayer ~= self.Entity then return end
         local sc = self.Entity.StateComponent
         if not isvalid(sc) then return end
+        if (self.Entity.PlayerComponent.Hp<=0 or self.Entity.PlayerComponent:IsDead() or sc.CurrentStateName=="DEAD") and _UtilLogic.ElapsedSeconds >= (self._T.respawnRetryAt or 0) then
+            self._T.respawnRetryAt=_UtilLogic.ElapsedSeconds+2
+            self:RequestRespawnRecovery()
+        end
 
         -- (요청) 브랜디쉬 시전 중에는 HIT -> IDLE 복귀를 미룬다 - 여기서 IDLE로 되돌리면 IDLE에 매핑된
         -- 기본 자세(stand)가 몸에 내려가 브랜디쉬 모션을 끊는다("모션은 그대로 두고 표정만" 요청).
@@ -275,7 +280,7 @@ script PlayerHit extends HitComponent
         -- - HIT에 영구히 갇히는 이동불가 버그로 돌아가지 않는다.
         ---@type PlayerAttack
         local pa = self.Entity:GetComponent("script.PlayerAttack")
-        if isvalid(pa) and pa:IsBrandishMotionGuardOn() then return end
+        if isvalid(pa) and (pa:IsDeathBlocked() or pa:IsBrandishMotionGuardOn()) then return end
 
         if sc.CurrentStateName ~= "HIT" then
             self._T.hitFor = 0
@@ -437,7 +442,9 @@ script PlayerHit extends HitComponent
         -- (피드백) 방패 이펙트 높이: -0.3 (사용자 지정값)
         _EffectService:PlayEffectAttached("fd0e7aeb826f4a5486af1a03dfbf592e", self.Entity, Vector3(0, -0.3, 0), 0, Vector3(1, 1, 1), false)
         -- 엔진 데미지 스킨의 "Guard" 텍스트(피격 스킨 RUID 기반) - 데미지 숫자 대신 Guard가 뜬다.
+        if not _AutoHuntPowerSave.active then
         _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        end
         -- (팔라딘 개편) 머리 위 상태 아이콘(29dc0219···)을 감소 버프 지속(10초) 동안 루프 표시.
         -- 재가드로 갱신되면 기존 아이콘을 지우고 새로 건다(토큰으로 옛 제거 타이머 무효화).
         self._T.guardHeadToken = (self._T.guardHeadToken or 0) + 1
@@ -501,13 +508,17 @@ script PlayerHit extends HitComponent
             _EffectService:RemoveEffect(serial)
         end, 1.2)
         -- 가드 표시(가드/패링과 같은 엔진 텍스트 데미지스킨).
+        if not _AutoHuntPowerSave.active then
         _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        end
         -- 남은 쉴드 개수를 머리 위에 숫자로 표시(힐과 같은 파란 스킨 재사용).
+        if not _AutoHuntPowerSave.active then
         _DamageSkinService:Play(
             self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0,
             { remain }, DamageSkinTweenType.Default, false,
             Vector2(0, 0.35), Vector2(1, 1), 1.0, 1.0, LitMode.Default
         )
+        end
     end
 
     @ExecSpace("ServerOnly")
@@ -567,7 +578,9 @@ script PlayerHit extends HitComponent
         if not self:IsClient() then return end
         if not isvalid(self.Entity) then return end
         _GameAudio:PlaySound("dca3f8aa0f524bf59e85ff44792b1860", 1.0)
+        if not _AutoHuntPowerSave.active then
         _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        end
         self:PlayParryShimmer()
     end
 
@@ -652,7 +665,9 @@ script PlayerHit extends HitComponent
         -- 무적 상태면 판정을 거부한다 - 실측 결과 이 프로젝트의 몬스터 근접공격(MonsterAttack)에는 이 훅이
         -- 전혀 호출되지 않는 것으로 확인됐지만, 다른 공격 경로가 이 훅을 실제로 참조할 경우를 대비한
         -- 보조 방어선으로 남겨둔다 - 주 방어선은 MonsterAttack.IsAttackTarget의 IsInvincible 체크.
-        if self.IsInvincible or self._T.invincible or self._T.climbInvincible then return false end
+        if self._T.climbInvincible then return false end
+        if attackInfo=="boss.mano.dash" then return true end
+        if self.IsInvincible or self._T.invincible then return false end
         return true
     end
 
@@ -660,7 +675,13 @@ script PlayerHit extends HitComponent
         -- 서버가 유일한 권위 - OnHit의 부모 ExecSpace가 미지정(=All)이라 클라이언트에서도 호출될 수 있어
         -- 클라이언트 쪽 실행은 맨 앞에서 걸러낸다.
         if not self:IsServer() then return end
-        if self._T.invincible or self._T.climbInvincible then return end
+        if _BossStageManager:IsStumpyParryInvincible(self.Entity) then return end
+        local snail=isvalid(attacker) and attacker:GetComponent("script.ManoSnail") or nil
+        local dash=attackInfo=="boss.mano.dash" and isvalid(snail) and snail.Special and snail.Phase=="flight" and snail.OwnerId==self.Entity.PlayerComponent.UserId
+        -- Only a validated special-snail dash bypasses the ordinary hit cooldown.
+        if self._T.climbInvincible or ((self.IsInvincible or self._T.invincible) and not dash) then return end
+        self._T.hitImmuneGeneration=(self._T.hitImmuneGeneration or 0)+1
+        local generation=self._T.hitImmuneGeneration
         self._T.invincible = true
         self.IsInvincible = true
         -- 무적은 IsInvincible/IsHitTarget으로 판정한다. Enable=false는 HIT·표정 종료를 끊는다.
@@ -668,6 +689,8 @@ script PlayerHit extends HitComponent
 
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
         self:ShowTakenDamage(damage)
+        if damage>0 then _BossStageManager:BossContactHit(attacker,self.Entity,attackInfo) end
+        if dash and damage>0 then _BossStageManager:PlayDashImpact(self.Entity,self.Entity.PlayerComponent.UserId) end
 
         -- (개편 2026-08-12, 표시 조정) 파워가드 버프 중이면 **3초에 한 번씩 총 3틱**으로
         -- 입은 피해의 healPct%(분배당 2%, 마스터 40%)를 회복한다. 표시는 힐 데미지 스킨.
@@ -710,7 +733,7 @@ script PlayerHit extends HitComponent
         -- 서버가 ChangeState("IDLE")를 호출하면 플레이어 상태 권한이 없어 [LEA-3022]로 항상 실패한다.
 
         _TimerService:SetTimerOnce(function()
-            if isvalid(self.Entity) then
+            if isvalid(self.Entity) and self._T.hitImmuneGeneration==generation then
                 self.Enable = true
                 self._T.invincible = false
                 self.IsInvincible = self._T.climbInvincible == true
@@ -722,11 +745,45 @@ script PlayerHit extends HitComponent
     @ExecSpace("Client")
     method void ShowTakenDamage(integer damage)
         if not isvalid(self.Entity) then return end
+        if not _AutoHuntPowerSave.active then
         _DamageSkinService:Play(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", 0,
             { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, false,
             Vector2(0, 0), Vector2(1, 1), 1, 1, LitMode.Default)
+        end
         self._T.takenDamageDisplayCount = (self._T.takenDamageDisplayCount or 0) + 1
         log("[PlayerDamageSkin] accepted hit=" .. tostring(self._T.takenDamageDisplayCount) .. " damage=" .. tostring(damage) .. " skin=02c22d93421b4038b3c413b3e40b57ec")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void EnsureRespawn()
+        local pc=self.Entity.PlayerComponent
+        if not isvalid(pc) then return end
+        if pc.Hp>0 then self._T.respawnDeadline=nil return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if self._T.respawnDeadline==nil then
+            local duration=math.max(1,pc.RespawnDuration)
+            local deadline=pc.RespawnTime
+            if deadline<=0 or deadline>now+duration+2 then deadline=now+duration end
+            self._T.respawnDeadline=deadline
+        end
+        if now<self._T.respawnDeadline+1 then return end
+        -- Server owns the deadline and HP. A lost client/timer callback cannot strand a corpse.
+        pc:Respawn()
+        pc.Hp=math.max(1,pc.MaxHp)
+        pc:ProcessRevive(pc.UserId)
+        self._T.respawnDeadline=nil
+        log("[RespawnRecovery] overdue respawn completed")
+    end
+
+    @ExecSpace("Server")
+    method void RequestRespawnRecovery()
+        local pc=self.Entity.PlayerComponent
+        if not isvalid(pc) or senderUserId~=pc.UserId then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(self._T.respawnRequestAt or 0) then return end
+        self._T.respawnRequestAt=now+1
+        self:EnsureRespawn()
+        if pc.Hp>0 then pc:ProcessRevive(pc.UserId) end
     end
 
 end

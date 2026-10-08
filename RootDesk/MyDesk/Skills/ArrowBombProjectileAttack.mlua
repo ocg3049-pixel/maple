@@ -18,6 +18,13 @@ script ArrowBombProjectileAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+        if not isvalid(defender) then return false end
+        local planned = self._T.flyingDamage ~= nil and self._T.flyingDamage[defender.Id] or nil
+        if self._T.flyingDamage~=nil and planned==nil and string.find(attackInfo or "", ".blast",1,true)==nil then return false end
+        if planned ~= nil then
+            local mon = defender:GetComponent("script.Monster")
+            if not isvalid(mon) or mon.LifeSerial ~= planned.life then return false end
+        end
 		-- 직격("skill.arrowbomb")은 화살 한 발이 적 "한 명"만 맞힌다 - 이미 명중했으면 이후 판정을 막는다.
 		-- 폭발의 추가 타격("skill.arrowbomb.blast")은 명중 뒤의 별도 판정이라 HasHit 필터를 타지 않고,
 		-- 대신 그 순간 지정된 단일 대상만 통과시킨다(밀집 지역 교차 히트 방지).
@@ -49,9 +56,6 @@ script ArrowBombProjectileAttack extends AttackComponent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
-		-- 화살에 새겨진 RateMin/RateMax(1레벨 150%~170%, 분배 1포인트당 각 +10%p)를 쓴다.
-		-- 직격 판정에서만 명중을 기록하고 그 자리에서 폭발을 시작한다.
-		---@type ArrowBombProjectile
 		local proj = self.Entity:GetComponent("script.ArrowBombProjectile")
 		local combatPower = 0
 		local critRate = 0.5
@@ -66,16 +70,11 @@ script ArrowBombProjectileAttack extends AttackComponent
 				proj:MarkHit(defender)
 			end
 		end
-		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
-		local dmg = math.floor(combatPower * mult)
-		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
-		-- 크리티컬은 여기서 직접 굴리고 배율을 반환값에 바로 곱한다(아래 CalcCritical은 엔진의 이중
-		-- 배율 적용을 막기 위해 항상 false를 반환). math.random() 대신 _UtilLogic:RandomDouble()을 쓰는
-		-- 이유는 짧은 간격의 연속 호출에서 같은 시퀀스를 반복 소비하는 문제 때문(다른 화살 스킬과 동일).
-		local isCritical = _UtilLogic:RandomDouble() < critRate
-		if isCritical then
-			dmg = math.floor(dmg * 2.0)
-		end
+        local pa = isvalid(self.OwnerEntity) and self.OwnerEntity:GetComponent("script.PlayerAttack") or nil
+        local roll
+        if isvalid(pa) then roll = pa:ResolveFlyingDamage(self, defender, attackInfo)
+        else roll = self:RollPlannedDamage(defender, attackInfo) end
+        local dmg, isCritical = roll.dmg, roll.critical
 		self:ShowArrowBombDamageSkin(defender, dmg, isCritical, self:GetProjectileDamageSkinId())
 		return dmg
 	end
@@ -89,11 +88,13 @@ script ArrowBombProjectileAttack extends AttackComponent
 	method void ShowArrowBombDamageSkin(Entity target, integer damage, boolean isCritical, string skinRuid)
 		-- 다른 스킬들과 동일한 데미지 스킨(RUID)을 재생해 룩앤필을 통일한다.
 		if not isvalid(target) then return end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, skinRuid, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCritical,
 			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 	end
 
 	-- ── 폭발 연출 ────────────────────────────────────────────────────────
@@ -215,5 +216,41 @@ script ArrowBombProjectileAttack extends AttackComponent
 		-- 피해/MISS는 위 수동 표시에서 처리한다. 엔진의 숫자를 중복 출력하지 않는다.
 		return 0
 	end
+
+
+    @ExecSpace("ServerOnly")
+    method table RollPlannedDamage(Entity defender, string attackInfo)
+		local proj = self.Entity:GetComponent("script.ArrowBombProjectile")
+		local combatPower = 0
+		local critRate = 0.5
+		local rateMin = 1.5
+		local rateMax = 1.7
+		if proj ~= nil then
+			combatPower = proj.CombatPower
+			critRate = (proj.CritRate or 50) / 100
+			rateMin = proj.RateMin or rateMin
+			rateMax = proj.RateMax or rateMax
+			if attackInfo ~= "skill.arrowbomb.blast" then
+
+			end
+		end
+		local mult = rateMin + _UtilLogic:RandomDouble() * math.max(0, rateMax - rateMin)
+		local dmg = math.floor(combatPower * mult)
+		dmg = self:ApplyBackstabToDamage(dmg, defender, attackInfo)
+		local isCritical = _UtilLogic:RandomDouble() < critRate
+		if isCritical then
+			dmg = math.floor(dmg * 2.0)
+		end
+        return {dmg=dmg,bonus=0,critical=isCritical,bonusCritical=false}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        for _, roll in pairs(self._T.flyingDamage or {}) do
+            local mon = isvalid(roll.target) and roll.target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
+        end
+        self._T.flyingDamage = nil
+    end
 
 end

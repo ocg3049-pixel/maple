@@ -1,0 +1,203 @@
+@Logic
+script AutoHuntPowerSave extends Logic
+    property boolean active = false
+    property number elapsed = 0
+    property number fade = 0
+    property number hold = 0
+    property integer touchId = 0
+    property boolean stopped = false
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- Keep the entry on the HUD layer while the active blackout remains above windows.
+        if path=="Entry" then return _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/PowerSaveEntry") end
+        return _EntityService:GetEntityByPath("/ui/AutoHuntPowerSave/" .. path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self.active = false
+        self.fade = 0
+        self._T.links = {}
+        self:UI("Entry").Enable = false
+        self:UI("Overlay").Enable = false
+        self:Bind("Entry", ButtonClickEvent, function() self:Enter() end)
+        self:Bind("Overlay", UITouchDownEvent, function(e)
+            if self.active and self.touchId == 0 and (e.TouchId == -1 or e.TouchId > 0) then
+                self.touchId = e.TouchId self.hold = 0
+            end
+        end)
+        self:Bind("Overlay", UITouchUpEvent, function(e)
+            if e.TouchId == self.touchId then self:CancelHold() end
+        end)
+        self:Bind("Overlay", UITouchExitEvent, function() self:CancelHold() end)
+        log("[MobileCheck] PowerSave ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any eventType, any callback)
+        local e = self:UI(path)
+        table.insert(self._T.links, {entity=e, eventType=eventType, listener=e:ConnectEvent(eventType, callback)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Enter()
+        if self.active or not _AutoHuntManager:IsActive() or not _LoginFlow:IsInGame() then return end
+        _MobileUIManager:ReleaseControls()
+        self.active = true
+        self.elapsed = 0
+        self.stopped = false
+        self._T.second = -1
+        self:CancelHold()
+        self:UI("Entry").Enable = false
+        self:UI("Overlay").Enable = true
+        self:Draw()
+        log("[MobileCheck] PowerSave entered")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CancelHold()
+        self.touchId = 0
+        self.hold = 0
+        self._T.percent = -1
+        local hint = self:UI("Overlay/Unlock")
+        if isvalid(hint) then hint.TextGUIRendererComponent.Text = "화면 아무 곳이나 1.5초 길게 눌러 해제" end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Exit()
+        self.active = false
+        self:CancelHold()
+        self:UI("Overlay").Enable = false
+        self.fade = 0
+        _MapleHUDManager:UpdateHUD()
+        _MapleHUDManager:RefreshBars()
+        log("[MobileCheck] PowerSave exited")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Scale the complete entry only in mobile mode and refresh its placement bounds.
+        local entry = self:UI("Entry")
+        if not isvalid(entry) then return end
+        local mobile = _MobileUIManager:IsMobile()
+        if self._T.entryMobile ~= mobile then
+            local tr = entry.UITransformComponent
+            self._T.entryBaseScale = self._T.entryBaseScale or tr.UIScale
+            local baseScale = self._T.entryBaseScale
+            local factor = mobile and 0.7 or 1
+            tr.UIScale = Vector3(baseScale.x*factor, baseScale.y*factor, baseScale.z)
+            self._T.entryMobile = mobile
+            self._T.nextPosition = 0
+            log("[PowerSave] entry mobile="..tostring(mobile).." scale="..tostring(tr.UIScale))
+        end
+        local hunting = _AutoHuntManager:IsActive()
+        local inGame = _LoginFlow:IsInGame()
+        if self.active then
+            if not inGame then self:Exit() return end
+            local player = _UserService.LocalPlayer
+            local dead = isvalid(player) and isvalid(player.PlayerComponent) and player.PlayerComponent:IsDead()
+            if (not hunting or dead) and not self.stopped then
+                self.stopped = true
+                self:CancelHold()
+                self._T.second = -1
+                log("[MobileCheck] PowerSave hunt stopped")
+            end
+            if hunting and not dead and self.stopped then
+                self.stopped = false self._T.second = -1
+            end
+            if not self.stopped then self.elapsed += delta end
+            if self.touchId ~= 0 then
+                self.hold += delta
+                local percent = math.min(100, math.floor(self.hold / 1.5 * 100))
+                if percent ~= self._T.percent then
+                    self._T.percent = percent
+                    self:UI("Overlay/Unlock").TextGUIRendererComponent.Text = "해제 중 " .. tostring(percent) .. "%"
+                end
+                if self.hold >= 1.5 then self:Exit() return end
+            end
+            if math.floor(self.elapsed) ~= self._T.second then self:Draw() end
+            return
+        end
+        local visible = hunting and inGame
+        if visible and _MobileUIManager:IsMobile() then
+            if _MobileUIManager:CurrentWindow() ~= "" or _MobileUIManager:UI("MenuPanel").Enable then visible = false
+            else visible = self:PlaceEntry() end
+        elseif visible then entry.UITransformComponent.anchoredPosition = Vector2(-28,90) end
+        entry.Enable = visible
+        if not visible then self.fade = 0 return end
+        if self.fade < 1 then
+            self.fade = math.min(1, self.fade + delta / 1.2)
+            entry.CanvasGroupComponent.GroupAlpha = self.fade
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        local overlay = self:UI("Overlay").UITransformComponent
+        local parent = self:UI("Overlay").Parent.UITransformComponent
+        local a = _UILogic:ScreenToLocalUIPosition(Vector2.zero, parent)
+        local b = _UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight), parent)
+        overlay.RectSize = Vector2(math.abs(b.x-a.x)+4, math.abs(b.y-a.y)+4)
+        overlay.anchoredPosition = (a+b)*0.5
+        self._T.second = math.floor(self.elapsed)
+        local seconds = self._T.second
+        self:UI("Overlay/Status").TextGUIRendererComponent.Text = self.stopped and "자동사냥이 중단되었습니다" or "자동사냥 중"
+        self:UI("Overlay/Status").TextGUIRendererComponent.FontColor = self.stopped and Color(1,0.72,0.35,1) or Color(0.65,0.7,0.7,1)
+        self:UI("Overlay/Time").TextGUIRendererComponent.Text = "절전 경과 " .. string.format("%02d:%02d:%02d", math.floor(seconds/3600), math.floor(seconds/60)%60, seconds%60)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        self.active = false
+        for _, link in ipairs(self._T.links or {}) do
+            if isvalid(link.entity) then link.entity:DisconnectEvent(link.eventType, link.listener) end
+        end
+        self._T.links = {}
+    end
+    @ExecSpace("ClientOnly")
+    method boolean PlaceEntry()
+        local now = _UtilLogic.ElapsedSeconds
+        if now < (self._T.nextPosition or 0) then return self._T.positionFound == true end
+        self._T.nextPosition = now + 0.5
+        local entry = self:UI("Entry")
+        local root = entry.Parent.UITransformComponent
+        local width, height = root.RectSize.x, root.RectSize.y
+        local buttonWidth = entry.UITransformComponent.RectSize.x * entry.UITransformComponent.UIScale.x
+        local halfHeight = entry.UITransformComponent.RectSize.y * entry.UITransformComponent.UIScale.y / 2 + 6
+        local bounds = {}
+        for _, target in ipairs(_MobileUIManager:LayoutTargets()) do
+            if target.path ~= "Skills" then
+                local e = _MobileUIManager:UI(target.path)
+                if isvalid(e) and e.EnabledInHierarchy then
+                    local tr = e.UITransformComponent
+                    local a = Vector2(-tr.RectSize.x*tr.Pivot.x,-tr.RectSize.y*tr.Pivot.y)
+                    local b = a + tr.RectSize
+                    a = _UILogic:ScreenToLocalUIPosition(_UILogic:WorldToScreenPosition(_UILogic:LocalUIToWorldPosition(a,tr)),root)
+                    b = _UILogic:ScreenToLocalUIPosition(_UILogic:WorldToScreenPosition(_UILogic:LocalUIToWorldPosition(b,tr)),root)
+                    table.insert(bounds,{left=math.min(a.x,b.x)-14,right=math.max(a.x,b.x)+14,bottom=math.min(a.y,b.y)-14,top=math.max(a.y,b.y)+14})
+                end
+            end
+        end
+        for column = 0, 1 do
+            local right = width/2 - 28 - column*220
+            for row = 0, 5 do
+                local y = height/2 - 230 - row*85
+                if y-halfHeight > -height/2+120 then
+                    local clear = true
+                    for _, box in ipairs(bounds) do
+                        if right > box.left and right-buttonWidth < box.right and y+halfHeight > box.bottom and y-halfHeight < box.top then clear=false break end
+                    end
+                    if clear then
+                        entry.UITransformComponent.anchoredPosition=Vector2(right-width/2,y)
+                        self._T.positionFound=true
+                        return true
+                    end
+                end
+            end
+        end
+        self._T.positionFound=false
+        return false
+    end
+
+end

@@ -1,0 +1,142 @@
+@Logic
+script DestructionFragments extends Logic
+    @ExecSpace("ClientOnly")
+    method void OpenShop()
+        _UIEquipInventoryManager:CancelInvenDrag()
+        _UIEquipInventoryManager:HideTooltip()
+        if not _CosmeticExchange.opened then _CosmeticExchange:Open() end
+        if _CosmeticExchange.opened then _CosmeticExchange:SetMode("destruction") end
+    end
+
+
+    property string icon = "69421a781fc04221a7d7a2c79f6b94f1"
+
+    @ExecSpace("ClientOnly")
+    method boolean IsShard(string item)
+        return string.find((item or "").."|", "|destruction_shard|", 1, true) ~= nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Item(integer count)
+        return "파괴의 조각|"..self.icon.."|0|0|0|0|"..tostring(count).."|destruction_shard"
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer Count()
+        local inv=_UIEquipInventoryManager
+        local total=0
+        for i=1,128 do
+            local item=inv:GetTabItem("etc",i)
+            if self:IsShard(item) and not inv:IsItemLocked(item) then total=total+inv:ParseCount(item) end
+        end
+        return total
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshMaterials()
+        local inv=_UIEquipInventoryManager
+        if inv._T.tabData==nil then return end
+        -- Migrate only the icon field: preserve quantities, locks and future metadata.
+        for i=1,128 do
+            local item=inv:GetTabItem("etc",i)
+            if _CosmeticExchange:IsShard(item) and inv:ParseRUID(item)~=_CosmeticExchange.shardRuid then
+                local fields=_EnhancementManager:SplitItemFieldsPreserve(item)
+                fields[2]=_CosmeticExchange.shardRuid
+                inv:SetTabItem("etc",i,table.concat(fields,"|"))
+            end
+        end
+        local left=inv._T.pendingDestructionShards or 0
+        if left<=0 then return end
+        for pass=1,2 do
+            for i=1,128 do
+                local item=inv:GetTabItem("etc",i)
+                if (pass==1 and self:IsShard(item) and not inv:IsItemLocked(item)) or (pass==2 and item=="") then
+                    local old=item=="" and 0 or inv:ParseCount(item)
+                    local add=math.min(left,math.max(0,inv:GetItemMaxStack(self.icon)-old))
+                    if add>0 then inv:SetTabItem("etc",i,inv:WithStackCount(item=="" and self:Item(1) or item,old+add)) left=left-add end
+                    if left==0 then break end
+                end
+            end
+            if left==0 then break end
+        end
+        inv._T.pendingDestructionShards=left
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AwardDestroyed(string item)
+        if item==nil or item=="" then return end
+        -- Called only after an actual destruction commit, before its save/refresh.
+        local count=math.max(0,math.floor(_UIEquipInventoryManager:ParseStars(item)))
+        local inv=_UIEquipInventoryManager
+        inv._T.pendingDestructionShards=(inv._T.pendingDestructionShards or 0)+count
+        self:RefreshMaterials()
+        self._T.notices=self._T.notices or {}
+        table.insert(self._T.notices,count)
+        if (inv._T.pendingDestructionShards or 0)>0 then
+            _UIToast:ShowMessage("기타 인벤토리가 가득 찼습니다. 파괴의 조각은 보관되며 빈 칸이 생기면 지급됩니다.")
+        end
+        log("[DestructionFragments] awarded="..tostring(count).." pending="..tostring(inv._T.pendingDestructionShards or 0))
+    end
+
+    @ExecSpace("ClientOnly")
+    method table Catalog()
+        -- 파괴 손실을 보완하는 교환가. 일반 상자 100, 고급 3,000조각은 유지.
+        -- 프로텍트/1~5성권은 모두 기본 드롭률 0.005%, 평균 2만 처치당 1개.
+        -- 같은 사냥량에서 일반 상자 약 200개. 전부 강화 중 파괴하면 평균 약 1,700조각.
+        -- 메소 비용도 드는 보완 획득 경로이므로 두 주문서를 2,000조각으로 조정.
+        -- 1~5성권은 성공 70%, 파괴 30%; 성공 시 각 추가 성수는 균등 20%.
+        return {
+            {key="fragment_box",name="장비 상자",price=100,ruid="90d3412612004466b328850446cb1d68",kind="normal",desc="원하는 부위의 0~30성 장비를 획득합니다."},
+            {key="fragment_premium",name="고급 장비 상자",price=3000,ruid="fcaef6c94e144f498bac3c713e7e97e4",kind="premium",desc="희귀 교환품 · 캐시 상자와 동일한 구성\n5성 이상 각 등장 확률이 일반 상자의 10배입니다."},
+            {key="fragment_scroll",name="1~5성 장비강화 주문서",price=2000,ruid="bb6c1532d7364170a11abd2d8835bc81",desc="희귀 교환품 · 성공 시 1~5성 상승\n성공률 70% · 파괴 30% (보호 적용 가능)"},
+            {key="fragment_protect",name="프로텍트 주문서",price=2000,ruid="a6c6ff42196548dd874b83332ad5b336",desc="장비에 1회 강화 보호를 적용합니다.\n스타포스 또는 장비강화 주문서에 사용됩니다."},
+            {key="fragment_potential",name="잠재능력 부여 주문서",price=750,ruid="14267ae8e168458480697c148ddfdcab",desc="잠재능력을 부여합니다.\n성공률 70% · 실패 시 장비 파괴"},
+            {key="fragment_additional",name="에디셔널 잠재능력 부여 주문서",price=1500,ruid="0f134eebddee4b368062790b46afc26a",desc="에디셔널 잠재능력을 부여합니다.\n성공률 70% · 실패 시 장비 파괴"}
+        }
+    end
+
+    @ExecSpace("ClientOnly")
+    method table Product(string key)
+        for _,p in ipairs(self:Catalog()) do if p.key==key then return p end end
+        return nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method string ProductItem(string key)
+        local p=self:Product(key)
+        if p==nil then return "" end
+        if p.kind~=nil then return _SpecialEquipment:BoxItem(p.kind,1) end
+        return p.name.."|"..p.ruid.."|0|0|0|0|1"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.notices={}
+        self._T.noticeAge=0
+        local e=_EntityService:GetEntityByPath("/ui/DestructionNotice/Message")
+        if isvalid(e) then e.Enable=false end
+        log("[DestructionFragments] ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        local e=_EntityService:GetEntityByPath("/ui/DestructionNotice/Message")
+        if not isvalid(e) then return end
+        if self._T.activeNotice==nil then
+            if self._T.notices==nil or #self._T.notices==0 then return end
+            self._T.activeNotice=table.remove(self._T.notices,1)
+            self._T.noticeAge=0
+            e.TextGUIRendererComponent.Text="파괴의 조각을 "..tostring(self._T.activeNotice).."개 획득했습니다."
+            e.CanvasGroupComponent.GroupAlpha=1
+            e.Enable=true
+            log("[DestructionFragments] notice shown count="..tostring(self._T.activeNotice))
+        end
+        self._T.noticeAge=self._T.noticeAge+delta
+        e.CanvasGroupComponent.GroupAlpha=math.max(0,math.min(1,(2.6-self._T.noticeAge)/1.4))
+        if self._T.noticeAge>=2.6 then
+            e.Enable=false
+            self._T.activeNotice=nil
+            log("[DestructionFragments] notice hidden")
+        end
+    end
+end

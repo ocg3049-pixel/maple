@@ -1,6 +1,7 @@
 @Component
 script PlayerAttack extends AttackComponent
 
+    @Sync property boolean BossNearestTarget = false
 	@Sync property integer CombatLevel = 1
 	@Sync property integer MonsterKillCount = 0
 
@@ -76,6 +77,7 @@ script PlayerAttack extends AttackComponent
             self._T.playerNameOverlay = nil
             return
         end
+        if self._T.deadLockTimerId~=nil then _TimerService:ClearTimer(self._T.deadLockTimerId) self._T.deadLockTimerId=nil end
 		-- (성능/누수 수정) 플레이어 퇴장 시 감시 타이머 해제 - 해제하지 않으면 입퇴장이 반복될수록
 		-- 고아 타이머가 4Hz no-op으로 서버에 누적됐다.
 		if self._T.ctrlWatchdogId ~= nil then
@@ -89,6 +91,13 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void ControlWatchdogTick()
+        if not isvalid(self.Entity) then return end
+        if self:IsDeathBlocked() then self:BeginDeadLock() self._T.ctrlDisabledFor=0 return end
+		-- Boss loading is an intentional control lock, including slow resource reveals.
+		local entry=(_BossStageManager._T.runs or {})[self.Entity.PlayerComponent.UserId]
+		if entry~=nil and (entry.state=="loading" or entry.state=="spawning" or entry.state=="revealing") then
+			self._T.ctrlDisabledFor=0 return
+		end
 		-- 로그인 대기 맵에서는 컨트롤러가 의도적으로 잠겨 있다.
 		if isvalid(self.Entity.CurrentMap) and self.Entity.CurrentMap.Name == "login" then
 			self._T.ctrlDisabledFor = 0
@@ -117,78 +126,95 @@ script PlayerAttack extends AttackComponent
 		end
 		self._T.ctrlDisabledFor = (self._T.ctrlDisabledFor or 0) + 0.25
 		if self._T.ctrlDisabledFor >= 4.5 then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 			self._T.ctrlDisabledFor = 0
 			log_warning("[PlayerAttack] 조작 잠금이 3초 이상 풀리지 않아 강제 복구 (스킬 복구 타이머 유실 추정) - 이동불가 버그 자가복구")
 		end
 	end
 
-	-- (기능 추가) "캐릭터가 사망했을 때 부활 전까지 다른 행동을 못하게 해달라"는 요청.
-	-- 사망(DEAD) 상태로 들어가면 조작(PlayerControllerComponent)을 꺼서 이동/점프/기본공격을 막고,
-	-- 부활(DEAD -> IDLE)하는 순간 다시 켠다. 스킬 입력은 SkillManager.UseSkillInSlot의 사망 가드가 막는다.
-	--
-	-- 반복 타이머로 계속 눌러 끄는 이유: 사망 직전에 시전한 스킬의 컨트롤 복구 타이머
-	-- (RestoreSavageBlowControl 등 스킬마다 존재)가 사망 도중에 터지면 조작을 다시 켜버린다.
-	-- 그 타이머들을 스킬별로 전부 고치는 대신, 사망 중에는 매 프레임 가까이 다시 꺼서 확실히 봉인한다.
-	@ExecSpace("ServerOnly")
-	@EventSender("Self")
-	handler HandleDeadLockStateEvent(StateChangeEvent event)
-		if event.CurrentStateName == "DEAD" then
-			if self._T.isDeadLocked then return end
-			self._T.isDeadLocked = true
-			-- (다크사이트) 죽으면 투명도/어두워짐/BGM/이동속도가 남지 않도록 먼저 해제한다.
-			self:EndDarkSight("사망")
-			-- (각성) 같은 이유 - 어두워짐/전용 BGM/공속 상승이 사망 후에도 남으면 안 된다.
-			self:EndAwakening("사망")
-			self:ApplyDeadLock()
-			self._T.deadLockTimerId = _TimerService:SetTimerRepeat(function()
-				if not self._T.isDeadLocked then return end
-				-- (버그 수정) 부활 이벤트(PrevStateName == "DEAD")를 놓치면 조작이 영구히 잠긴 채로 남는다 -
-				-- 매 틱 실제 상태를 직접 확인해, DEAD가 아니면 스스로 봉인을 푼다(자가복구).
-				local sc = self.Entity.StateComponent
-				if isvalid(sc) and sc.CurrentStateName ~= "DEAD" then
-					self:ReleaseDeadLock()
-					log("[PlayerAttack] 부활 감지(상태 확인) - 행동 봉인 해제")
-					return
-				end
-				self:ApplyDeadLock()
-			end, 0.05)
-			log("[PlayerAttack] 사망 - 부활 전까지 행동 봉인")
-		elseif event.PrevStateName == "DEAD" then
-			if not self._T.isDeadLocked then return end
-			self:ReleaseDeadLock()
-			log("[PlayerAttack] 부활 - 행동 봉인 해제")
-		end
-	end
+    -- Animation recovery can briefly leave DEAD without reviving the player.
+    -- HP and the native death flag, not an animation transition alone, own this lock.
+    method boolean IsDeathBlocked()
+        if not isvalid(self.Entity) then return true end
+        local pc=self.Entity.PlayerComponent
+        return not isvalid(pc) or pc.Hp<=0 or pc:IsDead()
+    end
 
-	@ExecSpace("ServerOnly")
-	method void ReleaseDeadLock()
-		-- 사망 봉인을 풀고 조작을 되돌린다(부활 이벤트 경로와 상태 확인 경로 둘 다 여기로 모인다).
-		self._T.isDeadLocked = false
-		if self._T.deadLockTimerId then
-			_TimerService:ClearTimer(self._T.deadLockTimerId)
-			self._T.deadLockTimerId = nil
-		end
-		self._T.ctrlDisabledFor = 0
-		local playerCtrl = self.Entity.PlayerControllerComponent
-		if isvalid(playerCtrl) then
-			playerCtrl.Enable = true
-		end
-	end
+    @ExecSpace("ServerOnly")
+    @EventSender("Self")
+    handler HandleDeadLockStateEvent(StateChangeEvent event)
+        if event.CurrentStateName=="DEAD" or self:IsDeathBlocked() then
+            self:BeginDeadLock()
+        elseif event.PrevStateName=="DEAD" and self._T.isDeadLocked then
+            self:ReleaseDeadLock()
+        end
+    end
 
-	@ExecSpace("ServerOnly")
-	method void ApplyDeadLock()
-		-- 사망 중 이동/조작을 계속 꺼둔다.
-		if not isvalid(self.Entity) then return end
-		local playerCtrl = self.Entity.PlayerControllerComponent
-		if isvalid(playerCtrl) and playerCtrl.Enable then
-			playerCtrl.Enable = false
-		end
-		local movement = self.Entity.MovementComponent
-		if isvalid(movement) then
-			movement:Stop()
-		end
-	end
+    @ExecSpace("ServerOnly")
+    method void BeginDeadLock()
+        if not self._T.isDeadLocked then
+            self._T.isDeadLocked=true
+            self:EndDarkSight("사망")
+            self:EndAwakening("사망")
+            log("[DeathLock] server locked until HP and death state recover")
+        end
+        self:ApplyDeadLock()
+        if self._T.deadLockTimerId~=nil then return end
+        self._T.deadLockTimerId=_TimerService:SetTimerRepeat(function()
+            if not isvalid(self.Entity) then return end
+            if self:IsDeathBlocked() then self:ApplyDeadLock()
+            else self:ReleaseDeadLock() end
+        end,0.05)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReleaseDeadLock()
+        if self:IsDeathBlocked() then self:ApplyDeadLock() return end
+        self._T.isDeadLocked=false
+        if self._T.deadLockTimerId~=nil then
+            _TimerService:ClearTimer(self._T.deadLockTimerId)
+            self._T.deadLockTimerId=nil
+        end
+        self._T.ctrlDisabledFor=0
+        local playerCtrl=self.Entity.PlayerControllerComponent
+        if isvalid(playerCtrl) then playerCtrl.Enable=true end
+        log("[DeathLock] revived; server lock released")
+    end
+
+    method void ApplyDeadLock()
+        if not isvalid(self.Entity) then return end
+        local playerCtrl=self.Entity.PlayerControllerComponent
+        if isvalid(playerCtrl) and playerCtrl.Enable then playerCtrl.Enable=false end
+        local movement=self.Entity.MovementComponent
+        if isvalid(movement) then movement:Stop() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean MaintainLocalDeadLock()
+        if self.Entity~=_UserService.LocalPlayer then return false end
+        if self:IsDeathBlocked() then
+            if not self._T.localDeadLocked then
+                self._T.localDeadLocked=true
+                _MobileUIManager:ReleaseControls()
+                self._T.isBreatherPlaying=false self._T.isBreatherArmed=false
+                self._T.breatherToken=(self._T.breatherToken or 0)+1
+                log("[DeathLock] local input locked")
+            end
+            self:ApplyDeadLock()
+            return true
+        end
+        if self._T.localDeadLocked then
+            self._T.localDeadLocked=false
+            if _LoginFlow:IsInGame() and not _GameSystemMenu:BlocksInput()
+                and not _MapleHUDManager:IsChatTyping() and not _UIItemDiscardManager:BlocksInput()
+                and _LoginFlow._T.fullScreenFade==nil and _BossStageManager._T.destination==nil
+                and not _SkillManager._T.actionLock and not _AutoHuntManager.autoOn then
+                self.Entity.PlayerControllerComponent.Enable=true
+            end
+            log("[DeathLock] revived; local input released")
+        end
+        return false
+    end
 
 	-- 아대(가니어) 장착 여부를 클라이언트가 서버로 알려준다.
 	-- 인벤토리/장비(CostumeManagerComponent의 실제 장착값)는 클라이언트 전용 상태라 서버가 직접 읽을 수
@@ -445,6 +471,9 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+		-- Do not resolve hits or secondary effects during the respawn grace period.
+		local spawning = isvalid(defender) and defender:GetComponent("script.Monster") or nil
+		if isvalid(spawning) and spawning:IsSpawnProtected() then return false end
 		if not isvalid(defender) or defender.CurrentMap ~= self.Entity.CurrentMap then return false end
 		        -- 작은 불씨는 용사 소환과 같은 아군 소환수다. 판정 전에 제외해 데미지 숫자도 만들지 않는다.
 		        if defender:GetComponent("script.FireAffinityEmber") ~= nil then return false end
@@ -862,6 +891,22 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
+        local direct=self._T.resolvingDirectFlight
+        if direct~=nil and direct.target==defender and direct.tag==attackInfo then
+            for _,key in ipairs({"shadowEchoOriginal","shadowEchoBonus","shadowEchoOriginalIsCritical","shadowEchoBonusIsCritical","shadowEchoIsManualSkin"}) do self._T[key]=direct.shadow[key] end
+            return direct.dmg
+        end
+        local planned=self._T.resolvingStrafePlan
+        if attackInfo=="skill.strafe.lock" and planned~=nil then
+            self._T.lastStrafeDamage=planned.dmg
+            self._T.lastStrafeIsCritical=planned.critical
+            self._T.shadowEchoOriginal=planned.dmg
+            self._T.shadowEchoBonus=planned.bonus
+            self._T.shadowEchoOriginalIsCritical=planned.critical
+            self._T.shadowEchoBonusIsCritical=planned.bonusCritical
+            self._T.shadowEchoIsManualSkin=true
+            return planned.dmg+planned.bonus
+        end
 		-- 실제 공식은 CalcDamageBase에 있고, 여기서는 콤보 어택 버프 보너스(구슬 1개당 +20%)만
 		-- 모든 스킬/기본공격에 일괄 적용한다. 수동 데미지 표시용 캐시(lastDoubleStabDamage 등)는
 		-- Base 안에서 보너스 미반영 값으로 먼저 채워지므로, 여기서 보너스 반영값으로 재갱신해
@@ -1549,6 +1594,8 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method boolean CalcCritical(Entity attacker, Entity defender, string attackInfo)
+        local direct=self._T.resolvingDirectFlight
+        if direct~=nil and direct.target==defender and direct.tag==attackInfo then return direct.critical end
 		if self:GetServerCombatPower() <= 1 then return false end
 		        -- 더블스탭/매직클로/스피어버스터(수동 다중 표시 스킬)와 쉐도우 파트너 활성 중인 모든 히트는
 		        -- CalcDamage에서 각 줄(원본/보너스, 또는 각 타격)마다 독립적으로 크리티컬을 굴려 배율까지
@@ -1577,6 +1624,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method float GetCriticalDamageRate()
+        if self._T.resolvingDirectFlight~=nil then return 1 end
 		        -- (기능 수정) "크리티컬이 뜨면 캐릭터 정보창의 크리티컬 데미지 스탯(기본 125%)을 참고해야
 		        -- 한다"는 요청 - 하드코딩된 200%(2.0배) 대신 SyncCritDamage로 동기화해둔 실제 스탯을 쓴다.
 		        return (self._T.currentCritDamagePercent or 125) / 100
@@ -1604,9 +1652,11 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("Client")
 	method void ShowResolvedDamage(Entity target, integer damage, boolean critical, string skin)
 		if not isvalid(target) then return end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(target, skin, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, critical,
 			Vector2(0, 0), Vector2(1, 1), 1, 1, LitMode.Default)
+		end
 		if damage <= 0 then log("[DamageDisplay] zero damage -> MISS") end
 	end
 
@@ -1656,6 +1706,11 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackPowerStrikeLvPos(number combatPower, number atkMultiplier, string weaponClass, number rateMin, number rateMax, number castX, number castY)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		local repeatChargeMode=self._T.nextChargeBlowMode
+		self._T.nextChargeBlowMode=0
+		if not self:AwaitCastRecovery("isPowerStriking") then return end
+		self._T.nextChargeBlowMode=repeatChargeMode
 		-- (신고 2026-08-10 "점프 중 확실한 거리인데 안 맞는다") castX/castY = 클라이언트의 시전 순간
 		-- 좌표. 시전 시점 대상 잠금이 서버 복제 위치 기준이라, 점프 상승 중에는 복제 y가 클라보다
 		-- 뒤처져(클라 권한 이동 동기화 지연) 세로 박스(위 1.0/아래 0.5) 밖으로 계산돼 잠금이 비었다.
@@ -1793,7 +1848,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isPowerStriking = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- 파이널어택(2차 패시브): 60% 확률로, 컨트롤이 "실제로" 돌아오는 이 시점에 바로 이어서(동기 호출)
 		        -- 강화된 추가타를 한 번 더 실행한다. 이전에는 이 호출을 별도의 동일 딜레이 타이머로 나란히 예약했는데,
@@ -1837,6 +1892,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackSlashBlastLvCostPos(number combatPower, number atkMultiplier, string weaponClass, number rateMin, number rateMax, number castX, number castY, integer skillLevel)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isSlashBlasting") then return end
 		-- (신고 2026-08-10 "점프 슬래시블러스트가 확실한 거리인데 안 맞는다") castX/castY = 클라이언트의
 		-- 시전 순간 좌표. 대상 선정(FindSlashBlastTargets)이 서버 복제 위치 기준이라, 점프 상승 중에는
 		-- 복제 y가 클라보다 뒤처져 세로 박스(±1.0) 밖으로 계산돼 0명 선정이 났다(선정만 되면 타격은
@@ -1954,7 +2011,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isSlashBlasting = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingSlashWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- 파이널어택(2차 패시브): 60% 확률로, 컨트롤이 실제로 돌아오는 이 시점에 바로 이어서(동기 호출) 추가타를
 		        -- 실행한다. 파워스트라이크와 동일한 이유(별도 동일-딜레이 타이머의 실행 순서 레이스 방지)로 이 메서드
@@ -2121,6 +2178,12 @@ script PlayerAttack extends AttackComponent
 	-- 이펙트 RUID만** 다르고 판정·조준·모션·컨트롤 잠금은 완전히 같다.
 	@ExecSpace("ServerOnly")
 	method void AttackStarThrow(number combatPower, number atkMultiplier, integer shotCount, string variant)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		local repeatRateMin=self._T.pendingStarRateMin
+		local repeatRateMax=self._T.pendingStarRateMax
+		self._T.pendingStarRateMin=nil self._T.pendingStarRateMax=nil
+		if not self:AwaitCastRecovery("isLuckySeven") then return end
+		self._T.pendingStarRateMin=repeatRateMin self._T.pendingStarRateMax=repeatRateMax
 		        -- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		        self:StopBreather()
 		        -- 표창 N개를 0.4초부터 0.1초 간격으로 하나의 고정 표적에게 순서대로 던진다.
@@ -2176,18 +2239,25 @@ script PlayerAttack extends AttackComponent
 		        -- (표창 분산 2026-08-07) 토글이 켜져 있으면 표창을 **한 마리에 몰지 않고** 발 수만큼
 		        -- 서로 다른 적에게 한 발씩 나눠 던진다. 꺼져 있으면 기존과 완전히 같은 단일 표적 동작이다.
 		        -- ⚠ 이 시전이 분산이었는지는 발사(FireLuckySevenShuriken)까지 유지돼야 하므로 _T에 새긴다.
-		        local spreadOn = (self._T.starSpreadOn == true)
-		        self._T.starSpreadCast = spreadOn
-		        local spreadTargets = {}
-		        -- 단일 고정 표적: 전방(x축) 사거리를 기존 대비 4배(2.0 → 8.0)로 늘린 럭키세븐 전용 탐색을 사용한다.
-		        -- (각성) 각성 중에는 드래곤 로어 범위(가로 ±15.0 / 세로 ±7.5, 방향 무관)로 넓어진다.
-		        if spreadOn then
-		            -- 분산: 같은 범위/제외 규칙으로 가까운 순 최대 shots마리를 잡는다(모자라면 그만큼만).
-		            spreadTargets = self:FindStarThrowTargets(Vector2(worldPos.x, worldPos.y), dirX, shots)
-		            self._T.luckySevenTarget = spreadTargets[1]
-		        else
-		            self._T.luckySevenTarget = self:FindStarThrowTarget(Vector2(worldPos.x, worldPos.y), dirX)
-		        end
+            local spreadOn = self._T.starSpreadOn == true
+            local spreadTargets = {}
+            if spreadOn or self._T.autoHuntActive == true then
+                spreadTargets = self:FindStarThrowTargets(Vector2(worldPos.x,worldPos.y),dirX,shots)
+            end
+            if self._T.autoHuntActive == true then
+                spreadOn = self:ShouldAutoSpread(spreadTargets,combatPower,shots)
+                if self._T.starSpreadOn ~= spreadOn then
+                    self._T.starSpreadOn = spreadOn
+                    _SkillManager:ReceiveAutoStarSpread(spreadOn,self.Entity.PlayerComponent.UserId)
+                    log("[AutoStarSpread] enabled="..tostring(spreadOn).." targets="..tostring(#spreadTargets))
+                end
+            end
+            self._T.starSpreadCast = spreadOn
+            if spreadOn then self._T.luckySevenTarget=spreadTargets[1]
+            else
+                self._T.luckySevenTarget=spreadTargets[1] or self:FindStarThrowTarget(Vector2(worldPos.x,worldPos.y),dirX)
+                spreadTargets={}
+            end
 		        -- (각성) 등 뒤/위아래의 적도 잡히므로, 잡은 대상 쪽으로 몸을 돌려 던진다. 이 dirX는 모션 반전과
 		        -- 시전 이펙트/그림자 표창 위치에 함께 쓰이므로 표적을 정한 **직후** 한 번만 고쳐 잡는다
 		        -- (표창 자체는 목표 좌표로 날아가므로 dirX와 무관하게 명중한다).
@@ -2212,7 +2282,7 @@ script PlayerAttack extends AttackComponent
 		        else
 		            -- (요청) 적이 없어도 표창은 **허공으로 앞으로** 날아가야 한다(예전엔 스킵해서 아무것도
 		            -- 안 나갔다). 발사 높이와 같은 y를 써서 **반듯한 수평 직선**으로 날아간다.
-		            self._T.luckySevenTargetPos = Vector3(worldPos.x + dirX * 8.0, worldPos.y + throwH, worldPos.z)
+		            self._T.luckySevenTargetPos = Vector3(worldPos.x + dirX * _ShurikenLibrary:GetSkillReach(self:IsAwakeningActive()).x, worldPos.y + throwH, worldPos.z)
 		            self._T.luckySevenWhiff = true
 		        end
 
@@ -2336,34 +2406,15 @@ script PlayerAttack extends AttackComponent
 		        -- 몬스터가 영구히 대상에서 빠지는 일이 없다.
 		        local reserveSec = (0.4 + shotGap * (shots - 1)) * mult + 2.5
 		        local reservedTotal = 0
-		        if spreadOn then
-		            -- (표창 분산) 예약은 **표적별로 나눠** 건다 - 한 마리에 전부 몰아 걸면 60%만 맞는
-		            --   몬스터까지 "이번 공격에 죽는다"로 선고돼 다음 시전의 대상 선정에서 통째로 빠진다.
-		            for ti = 1, tCount do
-		                local rt = spreadTargets[ti]
-		                if isvalid(rt) then
-		                    local sum = 0
-		                    for i = 1, shots do
-		                        if self._T.starTargets[i] == rt then
-		                            sum = sum + self._T.starRolls[i].dmg + self._T.starRolls[i].bonus
-		                        end
-		                    end
-		                    ---@type Monster
-		                    local rtm = rt:GetComponent("script.Monster")
-		                    if isvalid(rtm) then rtm:ReserveDamage(sum, reserveSec) end
-		                    reservedTotal = reservedTotal + sum
-		                end
-		            end
-		        elseif isvalid(self._T.luckySevenTarget) then
-		            ---@type Monster
-		            local targetMonster = self._T.luckySevenTarget:GetComponent("script.Monster")
-		            if isvalid(targetMonster) then
-		                for _, roll in ipairs(self._T.starRolls) do
-		                    reservedTotal = reservedTotal + roll.dmg + roll.bonus
-		                end
-		                targetMonster:ReserveDamage(reservedTotal, reserveSec)
-		            end
-		        end
+        for i, roll in ipairs(self._T.starRolls) do
+            local target = self._T.starTargets[i]
+            local mon = isvalid(target) and target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then
+                roll.token = mon:ReserveIncomingHit(roll.dmg + roll.bonus, reserveSec)
+                roll.life = mon.LifeSerial
+                reservedTotal = reservedTotal + roll.dmg + roll.bonus
+            end
+        end
 
 		        -- 공속 배율과 **실제 발 사이 간격(초)** 을 같이 남긴다 - "표창이 뭉쳐 날아간다" 류의 신고를
 		        -- 다시 받았을 때 하한 배율이 먹고 있는지 로그만으로 바로 확인할 수 있다.
@@ -2539,7 +2590,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isLuckySeven = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingLuckySevenWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- 복구를 마쳤으니 기억값을 비운다 - 다음 시전이 "기억값이 없을 때만 저장"으로 새로 잰다
 		        -- (연타 중 이미 잠긴 상태를 원래 값으로 덮어써 복구가 영영 안 되던 함정 방지 - 암살과 동일).
@@ -2611,6 +2662,9 @@ script PlayerAttack extends AttackComponent
 		        local roll = (self._T.starRolls ~= nil) and self._T.starRolls[idx] or nil
 		        if roll ~= nil then
 		            pc.PreRolled = true
+                pc.GuaranteedHit = true
+                pc.ReservationToken = roll.token or 0
+                pc.TargetLifeSerial = roll.life or 0
 		            pc.PreDamage = roll.dmg
 		            pc.PreBonus = roll.bonus
 		            pc.PreDamageCritical = roll.dmgCrit
@@ -2753,7 +2807,7 @@ script PlayerAttack extends AttackComponent
 		-- (자동사냥) 자동사냥 걷기는 컨트롤러를 끈 채 이동하므로 위 판정에 안 걸린다 - 내 캐릭터가
 		-- 자동사냥으로 걷는 동안도 같은 이유로 물러난다(시전 중에는 자동사냥이 스스로 걷기를 멈추므로
 		-- 시전 모션 보호에는 영향이 없다).
-		if self.Entity == _UserService.LocalPlayer and _AutoHuntManager:IsAutoMoving() then
+		if self.Entity == _UserService.LocalPlayer and (_AutoHuntManager:IsAutoMoving() or _MobileUIManager:IsMoving()) then
 			return false
 		end
 		local pcc = self.Entity.PlayerControllerComponent
@@ -2948,7 +3002,7 @@ script PlayerAttack extends AttackComponent
 		        ---@type LuckySevenProjectile
 		        local pc = proj:GetComponent("script.LuckySevenProjectile")
 		        if pc == nil then return end
-		        pc.MaxLifetime = self:GetBasicProjectileTravelRange() / pc.Speed
+		        pc.MaxLifetime = (shot.travelRange or self:GetBasicProjectileTravelRange()) / pc.Speed + 0.1
 		        if isvalid(target) and shot.damage ~= nil then
 		            pc.GuaranteedHit = true
 		            pc.ReservationToken = shot.token
@@ -3049,7 +3103,7 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(map) then return nil end
 		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
 		local nearest = nil
-		local nearestDist = 8.0
+		local nearestDist = _ShurikenLibrary:GetSkillReach(false).x
 		for _, comp in ipairs(monsterComps) do
 			---@type Monster
 			local mc = comp
@@ -3062,9 +3116,9 @@ script PlayerAttack extends AttackComponent
 				local pos = mc.Entity.TransformComponent.WorldPosition
 				local dx = pos.x - fromPos.x
 				local dy = pos.y - fromPos.y
-				if dx * dirX >= 0 and math.abs(dx) <= 8.0 and math.abs(dy) <= 1.0 then
+				if dx * dirX >= 0 and math.abs(dx) <= _ShurikenLibrary:GetSkillReach(false).x and _ShurikenLibrary:InVerticalReach(dy,false) then
 					local dist = math.abs(dx)
-					if dist <= nearestDist then
+					if self:PreferMonster(mc.Entity,dist,nearest,nearestDist) then
 						nearest = mc.Entity
 						nearestDist = dist
 					end
@@ -3079,7 +3133,7 @@ script PlayerAttack extends AttackComponent
 	-- 세로 ±7.5, 방향 무관)에서 가장 가까운 적을 고른다.
 	-- ⚠ 아대 기본공격(AttackClawThrow)은 이 함수를 쓰지 않는다 - 요청은 "표창 스킬 3종"이 대상이다.
 	@ExecSpace("ServerOnly")
-	method Entity FindStarThrowTarget(Vector2 fromPos, number dirX)
+	method Entity FindLegacyStarThrowTarget(Vector2 fromPos, number dirX)
 		if not self:IsAwakeningActive() then
 			return self:FindLuckySevenTarget(fromPos, dirX)
 		end
@@ -3098,9 +3152,9 @@ script PlayerAttack extends AttackComponent
 				local pos = mc.Entity.TransformComponent.WorldPosition
 				local dx = pos.x - fromPos.x
 				local dy = pos.y - fromPos.y
-				if math.abs(dx) <= 15.0 and math.abs(dy) <= 7.5 then
+				if math.abs(dx) <= _ShurikenLibrary:GetSkillReach(true).x and _ShurikenLibrary:InVerticalReach(dy,true) then
 					local dist = math.sqrt(dx * dx + dy * dy)
-					if nearestDist == nil or dist < nearestDist then
+					if self:PreferMonster(mc.Entity,dist,nearest,nearestDist or math.huge) then
 						nearest = mc.Entity
 						nearestDist = dist
 					end
@@ -3109,6 +3163,11 @@ script PlayerAttack extends AttackComponent
 		end
 		return nearest
 	end
+
+    @ExecSpace("ServerOnly")
+    method Entity FindStarThrowTarget(Vector2 fromPos, number dirX)
+        return self:FindStarThrowTargets(fromPos,dirX,1)[1]
+    end
 
 	-- (표창 분산) 표창 3종 전용 **다중 표적** 탐색. 단일 표적 탐색(FindStarThrowTarget)과
 	-- **완전히 같은 범위/제외 규칙**으로 후보를 모아 가까운 순으로 최대 count마리를 돌려준다.
@@ -3123,28 +3182,29 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(map) then return result end
 		local want = math.max(1, math.floor(count or 1))
 		local awake = self:IsAwakeningActive()
+        local reach = _ShurikenLibrary:GetSkillReach(awake)
 		local monsterComps = map:GetChildComponentsByTypeName("script.Monster", true)
 		local cands = {}
 		for _, comp in ipairs(monsterComps) do
 			---@type Monster
 			local mc = comp
 			if isvalid(mc) and isvalid(mc.Entity) and mc.Entity.Enable
-				and not mc.IsDead and not mc:IsDeathPending() then
+				and not mc.IsDead and not mc:IsDeathPending() and not mc:IsSpawnProtected() then
 				local pos = mc.Entity.TransformComponent.WorldPosition
 				local dx = pos.x - fromPos.x
 				local dy = pos.y - fromPos.y
 				if awake then
-					if math.abs(dx) <= 15.0 and math.abs(dy) <= 7.5 then
+					if math.abs(dx) <= reach.x and _ShurikenLibrary:InVerticalReach(dy,awake) then
 						table.insert(cands, { e = mc.Entity, d = math.sqrt(dx * dx + dy * dy) })
 					end
 				else
-					if dx * dirX >= 0 and math.abs(dx) <= 8.0 and math.abs(dy) <= 1.0 then
+					if dx * dirX >= 0 and math.abs(dx) <= reach.x and _ShurikenLibrary:InVerticalReach(dy,awake) then
 						table.insert(cands, { e = mc.Entity, d = math.abs(dx) })
 					end
 				end
 			end
 		end
-		table.sort(cands, function(a, b) return a.d < b.d end)
+		table.sort(cands, function(a, b) return self:PreferMonster(a.e,a.d,b.e,b.d) end)
 		for i = 1, math.min(want, #cands) do
 			result[i] = cands[i].e
 		end
@@ -3734,7 +3794,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isPowerStriking = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingFinalWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- 파이널 모션 종료 - 모션 가드 복구
 		        self:EndSwingMotionGuard()
@@ -3868,7 +3928,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isSlashBlasting = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingFinalSlashWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- 파이널 모션 종료 - 모션 가드 복구
 		        self:EndSwingMotionGuard()
@@ -4241,6 +4301,14 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
         self:UpdatePlayerNameOverlay()
+        if self:MaintainLocalDeadLock() then
+            local sc=self.Entity.StateComponent
+            if self.Entity.PlayerComponent.Hp<=0 and isvalid(sc) and sc.CurrentStateName~="DEAD" then
+                sc:ChangeState("DEAD")
+                log("[DeathLock] restored overwritten death state")
+            end
+            return
+        end
 		        -- (버그 수정) "여러 스킬을 사용해봤는데 스킬 사용 후 숨고르기 모션을 하지 않는다"는 신고 -
 		        -- 원인은 각 스킬 모션 정리용 IDLE→MOVE→IDLE 강제 토글(PlayAttackMotion 등, 같은 서버 호출
 		        -- 안에서 즉시 IDLE로 되돌아감)이 숨고르기 시작 직후와 시간상 겹쳐, 진짜 이동이 아닌 이 내부
@@ -4553,6 +4621,23 @@ script PlayerAttack extends AttackComponent
         return self:FindMonstersInShape(BoxShape(center, Vector2(xReach, upHalf + downHalf), 0), fromPos, maxCount)
 	end
 
+    method boolean IsPriorityBoss(Entity target)
+        -- Boss priority applies only to live, attackable bosses in this player's map.
+        if not isvalid(target) or target.CurrentMap~=self.Entity.CurrentMap then return false end
+        if self._T.starSpreadOn==true or (self:IsClient() and _SkillManager:IsStarSpreadEnabled()) then return false end
+        if self.BossNearestTarget and _BossStageManager:IsArena(self.Entity.CurrentMap.Name) then return false end
+        local monster=target:GetComponent("script.Monster")
+        return isvalid(monster) and monster.IsStageBoss and not monster.IsDead and monster.Hp>0 and self:IsLiveMonster(target)
+    end
+
+    method boolean PreferMonster(Entity candidate, number distance, Entity current, number currentDistance)
+        -- Call only after each skill's range, direction and exclusion checks have passed.
+        local candidateBoss=self:IsPriorityBoss(candidate)
+        local currentBoss=self:IsPriorityBoss(current)
+        if candidateBoss~=currentBoss then return candidateBoss end
+        return not isvalid(current) or distance<currentDistance
+    end
+
     method table FindMonstersInShape(any shape, Vector2 fromPos, integer maxCount)
         -- 엔진 충돌 조회로 후보를 제한한다. 작은 몬스터나 빈 공간으로 피격 박스를 확대하지 않는다.
         local result, candidates, seen = {}, {}, {}
@@ -4569,7 +4654,7 @@ script PlayerAttack extends AttackComponent
                 table.insert(candidates, {entity = target, distance = dx * dx + dy * dy})
             end
         end
-        table.sort(candidates, function(a, b) return a.distance < b.distance end)
+        table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.distance,b.entity,b.distance) end)
         for i = 1, math.min(maxCount, #candidates) do result[i] = candidates[i].entity end
         return result
     end
@@ -5917,6 +6002,7 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("ClientOnly")
 	@EventSender("Self")
 	handler HandleStateChangeEvent(StateChangeEvent event)
+        if self:MaintainLocalDeadLock() then return end
 		        -- 기본공격의 엔진 입력만 잠깐 막아 반대 방향 입력에 의한 물리 도약을 방지한다.
 		        self:UpdateBasicAttackInputLock(event.CurrentStateName)
 		        -- 파워스트라이크 실제 모션 재생 구간(_T.isMotionPlaying, 0~0.25초)에 착지(FALL/JUMP -> IDLE) 등 다른 상태
@@ -6800,6 +6886,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackDoubleStabLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isDoubleStabbing") then return end
 		        -- (2026-08-06 개편) 한 타당 데미지 배율을 클라이언트가 계산해 넘겨준다.
 		        -- ⚠ 기존 AttackDoubleStab에 인자를 더하지 않고 이름을 바꿨다(LEA-1102 회피 - 트리플/쿼드러플과 같은 관례).
 		        self._T.pendingDoubleStabRateMin = rateMin
@@ -6886,7 +6974,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isDoubleStabbing = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingDoubleStabWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		        -- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -7012,23 +7100,28 @@ script PlayerAttack extends AttackComponent
 		        -- 나눠, 항상 공간적으로도 분리된 줄로 보이게 한다.
 		        -- (버그 수정) "각자 크리티컬 여부를 독립적으로 판단해야 한다" - 하드코딩된 false 대신 각 줄에
 		        -- 대해 CalcDamage에서 독립적으로 굴린 크리티컬 결과를 그대로 전달해 강조 표시가 실제와 맞게 한다.
+		        if not _AutoHuntPowerSave.active then
 		        _DamageSkinService:Play(
 		            target, self:GetHitDamageSkinId(), 0,
 		            { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 		            Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		        )
+		        end
 		        if bonus > 0 then
+		            if not _AutoHuntPowerSave.active then
 		            _DamageSkinService:Play(
 		                target, self:GetHitDamageSkinId(), 0,
 		                { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 		                Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		            )
+		            end
 		        end
 		        log("[DoubleStab] ShowDoubleStabDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " baseCrit=" .. tostring(baseIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
 	end
 
 	@ExecSpace("Client")
 	method void PlayDoubleStabHitEffect(Entity target, number dirX)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		        -- 몬스터 몸에서 나타나는 타격 이펙트 (더블 스탭 리소스팩의 CharLevel/20/hit/0)
 		        if not isvalid(target) then return end
 		        local flipBack = dirX > 0
@@ -7092,6 +7185,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackMagicClaw(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isMagicClawing") then return end
 		        -- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		        self:StopBreather()
 		        -- 매직클로 발동: 럭키세븐과 같은 단일 대상·2타·2줄 스택 데미지 스킨이지만, 표창을 던지지 않고
@@ -7175,7 +7270,7 @@ script PlayerAttack extends AttackComponent
 		        self._T.isMagicClawing = false
 		        local playerCtrl = self.Entity.PlayerControllerComponent
 		        if isvalid(playerCtrl) and self._T.pendingMagicClawWasControllerEnabled then
-		            playerCtrl.Enable = true
+		            playerCtrl.Enable = not self:IsDeathBlocked()
 		        end
 		        -- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		        -- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -7303,22 +7398,27 @@ script PlayerAttack extends AttackComponent
 		        -- (버그 수정) 더블스탭과 동일한 이유로 원본/보너스를 하나의 Play() 배열로 묶지 않고, 서로 다른
 		        -- offsetY를 가진 별도의 Play() 호출로 나눠 겹쳐 보이지 않게 한다. 또한 각 줄의 크리티컬 여부도
 		        -- 하드코딩된 false 대신 CalcDamage가 독립적으로 굴린 결과를 그대로 전달한다.
+		        if not _AutoHuntPowerSave.active then
 		        _DamageSkinService:Play(
 		            target, self:GetHitDamageSkinId(), 0,
 		            { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 		            Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		        )
+		        end
 		        if bonus > 0 then
+		            if not _AutoHuntPowerSave.active then
 		            _DamageSkinService:Play(
 		                target, self:GetHitDamageSkinId(), 0,
 		                { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 		                Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		            )
+		            end
 		        end
 	end
 
 	@ExecSpace("Client")
 	method void PlayMagicClawHitEffect(Entity target, number dirX)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		        -- 맞는 몬스터 몸에서 나타나는 타격 이펙트 + 타격 사운드 (0.1초 텀을 두고 2번 재생됨 - 각 히트마다 1번씩)
 		        if not isvalid(target) then return end
 		        local flipBack = dirX > 0
@@ -7560,6 +7660,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackColdBeam(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isColdBeaming") then return end
 		local state = self.Entity.StateComponent.CurrentStateName
 		if state == "DEAD" or state == "CLIMB" or state == "LADDER" or self._T.isColdBeaming then return end
 		local ctrl = self.Entity.PlayerControllerComponent
@@ -7680,6 +7782,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackThunderbolt(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isThunderbolting") then return end
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		self:StopBreather()
 		-- 썬더볼트 발동: 방향(앞/뒤) 무관하게 캐릭터 주변의 몬스터 최대 6명을 동시에 타격한다.
@@ -7746,7 +7850,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isThunderbolting = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingThunderboltWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -7870,6 +7974,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayThunderboltHitEffect(Entity target)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		-- 타격받는 몬스터 머리 위에 나타나는 이펙트 (대상마다 1회, 전원 동시에 재생됨).
 		-- 높이 오프셋은 기존 0.6에서 사용자 요청으로 조금 낮춰 0.3으로 조정.
 		if not self:IsClient() then return end
@@ -7974,6 +8079,10 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackShiningRay(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		local repeatVisualKind=self._T.shiningRayVisualKind
+		if not self:AwaitCastRecovery("isShiningRaying") then return end
+		self._T.shiningRayVisualKind=repeatVisualKind
 		-- 샤이닝 레이(3차): 주변 전방위(드래곤 로어의 절반 범위) 최대 30명 광역 공격.
 		-- (비숍 개편 2026-08-08) 대상당 배율은 클라(SkillManager.GetShiningRay*Percent)가 계산해 넘긴다 -
 		-- 1레벨 1000%~1500%에서 분배 1포인트당 최소·최대 각 +30%p(마스터 20에서 1570%~2070%).
@@ -8047,7 +8156,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isShiningRaying = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingShiningRayWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -8108,6 +8217,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void PlayShiningRayHitEffect(Entity target)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		-- 샤이닝 레이에 맞은 몬스터 몸통 위치에 hit 8장을 프레임 교체로 재생한다(패딩 정렬본 - 흔들림 없음).
 		-- (요청 2026-07-29) 사용속도 1/2: 피격 이펙트도 시전과 동일하게 절반 속도(프레임당 120ms)로 맞춘다.
 		-- (요청 2026-07-29) 투명도 70%: SpawnBuffFrameEffectEx는 재생 중 알파가 1.0으로 고정이라,
@@ -8227,6 +8337,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackMagicMissileLv(number combatPower, number atkMultiplier, number playerLevel, string element, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isMagicMissiling") then return end
 		-- 매직 미사일(1차): 등 뒤 랜덤 위치에 마법 구체(레벨 비례 개수)를 소환하고, 각 구체가
 		-- 전방의 타겟을 향해 서서히 조준 회전한 뒤 발사 플래시와 함께 유도 비행해 명중 시
 		-- rateMin~rateMax 배율의 피해를 준다. (요청 2026-08-13 2차) 배율은 클라가 투자 레벨로 계산해
@@ -8295,7 +8407,7 @@ script PlayerAttack extends AttackComponent
 			---@type Monster
 			local mc = targetEnt:GetComponent("script.Monster")
 			if isvalid(mc) then
-				remainingHp[idx] = mc.Hp
+				remainingHp[idx] = math.max(0,mc.Hp-mc.IncomingHitDamage)
 			else
 				remainingHp[idx] = 999999
 			end
@@ -8330,16 +8442,25 @@ script PlayerAttack extends AttackComponent
 			end
 			if chosenIdx ~= nil then
 				target = targets[chosenIdx]
-				remainingHp[chosenIdx] = remainingHp[chosenIdx] - presetDamage
+				-- Final damage including crit/buffs is reserved below.
 				log("PlayerAttack: MagicMissile ball " .. tostring(i) .. " -> " .. tostring(target.Name) .. " preset=" .. tostring(presetDamage) .. " 남은예측HP=" .. tostring(remainingHp[chosenIdx]))
 			end
 
 			self:PlayMagicMissileSpawnEffect(bx, by, bz, dirX, element)
 			local capturedTarget = target
 			local capturedPreset = presetDamage
+            local plan=nil
+            if isvalid(target) then
+                local previous=self._T.magicMissileHitPreset
+                self._T.magicMissileHitPreset=presetDamage
+                plan=self:RollDirectFlyingDamage(target,"skill.magicmissile")
+                self._T.magicMissileHitPreset=previous
+                remainingHp[chosenIdx]=remainingHp[chosenIdx]-plan.dmg
+            end
 			-- (피드백) 생성 이펙트가 PlayRate 2배로 절반 시간에 끝나므로 구체 등장도 0.9→0.45초로 앞당긴다.
 			_TimerService:SetTimerOnce(function()
-				self:SpawnMagicMissileBall(bx, by, bz, capturedTarget, dirX, capturedPreset, element)
+				self._T.nextMagicFlightPlan=plan
+                self:SpawnMagicMissileBall(bx, by, bz, capturedTarget, dirX, capturedPreset, element)
 			end, 0.45)
 		end
 
@@ -8360,7 +8481,9 @@ script PlayerAttack extends AttackComponent
 	@ExecSpace("ServerOnly")
 	method void SpawnMagicMissileBall(number px, number py, number pz, Entity target, number dirX, number presetDamage, string element)
 		-- 생성 이펙트 마지막 프레임 시점에 호출되어 구체 엔티티를 실제로 소환한다.
-		if not isvalid(self.Entity) then return end
+		local plan=self._T.nextMagicFlightPlan
+        self._T.nextMagicFlightPlan=nil
+        if not isvalid(self.Entity) then return end
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
 		if self._T.magicMissileCount == nil then self._T.magicMissileCount = 0 end
@@ -8383,7 +8506,8 @@ script PlayerAttack extends AttackComponent
 			log_warning("PlayerAttack: SpawnMagicMissileBall - MagicMissileBall component not found")
 			return
 		end
-		bc:Setup(target, self.Entity, dirX, presetDamage, element)
+		bc._T.flightPlan=plan
+        bc:Setup(target, self.Entity, dirX, presetDamage, element)
 		log("PlayerAttack: SpawnMagicMissileBall " .. name .. " target=" .. (isvalid(target) and tostring(target.Name) or "none") .. " preset=" .. tostring(presetDamage))
 	end
 
@@ -8392,7 +8516,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isMagicMissiling = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingMagicMissileWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) 다른 스킬과 동일하게 컨트롤 복구 시점에 공용 숨고르기(PlayBreather)를 시작한다.
 		self:PlayBreather(self.Entity, self._T.pendingMagicMissileDirX or 1)
@@ -8522,6 +8646,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayMagicMissileHitEffect(Entity target)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		-- 명중 이펙트 + 타격음: 피드백으로 지정된 hit 클립을 대상 몸에서 재생.
 		-- (피드백) 매직 에로우 속성이 켜져 있어도 명중 이펙트는 틴트하지 않고 원본 색 그대로 둔다
 		-- (속성색은 구체/생성/발사 이펙트에만 적용).
@@ -8533,6 +8658,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackHeal(number combatPower, number atkMultiplier, number healPercent)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isHealing") then return end
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		self:StopBreather()
 		-- 힐 발동: 항상 자기 자신을 회복시키고, 주변(썬더볼트와 동일한 탐색 범위/최대 6명, 방향 무관)의
@@ -8701,7 +8828,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isHealing = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingHealWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -8987,6 +9114,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayHealUndeadHitEffect(Entity target)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		-- 언데드 몬스터가 힐로 피해를 입을 때만 머리 위에 나타나는 이펙트 (1회). 다른 공격에는 재생되지 않는다.
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
@@ -9007,11 +9135,13 @@ script PlayerAttack extends AttackComponent
 	method void ShowHealDamageSkin(Entity target, integer healAmount)
 		-- 회복된 양을 데미지처럼 숫자로 표시한다 (전용 데미지스킨 RUID 사용).
 		if not isvalid(target) then return end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0,
 			{ healAmount }, DamageSkinTweenType.Default, false,
 			Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 	end
 
 	method table GetHealMotion()
@@ -9383,7 +9513,7 @@ script PlayerAttack extends AttackComponent
 	method void RestoreHasteControl()
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingHasteWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -9516,7 +9646,7 @@ script PlayerAttack extends AttackComponent
 	method void RestoreComboAttackControl()
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingComboWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -9698,7 +9828,7 @@ script PlayerAttack extends AttackComponent
 	method void RestoreShadowPartnerControl()
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingShadowPartnerWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -9832,8 +9962,12 @@ script PlayerAttack extends AttackComponent
 		-- (버그 수정) "2줄 중 하나만 뜨는 경우 없이 항상 같이 뜬다" - 원본/보너스가 CalcCritical의 결과
 		-- 하나(isCritical)를 공유해서 생긴 문제였다. CalcDamage에서 각 줄에 대해 독립적으로 굴린 결과를
 		-- 각각 별도 파라미터(originalIsCritical/bonusIsCritical)로 받아 그대로 전달한다.
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(defender, skinRuid, 0, { original > 0 and original or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, originalIsCritical, Vector2(0, 0), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(defender, skinRuid, 0, { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical, Vector2(0, 0.3), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		end
 		log("[ShadowPartner] 데미지 2줄 표시 original=" .. tostring(original) .. " bonus=" .. tostring(bonus) .. " originalCrit=" .. tostring(originalIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
 	end
 
@@ -9909,6 +10043,7 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method void EchoShadowHitEffectAtPos(string ruid, Vector3 pos, number zRot, Vector3 scale, table options)
+        if self:IsClient() and _GameSystemMenu.lowSpecMode then return end
 		-- 히트 이펙트 2배(고정 좌표 버전): 지금 좌표를 그대로 캡처해 0.25초 뒤 한 번 더(투명도 70%) 재생한다.
 		-- 고정 좌표(PlayEffect)라서 그 사이 대상이 죽어 사라져도 항상 그 자리(허공)에서 발동한다.
 		if not self.ShadowPartnerOn then return end
@@ -10235,6 +10370,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackPanicLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isPanicking") then return end
 		-- (요청 2026-08-12) 구슬당 배율(rateMin/rateMax)이 투자 레벨 비례가 되면서 인자가 늘어 개명했다
 		-- (LEA-1102 회피, *Lv 관례). (2026-08-19 개편) 마스터 30, 1레벨 180~240% → 마스터 615~820%
 		-- (분배당 최소 +15%p/최대 +20%p) - 배율 계산은 클라 SkillManager.GetPanicMin/MaxPercent 단일 출처.
@@ -10323,7 +10460,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isPanicking = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingPanicWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -10441,6 +10578,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackComaLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isComaAttacking") then return end
 		-- (요청 2026-08-12) 패닉과 같은 사유로 개명. 1레벨 90~120% → 마스터(20) 180~240%(패닉의 절반).
 		self._T.pendingComaRateMin = rateMin
 		self._T.pendingComaRateMax = rateMax
@@ -10517,7 +10656,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isComaAttacking = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingComaWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -11639,7 +11778,7 @@ script PlayerAttack extends AttackComponent
 	method void RestoreBoosterControl()
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingBoosterWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -11802,7 +11941,7 @@ script PlayerAttack extends AttackComponent
 	method void RestorePoisonMistControl()
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingPoisonMistWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -11811,6 +11950,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackExplosionLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isExploding") then return end
 		-- ⚠ 인자 개수를 바꾸면 refresh를 해도 옛 시그니처(LEA-1102)로 계속 실패해 기존
 		-- AttackExplosion에서 이름을 바꿨다(드래곤 라이딩 전례).
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
@@ -11908,7 +12049,7 @@ script PlayerAttack extends AttackComponent
 	method void RestoreExplosionControl()
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingExplosionWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -11990,7 +12131,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
 			table.insert(result, candidates[i].entity)
@@ -12109,6 +12250,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackDragonRoar(number combatPower, number atkMultiplier, number dmgMult, number hpCostRate)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isDragonRoaring") then return end
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		self:StopBreather()
 		-- (스펙 개편 2026-08-04) 데미지 배율과 HP 소모율을 클라(투자 레벨)가 계산해 넘긴다.
@@ -12230,7 +12373,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isDragonRoaring = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingDragonRoarWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -12380,6 +12523,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackBlizzard(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isBlizzarding") then return end
 		-- 블리자드 타임라인 (쿨타임 20초는 클라이언트 SkillManager가 관리/표시):
 		--   0.0s      시전 이펙트(96b261) + 사운드(267aa4 1회 + c50b1e30 20초간 작게 반복)
 		--             + 맵이 서서히 살짝 어두워짐(15초 뒤 복귀)
@@ -12631,7 +12776,7 @@ script PlayerAttack extends AttackComponent
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		local wasLocked = isvalid(playerCtrl) and (not playerCtrl.Enable)
 		if isvalid(playerCtrl) and self._T.pendingBlizzardWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 복구 직전에 실제로 잠겨 있었는지(=3초 내내 잠금이 유지됐는지)를 함께 남긴다.
 		log("PlayerAttack: 블리자드 조작 잠금 해제 (3초 유지됨=" .. tostring(wasLocked) .. ")")
@@ -12722,11 +12867,11 @@ script PlayerAttack extends AttackComponent
 				local dx = mpos.x - myPos.x
 				local dy = mpos.y - myPos.y
 				if math.abs(dx) <= rangeX and math.abs(dy) <= rangeY then
-					table.insert(cands, { x = mpos.x, y = mpos.y, dist = dx * dx + dy * dy })
+					table.insert(cands, { entity = mc.Entity, x = mpos.x, y = mpos.y, dist = dx * dx + dy * dy })
 				end
 			end
 		end
-		table.sort(cands, function(a, b) return a.dist < b.dist end)
+		table.sort(cands, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		for _, c in ipairs(cands) do
 			if #out >= wantCount then break end
 			local y = nil
@@ -12961,6 +13106,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void SpawnBlizzardBackgroundEffect()
+        if self:IsClient() and _GameSystemMenu.lowSpecMode then return end
 		-- 시전 2.5초 뒤: 배경 이펙트(6da13ae8)를 지형지물보다 뒤에서 희미하게 1회 재생한다.
 		-- (버그 수정) OrderInLayer를 -100으로 두면 맵 배경 이미지 뒤로 완전히 밀려 화면에 아예 보이지
 		-- 않았다 - 지형 타일(기본 OrderInLayer 1)보다는 뒤, 배경보다는 앞이 되도록 -1로 올린다.
@@ -13094,6 +13240,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayBlizzardSparkleEffect(number px, number py)
+        if self:IsClient() and _GameSystemMenu.lowSpecMode then return end
 		if not self:IsClient() then return end
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
@@ -13121,6 +13268,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayBlizzardIceShardEffect(number px, number py)
+        if self:IsClient() and _GameSystemMenu.lowSpecMode then return end
 		-- (기능 수정) 얼음조각 이펙트는 4종 중 랜덤으로 하나를 재생한다.
 		if not self:IsClient() then return end
 		local map = self.Entity.CurrentMap
@@ -13205,6 +13353,7 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("Multicast")
 	method void PlayBlizzardHitEffect(Entity target)
+        if self:IsClient() and not _GameSystemMenu:AllowHitVisual() then return end
 		-- 블리자드에 맞은 몬스터 전용 히트 이펙트(팩의 hit/0 클립).
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
@@ -13349,7 +13498,7 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(self.Entity) then return end
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and _UserService.LocalPlayer == self.Entity and self._T.parryWasCtrlEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- PlayStrafeMotion은 클라이언트에서 실행된다. StateComponent:ChangeState는
 		-- 상태 권한을 가진 실행 공간에서만 호출할 수 있으므로 여기서 강제 전이하면
@@ -13531,7 +13680,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isFireArrowMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingFireArrowWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -13805,7 +13954,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isIronArrowMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingIronArrowWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -14033,7 +14182,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isAngelRayMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingAngelRayWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 다른 스킬들과 동일하게 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
 		self:PlayBreather(self.Entity, self._T.pendingAngelRayDirX or 1)
@@ -14244,7 +14393,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isHolyArrowMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingHolyArrowWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		self:PlayBreather(self.Entity, self._T.pendingHolyArrowDirX or 1)
 	end
@@ -14451,7 +14600,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isArrowBlowMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingArrowBlowWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 다른 스킬들과 동일하게 컨트롤 복구 시점에 공용 숨고르기 모션을 시작한다.
 		self:PlayBreather(self.Entity, self._T.pendingArrowBlowDirX or 1)
@@ -14558,7 +14707,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isArrowBombMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingArrowBombWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		self:PlayBreather(self.Entity, self._T.pendingArrowBombDirX or 1)
 	end
@@ -14674,13 +14823,14 @@ script PlayerAttack extends AttackComponent
 		local ballRuid = (jobIdx == 7) and "c43f61a98b8f41fd8a7d5f8769034db8" or "f1a8e518ae624dbcbe9c007af3429c2d"
 
 		self:PlayDoubleShotMotion(self.Entity, self:GetBowCastMotion(), dirX, atkMultiplier)
-		_TimerService:SetTimerOnce(function()
-			-- 조준은 실제로 화살이 나가는 이 시점에 계산한다(시전 중 대상이 움직여도 따라간다).
-			-- 두 발은 완전히 같은 방향/좌표에서 동시에 발사된다(HitIndex/SpreadDir만 다르다).
-			local aim = self:ComputeArrowAimDirection(dirX, self.ArrowAimXReach, self.ArrowAimYHalfHeight)
-			self:SpawnDoubleShotProjectile(ballRuid, combatPower, aim.x, aim.y, 1, 1)
-			self:SpawnDoubleShotProjectile(ballRuid, combatPower, aim.x, aim.y, 2, -1)
-		end, 0.2 * atkMultiplier)
+        local pos = self.Entity.TransformComponent.WorldPosition
+        self._T.doubleShotCastTarget = self:FindNearestMonsterInForwardBox(Vector2(pos.x,pos.y+.35),dirX,self.ArrowAimXReach,self.ArrowAimYHalfHeight)
+        self._T.doubleShotLaunchDelay = .2 * atkMultiplier
+        local aim = self:ComputeArrowAimDirection(dirX,self.ArrowAimXReach,self.ArrowAimYHalfHeight)
+        self:SpawnDoubleShotProjectile(ballRuid,combatPower,aim.x,aim.y,1,1)
+        self:SpawnDoubleShotProjectile(ballRuid,combatPower,aim.x,aim.y,2,-1)
+        self._T.doubleShotCastTarget = nil
+        self._T.doubleShotLaunchDelay = nil
 		-- 이동 잠금은 스킬 재사용 대기시간(SkillManager의 0.75*atkMultiplier 쿨다운)과 동일하게 유지한다.
 		_TimerService:SetTimerOnce(function()
 			self:RestoreDoubleShotControl(myMoveLockToken)
@@ -14757,7 +14907,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isDoubleShotMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingDoubleShotWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 다른 스킬들과 동일하게 컨트롤이 복구된 시점에 공용 숨고르기 모션을 시작한다.
 		self:PlayBreather(self.Entity, self._T.pendingDoubleShotDirX or 1)
@@ -14800,7 +14950,22 @@ script PlayerAttack extends AttackComponent
 			projComp.RateMax = self._T.pendingDoubleShotRateMax or (2.5 / 3.0)
 			-- 지금 적용 중인 데미지 스킨(블리자드 중이면 얼음 스킨)을 발사체에 새겨준다 - 수동 표시에 쓰인다.
 			projComp.DamageSkinRUID = self:GetHitDamageSkinId()
-			projComp:Fire(dirX, dirY)
+			local target=self._T.doubleShotCastTarget
+            local mon=isvalid(target) and target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then
+                projComp.GuaranteedTarget=target
+                projComp.TargetLifeSerial=mon.LifeSerial
+                self:ReserveFlyingDamage(projAtk,target,projComp.AttackTag,3.5)
+            end
+            proj.Visible=false
+            _TimerService:SetTimerOnce(function()
+                if not isvalid(proj) then return end
+                if not isvalid(self.Entity) or self.Entity.CurrentMap ~= map or self.Entity.StateComponent.CurrentStateName == "DEAD" then
+                    proj:Destroy() return
+                end
+                proj.Visible=true
+                projComp:Fire(dirX,dirY)
+            end,self._T.doubleShotLaunchDelay or 0)
 		end
 		log("[DoubleShot] 화살 발사 hitIndex=" .. tostring(hitIndex) .. " spreadDir=" .. tostring(spreadDir) .. " dir=(" .. string.format("%.2f", dirX) .. "," .. string.format("%.2f", dirY) .. ") combatPower=" .. tostring(combatPower))
 	end
@@ -15071,7 +15236,7 @@ script PlayerAttack extends AttackComponent
 
 		self:PlayStrafeMotion(self.Entity, self:GetBowCastMotion(), dirX, atkMultiplier)
 		self:PlayStrafeCastEffect(self.Entity, dirX)
-		_TimerService:SetTimerOnce(function()
+		do
 			-- 조준/타겟은 첫 발이 나가는 이 시점에 한 번만 확정하고 네 발이 그대로 공유한다.
 			-- (기능 변경) 스피어 버스터 로직 참고 - 전방 박스에서 몬스터 "한 명"을 타겟으로 고정하고,
 			-- 그 대상이 4발 도중에 죽더라도 4대가 전부 들어가도록 각 발의 도착 시점에 확정 히트
@@ -15117,7 +15282,8 @@ script PlayerAttack extends AttackComponent
 				local spreadT = (arrowCount <= 1) and 0 or ((i - 1) / (arrowCount - 1))
 				local destYOff = halfH * (0.75 - 1.5 * spreadT) * angleScale
 				-- 4줄이 뜨는 시간 간격은 스피어 버스터(0.1초*배율)와 같게 - 발사 간격이 곧 도착 간격이 된다.
-				local spawnDelay = 0.1 * atkMultiplier * (i - 1)
+				local spawnDelay = (0.2 + 0.1 * (i - 1)) * atkMultiplier
+                local planned = hasTarget and self:RollStrafePlanned(target,combatPower,rateMin,rateMax,hitIndex>4 and castFinalBonus or 1) or nil
 				-- (피드백) 출발은 네 발 모두 한 점(몸통 중심) - 도착점만 타겟 위→아래로 갈라진다.
 				local ddx = destX - originX
 				local ddy = (destCenterY + destYOff) - originY
@@ -15135,14 +15301,16 @@ script PlayerAttack extends AttackComponent
 				-- (요청) "한 명만 공격" - 화살의 물리 판정은 항상 끈다. 데미지는 x좌표가 타겟과 겹치는
 				-- 순간 화살이 직접 발동하는 확정 히트(DealStrafeLockHit)로만 들어간다.
 				if spawnDelay <= 0 then
+					self._T.nextStrafePlan=planned
 					self:SpawnStrafeProjectile(combatPower, dirAx, dirAy, hitIndex, 0, flightTime, hasTarget, target, destX, destYOff, castLineCount, castFinalBonus)
 				else
 					_TimerService:SetTimerOnce(function()
+						self._T.nextStrafePlan=planned
 						self:SpawnStrafeProjectile(combatPower, dirAx, dirAy, hitIndex, 0, flightTime, hasTarget, target, destX, destYOff, castLineCount, castFinalBonus)
 					end, spawnDelay)
 				end
 			end
-		end, 0.2 * atkMultiplier)
+        end
 		-- 이동 잠금은 스킬 재사용 대기시간(SkillManager의 0.9*atkMultiplier 쿨다운)과 동일하게 유지한다.
 		_TimerService:SetTimerOnce(function()
 			self:RestoreStrafeControl(myMoveLockToken)
@@ -15224,7 +15392,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isStrafeMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingStrafeWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 다른 스킬들과 동일하게 컨트롤이 복구된 시점에 공용 숨고르기 모션을 시작한다.
 		self:PlayBreather(self.Entity, self._T.pendingStrafeDirX or 1)
@@ -15236,7 +15404,9 @@ script PlayerAttack extends AttackComponent
 		-- (startYOffset)에서 시간차로 출발하고, 방향(dirX, dirY)은 호출부가 "자기 시작점 → 자기 도착
 		-- 높이(타겟 몸 위~아래)"로 미리 계산해 넘겨준다. lockHit이면 화살 스스로 x좌표가 targetX를
 		-- 지나는 순간 확정 히트를 발동하고 소멸한다(물리 판정은 항상 꺼짐 - "한 명만 공격").
-		local map = self.Entity.CurrentMap
+		local plan=self._T.nextStrafePlan
+        self._T.nextStrafePlan=nil
+        local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
 		self._T.strafeCount = (self._T.strafeCount or 0) + 1
 		local name = "strafe_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.strafeCount)
@@ -15251,7 +15421,10 @@ script PlayerAttack extends AttackComponent
 		-- 불의 영역/빙하지대 프록용 시전자 참조를 판정 컴포넌트에 새겨준다.
 		---@type StrafeProjectileAttack
 		local projAtk = proj:GetComponent("script.StrafeProjectileAttack")
-		if projAtk ~= nil then projAtk.OwnerEntity = self.Entity end
+		if projAtk ~= nil then
+            projAtk.OwnerEntity = self.Entity
+            if plan ~= nil then projAtk._T.flyingDamage={[plan.target.Id]=plan} end
+        end
 		---@type StrafeProjectile
 		local projComp = proj:GetComponent("script.StrafeProjectile")
 		if isvalid(projComp) then
@@ -15276,7 +15449,8 @@ script PlayerAttack extends AttackComponent
 			end
 			-- 지금 적용 중인 데미지 스킨(블리자드 중이면 얼음 스킨)을 발사체에 새겨준다 - 수동 표시에 쓰인다.
 			projComp.DamageSkinRUID = self:GetHitDamageSkinId()
-			projComp:Fire(dirX, dirY)
+			projComp._T.lockPlan=plan
+            projComp:Fire(dirX, dirY)
 		end
 		log("[Strafe] 화살 발사 hitIndex=" .. tostring(hitIndex) .. " startYOffset=" .. tostring(startYOffset) .. " dir=(" .. string.format("%.2f", dirX) .. "," .. string.format("%.2f", dirY) .. ") lockHit=" .. tostring(lockHit) .. " targetX=" .. string.format("%.2f", targetX) .. " hitYOffset=" .. string.format("%.2f", hitYOffset))
 	end
@@ -15361,11 +15535,13 @@ script PlayerAttack extends AttackComponent
 		-- DamageSkinService의 기본 위치가 이미 몬스터 위다. 다른 스킬과 동일하게 첫 줄은 추가
 		-- 오프셋 0에서 시작하고, 후속 줄만 위로 누적한다(히트박스 높이를 또 더하면 이중 상승).
 		local offsetY = (safeIndex - 1) * spacing
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 		log("[Strafe] ShowStrafeLockDamageSkin hitIndex=" .. tostring(hitIndex) .. "/" .. tostring(totalLines) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(isCritical))
 	end
 
@@ -15510,7 +15686,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isIceShotMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingIceShotWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		self:PlayBreather(self.Entity, self._T.pendingIceShotDirX or 1)
 	end
@@ -15607,7 +15783,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
 			table.insert(result, candidates[i].entity)
@@ -15652,7 +15828,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
 			table.insert(result, candidates[i].entity)
@@ -15747,7 +15923,9 @@ script PlayerAttack extends AttackComponent
 				local monsterComp = victim:GetComponent("script.Monster")
 				local pos = victim.TransformComponent.WorldPosition
 				local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
-				self:Attack(shape, "skill.iceshot", CollisionGroups.HitBox)
+				self._T.resolvingDirectFlight=self._T.areaFlightPlan~=nil and self._T.areaFlightPlan.target==victim and self._T.areaFlightPlan or nil
+                self:Attack(shape, "skill.iceshot", CollisionGroups.HitBox)
+                self._T.resolvingDirectFlight=nil
 				self._T.iceShotCurrentTarget = nil
 				hitCount = hitCount + 1
 				self:SpawnIceShotHitEffect(victim)
@@ -16290,8 +16468,9 @@ script PlayerAttack extends AttackComponent
 		local target = nil
 		if #inRange > 0 then
 			target = inRange[1 + math.floor(_UtilLogic:RandomDouble() * #inRange)]
+            for _,candidate in ipairs(inRange) do if self:IsPriorityBoss(candidate) then target=candidate break end end
 		else
-			table.sort(candidates, function(a, b) return a.dist < b.dist end)
+			table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 			local pickMax = math.min(#candidates, 12)
 			target = candidates[1 + math.floor(_UtilLogic:RandomDouble() * pickMax)].entity
 		end
@@ -16522,7 +16701,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isFireShotMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingFireShotWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		self:PlayBreather(self.Entity, self._T.pendingFireShotDirX or 1)
 	end
@@ -16576,7 +16755,9 @@ script PlayerAttack extends AttackComponent
 				self._T.fireShotCurrentTarget = victim
 				local pos = victim.TransformComponent.WorldPosition
 				local shape = BoxShape(Vector2(pos.x, pos.y), Vector2(1.0, 1.6), 0)
-				self:Attack(shape, "skill.fireshot", CollisionGroups.HitBox)
+				self._T.resolvingDirectFlight=self._T.areaFlightPlan~=nil and self._T.areaFlightPlan.target==victim and self._T.areaFlightPlan or nil
+                self:Attack(shape, "skill.fireshot", CollisionGroups.HitBox)
+                self._T.resolvingDirectFlight=nil
 				self._T.fireShotCurrentTarget = nil
 				hitCount = hitCount + 1
 				-- 대상 몸의 화염 폭발(hit/0)은 맞은 각 대상에 붙인다.
@@ -16762,7 +16943,7 @@ script PlayerAttack extends AttackComponent
 		-- 마지막 발사 1초 뒤 안전장치, 두 경로에서 호출되므로 여러 번 불려도 안전해야 한다.
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		log("[RapidFire] 이동 잠금 해제")
 	end
@@ -18090,7 +18271,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
 			table.insert(result, candidates[i].entity)
@@ -18162,13 +18343,15 @@ script PlayerAttack extends AttackComponent
 				rb.MoveVelocity = Vector2(0, 0)
 			end
 			if isvalid(mv) then mv:Stop() end
-			if isvalid(playerCtrl) then playerCtrl.Enable = true end
+			if isvalid(playerCtrl) then playerCtrl.Enable = not self:IsDeathBlocked() end
 			log("[ChainShot] 당기기 이동 종료")
 		end, duration)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void AttackFlash(number combatPower, number atkMultiplier, number rawDirX, number rawDirY, string weaponRuid)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isFlashActive") then return end
 		-- 섬광(섀도어 2차): 판정/데미지/조준 스냅은 체인샷과 동일하되 연출이 다르다.
 		-- swingT2 모션 후 전용 투척 단검(FLASH_DAGGER_RUID)이 **칼끝을 앞세워 일자로** 날아가 벽에 박히고,
 		-- 체인샷과 달리 한 번 더 누를 필요 없이 즉시 그 방향으로 돌진해 벽 위 땅에 안착한다.
@@ -18727,7 +18910,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isAvengerMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingAvengerWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- (기능 추가) "다른 스킬들을 사용하고 난 다음도 모두 숨고르기 모션을 3번 하도록 해달라"는 요청 -
 		-- 컨트롤이 복구된 이 시점에 공용 숨고르기(PlayBreather)를 시작한다.
@@ -18822,7 +19005,7 @@ script PlayerAttack extends AttackComponent
 				local dy = pos.y - fromPos.y
 				if dx * dirX >= 0 and math.abs(dx) <= xReach and math.abs(dy) <= yHalfHeight then
 					local dist = math.sqrt(dx * dx + dy * dy)
-					if dist < nearestDist then
+					if self:PreferMonster(mc.Entity,dist,nearest,nearestDist) then
 						nearestDist = dist
 						nearest = mc.Entity
 					end
@@ -18834,6 +19017,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackAssaulterLv(number combatPower, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isAssaulting") then return end
 		-- (2026-08-06 개편) 대상당 데미지 배율을 클라이언트가 투자 레벨로 계산해 넘겨준다.
 		-- ⚠ 기존 AttackAssaulter에 인자를 더하지 않고 이름을 바꿨다(LEA-1102 회피).
 		self._T.pendingAssaulterRateMin = rateMin
@@ -19073,7 +19258,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
 			table.insert(result, candidates[i].entity)
@@ -19267,12 +19452,14 @@ script PlayerAttack extends AttackComponent
 		self._T.assaulterControlSuppressed = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingAssaulterWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 	end
 
 	@ExecSpace("ServerOnly")
 	method void AttackSpearBurst(number combatPower, number atkMultiplier, boolean enhanced, number multMin, number multMax, integer targetCount, integer finalAttackLv)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isSpearBursting") then return end
 		-- (기능 추가) "다른 스킬을 쓰면 숨고르기 모션은 중지" 요청 - 이 스킬을 새로 시전하는 시점에 이전 숨고르기가 재생 중이었다면 즉시 정리한다.
 		self:StopBreather()
 		-- 스피어 버스터 요청에 파이널어택 투자 레벨을 함께 실어 서버에서 즉시 확정한다. 별도 동기화
@@ -19833,7 +20020,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isSpearBursting = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingSpearBurstWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		if isvalid(self.Entity.AvatarRendererComponent) then
 			self.Entity.AvatarRendererComponent.ShowDefaultWeaponEffects = true
@@ -20218,17 +20405,21 @@ script PlayerAttack extends AttackComponent
 		-- 더 얹어서 서로 다른 위치에 뜨도록 한다.
 		-- (버그 수정) "각자 크리티컬 여부를 독립적으로 판단해야 한다" - 하드코딩된 false 대신 CalcDamage가
 		-- 이 타격(hitIndex)에 대해 독립적으로 굴린 결과를 그대로 전달한다.
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 		if bonus > 0 then
+			if not _AutoHuntPowerSave.active then
 			_DamageSkinService:Play(
 			    target, self:GetHitDamageSkinId(), 0,
 			    { bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 			    Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
+			end
 		end
 		log("[SpearBurst] ShowSpearBurstStabDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " baseCrit=" .. tostring(baseIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
 	end
@@ -20337,6 +20528,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackSavageBlowLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isSavageBlowing") then return end
 		-- (2026-08-06 개편) 한 타당 데미지 배율을 클라이언트가 투자 레벨로 계산해 넘겨준다.
 		-- ⚠ 기존 AttackSavageBlow에 인자를 더하지 않고 이름을 바꿨다(LEA-1102 회피).
 		self._T.pendingSavageBlowRateMin = rateMin
@@ -20654,17 +20847,21 @@ script PlayerAttack extends AttackComponent
 			offsetY = -0.2 + (hitIndex - 1) * 0.5
 			bonusGap = 0.25
 		end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 		if bonus > 0 then
+			if not _AutoHuntPowerSave.active then
 			_DamageSkinService:Play(
 				target, self:GetHitDamageSkinId(), 0,
 				{ bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
+			end
 		end
 		log("[SavageBlow] ShowSavageBlowDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(baseIsCritical))
 	end
@@ -20713,7 +20910,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isSavageBlowing = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingSavageBlowWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 다른 스킬들과 동일하게 컨트롤이 복구된 시점에 공용 숨고르기 모션을 재생한다.
 		self:PlayBreather(self.Entity, self._T.pendingSavageBlowDirX or 1)
@@ -20741,7 +20938,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(candidates, function(a, b) return a.dist < b.dist end)
+		table.sort(candidates, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		local result = {}
 		for i = 1, math.min(#candidates, maxCount) do
 			table.insert(result, candidates[i].entity)
@@ -20807,6 +21004,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackRush(number combatPower, number atkMultiplier, string weaponClass)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isRushing") then return end
 		-- 돌진(4차): 전방의 적을 최대 10명까지 밀어내며 2.95초 동안 전진한다.
 		-- (요청) 앞에 적이 없으면 돌진하지 않고 제자리에서 시전만 한다.
 		-- 발판이 끊기는 지점에서는 플레이어도 몬스터도 더 나아가지 않는다.
@@ -21050,7 +21249,7 @@ script PlayerAttack extends AttackComponent
 		-- 컨트롤러 복귀는 딜레이 시점에. 이때까지는 돌진 자세가 그대로 유지된다.
 		_TimerService:SetTimerOnce(function()
 			if isvalid(playerCtrl) then
-				playerCtrl.Enable = true
+				playerCtrl.Enable = not self:IsDeathBlocked()
 			end
 			log("[Rush] RunRushMove 컨트롤 복귀")
 		end, ctrlRestoreDelay)
@@ -21080,7 +21279,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isRushing = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		log("[Rush] RestoreRushControl 컨트롤 복구 wasCtrl=" .. tostring(self._T.pendingRushWasControllerEnabled))
 	end
@@ -21399,6 +21598,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackBoomerangStep(number combatPower, integer skillLv)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isBoomerangStepping") then return end
 		-- 부메랑 스탭: 15프레임 시전 중 7번에서 1줄, 12번에서 2줄을 넣어 총 3타를 만든다.
 		self:StopBreather()
 		local state = self.Entity.StateComponent.CurrentStateName
@@ -21613,6 +21814,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackBrandish(number combatPower, number atkMultiplier, string weaponClass, boolean enhanced)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isBrandishing") then return end
 		-- 브랜디쉬(4차): 검을 크게 휘둘러 전방의 적을 벤다. 한 번 시전에 총 3줄 -
 		-- swingT3 마지막에 1줄, 이어지는 swingTF 마지막에 2줄이 들어간다(요청). 줄당 전투력의 400~700% 피해.
 		-- 모션은 무기 분류와 무관하게 swingT3 -> swingTF 연속 재생(요청) - weaponClass는 쓰지 않는다.
@@ -21898,17 +22101,21 @@ script PlayerAttack extends AttackComponent
 			bonusGap = 0.25
 		end
 		local skinRuid = self:GetHitDamageSkinId()
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, skinRuid, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, baseIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 		if bonus > 0 then
+			if not _AutoHuntPowerSave.active then
 			_DamageSkinService:Play(
 				target, skinRuid, 0,
 				{ bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
+			end
 		end
 		log("[Brandish] ShowBrandishFinishDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " offsetY=" .. tostring(offsetY) .. " crit=" .. tostring(baseIsCritical))
 	end
@@ -21925,7 +22132,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isBrandishing = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		-- 시전 중 빼뒀던 몸동작 매핑을 기본값 그대로 되돌린다(AttackBrandish 참고).
 		self:RestoreBrandishStateMotions()
@@ -22737,16 +22944,22 @@ script PlayerAttack extends AttackComponent
 	end
 
 	@ExecSpace("ServerOnly")
-	method Entity PickAmhaengRangeTarget()
-		-- (요청) 암행1·암행2는 모두 "때린 그 몬스터"가 아니라 **드래곤 로어 절반 범위
-		-- (가로 ±7.5 / 세로 ±3.75) 안의 랜덤한 위치의 적**을 공격한다. 범위 판정은 샤이닝 레이와
-		-- 같은 함수를 재사용하고(거리순 정렬된 목록) 그중 하나를 무작위로 고른다.
-		-- (암행2에서 먼저 도입 → 이후 요청으로 암행1도 같은 규칙을 쓰게 되어 공용 함수로 이름을 바꿨다.)
-		local myPos = self.Entity.TransformComponent.WorldPosition
-		local candidates = self:FindShiningRayTargets(Vector2(myPos.x, myPos.y), 30)
-		if #candidates <= 0 then return nil end
-		return candidates[_UtilLogic:RandomIntegerRange(1, #candidates)]
-	end
+    method Entity PickAmhaengRangeTarget()
+        -- Center on the player; 1.5 times Heal's horizontal/vertical reach.
+        local map=self.Entity.CurrentMap
+        if not isvalid(map) then return nil end
+        local center=self.Entity.TransformComponent.WorldPosition
+        local candidates={}
+        for _,monster in ipairs(map:GetChildComponentsByTypeName("script.Monster",true)) do
+            if isvalid(monster) and monster.Entity.EnabledInHierarchy and not monster.IsDead and not monster:IsDeathPending() and not monster:IsSpawnProtected() then
+                local p=monster.Entity.TransformComponent.WorldPosition
+                if math.abs(p.x-center.x)<=5.4 and math.abs(p.y-center.y)<=4.32 then table.insert(candidates,monster.Entity) end
+            end
+        end
+        if #candidates==0 then return nil end
+        for _,target in ipairs(candidates) do if self:IsPriorityBoss(target) then return target end end
+        return candidates[_UtilLogic:RandomIntegerRange(1,#candidates)]
+    end
 
 	method table GetAmhaeng2PoseClips(string variant)
 		-- 그림자가 취할 포즈(쉐도우 파트너 그림자와 동일한 skill/411.img/skill/4111002 special/* 클립).
@@ -23771,11 +23984,13 @@ script PlayerAttack extends AttackComponent
 		-- (본체 더블스탭 ±0.15 2줄 / 새비지블로우 6줄 배치와 같은 눈금).
 		local total = math.max(1, totalHits or 1)
 		local offsetY = ((hitIndex or 1) - (total + 1) / 2) * 0.3
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:Play(
 			target, self:GetHitDamageSkinId(), 0,
 			{ dmg > 0 and dmg or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, isCrit,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 		)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -23873,6 +24088,12 @@ script PlayerAttack extends AttackComponent
 		if code == 8 then return MapleAvatarItemCategory.TwoHandedWeapon end
 		if code == 9 then return MapleAvatarItemCategory.Cape end
 		if code == 10 then return MapleAvatarItemCategory.Glove end
+		if code == 11 then return MapleAvatarItemCategory.Longcoat end
+		if code == 12 then return MapleAvatarItemCategory.SubWeapon end
+		if code == 13 then return MapleAvatarItemCategory.FaceAccessory end
+		if code == 14 then return MapleAvatarItemCategory.EyeAccessory end
+		if code == 15 then return MapleAvatarItemCategory.EarAccessory end
+		if code == 16 then return MapleAvatarItemCategory.Ear end
 		return MapleAvatarItemCategory.Body
 	end
 
@@ -24139,7 +24360,7 @@ script PlayerAttack extends AttackComponent
 					local dx = pos.x - fromX
 					local dy = pos.y - fromY
 					local d = math.sqrt(dx * dx + dy * dy)
-					if d <= RADIUS and d < bestDist then
+					if d <= RADIUS and self:PreferMonster(mc.Entity,d,best,bestDist) then
 						best = mc.Entity
 						bestDist = d
 					end
@@ -25746,6 +25967,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackMeteorLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isMeteoring") then return end
 		-- ⚠ 인자 개수를 바꾸면 refresh를 해도 옛 시그니처(LEA-1102)로 계속 실패해 기존
 		-- AttackMeteor에서 이름을 바꿨다(드래곤 라이딩 전례).
 		-- (불독 개편 2026-08-08) rateMin/rateMax = 운석당 데미지 배율(클라 GetMeteor*Percent / 100) -
@@ -25829,7 +26052,7 @@ script PlayerAttack extends AttackComponent
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		local wasLocked = isvalid(playerCtrl) and (not playerCtrl.Enable)
 		if isvalid(playerCtrl) and self._T.pendingMeteorWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		log("PlayerAttack: 메테오 조작 잠금 해제 (3초 유지됨=" .. tostring(wasLocked) .. ")")
 	end
@@ -26059,6 +26282,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackGenesis(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Preserve early repeats until the previous cast releases its own lock.
+		if not self:AwaitCastRecovery("isGenesising") then return end
 		-- 제네시스 타임라인 (쿨타임 20초는 클라이언트 SkillManager가 관리/표시 - 블리자드/메테오와 동일 규격):
 		--   0.0s   시전 이펙트 2종(f0035d3b + 1c434f7c) + 사용음(d07011d8) + 전용 BGM(f0f6d14d, 20초 루프)
 		--          + 맵이 서서히 살짝 "하얗게 밝아짐"(메테오의 붉은 틴트와 같은 트윈, 색만 흰색)
@@ -26130,7 +26355,7 @@ script PlayerAttack extends AttackComponent
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		local wasLocked = isvalid(playerCtrl) and (not playerCtrl.Enable)
 		if isvalid(playerCtrl) and self._T.pendingGenesisWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		log("PlayerAttack: 제네시스 조작 잠금 해제 (3초 유지됨=" .. tostring(wasLocked) .. ")")
 	end
@@ -26394,6 +26619,11 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackChainLightning(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		local repeatFireWave=self._T.nextChainLightningIsFireWave
+		self._T.nextChainLightningIsFireWave=false
+		if not self:AwaitCastRecovery("isChainLightning") then return end
+		self._T.nextChainLightningIsFireWave=repeatFireWave
 		-- (썬콜 개편 2026-08-08) 연쇄 대상당 배율(GetChainLightning*Percent / 100)을 클라가 계산해
 		-- 넘긴다 - CalcDamage의 skill.chainlightning 분기가 읽는다.
 		self:StopBreather()
@@ -26543,7 +26773,7 @@ script PlayerAttack extends AttackComponent
 		self._T.isSmokeScreenMovementLocked = false
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingSmokeScreenWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		log("[SmokeScreen] 시전 모션 종료 - 조작 복구")
 	end
@@ -26734,8 +26964,10 @@ script PlayerAttack extends AttackComponent
 		-- 연막으로 공격이 빗나갔을 때의 MISS 표시(다른 스킬의 수동 표시와 같은 DamageSkinService 경로).
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
+		if not _AutoHuntPowerSave.active then
 		_DamageSkinService:PlayTextDamage(target, "02c22d93421b4038b3c413b3e40b57ec",
 			DamageSkinTextType.Miss, DamageSkinTweenType.Default)
+		end
 	end
 
 	-- ── 드레인 샷(나이트로드 2차) ────────────────────────────────────────
@@ -26744,7 +26976,9 @@ script PlayerAttack extends AttackComponent
 	-- 이펙트는 사용자 제공 클래식 아트 6프레임(ori 정렬 68x68 패딩 업로드 - RUID.md 참고).
 	@ExecSpace("ServerOnly")
 	method void AttackDrainShot(number combatPower, number atkMultiplier, number healPercent)
-		local sc = self.Entity.StateComponent
+		local hp=self.Entity.PlayerComponent
+        if not isvalid(hp) or hp.Hp>=hp.MaxHp then return end
+        local sc = self.Entity.StateComponent
 		if isvalid(sc) then
 			local st = sc.CurrentStateName
 			if st == "DEAD" or st == "CLIMB" or st == "LADDER" then return end
@@ -26755,7 +26989,7 @@ script PlayerAttack extends AttackComponent
 		local worldPos = self:GetCastOrigin()
 		local dirX = playerCtrl.LookDirectionX
 		-- 표창 스킬이므로 대상 탐색도 표창 3종과 같은 것을 쓴다(각성 중에는 드래곤 로어 범위로 넓어진다).
-		local target = self:FindStarThrowTarget(Vector2(worldPos.x, worldPos.y), dirX)
+		local target = self:FindLegacyStarThrowTarget(Vector2(worldPos.x, worldPos.y), dirX)
 		local throwH = _ShurikenLibrary:GetThrowHeight()
 		local fallbackPos = nil
 		if isvalid(target) then
@@ -26764,7 +26998,7 @@ script PlayerAttack extends AttackComponent
 			-- 각성 중에는 등 뒤/위아래 적도 잡히므로 그쪽으로 몸을 돌려 던진다(표창 3종과 같은 규칙).
 			if tp.x > worldPos.x then dirX = 1 elseif tp.x < worldPos.x then dirX = -1 end
 		else
-			fallbackPos = Vector3(worldPos.x + dirX * 8.0, worldPos.y + throwH, worldPos.z)
+			fallbackPos = Vector3(worldPos.x + dirX * _ShurikenLibrary:GetSkillReach(self:IsAwakeningActive()).x, worldPos.y + throwH, worldPos.z)
 		end
 		-- (요청 2026-08-05) 모션은 아대 기본공격과 **같은 스윙**(swingO1/O2/O3 순환)을 쓴다.
 		-- 기본공격은 클라에서 직접 재생하지만(CastClawBasicAttack), 드레인 샷은 서버 시전이라
@@ -26778,9 +27012,14 @@ script PlayerAttack extends AttackComponent
 		self._T.drainShotHealPct = healPercent
 		-- (요청) 표창은 **스윙 마지막 프레임이 나올 때** 손을 떠난다. 스윙 전체 길이가 0.6초(공속 배율
 		-- 적용)라 그 끝자락인 0.5×배율에 던진다(기본공격 AttackClawThrow도 같은 타이밍으로 맞췄다).
-		local throwAt = self:GetClawThrowReleaseDelay() * mult
+		local castMap=self.Entity.CurrentMap
+        local targetMonster=isvalid(target) and target:GetComponent("script.Monster") or nil
+        local targetLife=isvalid(targetMonster) and targetMonster.LifeSerial or 0
+        local throwAt = self:GetClawThrowReleaseDelay() * mult
 		_TimerService:SetTimerOnce(function()
-			self:FireClawShuriken(fallbackPos)
+			local reach=_ShurikenLibrary:GetSkillReach(self:IsAwakeningActive())
+            local monster=isvalid(target) and target:GetComponent("script.Monster") or nil
+            self:FireClawShurikenReserved(fallbackPos,{target=target,map=castMap,monster=monster,life=targetLife,token=0,travelRange=math.sqrt(reach.x*reach.x+math.max(reach.y,3)*math.max(reach.y,3))})
 		end, throwAt)
 		-- (요청) 흡혈은 **대상을 잡았을 때만** 들어간다 - 허공에 던지고 회복하는 것은 막는다.
 		if isvalid(target) then
@@ -26905,6 +27144,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackAssassinateLv(number combatPower, number atkMultiplier, number rateMin, number rateMax)
+		-- Serialize early repeat requests before changing this cast’s pending values.
+		if not self:AwaitCastRecovery("isAssassinating") then return end
 		-- (2026-08-06 개편) 대상당 데미지 배율(= 쿼드러플 스로우 합계의 절반)을 클라이언트가 투자 레벨로
 		-- 계산해 넘겨준다. ⚠ 기존 AttackAssassinate 개명(LEA-1102 회피).
 		self._T.pendingAssassinateRateMin = rateMin
@@ -26990,7 +27231,7 @@ script PlayerAttack extends AttackComponent
 				if smokeRange then
 					inRange = math.abs(dx) <= 15.0 and math.abs(dy) <= 7.5
 				end
-				if inRange and d < bestDist then
+				if inRange and self:PreferMonster(mc.Entity,d,best,bestDist) then
 					best = mc.Entity
 					bestDist = d
 				end
@@ -27341,7 +27582,7 @@ script PlayerAttack extends AttackComponent
 		if not isvalid(self.Entity) then return end
 		local playerCtrl = self.Entity.PlayerControllerComponent
 		if isvalid(playerCtrl) and self._T.pendingChainLightningWasControllerEnabled then
-			playerCtrl.Enable = true
+			playerCtrl.Enable = not self:IsDeathBlocked()
 		end
 		self:PlayBreather(self.Entity, isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1)
 	end
@@ -27503,7 +27744,7 @@ script PlayerAttack extends AttackComponent
 				local pos = mc.Entity.TransformComponent.WorldPosition
 				local dx = (pos.x - worldPos.x) * dirX
 				local dy = pos.y - worldPos.y
-				if dx >= 0.5 and dx <= 6.0 and math.abs(dy) <= 0.8 + dx * 0.45 and dx < firstDist then
+				if dx >= 0.5 and dx <= 6.0 and math.abs(dy) <= 0.8 + dx * 0.45 and self:PreferMonster(mc.Entity,dx,first,firstDist) then
 					first = mc.Entity
 					firstDist = dx
 				end
@@ -27531,7 +27772,7 @@ script PlayerAttack extends AttackComponent
 				end
 			end
 		end
-		table.sort(chainCands, function(a, b) return a.dist < b.dist end)
+		table.sort(chainCands, function(a, b) return self:PreferMonster(a.entity,a.dist,b.entity,b.dist) end)
 		for i = 1, math.min(#chainCands, 9) do
 			table.insert(targets, chainCands[i].entity)
 		end
@@ -27799,6 +28040,169 @@ script PlayerAttack extends AttackComponent
 		-- 새 전이가 전달되지 않을 수 있다. 각 화면에서 현재 자세를 직접 다시 적용한다.
 		self.Entity:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Stand))
 		log("[Breather] client idle animation restored")
+	end
+
+    @ExecSpace("ServerOnly")
+    method boolean ShouldAutoSpread(table targets, number combatPower, integer shots)
+        -- Compare mean per-target damage with HP remaining after already committed hits.
+        if #targets<2 or combatPower<=1 or self:IsPriorityBoss(targets[1]) then return false end
+        local rate=((self._T.starRateMin or 1)+(self._T.starRateMax or 1.5))/2
+        local crit=1+math.max(0,math.min(1,self:GetStarThrowCritRatePercent()/100))
+        local echo=self._T.shadowPartnerActive==true and self:GetShadowEchoRate()*crit or 0
+        local kills=0
+        for i,target in ipairs(targets) do
+            local monster=target:GetComponent("script.Monster")
+            if not isvalid(monster) or monster.NeverDie then if i==1 then return false end continue end
+            local repetitions=math.floor((shots-i)/#targets)+1
+            local share=0.6+0.1*math.max(0,repetitions-1)
+            local damage=math.floor(combatPower*rate*shots*share)
+            if self._T.backstabEnabled==true and (self:IsSmokeScreenActive() or self:IsBackstabPosition(self.Entity,target)) then
+                damage=math.floor(damage*(1+0.01*(self._T.backstabLevel or 0)))
+            end
+            damage=_RegionTierLogic:ApplyMonsterLevelDamage(damage,self.Entity,target)*crit*(1+echo)
+            local reserved=monster:GetReservedDamage()
+            if monster.IncomingHitExpires>_UtilLogic.ServerElapsedSeconds then reserved=math.max(reserved,monster.IncomingHitDamage) end
+            local remaining=math.max(1,monster.Hp-reserved)
+            local lethal=damage>=remaining
+            if i==1 and not lethal then return false end
+            if lethal then kills=kills+1 end
+        end
+        -- A single enemy gets stronger focused fire; spread only earns multiple likely kills.
+        return kills>=2
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReserveFlyingDamage(any attack, Entity target, string tag, number duration)
+        local mon = isvalid(target) and target:GetComponent("script.Monster") or nil
+        if not isvalid(mon) or mon.IsDead or mon:IsSpawnProtected() then return end
+        attack._T.flyingDamage = attack._T.flyingDamage or {}
+        if attack._T.flyingDamage[target.Id] ~= nil then return end
+        local roll = attack:RollPlannedDamage(target, tag)
+        roll.target = target
+        roll.life = mon.LifeSerial
+        roll.tag = tag
+        roll.token = mon:ReserveIncomingHit(roll.dmg + (roll.bonus or 0), duration)
+        attack._T.flyingDamage[target.Id] = roll
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveFlyingDamage(any attack, Entity target, string tag)
+        local plan = attack._T.flyingDamage
+        local roll = plan ~= nil and plan[target.Id] or nil
+        if roll ~= nil and roll.tag == tag then
+            plan[target.Id] = nil
+            local mon = target:GetComponent("script.Monster")
+            if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
+            return roll
+        end
+        return attack:RollPlannedDamage(target, tag)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReleaseFlyingDamage(any attack)
+        for _, roll in pairs(attack._T.flyingDamage or {}) do
+            local mon = isvalid(roll.target) and roll.target:GetComponent("script.Monster") or nil
+            if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
+        end
+        attack._T.flyingDamage = nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PlanFlyingDamage(any attack, number dirX, number dirY, number reach, integer count, number halfHeight, string tag, number duration)
+        if attack._T.flyingDamage ~= nil then return end
+        local origin = attack.Entity.TransformComponent.WorldPosition
+        local candidates = {}
+        local simulator = _CollisionService:GetSimulator(attack.Entity)
+        if simulator == nil then return end
+        local center = Vector2(origin.x+dirX*reach/2,origin.y+dirY*reach/2)
+        local hits = simulator:OverlapAll(CollisionGroups.HitBox,BoxShape(center,Vector2(reach+2,reach+2),0))
+        local seen = {}
+        for _, collider in ipairs(hits) do
+            local target = collider.Entity
+            local mon = isvalid(target) and target:GetComponent("script.Monster") or nil
+            local hit = isvalid(target) and target.HitComponent or nil
+            if not seen[target] and isvalid(mon) and not mon.IsDead and not mon:IsDeathPending() and mon.Hp > 0 and not mon:IsSpawnProtected() and isvalid(hit) and hit.Enable then
+                local p = target.TransformComponent:ToWorldPoint(Vector3(hit.ColliderOffset.x, hit.ColliderOffset.y, 0))
+                local dx, dy = p.x-origin.x, p.y-origin.y
+                local along = dx*dirX + dy*dirY
+                local across = math.abs(dx*dirY - dy*dirX)
+                local body = hit.ColliderType == ColliderType.Box and hit.BoxSize.y/2 or hit.CircleRadius
+                if along >= -0.1 and along <= reach and across <= halfHeight + body then
+                    seen[target] = true
+                    table.insert(candidates, {target=target, distance=along})
+                end
+            end
+        end
+        table.sort(candidates, function(a,b) return self:PreferMonster(a.target,a.distance,b.target,b.distance) end)
+        for i=1, math.min(count,#candidates) do
+            self:ReserveFlyingDamage(attack,candidates[i].target,tag,duration)
+        end
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method table RollStrafePlanned(Entity target, number power, number low, number high, number finalBonus)
+        local damage=math.floor(power*(low+_UtilLogic:RandomDouble()*math.max(0,high-low))*finalBonus)
+        damage=self:ApplyComboAttackBonus(self:ApplyBackstabBonus(damage,self.Entity,target,"skill.strafe.lock"))
+        damage=self:ApplyDemonMarkBonuses(damage,target,"skill.strafe.lock")
+        local chance=self:GetServerCritRatePercent()/100
+        local critMult=(self._T.currentCritDamagePercent or 125)/100
+        if self:GetServerCombatPower() <= 1 then
+            damage=math.min(self:GetServerCombatPower() <= 0 and 2 or 5,math.max(0,damage))
+            chance=0 critMult=1
+        end
+        local critical=_UtilLogic:RandomDouble()<chance
+        if critical then damage=math.floor(damage*critMult) end
+        local bonus, bonusCritical=0,false
+        if self._T.shadowPartnerActive then
+            bonus=math.floor(damage*self:GetShadowEchoRate())
+            bonusCritical=_UtilLogic:RandomDouble()<chance
+            if bonusCritical then bonus=math.floor(bonus*critMult) end
+        end
+        local mon=target:GetComponent("script.Monster")
+        return {dmg=damage,bonus=bonus,critical=critical,bonusCritical=bonusCritical,target=target,life=mon.LifeSerial,tag="skill.strafe.lock",token=mon:ReserveIncomingHit(damage+bonus,4)}
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method table RollDirectFlyingDamage(Entity target, string tag)
+        -- CalcDamage only calculates/caches numbers; Attack/HitEvent is still impact-only.
+        local keys={"shadowEchoOriginal","shadowEchoBonus","shadowEchoOriginalIsCritical","shadowEchoBonusIsCritical","shadowEchoIsManualSkin"}
+        local previous={}
+        for _,key in ipairs(keys) do previous[key]=self._T[key] end
+        local damage=self:CalcDamage(self.Entity,target,tag)
+        local critical=self:CalcCritical(self.Entity,target,tag)
+        if critical then damage=math.floor(damage*self:GetCriticalDamageRate()) end
+        local roll={dmg=damage,bonus=0,critical=critical,shadow={}}
+        for _,key in ipairs(keys) do roll.shadow[key]=self._T[key] self._T[key]=previous[key] end
+        local mon=target:GetComponent("script.Monster")
+        roll.target=target roll.life=mon.LifeSerial roll.tag=tag
+        roll.token=mon:ReserveIncomingHit(damage,6)
+        return roll
+    end
+
+	@ExecSpace("ServerOnly")
+	method boolean AwaitCastRecovery(string busyKey)
+		-- Keep one early repeat until the previous cast finishes instead of losing a full cooldown.
+		local entity=self.Entity
+		if not isvalid(entity) or entity.PlayerComponent.Hp<=0 then return false end
+		local map=entity.CurrentMap
+		local run=(_BossStageManager._T.runs or {})[entity.PlayerComponent.UserId]
+		if run~=nil and run.state~="active" then return false end
+		if self._T.bufferedCastKey~=nil then return false end
+		if not self._T[busyKey] then return true end
+		self._T.bufferedCastKey=busyKey
+		local deadline=_UtilLogic.ElapsedSeconds+0.5
+		while isvalid(entity) and entity.CurrentMap==map and entity.PlayerComponent.Hp>0 and self._T[busyKey] and _UtilLogic.ElapsedSeconds<deadline do
+			wait(0.01)
+		end
+		self._T.bufferedCastKey=nil
+		if not isvalid(entity) or entity.CurrentMap~=map or entity.PlayerComponent.Hp<=0 then return false end
+		run=(_BossStageManager._T.runs or {})[entity.PlayerComponent.UserId]
+		if run~=nil and run.state~="active" then return false end
+		if self._T[busyKey] then return false end
+		log("[SkillRepeat] resumed "..busyKey)
+		return true
 	end
 
 end

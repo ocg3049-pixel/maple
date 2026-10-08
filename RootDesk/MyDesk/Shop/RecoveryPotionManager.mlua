@@ -22,7 +22,12 @@ script RecoveryPotionManager extends Logic
         self._T.pending=nil
         local modal=_EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal")
         if isvalid(modal) then modal.Enable=false end
-        if accept and pending~=nil then self:Consume(pending.slot,pending.item) end
+        if accept and pending~=nil then
+            if pending.action=="cancel" then
+                local tier=pending.kind=="hp" and self.hpTier or self.mpTier
+                if pending.owner==self._T.characterId and pending.revision==self._T.buffRevision and tier==pending.tier then self:Cancel(pending.kind) end
+            else self:Consume(pending.slot,pending.item) end
+        end
     end
 
     @ExecSpace("ClientOnly")
@@ -96,7 +101,11 @@ script RecoveryPotionManager extends Logic
         self._T.iconRequests=self._T.iconRequests or {}
         local request={}
         self._T.iconRequests[icon.Id]=request
-        if not self:IsIcon(ruid) and ruid~="17ae6a22966f45738bb92fb97ecc3e9d" then return end
+        icon.UITransformComponent.RectSize=Vector2(width,height)
+        renderer.Type=ImageType.Simple
+        renderer.PreserveSprite=PreserveSpriteType.AspectOnly
+        renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
+        if string.sub(ruid,1,12)=="thumbnail://" then return end
         local size=self._T.iconSizes[ruid]
         if size==nil then
             local sprite=_ResourceService:LoadSpriteAndWait(ruid)
@@ -129,6 +138,7 @@ script RecoveryPotionManager extends Logic
             self._T.pending=pending
             inv:CancelInvenDrag() inv:HideTooltip()
             local panel=_EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal/Panel")
+            panel:GetChildByName("Title").TextGUIRendererComponent.Text="회복 효과 갱신"
             panel:GetChildByName("Message").TextGUIRendererComponent.Text=(current and current.name or string.upper(row.kind)).." 사용 중 ("..tostring(tier).."%, 남은 "..tostring(math.ceil(remaining/60)).."분)\n"..row.name.." ("..tostring(row.tier).."%)로 교체하고\n지속시간을 1시간으로 갱신할까요?"
             _EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal").Enable=true
             log("[RecoveryPotion] replacement confirmation "..row.kind)
@@ -146,10 +156,12 @@ script RecoveryPotionManager extends Logic
         if row == nil or inv:ParseRUID(item) ~= row.ruid or inv:ParseCount(item) < 1 then return false end
         if self._T.using then return false end
         self._T.using = true
+        self._T.buffRevision=(self._T.buffRevision or 0)+1
         if row.kind == "hp" then self.hpTier = row.tier self.hpRemaining = 3600
         else self.mpTier = row.tier self.mpRemaining = 3600 end
         inv:SetTabItem("consume", slot, inv:WithStackCount(item, inv:ParseCount(item) - 1))
         self:Apply()
+        _GameAudio:PlaySound("ad3fde2e53314fe29ec759886bc88e04",1)
         inv:CancelInvenDrag() inv:RefreshUI()
         _CharacterPersistence:MarkDirty("regen_potion_use")
         log("[RecoveryPotion] used " .. row.key .. " duration=3600")
@@ -168,6 +180,9 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void Cancel(string kind)
+        -- 확인 후에만 호출하며 다른 종류의 포션은 유지한다.
+        if kind~="hp" and kind~="mp" then return end
+        self._T.buffRevision=(self._T.buffRevision or 0)+1
         if kind == "hp" then self.hpTier = 0 self.hpRemaining = 0
         else self.mpTier = 0 self.mpRemaining = 0 end
         self:Apply()
@@ -178,7 +193,7 @@ script RecoveryPotionManager extends Logic
     method void OnUpdate(number delta)
         if self._T.pending~=nil and _LoginFlow.phase~="ingame" then self:CloseConfirmation(false) end
         local cl = _CharacterPersistence._T.cl
-        if cl == nil or not cl.entered or _LoginFlow.phase ~= "ingame" then return end
+        if cl == nil or not cl.entered or _LoginFlow.phase ~= "ingame" or self._T.characterId~=_FieldRecoveryDrops.characterId then return end
         local expired = false
         if self.hpRemaining > 0 then
             self.hpRemaining = math.max(0, self.hpRemaining - delta)
@@ -191,6 +206,8 @@ script RecoveryPotionManager extends Logic
         if expired then self:Apply() _CharacterPersistence:MarkDirty("regen_potion_change") log("[RecoveryPotion] expired") end
         self._T.uiTick = (self._T.uiTick or 0) + delta
         if self._T.uiTick >= 0.2 then self._T.uiTick = 0 self:UpdateUI() end
+        self._T.autoTick=(self._T.autoTick or 0)+delta
+        if self._T.autoTick>=1 then self._T.autoTick=0 self:RefreshQuickslotPotions() end
     end
 
     @ExecSpace("ClientOnly")
@@ -205,6 +222,7 @@ script RecoveryPotionManager extends Logic
                 icon.Enable = remaining > 0 and row ~= nil
                 if icon.Enable then
                     icon.SpriteGUIRendererComponent.ImageRUID = row.ruid
+                    self:FitIcon(icon,row.ruid,32,32)
                     local text = _EntityService:GetEntityByPath(path .. "/Text")
                     text.TextGUIRendererComponent.Text = tostring(math.floor(math.ceil(remaining)/60)) .. ":" .. string.format("%02d", math.ceil(remaining)%60)
                     _EntityService:GetEntityByPath(path .. "/GrayOverlay").SpriteGUIRendererComponent.FillAmount = 1 - remaining/3600
@@ -247,6 +265,8 @@ script RecoveryPotionManager extends Logic
     @ExecSpace("ClientOnly")
     method void Restore(string raw)
         self:CloseConfirmation(false)
+        self._T.characterId=_FieldRecoveryDrops.characterId
+        self._T.buffRevision=(self._T.buffRevision or 0)+1
         local s = self:ReadState(raw)
         self.hpTier = s.hp.tier self.hpRemaining = s.hp.left
         self.mpTier = s.mp.tier self.mpRemaining = s.mp.left
@@ -263,7 +283,7 @@ script RecoveryPotionManager extends Logic
     @ExecSpace("ServerOnly")
     method void CaptureRemaining(table sv, boolean final)
         local r = sv.recoveryPotion
-        if r == nil or sv.activeId == "" or r.id ~= sv.activeId then return end
+        if r == nil or r.paused or sv.activeId == "" or r.id ~= sv.activeId then return end
         local now = _UtilLogic.ElapsedSeconds
         if not final and now - r.checkpoint < 60 then return end
         local elapsed = math.max(0, now - r.at)
@@ -279,4 +299,102 @@ script RecoveryPotionManager extends Logic
         if updated ~= old then sv.saves[r.id] = updated sv.dirtySaves[r.id] = true end
         if final then log("[RecoveryPotion] logout remaining hp=" .. tostring(r.state.hp.left) .. " mp=" .. tostring(r.state.mp.left)) end
     end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsQuickslotPotion(string name)
+        -- Recognize only supported inventory consumables, never arbitrary skill names.
+        return self:ByName(name)~=nil or name=="공격 속도의 비약" or name=="공격력 물약" or name=="레벨 70 물약"
+    end
+
+    @ExecSpace("ClientOnly")
+    method table QuickslotPotions()
+        -- Aggregate owned stacks independently of the currently selected inventory tab.
+        local entries={} local index={} local inv=_UIEquipInventoryManager
+        for _,item in pairs(inv._T.tabData.consume or {}) do
+            local name=inv:ParseName(item)
+            if item~="" and self:IsQuickslotPotion(name) and inv:ParseCount(item)>0 then
+                if index[name]==nil then local row={name=name,ruid=inv:ParseRUID(item),count=0} table.insert(entries,row) index[name]=row end
+                index[name].count=index[name].count+inv:ParseCount(item)
+            end
+        end
+        table.sort(entries,function(a,b) return a.name<b.name end)
+        return entries
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UseQuickslot(string name, string ruid)
+        -- Consume one matching stack without switching the visible inventory tab.
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.PlayerComponent:IsDead() or _GameSystemMenu:BlocksInput() then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now<(self._T.quickUseUntil or 0) then return end self._T.quickUseUntil=now+0.35
+        local inv=_UIEquipInventoryManager
+        for slot,item in pairs(inv._T.tabData.consume or {}) do
+            if item~="" and inv:ParseName(item)==name and inv:ParseRUID(item)==ruid and inv:ParseCount(item)>0 then
+                if self:ByName(name)~=nil then self:Use(slot) return end
+                if name=="공격 속도의 비약" then _CharInfoManager:IncreaseAttackSpeedStage()
+                elseif name=="공격력 물약" then _CharInfoManager:UseAttackPotion()
+                elseif name=="레벨 70 물약" then _CharInfoManager:UseLevel70Potion()
+                else return end
+                local count=inv:ParseCount(item)
+                if count<=1 then inv:SetTabItem("consume",slot,"")
+                else local parts={} for part in string.gmatch(item,"[^|]+") do table.insert(parts,part) end while #parts<7 do table.insert(parts,"0") end parts[7]=tostring(count-1) inv:SetTabItem("consume",slot,table.concat(parts,"|")) end
+                inv:RefreshUI() _CharacterPersistence:MarkDirty("inventory")
+                log("[QuickslotPotion] consumed "..name) return
+            end
+        end
+        _UIToast:ShowMessage("인벤토리에 "..name.."이(가) 없습니다.")
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void RefreshQuickslotPotions()
+        -- Renew only timed potions registered in the currently used quickslot layout.
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.PlayerComponent:IsDead() or self._T.pending~=nil then return end
+        local slots=_MobileUIManager:IsMobile() and _MobileUIManager:ExportMobileSlots() or (_SkillManager._T.slotData or {})
+        local best={} local owned={}
+        for _,item in pairs((_UIEquipInventoryManager._T.tabData or {}).consume or {}) do
+            if _UIEquipInventoryManager:ParseCount(item)>0 then owned[_UIEquipInventoryManager:ParseName(item)]=true end
+        end
+        for _,slot in pairs(slots) do
+            local row=self:ByName(slot.name or "")
+            if row and owned[row.name] and (best[row.kind]==nil or best[row.kind].tier<row.tier) then best[row.kind]=row end
+            if slot.name=="공격 속도의 비약" and owned[slot.name] then best.speed={name=slot.name,ruid=slot.ruid} end
+        end
+        for _,kind in ipairs({"hp","mp","speed"}) do
+            local row=best[kind]
+            local remaining=kind=="hp" and self.hpRemaining or kind=="mp" and self.mpRemaining or _CharInfoManager.attackSpeedPotionRemaining
+            if row and remaining<=0 then
+                for _,item in pairs(_UIEquipInventoryManager._T.tabData.consume or {}) do
+                    if _UIEquipInventoryManager:ParseName(item)==row.name and _UIEquipInventoryManager:ParseCount(item)>0 then self:UseQuickslot(row.name,row.ruid) return end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RequestCancel(string kind)
+        -- 좌/우클릭과 모바일 탭 모두 같은 삭제 확인을 거친다.
+        if self._T.pending~=nil or (kind~="hp" and kind~="mp") or self:Bonus(kind)<=0 then return end
+        local tier=kind=="hp" and self.hpTier or self.mpTier
+        local remaining=kind=="hp" and self.hpRemaining or self.mpRemaining
+        local row=self:Product("regen_"..kind..tostring(tier))
+        self._T.pending={action="cancel",kind=kind,tier=tier,owner=self._T.characterId,revision=self._T.buffRevision}
+        local panel=_EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal/Panel")
+        panel:GetChildByName("Title").TextGUIRendererComponent.Text="포션 효과 삭제"
+        panel:GetChildByName("Message").TextGUIRendererComponent.Text=row.name.." 효과가 "..tostring(math.ceil(remaining/60)).."분 남아 있습니다.\n정말 해당 포션 버프를 삭제할까요?\n삭제한 효과와 남은 시간은 복구되지 않습니다."
+        _EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal").Enable=true
+        _UIAudio:Play("DlgNotice")
+        log("[RecoveryPotion] cancel confirmation "..kind)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PauseSession(table sv)
+        -- 퇴장 저장이 실패해 재시도하더라도 오프라인 시간은 차감하지 않는다.
+        if sv==nil then return end
+        self:CaptureRemaining(sv,true)
+        if sv.recoveryPotion~=nil then sv.recoveryPotion.paused=true end
+    end
+
 end

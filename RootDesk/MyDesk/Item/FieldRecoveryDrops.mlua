@@ -1,0 +1,216 @@
+@Logic
+script FieldRecoveryDrops extends Logic
+    property string characterId = ""
+
+    method table Appearance(string kind, integer level)
+        -- Five shop sprites, changing at each 30-level boundary.
+        local tier=math.max(1,math.min(5,math.floor(math.max(0,level)/30)+1))
+        return _RecoveryPotionManager:Product("regen_"..kind..tostring(tier))
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity Spawn(Entity map, Vector3 position, string kind, integer level)
+        -- Reuse the registered drop model; these drops never enter inventory.
+        local row=self:Appearance(kind,level)
+        if row==nil or not isvalid(map) then return nil end
+        self._T.sequence=(self._T.sequence or 0)+1
+        local drop=_SpawnService:SpawnByModelId("droppedshell","RecoveryDrop"..tostring(self._T.sequence),position,map)
+        if not isvalid(drop) then return nil end
+        local item=drop:GetComponent("script.DroppedItemComponent")
+        item.ItemType="recovery_"..kind item.ItemName=row.name item.ItemRUID=row.ruid
+        item.GroundOffset=0.1
+        item.RecoveryExpiresAt=_UtilLogic.ServerElapsedSeconds+120
+        drop.SpriteRendererComponent.SpriteRUID=row.ruid
+        drop.SpriteRendererComponent.DrawMode=SpriteDrawMode.Simple
+        drop.TransformComponent.Scale=Vector3.one
+        return drop
+    end
+
+    method void OnBeginPlay()
+        -- Bind only client input; the server owns drops and recovery schedules.
+        self._T.effects={}
+        if self:IsClient() then
+            self:PreloadRecoveryCenters()
+            self._T.touch=_InputService:ConnectEvent(ScreenTouchEvent,self.OnTouch)
+            self._T.key=_InputService:ConnectEvent(KeyDownEvent,self.OnKey)
+        end
+    end
+
+    method void OnEndPlay()
+        -- No effect or input listener survives the play session.
+        self._T.effects={}
+        if self:IsClient() then
+            if self._T.touch then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.touch) end
+            if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnTouch(ScreenTouchEvent event)
+        -- TouchId 1 is the ordinary left click / primary touch.
+        if event.TouchId==1 then self:Click(event.TouchPoint) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        -- Native PC mouse events share the same guarded click handler.
+        if event.key==KeyboardKey.Mouse0 then self:Click(_InputService:GetCursorPosition()) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Click(Vector2 point)
+        -- Pick one visible potion under the cursor; UI and repeated event delivery cannot consume it twice.
+        local now=_UtilLogic.ElapsedSeconds
+        if now-(self._T.clickAt or -10)<0.04 then return end
+        self._T.clickAt=now
+        local player=_UserService.LocalPlayer
+        if not _LoginFlow:IsInGame() or not isvalid(player) or player.PlayerComponent.Hp<=0 then return end
+        if _GameSystemMenu:BlocksInput() or _UIClickArbiter:BlocksWorldClick(point) then return end
+        local world=_UILogic:ScreenToWorldPosition(point)
+        local best,nearest=nil,math.huge
+        for _,item in ipairs(player.CurrentMap:GetChildComponentsByTypeName("script.DroppedItemComponent",true)) do
+            if isvalid(item) and item:IsRecoveryPotion() and item.Entity.EnabledInHierarchy then
+                local pos=item.Entity.TransformComponent.WorldPosition
+                local dx,dy=world.x-pos.x,world.y-pos.y
+                local d=dx*dx+dy*dy
+                if math.abs(dx)<=0.32 and math.abs(dy)<=0.38 and d<nearest then best=item.Entity nearest=d end
+            end
+        end
+        if isvalid(best) then self:RequestPickup(best) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestPickup(Entity drop)
+        -- The caller may consume only a live drop in their current map.
+        self:Pickup(_UserService:GetUserEntityByUserId(senderUserId),drop)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Pickup(Entity player, Entity drop)
+        -- Claim before destroying or notifying; concurrent clicks have a single winner.
+        if not isvalid(player) or not isvalid(drop) or player.CurrentMap~=drop.CurrentMap or player.PlayerComponent.Hp<=0 then return false end
+        local item=drop:GetComponent("script.DroppedItemComponent")
+        if not isvalid(item) or not item:IsRecoveryPotion() or item._T.claimed or (item.RecoveryExpiresAt>0 and _UtilLogic.ServerElapsedSeconds>=item.RecoveryExpiresAt) then return false end
+        local uid=player.PlayerComponent.UserId
+        local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId=="" then return false end
+        local pos,pp=drop.TransformComponent.WorldPosition,player.TransformComponent.WorldPosition
+        if math.abs(pos.x-pp.x)>25 or math.abs(pos.y-pp.y)>15 then return false end
+        item._T.claimed=true
+        local kind=item.ItemType=="recovery_hp" and "hp" or "mp"
+        self._T.effects=self._T.effects or {}
+        table.insert(self._T.effects,{player=player,uid=uid,id=sv.activeId,kind=kind,remaining=3,ticks=3})
+        self:PlayPickup(drop.CurrentMap, pos, uid)
+        item._T.recoveryTarget=player
+        item.homeElapsed=0
+        item.phase=1
+        log("[FieldRecovery] clicked kind="..kind.." active="..tostring(#self._T.effects))
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickEffects(number delta)
+        -- Independent schedules preserve stacking even when two potions are clicked together.
+        local effects=self._T.effects or {}
+        for i=#effects,1,-1 do
+            local e=effects[i]
+            local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[e.uid]
+            if not isvalid(e.player) or e.player.PlayerComponent.Hp<=0 or sv==nil or sv.activeId~=e.id then
+                table.remove(effects,i)
+            else
+                e.remaining=e.remaining-delta
+                while e.remaining<=0 and e.ticks>0 do
+                    e.remaining=e.remaining+3 e.ticks=e.ticks-1
+                    local actual=0
+                    if e.kind=="hp" then
+                        local pc=e.player.PlayerComponent
+                        actual=math.min(math.max(0,pc.MaxHp-pc.Hp),math.max(1,math.floor(pc.MaxHp*0.2)))
+                        pc.Hp=pc.Hp+actual
+                    end
+                    self:RecoveryTick(e.id,e.kind,actual,e.uid)
+                    log("[FieldRecovery] tick kind="..e.kind.." ticksLeft="..tostring(e.ticks))
+                end
+                if e.ticks==0 then table.remove(effects,i) end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        -- Server delta drives the 3/6/9 second ticks, without timer leaks.
+        self:TickEffects(delta)
+    end
+
+    @ExecSpace("Client")
+    method void RecoveryTick(string id, string kind, integer amount)
+        -- MP already belongs to MpManager; reject late packets from a previous character.
+        local player=_UserService.LocalPlayer
+        if self.characterId~=id or not _LoginFlow:IsInGame() or not isvalid(player) or player.PlayerComponent.Hp<=0 then return end
+        if kind=="mp" then
+            local before=_MpManager:GetCurrentMp()
+            _MpManager:RestoreMp(math.max(1,math.floor(_MpManager:GetMaxMp()*0.2)))
+            amount=math.max(0,math.floor(_MpManager:GetCurrentMp()-before))
+        end
+        if amount>0 then
+            if not _AutoHuntPowerSave.active then
+            _DamageSkinService:Play(player,"d58b67cf0f3a4eaf9fe1ad87c0ffac8a",0,{amount},DamageSkinTweenType.Default,false,Vector2(0,0),Vector2.one,1,1,LitMode.Default)
+            end
+        end
+    end
+    @ExecSpace("Client")
+    method void PlayPickup(Entity map, Vector3 position)
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap~=map then return end
+        _MapleIslandTutorial:Notify("potion")
+        local avatar=player.AvatarRendererComponent
+        _EffectService:PlayEffect("0e35906499314071a510a886c92a1dde",player,position,0,Vector3.one,false,{SortingLayer=avatar.SortingLayer,OrderInLayer=math.min(32767,avatar.OrderInLayer+1),IgnoreMapLayerCheck=avatar.IgnoreMapLayerCheck})
+        _GameAudio:PlaySound("ad3fde2e53314fe29ec759886bc88e04",2)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PreloadRecoveryCenters()
+        -- Load original sprite pivots once; no resource waits in drop updates.
+        local effectFrame="680cc623b308435baa50ee8fd464bbad"
+        local ids={effectFrame,"40a15832a52048da855199f373d4ccc2","7b4a813bfbf94649a832224f5624376c","b9d99f347701432ea0cbb66731327df1"}
+        for _,row in ipairs(_RecoveryPotionManager:Catalog()) do table.insert(ids,row.ruid) end
+        self._T.recoveryVisualCenters={}
+        _ResourceService:PreloadAsync(ids,function()
+            for _,id in ipairs(ids) do
+                local sprite=_ResourceService:LoadSpriteAndWait(id)
+                if sprite~=nil and sprite.IsLoadComplete then
+                    local ppu=math.max(1,sprite.PixelPerUnit)
+                    self._T.recoveryVisualCenters[id]=Vector3((sprite.Width/2-sprite.PivotPixel.x)/ppu,(sprite.Height/2-sprite.PivotPixel.y)/ppu,0)
+                end
+            end
+            self._T.recoveryAuraCenter=self._T.recoveryVisualCenters[effectFrame]
+            log("[FieldRecovery] sprite centers preloaded")
+        end)
+    end
+
+    @ExecSpace("Server")
+    method void RequestTutorialPotion()
+        -- Only a character at the potion lesson can request one live practice drop.
+        local uid=senderUserId
+        local player=_UserService:GetUserEntityByUserId(uid)
+        local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        if not isvalid(player) or not isvalid(player.CurrentMap) or player.PlayerComponent.Hp<=0 or sv==nil or sv.activeId=="" then return end
+        local raw=sv.saves[sv.activeId] or ""
+        if string.match("\n"..raw,"\nQ\t6\t4\t%d+\t%d+\t0") == nil then return end
+        self._T.practice=self._T.practice or {}
+        local old=self._T.practice[uid]
+        local now=_UtilLogic.ServerElapsedSeconds
+        if old~=nil and now-old.at<4 then return end
+        local pos=player.TransformComponent.WorldPosition
+        if old~=nil and isvalid(old.drop) then
+            local dp=old.drop.TransformComponent.WorldPosition
+            if old.id==sv.activeId and old.drop.CurrentMap==player.CurrentMap and math.abs(dp.x-pos.x)<4 and math.abs(dp.y-pos.y)<3 and now<old.expires then return end
+            old.drop:Destroy()
+        end
+        local drop=self:Spawn(player.CurrentMap,Vector3(pos.x,pos.y+0.3,pos.z),"hp",1)
+        if not isvalid(drop) then return end
+        drop:GetComponent("script.DroppedItemComponent")._T.vx=0
+        self._T.practice[uid]={drop=drop,id=sv.activeId,at=now,expires=now+120}
+        log("[Tutorial] practice potion spawned")
+    end
+
+end

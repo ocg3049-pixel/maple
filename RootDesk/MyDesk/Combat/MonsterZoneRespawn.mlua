@@ -5,34 +5,93 @@ script MonsterZoneRespawn extends Logic
 
     @ExecSpace("ServerOnly")
     method void OnBeginPlay()
-        self._T.monsters = {}
-        _TimerService:SetTimerRepeat(function()
-            self:BatchRespawn()
-        end, self.RespawnInterval)
-        log("[MonsterZoneRespawn] 시작, 리젠 간격=" .. tostring(self.RespawnInterval) .. "초")
+        -- Keep registrations made by components earlier in the initialization order.
+        self._T.maps = self._T.maps or {}
+        self._T.activityTimer = _TimerService:SetTimerRepeat(function() self:RefreshMapActivity() end, 0.5)
+        self._T.respawnTimer = _TimerService:SetTimerRepeat(function() self:BatchRespawn() end, self.RespawnInterval)
+        log("[MonsterZoneRespawn] map activity scheduler ready; empty-map AI and attack timers sleep")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- No timers or entity references survive a world session.
+        if self._T.activityTimer then _TimerService:ClearTimer(self._T.activityTimer) end
+        if self._T.respawnTimer then _TimerService:ClearTimer(self._T.respawnTimer) end
+        self._T.activityTimer = nil
+        self._T.respawnTimer = nil
+        self._T.maps = nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsMapActive(Entity map)
+        -- One occupancy lookup per newly registered map, then cached by the scheduler.
+        if not isvalid(map) then return false end
+        self._T.maps = self._T.maps or {}
+        local entry = self._T.maps[map.Id]
+        if entry == nil then
+            local users = _UserService:GetUsersByMapComponent(map.MapComponent)
+            entry = {map=map, monsters={}, active=users ~= nil and #users > 0}
+            self._T.maps[map.Id] = entry
+        end
+        return entry.active
     end
 
     @ExecSpace("ServerOnly")
     method void Register(Component monsterComp)
+        -- Track every field monster, not only monsters that use batch respawn.
         if not isvalid(monsterComp) then return end
-        if not self._T.monsters then self._T.monsters = {} end
-        table.insert(self._T.monsters, monsterComp)
-        log("[MonsterZoneRespawn] 등록: " .. monsterComp.Entity.Name .. " (총 " .. tostring(#self._T.monsters) .. "마리)")
+        local map = monsterComp.Entity.CurrentMap
+        if not isvalid(map) then return end
+        local active = self:IsMapActive(map)
+        self._T.maps[map.Id].monsters[monsterComp.Entity.Id] = monsterComp
+        monsterComp:SetMapSimulationActive(active)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void RefreshMapActivity()
+        -- Scan players once; only maps whose occupancy changed touch their monsters.
+        local occupied = {}
+        for _, user in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(user) and isvalid(user.CurrentMap) then occupied[user.CurrentMap.Id] = true end
+        end
+        for id, entry in pairs(self._T.maps or {}) do
+            if not isvalid(entry.map) then
+                self._T.maps[id] = nil
+            else
+                local active = occupied[id] == true
+                if entry.active ~= active then
+                    entry.active = active
+                    local count = 0
+                    for entityId, monster in pairs(entry.monsters) do
+                        if isvalid(monster) then
+                            monster:SetMapSimulationActive(active)
+                            count = count + 1
+                        else
+                            entry.monsters[entityId] = nil
+                        end
+                    end
+                    log("[MonsterActivity] map=" .. entry.map.Name .. " active=" .. tostring(active) .. " monsters=" .. tostring(count))
+                end
+            end
+        end
     end
 
     @ExecSpace("ServerOnly")
     method void BatchRespawn()
-        if not self._T.monsters then return end
+        -- Empty maps defer respawns until occupied; the active-map interval stays 10 seconds.
         local count = 0
-        for _, mc in ipairs(self._T.monsters) do
-            if isvalid(mc) and mc.IsDead and not mc.Entity.Enable then
-                mc:Respawn()
-                count = count + 1
+        for _, entry in pairs(self._T.maps or {}) do
+            if entry.active then
+                for id, mc in pairs(entry.monsters) do
+                    if not isvalid(mc) then
+                        entry.monsters[id] = nil
+                    elseif mc.GroupRespawn and mc.IsDead and not mc.Entity.Enable then
+                        mc:Respawn()
+                        count = count + 1
+                    end
+                end
             end
         end
-        if count > 0 then
-            log("[MonsterZoneRespawn] 배치 리젠: " .. tostring(count) .. "마리")
-        end
+        if count > 0 then log("[MonsterZoneRespawn] batch respawn=" .. tostring(count)) end
     end
-
 end

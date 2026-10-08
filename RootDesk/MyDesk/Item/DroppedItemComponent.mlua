@@ -15,8 +15,12 @@ script DroppedItemComponent extends Component
     -- 단계: 0 = 튀어오름(포물선), 2 = 착지 대기, 1 = 플레이어로 유도, 4 = 발판 없어 계속 낙하 중,
     --       (그 뒤 습득/소멸). phase는 @Sync가 아닌 일반 프로퍼티라 서버에서 다른 인스턴스도 읽을 수 있다.
     property number GroundOffset = 0
-    property integer phase = 0
+    @Sync property integer phase = 0
+    @Sync property number FloatBaseY = 0
+    @Sync property number RecoveryExpiresAt = 0
     property string KillerUserId = ""
+    property integer BossRewardKey = 0
+    property string BossRewardCharacter = ""
 
     -- ① 튀어오름 단계 (포물선: 위로 톡 튀었다가 중력으로 낙하 → 아래 발판 위에 착지)
     -- 하강 중에는 매 프레임 현재 x 아래로 FootholdComponent 레이캐스트를 쏴 실제 발판 표면 y를 찾는다.
@@ -52,17 +56,23 @@ script DroppedItemComponent extends Component
         log("[DroppedItem] 드랍: " .. self.ItemName)
     end
 
-    @ExecSpace("ServerOnly")
     method void OnUpdate(number delta)
-        if self.phase == 0 then
-            self:UpdatePop(delta)
-        elseif self.phase == 2 then
-            self:UpdateSettle(delta)
-        elseif self.phase == 1 then
-            self:UpdateHome(delta)
-        elseif self.phase == 4 then
-            self:UpdateFall(delta)
+        if self:IsClient() then
+            if self.ItemRUID=="3eb056d03f034a29b52bfa917319d71a" then self:UpdateShellVisual() end
+            if self:IsRecoveryPotion() then
+                local now=_UtilLogic.ElapsedSeconds
+                if now>=(self._T.nextRecoveryVisual or 0) then self._T.nextRecoveryVisual=now+(_GameSystemMenu.lowSpecMode and 0.1 or 0) self:UpdatePotionHint() self:UpdateRecoveryVisual() end
+            end
+            return
         end
+        if self:IsRecoveryPotion() and not self._T.claimed then
+            if self.RecoveryExpiresAt<=0 then self.RecoveryExpiresAt=_UtilLogic.ServerElapsedSeconds+120 end
+            if _UtilLogic.ServerElapsedSeconds>=self.RecoveryExpiresAt+2 then self.Entity:Destroy() return end
+        end
+        if self.phase == 0 then self:UpdatePop(delta)
+        elseif self.phase == 2 then self:UpdateSettle(delta)
+        elseif self.phase == 1 then self:UpdateHome(delta)
+        elseif self.phase == 4 then self:UpdateFall(delta) end
     end
 
     @ExecSpace("ServerOnly")
@@ -91,6 +101,7 @@ script DroppedItemComponent extends Component
                 self.Entity.TransformComponent.Position = Vector3(nx, floorY, 0)
                 self._T.vx = 0
                 self._T.vy = 0
+                self.FloatBaseY = floorY
                 self.phase = 2
                 return
             end
@@ -128,6 +139,7 @@ script DroppedItemComponent extends Component
     @ExecSpace("ServerOnly")
     method void UpdateSettle(number delta)
         -- ①.5 착지 대기: 바닥에 잠깐 머문 뒤 유도(phase 1)로 넘어간다("떨어진 후 빨려옴").
+        if self:IsRecoveryPotion() then return end
         self.settleElapsed = self.settleElapsed + delta
         if self.settleElapsed >= self.settleDuration then
             self.phase = 1
@@ -142,7 +154,10 @@ script DroppedItemComponent extends Component
         -- 걸어도 자연스럽게 따라붙는다(단, 조향이라 방향이 튀지 않는다).
         self.homeElapsed = self.homeElapsed + delta
 
-        local target = self:FindNearestPlayer()
+        local target = self:IsRecoveryPotion() and self._T.recoveryTarget or self:FindNearestPlayer()
+        if self:IsRecoveryPotion() and (not isvalid(target) or target.CurrentMap~=self.Entity.CurrentMap) then
+            self.Entity:Destroy() return
+        end
         if not isvalid(target) then
             if self.homeElapsed >= self.homeTimeout then self.Entity:Destroy() end
             return
@@ -158,7 +173,10 @@ script DroppedItemComponent extends Component
         -- 이번 프레임 이동 거리(등속). 목표까지 남은 거리보다 크거나 충분히 가까우면 습득.
         local step = self.homeSpeed * delta
         if dist <= step or dist <= 0.35 or self.homeElapsed >= self.homeTimeout then
-            self:PickupBy(target)
+            if self:IsRecoveryPotion() then
+                -- 회복은 클릭 때 한 번만 예약하며 도착 시에는 시각 엔티티만 제거한다.
+                self.Entity:Destroy()
+            else self:PickupBy(target) end
             return
         end
 
@@ -195,6 +213,7 @@ script DroppedItemComponent extends Component
     @ExecSpace("ServerOnly")
     method Entity FindNearestPlayer()
         -- 이 맵에서 가장 가까운(살아있는) 플레이어 엔티티를 돌려준다. 없으면 nil.
+        if self.BossRewardKey>0 then return _UserService:GetUserEntityByUserId(self.KillerUserId) end
         local map = self.Entity.CurrentMap
         if not isvalid(map) then return nil end
         local players = _UserService:GetUsersByMapComponent(map.MapComponent)
@@ -219,6 +238,7 @@ script DroppedItemComponent extends Component
 
     @ExecSpace("ServerOnly")
     method void PickupBy(Entity player)
+        if self:IsRecoveryPotion() then return end
         -- 플레이어와 부딪힌 순간: 아이템을 그 플레이어 인벤토리에 넣고 이 엔티티를 소멸시킨다.
         if not isvalid(player) then
             self.Entity:Destroy()
@@ -226,6 +246,7 @@ script DroppedItemComponent extends Component
         end
         local pc = player.PlayerComponent
         local targetUserId = isvalid(pc) and pc.UserId or nil
+        if self.BossRewardKey>0 then self:CollectSelfTo(targetUserId or "") return end
         local map = self.Entity.CurrentMap
 
         local itemName = self.ItemName
@@ -269,6 +290,12 @@ script DroppedItemComponent extends Component
 
     @ExecSpace("ServerOnly")
     method void CollectSelfTo(string userId)
+        if self:IsRecoveryPotion() then return end
+        if self.BossRewardKey>0 then
+            if userId~=self.KillerUserId then return end
+            _BossRewards:Collect(self.BossRewardCharacter,self.BossRewardKey,userId)
+            self.Entity:Destroy() return
+        end
         -- 발판 없이 떨어지던 아이템을 강제 회수: 지급 후 소멸(플레이어 충돌 없이 원격 회수).
         local itemName = self.ItemName
         local itemRUID = self.ItemRUID
@@ -280,6 +307,122 @@ script DroppedItemComponent extends Component
             else _ItemPickupLogic:DeliverItem(itemName, itemRUID, itemType, userId) end
             log("[DroppedItem] 같이 회수(발판 없음): " .. itemName)
         end
+    end
+
+    method boolean IsRecoveryPotion()
+        -- Click-only consumables cannot enter any automatic pickup path.
+        return self.ItemType=="recovery_hp" or self.ItemType=="recovery_mp"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        if isvalid(self._T.shellAura) then self._T.shellAura:Destroy() end
+        self._T.shellAura=nil
+        if isvalid(self._T.potionHint) then self._T.potionHint:Destroy() end
+        self._T.potionHint=nil
+        if isvalid(self._T.recoveryAura) then self._T.recoveryAura:Destroy() end
+        self._T.recoveryAura=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateRecoveryVisual()
+        -- 클릭 후에는 일반 아이템 유도/페이드가 담당한다. 바닥 부유와 주변 이펙트는 종료한다.
+        if self.phase==1 then
+            if isvalid(self._T.recoveryAura) then self._T.recoveryAura:Destroy() end
+            self._T.recoveryAura=nil
+            return
+        end
+        if self.phase==2 then
+            local p=self.Entity.TransformComponent.Position
+            self.Entity.TransformComponent.Position=Vector3(p.x,self.FloatBaseY+math.sin(_UtilLogic.ElapsedSeconds*1.8)*0.04,p.z)
+        end
+        local alpha=1
+        if self.RecoveryExpiresAt>0 then alpha=math.max(0,math.min(1,1-(_UtilLogic.ServerElapsedSeconds-self.RecoveryExpiresAt)/2)) end
+        local sprite=self.Entity.SpriteRendererComponent
+        sprite.Color=Color(1,1,1,alpha)
+        local aura=self._T.recoveryAura
+        if _GameSystemMenu.lowSpecMode then
+            if isvalid(aura) then aura:Destroy() end self._T.recoveryAura=nil
+            return
+        end
+        if not isvalid(aura) and _UtilLogic.ElapsedSeconds>=(self._T.auraRetryAt or 0) then
+            self._T.auraRetryAt=_UtilLogic.ElapsedSeconds+1
+            aura=_SpawnService:SpawnByModelId("spearburstfadingeffect","RecoveryAura",self.Entity.TransformComponent.WorldPosition,self.Entity.CurrentMap)
+            self._T.recoveryAura=aura
+            if isvalid(aura) then
+                local renderer=aura.SpriteRendererComponent
+                renderer.SpriteRUID="cb4b8f3451bb4f0dab53327cce29c873"
+                local player=_UserService.LocalPlayer
+                local avatar=isvalid(player) and player.AvatarRendererComponent or nil
+                renderer.SortingLayer=isvalid(avatar) and avatar.SortingLayer or sprite.SortingLayer
+                renderer.OrderInLayer=math.min(32767,(isvalid(avatar) and avatar.OrderInLayer or sprite.OrderInLayer)+1)
+                renderer.IgnoreMapLayerCheck=true
+                renderer.DrawMode=SpriteDrawMode.Simple
+                renderer.StartFrameIndex=0
+                renderer.EndFrameIndex=2147483647
+                renderer.PlayRate=1
+            end
+        end
+        if isvalid(aura) then
+            local centers=_FieldRecoveryDrops._T.recoveryVisualCenters
+            local potionCenter=centers and centers[self.ItemRUID]
+            local auraCenter=_FieldRecoveryDrops._T.recoveryAuraCenter
+            aura.Enable=potionCenter~=nil and auraCenter~=nil
+            if potionCenter~=nil and auraCenter~=nil then
+                local scale=self.Entity.TransformComponent.Scale
+                local offset=Vector3(potionCenter.x*scale.x-auraCenter.x,potionCenter.y*scale.y-auraCenter.y,0)
+                aura.TransformComponent.WorldPosition=self.Entity.TransformComponent.WorldPosition+offset
+            end
+            aura.SpriteRendererComponent.Color=Color(1,1,1,alpha)
+        end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void UpdateShellVisual()
+        -- Float while settled and keep the aura strictly behind the shell in the same layer.
+        if self.phase==2 then
+            local p=self.Entity.TransformComponent.Position
+            self.Entity.TransformComponent.Position=Vector3(p.x,self.FloatBaseY+math.sin(_UtilLogic.ElapsedSeconds*2.8)*0.08,p.z)
+        end
+        local aura=self._T.shellAura
+        if not isvalid(aura) then
+            aura=_SpawnService:SpawnByModelId("spearburstfadingeffect","RainbowShellAura",self.Entity.TransformComponent.WorldPosition,self.Entity.CurrentMap)
+            self._T.shellAura=aura
+            if isvalid(aura) then
+                local sr=aura.SpriteRendererComponent
+                sr.SpriteRUID="6a5a541305bb489d8d83730b4a245953" sr.DrawMode=SpriteDrawMode.Simple
+                sr.SortingLayer=self.Entity.SpriteRendererComponent.SortingLayer
+                sr.OrderInLayer=self.Entity.SpriteRendererComponent.OrderInLayer-1
+                sr.IgnoreMapLayerCheck=true sr.StartFrameIndex=0 sr.EndFrameIndex=2147483647 sr.PlayRate=1
+                aura.TransformComponent.Scale=Vector3(0.22,0.22,1)
+                log("[BossRewards] shell aura behind item")
+            end
+        end
+        if isvalid(aura) then
+            aura.TransformComponent.WorldPosition=self.Entity.TransformComponent.WorldPosition+(_BossRewards._T.auraOffset or Vector3.zero)
+            aura.SpriteRendererComponent.Color=self.Entity.SpriteRendererComponent.Color
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePotionHint()
+        local show=self.phase~=1 and _LoginFlow.phase=="ingame" and not _MapleIslandTutorial.reachedLevel15
+        local hint=self._T.potionHint
+        if not show then if isvalid(hint) then hint:Destroy() end self._T.potionHint=nil return end
+        if not isvalid(hint) then
+            hint=_SpawnService:SpawnByModelId("spearburstfadingeffect","PotionHint",self.Entity.TransformComponent.WorldPosition,self.Entity.CurrentMap)
+            self._T.potionHint=hint
+            if isvalid(hint) then
+                local renderer=hint.SpriteRendererComponent
+                renderer.SpriteRUID="7c7e395dcf1f4d8d92ad29683e188d1e"
+                renderer.SortingLayer=self.Entity.SpriteRendererComponent.SortingLayer renderer.OrderInLayer=32760 renderer.IgnoreMapLayerCheck=true
+                renderer.PlayRate=2.2 renderer.DrawMode=SpriteDrawMode.Simple
+                hint.TransformComponent.Scale=Vector3(2,2,1)
+                log("[PotionHint] created before first level15")
+            end
+        end
+        if isvalid(hint) then hint.TransformComponent.WorldPosition=self.Entity.TransformComponent.WorldPosition+Vector3(0,0.55,0) end
     end
 
 end

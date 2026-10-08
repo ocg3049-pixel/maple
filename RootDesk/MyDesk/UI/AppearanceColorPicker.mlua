@@ -26,6 +26,21 @@ script AppearanceColorPicker extends Logic
         self:Bind("Confirm", function() self:Confirm() end)
         self:Bind("Advanced/Reset",function() self:SetHSV("FFFFFF") self:DrawAdvanced() end)
         self._T.sliderLinks={}
+        for _, side in ipairs({"Base", "Mix"}) do
+            local selectedSide = side
+            for i = 1, 8 do
+                local colorIndex = i
+                self:Bind("HairMix/" .. side .. "/Color" .. tostring(i), function() self:SelectHairColor(selectedSide, colorIndex) end)
+            end
+        end
+        self:Bind("HairMix/Less", function() self:SetHairRatio((self._T.hairRatio or 0) - 1) end)
+        self:Bind("HairMix/More", function() self:SetHairRatio((self._T.hairRatio or 0) + 1) end)
+        local mixSlider = self:UI("HairMix/Ratio")
+        local mixListener = mixSlider:ConnectEvent(SliderValueChangedEvent, function(event)
+            if self.opened and self._T.hair and not self._T.settingHair then self:SetHairRatio(event.Value) end
+        end)
+        table.insert(self._T.sliderLinks, {e=mixSlider,h=mixListener})
+        self._T.numberLinks={}
         for _,key in ipairs({"Hue","Saturation","Value"}) do
             local field=key
             local e=self:UI("Advanced/"..field)
@@ -33,6 +48,10 @@ script AppearanceColorPicker extends Logic
                 if self.opened and self._T.dye and not self._T.settingHSV then self:DrawAdvanced() end
             end)
             table.insert(self._T.sliderLinks,{e=e,h=h})
+            local input=self:UI("Advanced/"..field.."Value")
+            local finish=input:ConnectEvent(TextInputEndEditEvent,function(event) self:CommitNumber(field,event.text) end)
+            local submit=input:ConnectEvent(TextInputSubmitEvent,function(event) self:CommitNumber(field,event.Text) end)
+            table.insert(self._T.numberLinks,{e=input,finish=finish,submit=submit})
         end
         self:Bind("Cancel", function() self:Close() end)
         self:Bind("Previous", function() self:ChangePage(-1) end)
@@ -56,6 +75,13 @@ script AppearanceColorPicker extends Logic
             if isvalid(link.entity) then link.entity:DisconnectEvent(ButtonClickEvent, link.listener) end
         end
         for _,link in ipairs(self._T.sliderLinks or {}) do if isvalid(link.e) then link.e:DisconnectEvent(SliderValueChangedEvent,link.h) end end
+        for _,link in ipairs(self._T.numberLinks or {}) do
+            if isvalid(link.e) then
+                link.e:DisconnectEvent(TextInputEndEditEvent,link.finish)
+                link.e:DisconnectEvent(TextInputSubmitEvent,link.submit)
+            end
+        end
+        self._T.numberLinks=nil
         self._T.links = nil
     end
 
@@ -80,6 +106,11 @@ script AppearanceColorPicker extends Logic
     @ExecSpace("ClientOnly")
     method string GetSourceItem()
         -- Keep the original tab/index so changing the active tab cannot recolor another item.
+        if self._T.source == "creation" then
+            local setting=self:CreationSetting()
+            if setting==nil or _LoginFlow.phase~="create" then return "" end
+            return setting:AppearanceItem(self._T.index)
+        end
         if self._T.source == "deco" then return _DecoWindowManager:GetDecoItem(_DecoWindowManager:SlotUIKeys()[self._T.index]) end
         if self._T.source == "equip" then return _UIEquipInventoryManager:GetEquip(self._T.index) end
         return _UIEquipInventoryManager:GetTabItem(self._T.tab, self._T.index)
@@ -89,10 +120,12 @@ script AppearanceColorPicker extends Logic
     method void Open(string source, integer index, string tab)
         -- Hair/face use native variants; other cosmetics use continuous HSV tint.
         if index < 1 or index > 128 or self.opened then return end
-        if _EnhancementManager:RequireCubeChoice() then return end
+        if source ~= "creation" and _EnhancementManager:RequireCubeChoice() then return end
         self._T.source, self._T.index, self._T.tab = source, index, tab
         local item = self:GetSourceItem()
         self._T.dye = _UIEquipInventoryManager:GetField(item,3) == "deco"
+        self._T.hair = _UIEquipInventoryManager:ParseSlotIdx(item) == 2 or _UIEquipInventoryManager:GetField(item,4) == "hair"
+        if self._T.hair then self._T.dye = false end
         if not self._T.dye and not _UIEquipInventoryManager:IsHairOrFaceItem(item) then return end
         self._T.original = item
         self._T.dyePreviewFinals=nil
@@ -114,6 +147,10 @@ script AppearanceColorPicker extends Logic
             elseif row[2] == _UIEquipInventoryManager:ParseRUID(item) then self._T.selected = i end
         end
         self._T.page = math.floor((self._T.selected - 1) / 12) + 1
+        if self._T.hair then
+            self:PrepareHairMix(item)
+            if self._T.hairBase==0 then self._T.hair=false end
+        end
         _UIEquipInventoryManager:CancelEquipDrag()
         _UIEquipInventoryManager:ConsumeEnhancePick()
         _UIEquipInventoryManager:HideTooltip()
@@ -148,13 +185,15 @@ script AppearanceColorPicker extends Logic
     method void Draw()
         -- Switch between native hair/face variants and a continuous tint editor.
         self:LayoutColorMode()
+        if self._T.hair then self:DrawHairMix() return end
         if self._T.dye then self:DrawAdvanced() return end
+        _DecoWindowManager:ConfigureDyeMaterial(self:UI("Preview").SpriteGUIRendererComponent,false)
         local colors = self._T.colors
         local row = colors[self._T.selected]
         self:UI("Name").TextGUIRendererComponent.Text = row[1]
         self:UI("Preview").SpriteGUIRendererComponent.ImageRUID = "thumbnail://" .. row[2]
         self:UI("Preview").SpriteGUIRendererComponent.Color = Color.FromHexCode("#"..(row[5] or "FFFFFF"))
-        self:UI("Hint").TextGUIRendererComponent.Text = #colors > 1 and "색상을 고른 뒤 확인을 누르면 적용됩니다." or "이 스타일에 등록된 색상은 한 가지입니다."
+        self:UI("Hint").TextGUIRendererComponent.Text = #colors > 1 and "색상을 고른 뒤 적용하기를 눌러주세요." or "이 스타일에 등록된 색상은 한 가지입니다."
         if self._T.dye then self:UI("Hint").TextGUIRendererComponent.Text="치장의 원래 색에 선택한 색을 입힙니다. 원본으로 되돌릴 수 있습니다." end
         for i = 1, 12 do
             local index = (self._T.page - 1) * 12 + i
@@ -178,17 +217,31 @@ script AppearanceColorPicker extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method string BuildSelectedItem()
+        -- Continuous dyes have no variant row; validate and build the two modes separately.
+        local original = self._T.original or ""
+        local suffix = string.match(original, "^[^|]*|[^|]*(|.*)$")
+        if suffix == nil then return "" end
+        if self._T.hair then return self:BuildHairItem() end
+        if self._T.dye then return self:BuildDyeItem() end
+        local colors = self._T.colors or {}
+        local row = colors[self._T.selected or 0]
+        if row == nil or row[1] == nil or row[2] == nil then return "" end
+        return row[1] .. "|" .. row[2] .. suffix
+    end
+
+    @ExecSpace("ClientOnly")
     method void Confirm()
         -- Reject stale targets and preserve every field except display name and appearance RUID.
         if not self.opened then return end
         if self:GetSourceItem() ~= self._T.original then self:Close() return end
-        local row = self._T.colors[self._T.selected]
-        local suffix = string.match(self._T.original, "^[^|]*|[^|]*(|.*)$")
-        if suffix == nil then self:Close() return end
-        local updated = row[1] .. "|" .. row[2] .. suffix
-        
-        if self._T.dye then
-            updated=self:BuildDyeItem()
+        local updated = self:BuildSelectedItem()
+        if updated == "" then self:Close() return end
+        if self._T.source == "creation" then
+            local setting=self:CreationSetting()
+            if setting~=nil then setting:SetAppearanceColor(self._T.index,updated) end
+            self:Close()
+            return
         end
         if self._T.source == "deco" then
             local data=_DecoWindowManager:ExportDeco()
@@ -200,7 +253,7 @@ script AppearanceColorPicker extends Logic
         _DecoWindowManager:ApplyAppearance()
         _CharacterPersistence:MarkDirty("appearance_color")
         _CharacterPersistence:FlushToServer()
-        log("[AppearanceColor] applied=" .. row[2])
+        log("[AppearanceColor] applied=" .. _UIEquipInventoryManager:ParseRUID(updated))
         self:Close()
     end
 
@@ -216,20 +269,206 @@ script AppearanceColorPicker extends Logic
     end
     @ExecSpace("ClientOnly")
     method void LayoutColorMode()
-        -- Preserve the existing hair/face selector layout.
+        -- Match the creation book with a cream page, brown type and gold selection.
         local dye=self._T.dye
         local panel=_EntityService:GetEntityByPath("/ui/AppearanceColorGroup/Modal/Panel")
         panel.UITransformComponent.RectSize=dye and Vector2(660,660) or Vector2(560,470)
         self:UI("Advanced").Enable=dye
         for i=1,12 do self:UI("Color"..tostring(i)).Enable=not dye end
-        self:UI("Title").UITransformComponent.anchoredPosition=dye and Vector2(-55,299) or Vector2(-55,202)
-        self:UI("Title").TextGUIRendererComponent.Text=dye and "치장 색상 조절" or "헤어 / 성형 색상"
+        self:UI("Title").UITransformComponent.anchoredPosition=dye and Vector2(-55,299) or Vector2(0,202)
+        self:UI("Title").TextGUIRendererComponent.FontColor=Color(.31,.22,.16,1)
+        self:UI("Title").TextGUIRendererComponent.Text=dye and "치장 색상 조절" or "성형 색상 고르기"
         self:UI("Name").UITransformComponent.anchoredPosition=dye and Vector2(49,248) or Vector2(49,149)
         self:UI("Preview").UITransformComponent.anchoredPosition=dye and Vector2(-240,247) or Vector2(-200,132)
         self:UI("Hint").Enable=not dye
         self:UI("Confirm").UITransformComponent.anchoredPosition=dye and Vector2(90,-289) or Vector2(78,-195)
         self:UI("Cancel").UITransformComponent.anchoredPosition=dye and Vector2(222,-289) or Vector2(202,-195)
         if dye then self:UI("Previous").Enable=false self:UI("Next").Enable=false self:UI("Page").Enable=false end
+        self:UI("HairMix").Enable = self._T.hair == true
+        self:UI("Preview").Enable = not self._T.hair
+        self:UI("Name").Enable = not self._T.hair
+        if self._T.hair then
+            panel.UITransformComponent.RectSize = Vector2(760,650)
+            self:UI("Title").UITransformComponent.anchoredPosition = Vector2(0,285)
+            self:UI("Title").TextGUIRendererComponent.Text = "헤어 믹스염색"
+            self:UI("Title").TextGUIRendererComponent.FontColor = Color(.31,.22,.16,1)
+            self:UI("Hint").Enable = false
+            self:UI("Confirm").UITransformComponent.anchoredPosition = Vector2(175,-280)
+            self:UI("Cancel").UITransformComponent.anchoredPosition = Vector2(299,-280)
+            for i=1,12 do self:UI("Color"..tostring(i)).Enable=false end
+            self:UI("Previous").Enable=false self:UI("Next").Enable=false self:UI("Page").Enable=false
+        end
+        local size=panel.UITransformComponent.RectSize
+        self:UI("Paper").UITransformComponent.RectSize=Vector2(size.x-16,size.y-16)
+        self:UI("HeaderRule").UITransformComponent.RectSize=Vector2(size.x-64,2)
+        self:UI("HeaderRule").UITransformComponent.anchoredPosition=Vector2(0,size.y/2-64)
+        -- Keep the paper behind every color control after Maker loads the tree.
+        _UILogic:SetSiblingIndex(self:UI("HeaderRule").UITransformComponent,1)
+        _UILogic:SetSiblingIndex(self:UI("Paper").UITransformComponent,1)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SyncNumber(string field, number value)
+        local input=self:UI("Advanced/"..field.."Value").TextGUIRendererInputComponent
+        if not input.IsFocused then input.Text=string.format("%.2f",value) end
+    end
+
+    method table HairPalette()
+        -- Stable eight-color order matches the two palettes in the dye window.
+        return {{"노란색","E8CC67"},{"주황색","DC9255"},{"빨간색","C76764"},{"초록색","83A96C"},{"보라색","9A80BB"},{"파란색","718DBB"},{"검은색","494650"},{"갈색","99775E"}}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PrepareHairMix(string item)
+        -- Resolve only variants belonging to this hairstyle; missing colors remain disabled.
+        self._T.hairChoices = {}
+        local baseRuid, mixRuid, ratio = string.match(item,"|hairMix:(%x+),(%x+),(%d+)")
+        baseRuid = baseRuid or _UIEquipInventoryManager:ParseRUID(item)
+        self._T.hairBase, self._T.hairMix = 0, 0
+        local english={"Yellow","Orange","Red","Green","Purple","Blue","Black","Brown"}
+        for i, color in ipairs(self:HairPalette()) do
+            for _, row in ipairs(self._T.colors) do
+                if row[3] == color[1] or row[3] == english[i] or string.sub(row[1],1,#color[1]) == color[1] then
+                    if self._T.hairChoices[i] == nil or row[2] == baseRuid or row[2] == mixRuid then self._T.hairChoices[i] = row end
+                end
+            end
+            local row = self._T.hairChoices[i]
+            if row ~= nil then
+                if row[2] == baseRuid then self._T.hairBase=i end
+                if row[2] == mixRuid then self._T.hairMix=i end
+            end
+        end
+        if self._T.hairBase == 0 then
+            -- Unclassified custom hair must remain unchanged instead of becoming another style.
+            self._T.hairChoices = {}
+        end
+        if self._T.hairMix == 0 then
+            for i=1,8 do if self._T.hairChoices[i] ~= nil and i ~= self._T.hairBase then self._T.hairMix=i break end end
+        end
+        if self._T.hairMix == 0 then self._T.hairMix=self._T.hairBase end
+        self._T.hairRatio = math.max(0,math.min(100,tonumber(ratio) or 50))
+        self._T.hairPreviewKey = nil
+        local equips = {}
+        for i=1,27 do
+            local value = _UIEquipInventoryManager:GetEquip(i)
+            equips[i]={name=_UIEquipInventoryManager:ParseName(value),ruid=_UIEquipInventoryManager:ParseRUID(value),item=value}
+        end
+        self._T.hairPreviewEquips=equips
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectHairColor(string side, integer index)
+        -- Palette clicks affect the pending preview only.
+        if not self.opened or not self._T.hair or self._T.hairChoices[index] == nil then return end
+        if side == "Mix" and index == self._T.hairBase then return end
+        if side == "Base" then
+            local previous=self._T.hairBase
+            self._T.hairBase=index
+            if self._T.hairMix==index then self._T.hairMix=previous end
+        else self._T.hairMix=index end
+        self:DrawHairMix()
+        _UIAudio:Play("BtMouseClick")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetHairRatio(number value)
+        -- Clamp and round to one-percent steps for slider and arrow buttons.
+        if not self.opened or not self._T.hair then return end
+        self._T.hairRatio=math.max(0,math.min(100,math.floor(value+0.5)))
+        self:DrawHairMix()
+    end
+
+    @ExecSpace("ClientOnly")
+    method string BuildHairItem()
+        -- Persist selection and tint in the item so moves, saves and outfit sync retain it.
+        local original=self._T.original or ""
+        local base=self._T.hairChoices[self._T.hairBase]
+        local mix=self._T.hairChoices[self._T.hairMix]
+        if base == nil or mix == nil then return original end
+        local ratio=self._T.hairRatio or 0
+        local row=ratio==100 and mix or base
+        local suffix=string.match(original,"^[^|]*|[^|]*(|.*)$")
+        if suffix==nil then return "" end
+        suffix=string.gsub(suffix,"|hairMix:[^|]*","")
+        suffix=string.gsub(suffix,"|dye:[^|]*","")
+        suffix=string.gsub(suffix,"|dyePower:[^|]*","")
+        suffix=string.gsub(suffix,"|dyeHSV:[^|]*","")
+        local item=row[1].."|"..row[2]..suffix
+        if ratio>0 and ratio<100 and base[2]~=mix[2] then
+            -- MSW exposes part tint, not native two-texture hair blending. Approximate
+            -- the target palette relative to the base while preserving its shading.
+            local palette=self:HairPalette()
+            local a=Color.FromHexCode("#"..palette[self._T.hairBase][2])
+            local b=Color.FromHexCode("#"..palette[self._T.hairMix][2])
+            local t=ratio/100
+            local r=math.min(2,((1-t)*a.r+t*b.r)/a.r)
+            local g=math.min(2,((1-t)*a.g+t*b.g)/a.g)
+            local blue=math.min(2,((1-t)*a.b+t*b.b)/a.b)
+            local power=math.max(1,r,g,blue)
+            local hex=string.format("%02X%02X%02X",math.floor(r/power*255+0.5),math.floor(g/power*255+0.5),math.floor(blue/power*255+0.5))
+            item=item.."|dye:"..hex.."|dyePower:"..tostring(math.floor(power*100+0.5))
+        end
+        return item.."|hairMix:"..base[2]..","..mix[2]..","..tostring(ratio)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawHairMix()
+        -- The preview shares the same costume/tint path as the equipped character.
+        local palette=self:HairPalette()
+        for _,side in ipairs({"Base","Mix"}) do
+            local selected=side=="Base" and self._T.hairBase or self._T.hairMix
+            for i,color in ipairs(palette) do
+                local button=self:UI("HairMix/"..side.."/Color"..tostring(i))
+                local available=self._T.hairChoices[i]~=nil
+                button.ButtonComponent.Enable=available and not (side=="Mix" and i==self._T.hairBase)
+                button.SpriteGUIRendererComponent.Color=available and (selected==i and Color(.88,.65,.32,1) or Color(.96,.85,.65,1)) or Color(.8,.76,.67,.6)
+                button:GetChildByName("Selected").Enable=available and selected==i
+                button:GetChildByName("Label").TextGUIRendererComponent.Text=available and color[1] or color[1].."\n미지원"
+            end
+        end
+        local ratio=self._T.hairRatio or 0
+        self._T.settingHair=true
+        self:UI("HairMix/Ratio").SliderComponent.Value=ratio
+        self._T.settingHair=false
+        local a=palette[self._T.hairBase]
+        local b=palette[self._T.hairMix]
+        self:UI("HairMix/BaseValue").TextGUIRendererComponent.Text=(a and a[1] or "원본").." "..tostring(100-ratio).."%"
+        self:UI("HairMix/MixValue").TextGUIRendererComponent.Text=(b and b[1] or "원본").." "..tostring(ratio).."%"
+        self:UI("HairMix/Note").TextGUIRendererComponent.Text=a and "두 색과 비율을 선택한 뒤 적용하기를 눌러주세요." or "이 헤어에는 기본 8색 변형이 등록되어 있지 않습니다."
+        self:UI("HairMix/Ratio").SliderComponent.Enable=a~=nil
+        local item=self:BuildHairItem()
+        self:UI("HairMix/Name").TextGUIRendererComponent.Text=_UIEquipInventoryManager:ParseName(item)
+        if self._T.hairPreviewKey==item then return end
+        self._T.hairPreviewKey=item
+        local equips=self._T.hairPreviewEquips
+        equips[2]={name=_UIEquipInventoryManager:ParseName(item),ruid=_UIEquipInventoryManager:ParseRUID(item),item=item}
+        local finals=_DecoWindowManager:ComposeAppearance(equips,_DecoWindowManager:ExportDeco(),_UIMyInfoManager:GetSelectedCharacterJobIdx())
+        -- Uncover the hair in the dye preview even if the character wears a hat.
+        for _,f in ipairs(finals) do if f[1]==5 then f[2]="" end end
+        if _DecoWindowManager:DecoRuid("skin")=="" then table.insert(finals,{1,"3cf4cb29ae344577b9eed37e531688a4"}) end
+        if self._T.source=="creation" then
+            local setting=self:CreationSetting()
+            if setting~=nil then finals=setting:CreationAppearance(item) end
+        end
+        local cm=self:UI("HairMix/Avatar").CostumeManagerComponent
+        cm.UseCustomEquipOnly=true
+        _DecoWindowManager:ApplyCostumeSnapshot(cm,finals)
+        log("[HairMix] preview base="..tostring(self._T.hairBase).." mix="..tostring(self._T.hairMix).." ratio="..tostring(ratio))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CommitNumber(string field, string text)
+        if not self.opened or not self._T.dye or self._T.settingHSV then return end
+        if field~="Hue" and field~="Saturation" and field~="Value" then return end
+        local slider=self:UI("Advanced/"..field).SliderComponent
+        local value=tonumber(text)
+        if value==nil or value~=value then value=slider.Value end
+        value=math.floor(math.max(slider.MinValue,math.min(slider.MaxValue,value))*100+0.5)/100
+        self._T.settingHSV=true
+        slider.Value=value
+        self:UI("Advanced/"..field.."Value").TextGUIRendererInputComponent.Text=string.format("%.2f",value)
+        self._T.settingHSV=false
+        self:DrawAdvanced()
     end
 
     @ExecSpace("ClientOnly")
@@ -237,10 +476,11 @@ script AppearanceColorPicker extends Logic
         -- Original brightness is centered at 50%; old RGB-only dyes retain their brightness.
         local hex=string.match(item,"^%x%x%x%x%x%x$") or string.match(item,"|dye:(%x%x%x%x%x%x)") or "FFFFFF"
         local h,s,v=Color.RGBToHSV(Color.FromHexCode("#"..hex))
+        local savedH,savedS,savedV=string.match(item,"|dyeHSV:([%d.]+),([%d.]+),([%d.]+)")
         self._T.settingHSV=true
-        self:UI("Advanced/Hue").SliderComponent.Value=math.floor(h*359+0.5)
-        self:UI("Advanced/Saturation").SliderComponent.Value=math.floor(s*100+0.5)
-        self:UI("Advanced/Value").SliderComponent.Value=v*_DecoWindowManager:DyePower(item)*50
+        self:UI("Advanced/Hue").SliderComponent.Value=math.max(0,math.min(359,tonumber(savedH) or h*360))
+        self:UI("Advanced/Saturation").SliderComponent.Value=math.max(0,math.min(100,tonumber(savedS) or s*100))
+        self:UI("Advanced/Value").SliderComponent.Value=math.max(0,math.min(100,tonumber(savedV) or v*_DecoWindowManager:DyePower(item)*50))
         self._T.settingHSV=false
     end
 
@@ -249,10 +489,12 @@ script AppearanceColorPicker extends Logic
         -- Keep unrelated item flags, and store extra brightness separately from RGB.
         local item=string.gsub(self._T.original,"|dye:%x%x%x%x%x%x","")
         item=string.gsub(item,"|dyePower:%d+","")
+        item=string.gsub(item,"|dyeHSV:[^|]*","")
         local hex=self._T.dyeHex or "FFFFFF"
         local power=self._T.dyePower or 100
         if hex~="FFFFFF" then item=item.."|dye:"..hex end
         if power~=100 then item=item.."|dyePower:"..tostring(power) end
+        item=item..string.format("|dyeHSV:%.2f,%.2f,%.2f",self:UI("Advanced/Hue").SliderComponent.Value,self:UI("Advanced/Saturation").SliderComponent.Value,self:UI("Advanced/Value").SliderComponent.Value)
         return item
     end
 
@@ -267,9 +509,9 @@ script AppearanceColorPicker extends Logic
         local hex=string.format("%02X%02X%02X",math.floor(tint.r*255+0.5),math.floor(tint.g*255+0.5),math.floor(tint.b*255+0.5))
         self._T.dyeHex=hex
         self._T.dyePower=math.floor(power*100+0.5)
-        self:UI("Advanced/HueValue").TextGUIRendererComponent.Text=tostring(math.floor(h)).."°"
-        self:UI("Advanced/SaturationValue").TextGUIRendererComponent.Text=tostring(math.floor(s)).."%"
-        self:UI("Advanced/ValueValue").TextGUIRendererComponent.Text=tostring(math.floor(v)).."%"
+        self:SyncNumber("Hue",h)
+        self:SyncNumber("Saturation",s)
+        self:SyncNumber("Value",v)
         -- 선택한 색조를 기준으로 채도/명도 막대의 예상 색을 표시한다.
         for i=0,47 do
             local ratio=i/47
@@ -279,7 +521,7 @@ script AppearanceColorPicker extends Logic
         local item=self:BuildDyeItem()
         self:UI("Name").TextGUIRendererComponent.Text=_UIEquipInventoryManager:ParseName(item)
         self:UI("Preview").SpriteGUIRendererComponent.ImageRUID="thumbnail://".._UIEquipInventoryManager:ParseRUID(item)
-        self:UI("Preview").SpriteGUIRendererComponent.Color=_DecoWindowManager:DyeColor(hex,self._T.dyePower)
+        _DecoWindowManager:ApplyDyeIcon(self:UI("Preview").SpriteGUIRendererComponent,hex,self._T.dyePower)
         local cached=self._T.dyePreviewFinals
         if cached~=nil then
             local ruid=_UIEquipInventoryManager:ParseRUID(item)
@@ -290,7 +532,7 @@ script AppearanceColorPicker extends Logic
         local equips={}
         for i=1,27 do
             local e=_UIEquipInventoryManager:GetEquip(i)
-            equips[i]={name=_UIEquipInventoryManager:ParseName(e),ruid=_UIEquipInventoryManager:ParseRUID(e)}
+            equips[i]={name=_UIEquipInventoryManager:ParseName(e),ruid=_UIEquipInventoryManager:ParseRUID(e),item=e}
         end
         local deco={}
         for key,value in pairs(_DecoWindowManager:ExportDeco()) do deco[key]=value end
@@ -302,4 +544,12 @@ script AppearanceColorPicker extends Logic
         self._T.dyePreviewFinals=finals
         _DecoWindowManager:ApplyCostumeSnapshot(self:UI("Advanced/Avatar").CostumeManagerComponent,finals)
     end
+
+    @ExecSpace("ClientOnly")
+    method any CreationSetting()
+        local e=_EntityService:GetEntityByPath("/ui/LoginScene/Stage/CreateCharacter/CreateCharacterBackground/CharacterSettingPanel")
+        if isvalid(e) then return e.CharacterSettingComponent end
+        return nil
+    end
+
 end

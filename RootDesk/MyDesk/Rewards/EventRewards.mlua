@@ -1,0 +1,441 @@
+@Logic
+script EventRewards extends Logic
+    property boolean opened = false
+    property integer tab = 1
+
+    method number RewardMeso(string kind, integer key)
+        -- Tutorial currency is committed in the same snapshot as its box receipt.
+        if kind=="boss" then return (((_BossRewards._T.data or {}).bundles or {})[tostring(key)] or {}).meso or 0 end
+        return kind=="tutorial" and 20000 or 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean ClaimFromCenter(string kind, integer key)
+        -- Share the existing authoritative receipt/retry path with the unified window.
+        if self._T.busy or not self._T.ready then return false end
+        self._T.fromCenter=true self._T.confirmKind=kind self._T.confirmKey=key
+        self:Claim()
+        if self._T.pending==nil then self._T.fromCenter=false return false end
+        return true
+    end
+
+    method table Levels()
+        -- Stable milestone IDs are also the claim keys.
+        return {10,15,20,25,30,35,40,45,50}
+    end
+
+    method integer Day(number now)
+        -- Server calendar day: Korea midnight, independent of the device clock.
+        return math.floor((now-(DateTime(2026,1,1).Elapsed-9*3600000))/86400000)
+    end
+
+    method table ReadState(string snapshot)
+        -- Legacy milestones already received remain received after migration.
+        local rev,last,total,flags=string.match("\n"..(snapshot or ""),"\nEVNT\t(%d+)\t(%-?%d+)\t(%d+)\t([%d,]*)")
+        if rev then return {rev=tonumber(rev),last=tonumber(last),total=tonumber(total),flags=flags or ""} end
+        return {rev=0,last=-999999,total=0,flags=_LevelCosmeticRewards:ReadState(snapshot or "").claimed}
+    end
+
+    method string Record(table state)
+        return "EVNT\t"..tostring(state.rev).."\t"..tostring(state.last).."\t"..tostring(state.total).."\t"..state.flags
+    end
+
+    method string WriteState(string snapshot, table state)
+        local lines={}
+        for line in string.gmatch(snapshot,"[^\r\n]+") do if string.sub(line,1,5)~="EVNT\t" then table.insert(lines,line) end end
+        table.insert(lines,self:Record(state))
+        return table.concat(lines,"\n")
+    end
+
+    method boolean HasLevel(table state, integer level)
+        return string.find(","..state.flags..",",","..tostring(level)..",",1,true)~=nil
+    end
+
+    method table Rewards(string kind, integer key)
+        -- Edit this table to manage the event schedule and quantities in one place.
+        local gifts={}
+        if kind=="boss" then return (((_BossRewards._T.data or {}).bundles or {})[tostring(key)] or {}).items or {} end
+        if kind=="tutorial" and key==1000 then return {"장비 상자|47841bc4d3554cf0a68bd05f19de1f18|0|0|0|0|5", _RecoveryPotionManager:Item("regen_hp3",1), _RecoveryPotionManager:Item("regen_mp3",1)} end
+        if kind=="attendance" then
+            if key<1 or key>14 then return {} end
+            if key==14 then return {_SpecialEquipment:BoxItem("accessory",1)} end
+            if key==6 or key==7 or key==13 then return {_SpecialEquipment:BoxItem("premium",5)} end
+            return {"메소주머니|17ae6a22966f45738bb92fb97ecc3e9d|0|0|0|0|1|meso_pouch"}
+        end
+        if kind~="level" then return {} end
+        if key==20 then return {"메소주머니|17ae6a22966f45738bb92fb97ecc3e9d|0|0|0|0|2|meso_pouch"} end
+        if key==50 then return {_SpecialEquipment:BoxItem("accessory",1)} end
+        local schedule={[10]={"cap"},[15]={"longcoat"},[25]={"hair","face"},[30]={"skin"},[35]={"weapon"},[40]={"cap","longcoat"},[45]={"hair","face"}}
+        for _,category in ipairs(schedule[key] or {}) do table.insert(gifts,_CosmeticBoxCatalog:LevelRewardBoxItem("cosmetic:"..category,1)) end
+        return gifts
+    end
+
+    method table Transition(table old, string kind, integer key, integer day, integer highest)
+        -- Pure eligibility check; only a successful claim advances the cycle.
+        if kind~="boss" and #self:Rewards(kind,key)==0 then return {} end
+        local state={rev=old.rev+1,last=old.last,total=old.total,flags=old.flags}
+        if kind=="attendance" then
+            if day<=old.last or key~=old.total%14+1 then return {} end
+            state.last=day state.total=old.total+1
+        else
+            if (kind~="tutorial" and kind~="boss" and highest<key) or self:HasLevel(old,key) then return {} end
+            state.flags=old.flags..tostring(key)..","
+        end
+        return state
+    end
+
+    method table SlotsFor(string snapshot, string tab)
+        local slots={}
+        for i=1,128 do slots[i]="" end
+        for line in string.gmatch(snapshot,"[^\r\n]+") do
+            local index,item=string.match(line,"^I\t"..tab.."\t(%d+)\t(.+)$")
+            if index and tonumber(index)>=1 and tonumber(index)<=128 then slots[tonumber(index)]=item end
+        end
+        return slots
+    end
+
+    method table Slots(string snapshot)
+        -- Existing event gifts still use the consumption tab.
+        return self:SlotsFor(snapshot,"consume")
+    end
+
+    method table TabGifts(table gifts, string tab)
+        -- Rare shells are possessions, never consumables.
+        local out={}
+        for _,gift in ipairs(gifts) do if (_BossRewards:IsShell(gift) and "etc" or "consume")==tab then table.insert(out,gift) end end
+        return out
+    end
+
+    method table PlanGrant(table slots, table gifts)
+        -- Reuse the tested stack planner, but reject partial delivery for events.
+        local pending={meso=0,items={}}
+        for _,gift in ipairs(gifts) do pending.items[gift]=(pending.items[gift] or 0)+_RecoveryManager:Count(gift) end
+        local plan=_OfflineRestRewards:PlanGrant(slots,pending)
+        for item,count in pairs(pending.items) do if plan.items[item]~=count then return {} end end
+        return plan.slots
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean AcceptSnapshot(table sv, string snapshot)
+        -- Ordinary saves cannot invent receipts or roll inventory back behind a receipt.
+        if sv.eventCandidate==snapshot then return true end
+        local old=self:ReadState(sv.saves[sv.activeId] or "")
+        return self:Record(old)==self:Record(self:ReadState(snapshot))
+    end
+
+    @ExecSpace("Server")
+    method void RequestStatus(string id)
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or id=="" or sv.activeId~=id then return end
+        _BossRewards:Receive(id,_BossRewards:Record(_BossRewards:Read(sv.saves[id] or "")),senderUserId)
+        self:ReceiveStatus(id,self:Record(self:ReadState(sv.saves[id] or "")),self:Day(DateTime.UtcNow.Elapsed),senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveStatus(string id, string record, integer day)
+        if self._T.id~=id then return end
+        self._T.day=day self._T.ready=true
+        if self._T.pending==nil then self._T.state=self:ReadState(record) end
+        if self.opened then self:Draw() end
+    end
+
+    @ExecSpace("Server")
+    method void RequestClaim(string id, string kind, integer key, string before, string after)
+        -- Serialize claims per user and persist inventory plus receipt in the same save key.
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if sv==nil or id=="" or sv.activeId~=id or sv.eventBusy then return end
+        sv.eventBusy=true
+        local state=self:ReadState(sv.saves[id] or "")
+        local proposed=self:ReadState(after)
+        local accepted=false
+        if proposed.rev==state.rev and self:Record(proposed)==self:Record(state) then
+            -- Lost reply: the receipt exists, so retry only the storage write.
+            accepted=true
+        elseif proposed.rev==state.rev+1 and _CharacterPersistence:AcceptCharacterSnapshot(senderUserId,before,"event_before") then
+            local high=_LevelCosmeticRewards:ReadState(sv.saves[id] or "").highest
+            local expected=self:Transition(state,kind,key,self:Day(DateTime.UtcNow.Elapsed),high)
+            local bundle=kind=="boss" and _BossRewards:Bundle(sv.saves[id] or "",key) or {}
+            local gifts=kind=="boss" and (bundle.items or {}) or self:Rewards(kind,key)
+            local plan=self:PlanGrant(self:Slots(before),self:TabGifts(gifts,"consume"))
+            local etcPlan=self:PlanGrant(self:SlotsFor(before,"etc"),self:TabGifts(gifts,"etc"))
+            local etcReceived=self:SlotsFor(after,"etc")
+            local received=self:Slots(after)
+            local beforeMeso=tonumber(string.match(before,"^M\t(%d+)")) or 0
+            local afterMeso=tonumber(string.match(after,"^M\t(%d+)")) or 0
+            local valid=expected.rev~=nil and #plan==128 and self:Record(expected)==self:Record(proposed)
+            valid=valid and afterMeso==beforeMeso+(kind=="boss" and (bundle.meso or 0) or self:RewardMeso(kind,key))
+            if kind=="boss" then valid=valid and bundle.stage~=nil end
+            valid=valid and #etcPlan==128
+            if valid then for i=1,128 do if etcPlan[i]~=etcReceived[i] then valid=false break end end end
+            if kind=="tutorial" then valid=valid and (tonumber(string.match("\n"..before,"\nQ\t(%d+)")) or 0)>=11 end
+            if valid then for i=1,128 do if plan[i]~=received[i] then valid=false break end end end
+            if valid then
+                sv.eventCandidate=after
+                accepted=_CharacterPersistence:AcceptCharacterSnapshot(senderUserId,after,"event_reward")
+                sv.eventCandidate=nil
+            end
+        end
+        local saved=accepted and _CharacterPersistence:WriteCharacterSaves(sv,true)
+        local result=not accepted and "rejected" or saved and "saved" or "retry"
+        local record=self:Record(self:ReadState(sv.saves[id] or ""))
+        sv.eventBusy=false
+        self:ReceiveClaim(id,proposed.rev,result,record,self:Day(DateTime.UtcNow.Elapsed),senderUserId)
+        log("[EventRewards] claim kind="..kind.." key="..tostring(key).." result="..result)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string snapshot, string id)
+        self._T.id=id self._T.state=self:ReadState(snapshot)
+        self._T.pending=nil self._T.fromCenter=false self._T.ready=false self._T.busy=false self._T.deadline=nil
+        self:Close()
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Export()
+        return self:Record(self._T.state or self:ReadState(""))
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string child)
+        return _EntityService:GetEntityByPath("/ui/EventGroup/Modal"..(child=="" and "" or "/Panel/"..child))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.links={}
+        self:Bind("Close",function() self:Close() end)
+        self:Bind("Attendance",function() self.tab=1 self:UI("Confirm").Enable=false self:Draw() end)
+        self:Bind("Level",function() self.tab=2 self:UI("Confirm").Enable=false self:Draw() self:UI("LevelList").ScrollLayoutGroupComponent:SetScrollPositionByItemIndex(0) end)
+        self:Bind("Claim",function() self:AskReward("attendance",(self._T.state or self:ReadState("")).total%14+1) end)
+        self:Bind("Confirm/Box/No",function() self:UI("Confirm").Enable=false end)
+        self:Bind("Confirm/Box/Yes",function() self:UI("Confirm").Enable=false self:Claim() end)
+        for i=1,14 do local day=i self:Bind("Calendar/Day"..tostring(i),function() self:AskReward("attendance",day) end) end
+        for i,lv in ipairs(self:Levels()) do local level=lv self:Bind("LevelList/Row"..tostring(i),function()
+            if _UtilLogic.ElapsedSeconds<(self._T.scrollUntil or 0) then return end
+            self:AskReward("level",level)
+        end) end
+        local list=self:UI("LevelList")
+        self._T.scroll=list:ConnectEvent(ScrollPositionChangedEvent,function() self._T.scrollUntil=_UtilLogic.ElapsedSeconds+0.2 end)
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,self.OnKey)
+        self:UI("").Enable=false
+        log("[EventRewards] UI ready")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for _,link in ipairs(self._T.links or {}) do if isvalid(link.e) then link.e:DisconnectEvent(ButtonClickEvent,link.h) end end
+        if self._T.scroll then self:UI("LevelList"):DisconnectEvent(ScrollPositionChangedEvent,self._T.scroll) end
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        if not _LoginFlow:IsInGame() or (not self.opened and _KeySettingManager:IsCapturingKey()) or _MapleHUDManager:IsChatTyping() then return end
+        if self.opened and event.key==KeyboardKey.Escape then
+            if self:UI("Confirm").Enable then self:UI("Confirm").Enable=false else self:Close() end
+            return
+        end
+        if _KeySettingManager:GetFuncForKeyEnum(event.key)=="event" and (self.opened or not _GameSystemMenu:BlocksInput()) then self:Toggle() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        return self.opened or self._T.pending~=nil or _UtilLogic.ElapsedSeconds<(self._T.closedUntil or 0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Toggle()
+        if self.opened then self:Close() else self:Open(1) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open(integer tab)
+        local cl=_CharacterPersistence._T.cl
+        if not _LoginFlow:IsInGame() or cl==nil or not cl.entered then return end
+        if _EnhancementManager:RequireCubeChoice() then return end
+        self.tab=tab self.opened=true self:UI("Confirm").Enable=false
+        _MobileUIManager:ReleaseControls()
+        _UIEquipInventoryManager:HideTooltip()
+        self:UI("").Enable=true self:Draw()
+        if self.tab==2 then self:UI("LevelList").ScrollLayoutGroupComponent:SetScrollPositionByItemIndex(0) end
+        self:RequestStatus(self._T.id)
+        _UIAudio:Play("MenuUp")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        if self._T.pending then _UIToast:ShowMessage("보상 저장을 확인한 뒤 닫을 수 있습니다.") return end
+        self.opened=false self._T.closedUntil=_UtilLogic.ElapsedSeconds+0.2
+        local e=self:UI("") if isvalid(e) then e.Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer NextLevel()
+        local state=self._T.state or self:ReadState("")
+        for _,level in ipairs(self:Levels()) do if _LevelCosmeticRewards.highest>=level and not self:HasLevel(state,level) then return level end end
+        return 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Claim()
+        local cl=_CharacterPersistence._T.cl
+        if (not self.opened and not self._T.fromCenter) or cl==nil or not cl.entered or cl.flushing or self._T.busy or not self._T.ready then return end
+        if self._T.pending then self:SendPending() return end
+        local old=self._T.state
+        local kind=self._T.confirmKind or ""
+        local key=self._T.confirmKey or 0
+        if kind=="tutorial" and _MapleIslandTutorial.step<11 then return end
+        local state=self:Transition(old,kind,key,self._T.day,_LevelCosmeticRewards.highest)
+        if state.rev==nil then return end
+        self._T.busy=true self._T.deadline=nil
+        local before=_CharacterPersistence:BuildSaveString()
+        local slots=self:Slots(before)
+        local gifts=self:Rewards(kind,key)
+        local plan=self:PlanGrant(slots,self:TabGifts(gifts,"consume"))
+        local etcSlots=self:SlotsFor(before,"etc")
+        local etcPlan=self:PlanGrant(etcSlots,self:TabGifts(gifts,"etc"))
+        if #plan~=128 or #etcPlan~=128 then self._T.busy=false _UIToast:ShowMessage("소비·기타 인벤토리 공간을 비워주세요.") return end
+        if kind=="boss" and (((_BossRewards._T.data or {}).bundles or {})[tostring(key)] or {}).stage==nil then self._T.busy=false return end
+        local inv=_UIEquipInventoryManager
+        for i=1,128 do if inv:GetTabItem("consume",i)~=slots[i] or inv:GetTabItem("etc",i)~=etcSlots[i] then self._T.busy=false return end end
+        if inv.meso+self:RewardMeso(kind,key)>9000000000000000 then self._T.busy=false return end
+        for i=1,128 do inv:SetTabItem("consume",i,plan[i]) inv:SetTabItem("etc",i,etcPlan[i]) end
+        inv.meso=inv.meso+self:RewardMeso(kind,key) inv:UpdateMesoUI()
+        self._T.state=state
+        self._T.pending={kind=kind,key=key,before=before,gifts=gifts,rev=state.rev}
+        self._T.pending.after=_CharacterPersistence:BuildSaveString()
+        inv:RefreshUI()
+        self._T.busy=false self:SendPending()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SendPending()
+        local p=self._T.pending if p==nil then return end
+        self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
+        self:RequestClaim(self._T.id,p.kind,p.key,p.before,p.after)
+        self:Draw()
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveClaim(string id, integer revision, string result, string record, integer day)
+        local p=self._T.pending
+        if id~=self._T.id or p==nil or p.rev~=revision then return end
+        self._T.busy=false self._T.deadline=nil self._T.day=day
+        if result=="retry" then if self._T.fromCenter then _RewardCenter:OnClaimResult("event",false) end _UIToast:ShowMessage("저장을 확인하지 못했습니다. 보상 받기를 다시 눌러주세요.") self:Draw() return end
+        if result=="rejected" then
+            -- Undo only this provisional gift; preserve unrelated drops and stacks.
+            local inv=_UIEquipInventoryManager
+            inv.meso=math.max(0,inv.meso-self:RewardMeso(p.kind,p.key)) inv:UpdateMesoUI()
+            for _,gift in ipairs(p.gifts) do
+                local left=_RecoveryManager:Count(gift)
+                local giftTab=_BossRewards:IsShell(gift) and "etc" or "consume"
+                for i=128,1,-1 do
+                    local item=inv:GetTabItem(giftTab,i)
+                    if _RecoveryManager:Identity(item)==_RecoveryManager:Identity(gift) then
+                        local count=_RecoveryManager:Count(item) local take=math.min(left,count)
+                        inv:SetTabItem(giftTab,i,count==take and "" or _OfflineRestRewards:WithCount(item,count-take))
+                        left=left-take if left==0 then break end
+                    end
+                end
+            end
+            _UIToast:ShowMessage("수령 상태가 변경되었습니다. 다시 확인해주세요.")
+        else _UIToast:ShowMessage(p.kind=="boss" and "보스 주간 보상을 받았습니다." or "이벤트 보상을 받았습니다.") _GameAudio:PlayCue("Quest") _BossRewards:Acquired(p.gifts) end
+        self._T.state=self:ReadState(record) self._T.pending=nil
+        _UIEquipInventoryManager:RefreshUI()
+        _CharacterPersistence._T.cl.lastSentStr=""
+        _CharacterPersistence:MarkDirty("event_reward_ack") _CharacterPersistence:FlushToServer()
+        if self.opened then self:Draw() end
+        if self._T.fromCenter then self._T.fromCenter=false _RewardCenter:OnClaimResult("event",result=="saved") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        if self._T.busy and self._T.deadline and _UtilLogic.ElapsedSeconds>=self._T.deadline then self._T.busy=false self._T.deadline=nil if self.opened then self:Draw() end end
+        if not self.opened then return end
+        if not _LoginFlow:IsInGame() then self:Close() return end
+        self._T.tick=(self._T.tick or 0)+delta
+        if self._T.tick>=30 then self._T.tick=0 self:RequestStatus(self._T.id) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string RewardLabel(string kind, integer key)
+        local parts={}
+        if self:RewardMeso(kind,key)>0 then table.insert(parts,tostring(self:RewardMeso(kind,key)).." 메소") end
+        for _,gift in ipairs(self:Rewards(kind,key)) do table.insert(parts,_UIEquipInventoryManager:ParseName(gift).." ×"..tostring(_RecoveryManager:Count(gift))) end
+        return table.concat(parts," · ")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any action)
+        local e=self:UI(path)
+        table.insert(self._T.links,{e=e,h=e:ConnectEvent(ButtonClickEvent,action)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AskReward(string kind, integer key)
+        if self._T.busy or not self._T.ready then return end
+        local state=self._T.state or self:ReadState("")
+        if self._T.pending then
+            kind=self._T.pending.kind key=self._T.pending.key
+        elseif self:Transition(state,kind,key,self._T.day,_LevelCosmeticRewards.highest).rev==nil then
+            _UIToast:ShowMessage("이미 받은 보상이거나 아직 수령 조건을 달성하지 못했습니다.") return
+        end
+        self._T.confirmKind=kind self._T.confirmKey=key
+        self:UI("Confirm/Box/Message").TextGUIRendererComponent.Text=self:RewardLabel(kind,key).."\n\n해당 보상을 받으시겠습니까?"
+        self:UI("Confirm").Enable=true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawIcon(Entity icon, string item, number size)
+        -- Use the inventory's category-specific box artwork and center source pivots.
+        local ruid=_UIEquipInventoryManager:ItemIconRUID(item)
+        local renderer=icon.SpriteGUIRendererComponent
+        renderer.ImageRUID=ruid renderer.PreserveSprite=PreserveSpriteType.None
+        renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
+        icon.UITransformComponent.RectSize=Vector2(size,size)
+        _RecoveryPotionManager:FitIcon(icon,ruid,size,size)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        local state=self._T.state or self:ReadState("")
+        local attendance=self.tab==1
+        self:UI("Calendar").Enable=attendance self:UI("LevelList").Enable=not attendance
+        self:UI("Heading").TextGUIRendererComponent.Text=attendance and "매일 만나는 출석 선물" or "성장의 즐거움, 레벨업 보상"
+        self:UI("Description").TextGUIRendererComponent.Text=attendance and "캐릭터별 하루 1회 · 한국 시간 00시 초기화 · 14일마다 반복" or "보상 줄을 눌러 수령하세요. 목록을 위아래로 스크롤할 수 있습니다."
+        self:UI("Attendance").SpriteGUIRendererComponent.Color=attendance and Color(1,0.8,0.4,1) or Color.white
+        self:UI("Level").SpriteGUIRendererComponent.Color=not attendance and Color(1,0.8,0.4,1) or Color.white
+        local cycleDay=state.total%14+1
+        local claimedToday=self._T.day~=nil and state.last>=self._T.day
+        if attendance then
+            for i=1,14 do
+                local cell=self:UI("Calendar/Day"..tostring(i))
+                local done=i<cycleDay or state.total>0 and cycleDay==1 and claimedToday
+                local ready=i==cycleDay and not claimedToday
+                local gift=self:Rewards("attendance",i)[1]
+                self:DrawIcon(cell:GetChildByName("Icon"),gift,62)
+                cell:GetChildByName("Count").TextGUIRendererComponent.Text="×"..tostring(_RecoveryManager:Count(gift))
+                cell:GetChildByName("State").TextGUIRendererComponent.Text=done and "출석 완료" or ready and "오늘 보상" or ""
+                cell:GetChildByName("Check").Enable=done
+                cell.SpriteGUIRendererComponent.Color=ready and Color(1,0.84,0.48,1) or Color(0.91,0.86,0.77,1)
+            end
+        else
+            for i,key in ipairs(self:Levels()) do
+                local row=self:UI("LevelList/Row"..tostring(i))
+                local done=self:HasLevel(state,key)
+                row:GetChildByName("Title").TextGUIRendererComponent.Text="Lv. "..tostring(key)
+                row:GetChildByName("Reward").TextGUIRendererComponent.Text=string.gsub(self:RewardLabel("level",key)," · ","\n")
+                row:GetChildByName("State").TextGUIRendererComponent.Text=done and "수령 완료" or _LevelCosmeticRewards.highest>=key and "수령 가능" or "미달성"
+                local gifts=self:Rewards("level",key)
+                for j=1,2 do
+                    local icon=row:GetChildByName("Icon"..tostring(j)) icon.Enable=gifts[j]~=nil
+                    if gifts[j] then self:DrawIcon(icon,gifts[j],48) end
+                end
+            end
+        end
+        self:UI("Claim").Enable=attendance
+        self:UI("Claim").ButtonComponent.Enable=not self._T.busy and self._T.ready and (not claimedToday or self._T.pending~=nil)
+        self:UI("Claim").TextGUIRendererComponent.Text=self._T.busy and "저장 중…" or self._T.pending and "저장 재시도" or not self._T.ready and "확인 중…" or claimedToday and "오늘 출석 완료" or "출석 보상 받기"
+        self:UI("Footer").TextGUIRendererComponent.Text=attendance and (tostring(math.floor(math.max(0,state.total-(claimedToday and cycleDay==1 and 1 or 0))/14)+1).."회차 · 누적 "..tostring(state.total).."일 출석") or "치장 보상은 소비 탭의 코디 상자로 지급됩니다."
+    end
+end

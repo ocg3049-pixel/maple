@@ -9,6 +9,16 @@ script WorldMapManager extends Logic
 
     method void OnBeginPlay()
         if self:IsClient() then
+            self._T.mapMouse=_InputService:ConnectEvent(KeyDownEvent,function(event)
+                if event.key==KeyboardKey.Mouse0 then self:HandleMapPointer(_InputService:GetCursorPosition()) end
+            end)
+            self._T.mapTouch=_InputService:ConnectEvent(ScreenTouchEvent,function(event)
+                if event.TouchId==1 then self:HandleMapPointer(event.TouchPoint) end
+            end)
+            self:WireMapCloseButtons()
+            local randomButton = _EntityService:GetEntityByPath("/ui/WorldMapGroup/RandomHunt")
+            self._T.randomButton = randomButton
+            self._T.randomClick = randomButton:ConnectEvent(ButtonClickEvent, function() self:TravelRandomHunt() end)
             self:WireVictoriaTouch()
             self:WireSleepywoodTouch()
             self:WireRegionTouches()
@@ -34,11 +44,41 @@ script WorldMapManager extends Logic
     method void OnEndPlay()
         if self:IsClient() then
             if isvalid(self._T.filterButton) and self._T.filterClick then self._T.filterButton:DisconnectEvent(ButtonClickEvent, self._T.filterClick) end
+            if isvalid(self._T.randomButton) and self._T.randomClick then self._T.randomButton:DisconnectEvent(ButtonClickEvent,self._T.randomClick) end
+            if self._T.mapMouse then _InputService:DisconnectEvent(KeyDownEvent,self._T.mapMouse) end
+            if self._T.mapTouch then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.mapTouch) end
+            self:UnwireMapCloseButtons()
             self:UnwireVictoriaTouch()
             self:UnwireSleepywoodTouch()
             self:UnwireRegionTouches()
             self:UnwireRegionDestinations()
         end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void WireMapCloseButtons()
+        -- Each page uses exactly the same navigation path as ESC.
+        self._T.mapCloseConnections = {}
+        for _, panelName in pairs(self:GetMapPanels()) do
+            local button = _EntityService:GetEntityByPath("/ui/WorldMapGroup/" .. panelName .. "/CloseButton")
+            if isvalid(button) then
+                local click = button:ConnectEvent(ButtonClickEvent, function()
+                    _UIAudio:Play("BtMouseClick")
+                    self:OnEscKey()
+                end)
+                table.insert(self._T.mapCloseConnections, {entity=button, click=click})
+            end
+        end
+        log("[WorldMap] close buttons connected=" .. tostring(#self._T.mapCloseConnections))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UnwireMapCloseButtons()
+        -- Release UI subscriptions when the play session ends.
+        for _, connection in ipairs(self._T.mapCloseConnections or {}) do
+            if isvalid(connection.entity) then connection.entity:DisconnectEvent(ButtonClickEvent, connection.click) end
+        end
+        self._T.mapCloseConnections = nil
     end
 
     @ExecSpace("ClientOnly")
@@ -73,6 +113,9 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void FadeAndTeleport(string mapId)
+        if _MapleIslandTutorial:Active() and _MapleIslandTutorial.step < 9 then
+            _UIToast:ShowMessage("튜토리얼 안내를 먼저 완료해 주세요.") return
+        end
         if self._T.isFading then return end
         self._T.isFading = true
         _ScreenTransitionService:SetFadeInOutEnable(true)
@@ -110,8 +153,8 @@ script WorldMapManager extends Logic
         if not self:IsClient() then return end
         self:FollowMapTooltip(delta)
         self:UpdateLevelRecommendations(delta)
-        local filter = _EntityService:GetEntityByPath("/ui/WorldMapGroup/LevelFilter")
-        if isvalid(filter) then
+        local mapGroup=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        if isvalid(mapGroup) and mapGroup.Enable then
             self:LayoutLevelFilter()
         end
 
@@ -151,21 +194,13 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnMKey()
-        -- M으로 열 때마다 플레이어가 있는 가장 상세한 지역 지도를 선택한다.
-        local mapGroup = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
-        if not isvalid(mapGroup) then return end
-        if mapGroup.Enable then
-            self:CloseAll()
-            return
-        end
-        local player = _UserService.LocalPlayer
-        local mapName = ""
-        if isvalid(player) and isvalid(player.CurrentMap) then mapName = _ChannelManager:BaseName(player.CurrentMap.Name) end
-        self:ShowMapPage(self:GetPageForMap(mapName))
+        -- PC and mobile use the same scrollable destination browser.
+        _MobileUIManager:ToggleMobileWorldMap()
     end
 
     @ExecSpace("ClientOnly")
     method void OnEscKey()
+        if _MobileUIManager:IsMobile() and _MobileUIManager:UI("WorldMap").Enable then self:CloseAll() return end
         -- 상세 지도에서 한 단계씩 상위 지도로 돌아가고 전체 지도에서만 닫는다.
         local mapGroup = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
         if not isvalid(mapGroup) or not mapGroup.Enable then return end
@@ -178,6 +213,8 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void CloseAll()
+        _MobileUIManager:UI("WorldMap").Enable=false
+        self._T.mobileDestination=nil
         self:ResetDots()
         self:SetSleepywoodGlow(false)
         self:ClearRegionGlows()
@@ -218,33 +255,33 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void ShowMapPage(string page)
-        -- 한 번에 지도 하나만 표시하고 이전 페이지의 선택/호버 상태를 초기화한다.
-        local group = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
-        if not isvalid(group) then return end
-        local panels = self:GetMapPanels()
-        local name = panels[page]
-        if name == nil or not isvalid(group:GetChildByName(name)) then return end
-        self:ResetDots()
-        self:HideGlow()
-        self:SetSleepywoodGlow(false)
-        self:ClearRegionGlows()
-        for key, panelName in pairs(panels) do
-            local panel = group:GetChildByName(panelName)
-            if isvalid(panel) then panel.Enable = key == page end
+        -- PC keeps the original map artwork and uses a compact browser on its right.
+        if not _LoginFlow:IsInGame() then return end
+        local ui=_MobileUIManager
+        local group=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        local panels=self:GetMapPanels()
+        if panels[page]==nil then return end
+        self:ResetDots() self:HideGlow() self:ClearRegionGlows() self:ClearRegionSelection()
+        self._T.mapPage=page self._T.regionMapFilter=nil self._T.lastRegionDot=nil
+        for key,name in pairs(panels) do
+            local panel=group:GetChildByName(name)
+            if isvalid(panel) then
+                panel.Enable=key==page
+                panel.UITransformComponent.anchoredPosition=Vector2(-331,0)
+                panel.UITransformComponent.UIScale=Vector3(1.3,1.3,1)
+                local old=panel:GetChildByName("Destinations") if isvalid(old) then old.Enable=false end
+            end
         end
-        self._T.mapPage = page
-        self._T.regionListPage = 1
-        self._T.regionMapFilter = nil
-        self._T.lastRegionDot = nil
-        self:ClearRegionSelection()
-        self:RefreshRegionDestinations()
-        self:LayoutLevelFilter()
-        self:RefreshLevelFilterMark()
-        self._T.recommendElapsed = 1
-        self:UpdateLevelRecommendations(0)
-        group.Enable = true
+        group:GetChildByName("LevelFilter").Enable=false
+        group:GetChildByName("RandomHunt").Enable=false
+        group.Enable=not ui:IsMobile()
+        for i,region in ipairs(ui._T.mobileRegions) do if region[1]==page then ui._T.mobileRegion=i break end end
+        ui._T.mobileMapPage=1 ui._T.mobileMonsterPage=1 ui._T.mobileMapSelected=nil
+        if ui._T.mobileOnlyHunt==nil then ui._T.mobileOnlyHunt=true end
+        ui:UI("MenuPanel").Enable=false ui:UI("WorldMap").Enable=true
+        ui:ApplyWorldMapLayout() ui:DrawMobileWorldMap()
         _MapleIslandTutorial:Notify("worldmap")
-        log("[WorldMap] 페이지 열림: " .. page)
+        log("[WorldMap] map and browser opened page="..page.." mobile="..tostring(ui:IsMobile()))
     end
 
     @ExecSpace("ClientOnly")
@@ -1460,6 +1497,7 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method string GetMapDisplayName(string mapId)
+        if _BossStageManager:IsArena(mapId) then return (_BossStageManager._T.stage==2 and "스텀피의 돌풍 고원" or "마노의 초원") end
         -- 지역 지도와 미니맵이 같은 한글 맵 이름을 사용한다.
         for _, entry in ipairs(self._T.regionDestinations or {}) do
             if entry.id == mapId then return entry.title end
@@ -1503,35 +1541,7 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnDestinationDown(UITouchDownEvent event)
-        -- 페이지 버튼은 목록을 넘기고 같은 행의 더블클릭은 해당 맵으로 이동한다.
-        local row = event.Entity
-        if row.Name == "Title" then
-            self._T.lastRegionDot = nil
-            self._T.regionMapFilter = nil
-            self._T.regionListPage = 1
-            self:ClearRegionSelection()
-            self:RefreshRegionDestinations()
-            return
-        end
-        if row.Name == "Previous" or row.Name == "Next" then
-            local step = row.Name == "Next" and 1 or -1
-            self._T.regionListPage = (self._T.regionListPage or 1) + step
-            self:RefreshRegionDestinations()
-            return
-        end
-        local rowIndex = tonumber(string.match(row.Name, "^Row(%d+)$"))
-        if rowIndex == nil then return end
-        local entry = self._T.destinationEntryByRow and self._T.destinationEntryByRow[row.Id]
-        if entry == nil then return end
-        local now = _UtilLogic.ElapsedSeconds
-        if self._T.lastDestination == entry.id and now - (self._T.lastDestinationTime or -99) < 0.4 then
-            self:FadeAndTeleport(entry.id)
-            return
-        end
-        self:RefreshRegionDestinations()
-        self._T.lastDestination = entry.id
-        self._T.lastDestinationTime = now
-        row.SpriteGUIRendererComponent.Color = Color(1, 0.8, 0.35, 1)
+        self:HandleDestinationClick(event.Entity)
     end
 
     @ExecSpace("ClientOnly")
@@ -1554,40 +1564,7 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnRegionDotDown(UITouchDownEvent event)
-        -- 원본 이동점의 맵 묶음을 표시하고 더블클릭하면 대표 맵으로 이동한다.
-        local dot = event.Entity
-        local entry = self._T.regionPointByEntity and self._T.regionPointByEntity[dot.Id]
-        if entry == nil then return end
-        if entry.targetPage ~= nil then
-            self:ShowMapPage(entry.targetPage)
-            return
-        end
-        local now = _UtilLogic.ElapsedSeconds
-        if self._T.lastRegionDot == dot.Id and now - (self._T.lastRegionDotTime or -99) < 0.4 then
-            self:FadeAndTeleport(entry.maps[1])
-            return
-        end
-        self._T.lastRegionDot = dot.Id
-        self._T.lastRegionDotTime = now
-        self._T.regionMapFilter = {}
-        for _, mapId in ipairs(entry.maps) do self._T.regionMapFilter[mapId] = true end
-        self._T.regionListPage = 1
-        self:ClearRegionSelection()
-        self._T.activeRegionDot = dot
-        dot.SpriteGUIRendererComponent.ImageRUID = DataRef(entry.animationRUID)
-        dot.SpriteGUIRendererComponent.EndFrameIndex = 2147483647
-        dot.SpriteGUIRendererComponent.PlayRate = 1
-        dot.SpriteGUIRendererComponent.AnimClipPlayType = SpriteAnimClipPlayType.Loop
-        local arrow = _EntityService:GetEntityByPath("/ui/WorldMapGroup/" .. entry.panel .. "/RegionSelection")
-        if isvalid(arrow) then
-            arrow.Enable = true
-            arrow.UITransformComponent.anchoredPosition = dot.UITransformComponent.anchoredPosition
-            arrow.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.NativeSize
-            arrow.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
-            arrow.SpriteGUIRendererComponent.PlayRate = 1
-            arrow.SpriteGUIRendererComponent.AnimClipPlayType = SpriteAnimClipPlayType.Loop
-        end
-        self:RefreshRegionDestinations()
+        self:HandleRegionClick(event.Entity)
     end
 
 
@@ -2501,7 +2478,7 @@ script WorldMapManager extends Logic
                 entry.recommended = false
                 for _, mapId in ipairs(entry.maps or {}) do
                     for _, mob in ipairs(self:GetMapMonsters(mapId)) do
-                        if math.abs(mob.level - level) <= 5 then entry.recommended = true break end
+                        if mob.level >= level - 10 and mob.level <= level - 2 then entry.recommended = true break end
                     end
                     if entry.recommended then break end
                 end
@@ -2525,23 +2502,10 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void LayoutLevelFilter()
-        local group = _EntityService:GetEntityByPath("/ui/WorldMapGroup")
-        local filter = isvalid(group) and group:GetChildByName("LevelFilter") or nil
-        local panelName = self:GetMapPanels()[self._T.mapPage or "world"]
-        local panel = isvalid(group) and group:GetChildByName(panelName) or nil
-        if not isvalid(filter) or not isvalid(panel) then return end
-        local edge = panel:GetChildByName("Destinations")
-        if not isvalid(edge) then edge = panel end
-        local pt = panel.UITransformComponent
-        local et = edge.UITransformComponent
-        local right = pt.anchoredPosition.x + (1-pt.Pivot.x)*pt.RectSize.x
-        local bottom = pt.anchoredPosition.y - pt.Pivot.y*pt.RectSize.y
-        if edge ~= panel then
-            right = pt.anchoredPosition.x + et.anchoredPosition.x + (1-et.Pivot.x)*et.RectSize.x
-            bottom = math.min(bottom, pt.anchoredPosition.y+et.anchoredPosition.y-et.Pivot.y*et.RectSize.y)
-        end
-        local size = filter.UITransformComponent.RectSize
-        filter.UITransformComponent.anchoredPosition = Vector2(right-size.x/2,bottom-size.y/2-36)
+        -- Filters live inside the new right-hand browser; legacy controls stay hidden.
+        local group=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        group:GetChildByName("LevelFilter").Enable=false
+        group:GetChildByName("RandomHunt").Enable=false
     end
 
     @ExecSpace("ClientOnly")
@@ -2596,4 +2560,153 @@ script WorldMapManager extends Logic
             mark.Enable = self._T.recommendEnabled == true
         end
     end
+    @ExecSpace("ClientOnly")
+    method table RandomHuntCandidates(integer level)
+        -- Only implemented hunting maps with a monster inside the inclusive level window qualify.
+        self:GetMapMonsters("")
+        local maps={}
+        for mapId,mobs in pairs(self._T.mapMonsterCatalog or {}) do
+            if mapId~="001010000" then
+                for _,mob in ipairs(mobs) do
+                    if mob.level>=level-10 and mob.level<=level-2 then table.insert(maps,mapId) break end
+                end
+            end
+        end
+        table.sort(maps)
+        return maps
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TravelRandomHunt()
+        -- Reuse normal travel so channel selection and transition effects remain consistent.
+        if not _LoginFlow:IsInGame() then return end
+        local level=math.max(1,_UIMyInfoManager.DisplayLevel)
+        local maps=self:RandomHuntCandidates(level)
+        if #maps==0 then _UIToast:ShowMessage("현재 레벨 -10 ~ -2 범위의 사냥터가 없습니다.") return end
+        local destination=maps[_UtilLogic:RandomIntegerRange(1,#maps)]
+        _UIAudio:Play("BtMouseClick")
+        self:FadeAndTeleport(destination)
+        log("[WorldMap] random hunt level="..tostring(level).." candidates="..tostring(#maps).." destination="..destination)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HandleDestinationClick(Entity row)
+        -- 페이지 버튼은 목록을 넘기고 같은 행의 더블클릭은 해당 맵으로 이동한다.
+        if not self:AcceptMapPress(row) then return end
+        if row.Name == "Title" then
+            self._T.lastRegionDot = nil
+            self._T.regionMapFilter = nil
+            self._T.regionListPage = 1
+            self:ClearRegionSelection()
+            self:RefreshRegionDestinations()
+            return
+        end
+        if row.Name == "Previous" or row.Name == "Next" then
+            local step = row.Name == "Next" and 1 or -1
+            self._T.regionListPage = (self._T.regionListPage or 1) + step
+            self:RefreshRegionDestinations()
+            return
+        end
+        local rowIndex = tonumber(string.match(row.Name, "^Row(%d+)$"))
+        if rowIndex == nil then return end
+        local entry = self._T.destinationEntryByRow and self._T.destinationEntryByRow[row.Id]
+        if entry == nil then return end
+        if _MobileUIManager:IsMobile() then self._T.mobileDestination=entry.id end
+        local now = _UtilLogic.ElapsedSeconds
+        if not _MobileUIManager:IsMobile() and self._T.lastDestination == entry.id and now - (self._T.lastDestinationTime or -99) <= 0.65 then
+            self._T.lastDestination=nil
+            self:FadeAndTeleport(entry.id)
+            return
+        end
+        local previous=self._T.selectedDestinationRow
+        if isvalid(previous) then
+            local i=tonumber(string.match(previous.Name,"^Row(%d+)$")) or 1
+            previous.SpriteGUIRendererComponent.Color=i%2==1 and Color(0.91,0.84,0.68,0.8) or Color(0.97,0.94,0.85,0.8)
+        end
+        self._T.selectedDestinationRow=row
+        self._T.lastDestination = entry.id
+        self._T.lastDestinationTime = now
+        row.SpriteGUIRendererComponent.Color = Color(1, 0.8, 0.35, 1)
+    end
+    @ExecSpace("ClientOnly")
+    method void HandleRegionClick(Entity dot)
+        -- 원본 이동점의 맵 묶음을 표시하고 더블클릭하면 대표 맵으로 이동한다.
+        if not self:AcceptMapPress(dot) then return end
+        local entry = self._T.regionPointByEntity and self._T.regionPointByEntity[dot.Id]
+        if entry == nil then return end
+        if entry.targetPage ~= nil then
+            self:ShowMapPage(entry.targetPage)
+            return
+        end
+        local now = _UtilLogic.ElapsedSeconds
+        if self._T.lastRegionDot == dot.Id and now - (self._T.lastRegionDotTime or -99) <= 0.65 then
+            self._T.lastRegionDot=nil
+            self:FadeAndTeleport(entry.maps[1])
+            return
+        end
+        self._T.lastRegionDot = dot.Id
+        self._T.lastRegionDotTime = now
+        self._T.regionMapFilter = {}
+        for _, mapId in ipairs(entry.maps) do self._T.regionMapFilter[mapId] = true end
+        self._T.regionListPage = 1
+        self:ClearRegionSelection()
+        self._T.activeRegionDot = dot
+        dot.SpriteGUIRendererComponent.ImageRUID = DataRef(entry.animationRUID)
+        dot.SpriteGUIRendererComponent.EndFrameIndex = 2147483647
+        dot.SpriteGUIRendererComponent.PlayRate = 1
+        dot.SpriteGUIRendererComponent.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+        local arrow = _EntityService:GetEntityByPath("/ui/WorldMapGroup/" .. entry.panel .. "/RegionSelection")
+        if isvalid(arrow) then
+            arrow.Enable = true
+            arrow.UITransformComponent.anchoredPosition = dot.UITransformComponent.anchoredPosition
+            arrow.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.NativeSize
+            arrow.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+            arrow.SpriteGUIRendererComponent.PlayRate = 1
+            arrow.SpriteGUIRendererComponent.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+        end
+        _MobileUIManager._T.mobileMapSelected=nil
+        _MobileUIManager:DrawMobileWorldMap()
+    end
+    @ExecSpace("ClientOnly")
+    method boolean AcceptMapPress(Entity target)
+        local now=_UtilLogic.ElapsedSeconds
+        if not isvalid(target) or now-(self._T.mapPressAt or -10)<0.06 then return false end
+        self._T.mapPressAt=now
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HandleMapPointer(Vector2 cursor)
+        local group=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        if not isvalid(group) or not group.EnabledInHierarchy or _GameSystemMenu:BlocksInput() or _UIItemDiscardManager:BlocksInput() then return end
+        local top=_UIClickArbiter:GetTopmostWindowAt(cursor)
+        if top~="" and string.sub(top,1,17)~="/ui/WorldMapGroup/" then return end
+        local panelName=self:GetMapPanels()[self._T.mapPage or ""]
+        local panel=panelName and group:GetChildByName(panelName)
+        if not isvalid(panel) or not panel.EnabledInHierarchy then return end
+        local list=panel:GetChildByName("Destinations")
+        if isvalid(list) and list.EnabledInHierarchy then
+            for i=1,20 do
+                local row=list:GetChildByName("Row"..tostring(i))
+                if isvalid(row) and row.EnabledInHierarchy and _UICursorManager:Hit(row,cursor) then
+                    self:HandleDestinationClick(row)
+                    return
+                end
+            end
+        end
+        local points=self._T.regionHoverPages and self._T.regionHoverPages[self._T.mapPage]
+        local nearest,best=nil,math.huge
+        local pos=_UILogic:ScreenToLocalUIPosition(cursor,panel.UITransformComponent)
+        for _,entry in ipairs(points or {}) do
+            local dot=entry.entity
+            if isvalid(dot) and dot.EnabledInHierarchy then
+                local tr=dot.UITransformComponent
+                local dx,dy=pos.x-tr.anchoredPosition.x,pos.y-tr.anchoredPosition.y
+                local d=dx*dx+dy*dy
+                if math.abs(dx)<=math.max(18,tr.RectSize.x/2) and math.abs(dy)<=math.max(18,tr.RectSize.y/2) and d<best then nearest=dot best=d end
+            end
+        end
+        if isvalid(nearest) then self:HandleRegionClick(nearest) end
+    end
+
 end

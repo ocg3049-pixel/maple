@@ -1,0 +1,379 @@
+@Component
+script ManoEncounter extends Component
+    property string OwnerId = ""
+    @Sync property number HitAt = -10
+    @Sync property boolean CombatActive = false
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- A single action clock serializes summon and teleport animations.
+        self.Entity.RigidbodyComponent.WalkSpeed=0.35
+        self.Entity.MovementComponent.InputSpeed=1
+        self._T.elapsed=0 self._T.nextDawn=30 self._T.nextDusk=60 self._T.nextMay=_UtilLogic:RandomDouble()*30
+        self._T.nextTeleport=30 self._T.nextSummon=10+_UtilLogic:RandomDouble()*5
+        self._T.mode="opening" self._T.untilTime=0
+        self._T.dews={} self._T.snails={} self._T.props={} self._T.pendingBurst=0 self._T.serial=0
+        self._T.speedUntil=0 self._T.nextSpecial=20/1.5
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsCornered(Entity player)
+        -- Escape only when the direction away from the player runs into an arena edge.
+        local x=self.Entity.TransformComponent.WorldPosition.x
+        local px=player.TransformComponent.WorldPosition.x
+        return (x<=-7 and px>=x) or (x>=7 and px<=x)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StartTeleport()
+        -- Edge escapes and the periodic teleport share one non-overlapping cast.
+        self._T.mode="teleport1" self._T.actionAge=0
+        self.Entity.MovementComponent:Stop()
+        _BossStageManager:ManoEffect(self.Entity,"4a729e5b7b0f4759ba197dcbb1d25a8b",false,self.OwnerId)
+        log("[BossStage] teleport begin")
+    end
+
+    @ExecSpace("ServerOnly")
+    method number EscapeX(Entity player)
+        -- Land inside the arena, away from both the previous location and the player.
+        local x=self.Entity.TransformComponent.WorldPosition.x
+        local px=player.TransformComponent.WorldPosition.x
+        local points={}
+        for i=-13,13 do
+            local candidate=i*0.5
+            if math.abs(candidate-x)>=3 and math.abs(candidate-px)>=3.5 then table.insert(points,candidate) end
+        end
+        if #points==0 then return px>=0 and -6.5 or 6.5 end
+        return points[_UtilLogic:RandomIntegerRange(1,#points)]
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Decorate()
+        -- Keep scenery and traversal inside this private map.
+        local traversal=self.Entity.CurrentMap:AddComponent("ManoArenaTraversal")
+        traversal:Setup(self.OwnerId)
+        for i,x in ipairs({-7.7,-6.3,-4.2,3.8,5.9,7.1}) do
+            if not isvalid(self.Entity) then return end
+            local e=_SpawnService:SpawnByModelId("manoprop","ManoGarden"..tostring(i),Vector3(x,-0.04,0),self.Entity.CurrentMap)
+            if isvalid(e) then
+                if not isvalid(self.Entity) then e:Destroy() return end
+                e.SpriteRendererComponent.SpriteRUID=i%2==0 and "6450d7b1419948b8bed4bc55a4f1256e" or "8960e0548d684b9fb7af0b9fb0ff6812"
+                e.SpriteRendererComponent.OrderInLayer=0
+                table.insert(self._T.props,e)
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method number DistantX()
+        -- Sample from positions at least three world units away from Mano.
+        local bx=self.Entity.TransformComponent.WorldPosition.x
+        local points={}
+        for i=-14,14 do local x=i*0.5 if math.abs(x-bx)>=3 then table.insert(points,x) end end
+        return points[_UtilLogic:RandomIntegerRange(1,#points)]
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SpawnDew(string kind)
+        -- Keep every unclaimed drop for its own two-minute lifetime.
+        for i=#self._T.dews,1,-1 do
+            if not isvalid(self._T.dews[i]) then table.remove(self._T.dews,i) end
+        end
+        local x=self:DistantX()
+        local e=_SpawnService:SpawnByModelId("manodew","ManoDew_"..kind,Vector3(x,0.18,0),self.Entity.CurrentMap)
+        if not isvalid(e) then return end
+        local run=(_BossStageManager._T.runs or {})[self.OwnerId]
+        if not isvalid(self.Entity) or not _BossStageManager:IsEncounterVisible(run) or run.boss~=self.Entity then e:Destroy() return end
+        -- Spawn may yield: enforce the gap again against Mano's latest position.
+        if math.abs(x-self.Entity.TransformComponent.WorldPosition.x)<3 then
+            x=self:DistantX() e.TransformComponent.WorldPosition=Vector3(x,0.18,0)
+        end
+        local ids={dawn="40a15832a52048da855199f373d4ccc2",dusk="7b4a813bfbf94649a832224f5624376c",may="b9d99f347701432ea0cbb66731327df1"}
+        e.SpriteRendererComponent.SpriteRUID=ids[kind]
+        local d=e:AddComponent("ManoDew") d.Boss=self.Entity d.Kind=kind
+        table.insert(self._T.dews,e)
+        log("[BossStage] dew spawned "..kind.." distance="..tostring(math.abs(x-self.Entity.TransformComponent.WorldPosition.x)))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Consume(string kind)
+        -- Trigger callbacks claim a dew once; dawn queues behind the current action.
+        local m=self.Entity:GetComponent("script.Monster")
+        if m.IsDead or not self:CanDrink() then return end
+        self._T.mode="drink" self._T.untilTime=self._T.elapsed+0.7
+        self.Entity.MovementComponent:Stop()
+        if kind=="dawn" then
+            self._T.pendingBurst=self._T.pendingBurst+1
+            _BossStageManager:WarningText("마노가 마나를 회복하여 달팽이를 소환합니다.",self.OwnerId)
+        elseif kind=="dusk" then
+            self._T.untilTime=self._T.elapsed+3
+            self._T.healStarted=self._T.elapsed self._T.healing=true
+            self._T.healTicks=0 self._T.healLogged=false self._T.healTotal=math.floor(m.MaxHp*0.2) self._T.healApplied=0
+            local fixed=self.Entity.TransformComponent.WorldPosition
+            self.Entity.RigidbodyComponent.KinematicMove=true
+            self.Entity.RigidbodyComponent:SetWorldPosition(Vector2(fixed.x,fixed.y))
+            self.Entity.RigidbodyComponent.MoveVelocity=Vector2.zero
+            self.Entity.RigidbodyComponent:SetForce(Vector2.zero)
+            local pos=self.Entity.TransformComponent.WorldPosition
+            local effect=_SpawnService:SpawnByModelId("manoprop","ManoHealing",pos,self.Entity.CurrentMap)
+            if isvalid(effect) then
+                local run=(_BossStageManager._T.runs or {})[self.OwnerId]
+                if not isvalid(self.Entity) or not _BossStageManager:IsEncounterVisible(run) or run.boss~=self.Entity then effect:Destroy() return end
+                effect.SpriteRendererComponent.SpriteRUID="1efb3091b08f472c968f80127c77d632"
+                effect.SpriteRendererComponent.SortingLayer=self.Entity.SpriteRendererComponent.SortingLayer
+                effect.SpriteRendererComponent.OrderInLayer=self.Entity.SpriteRendererComponent.OrderInLayer-1
+                effect.SpriteRendererComponent.Color=Color(1,1,1,0)
+                self._T.healEffect=effect table.insert(self._T.props,effect)
+            end
+            _BossStageManager:PlayManoHealSound(self.Entity,self.OwnerId)
+            _BossStageManager:WarningText("마노가 황혼의 이슬로 3초 동안 HP를 20% 회복합니다.",self.OwnerId)
+        else
+            self._T.speedUntil=self._T.elapsed+30
+            if not isvalid(self._T.speedIcon) then
+                local p=self.Entity.TransformComponent.WorldPosition
+                local icon=_SpawnService:SpawnByModelId("manoprop","ManoSpeedBuff",Vector3(p.x-0.26,p.y+1.25,p.z),self.Entity.CurrentMap)
+                if isvalid(icon) then
+                    local run=(_BossStageManager._T.runs or {})[self.OwnerId]
+                    if not isvalid(self.Entity) or not _BossStageManager:IsEncounterVisible(run) then icon:Destroy() return end
+                    icon.SpriteRendererComponent.SpriteRUID="3287a4d1a95948c18d53eba9a5df6715"
+                    icon.SpriteRendererComponent.OrderInLayer=10
+                    self._T.speedIcon=icon table.insert(self._T.props,icon)
+                end
+            end
+            _BossStageManager:WarningText("마노가 5월의 이슬로 30초간 빨라집니다.",self.OwnerId)
+        end
+        log("[BossStage] Mano consumed "..kind)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SummonOne()
+        -- Existing Monster lifecycle supplies spawn protection and smooth fades.
+        self._T.serial=self._T.serial+1
+        local pos=self.Entity.TransformComponent.WorldPosition
+        local e=_SpawnService:SpawnByModelId("manosnail","ManoSnail_"..tostring(self._T.serial),Vector3(pos.x,pos.y+0.05,0),self.Entity.CurrentMap)
+        if not isvalid(e) then return end
+        local run=(_BossStageManager._T.runs or {})[self.OwnerId]
+        if not isvalid(self.Entity) or not _BossStageManager:IsEncounterVisible(run) or run.boss~=self.Entity then e:Destroy() return end
+        if run.state~="active" then e.HitComponent.Enable=false end
+        local a=e:GetComponent("script.MonsterAttack") a.BossOwner=self.OwnerId
+        local ai=e:AddComponent("ManoSnail") ai.OwnerId=self.OwnerId
+        table.insert(self._T.snails,e)
+        local burst=self._T.count==17
+        local special=self._T.specialWave==true or (burst and self._T.emitted>=15)
+        ai:Configure(special,_UtilLogic:RandomIntegerRange(1,3),burst and 7 or 0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StartSummon(integer count)
+        -- Dawn emits over two seconds; ordinary waves complete the 1.5-second skill clip.
+        self._T.mode="summon" self._T.actionAge=0 self._T.count=count self._T.emitted=0
+        self._T.duration=count==17 and 2 or 1.5
+        self._T.specialWave=count==1
+        self._T.nextSummon=self._T.elapsed+10+_UtilLogic:RandomDouble()*5
+        self.Entity.MovementComponent:Stop()
+        self.Entity.SpriteRendererComponent.SpriteRUID="1609b1cdb35a4a3e806c1e9a7e56224d"
+        _BossStageManager:ManoEffect(self.Entity,"",true,self.OwnerId)
+        log("[BossStage] summon begin count="..tostring(count))
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method void AdvanceHealing(Entity player)
+        -- Twenty scheduled ticks total exactly 20%; show only HP actually restored.
+        local t=self._T
+        local m=self.Entity:GetComponent("script.Monster")
+        if not t.healing or not isvalid(m) or m.IsDead or m.Hp<=0 then return end
+        local due=math.min(20,math.floor(math.max(0,t.elapsed-t.healStarted)/0.15+0.000001))
+        local attack=isvalid(player) and player:GetComponent("script.PlayerAttack") or nil
+        while t.healTicks<due do
+            local tick=t.healTicks+1
+            local amount=math.floor(t.healTotal*tick/20)-math.floor(t.healTotal*t.healTicks/20)
+            t.healTicks=tick
+            local healed=math.max(0,math.min(amount,m.MaxHp-m.Hp))
+            m.Hp=m.Hp+healed t.healApplied=t.healApplied+healed
+            if healed>0 and isvalid(attack) then attack:ShowHealDamageSkin(self.Entity,healed,self.OwnerId) end
+        end
+        if due==20 and not t.healLogged then
+            t.healLogged=true
+            log("[BossStage] heal completed ticks=20 duration=3 restored="..tostring(t.healApplied))
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        -- Resolve combat normally, or finish the current action during defeat presentation.
+        local t=self._T t.elapsed=t.elapsed+delta
+        if self.CombatActive then
+            if t.elapsed>=t.nextDawn then t.nextDawn=t.nextDawn+30 self:SpawnDew("dawn") end
+            if t.elapsed>=t.nextDusk then t.nextDusk=t.nextDusk+60 self:SpawnDew("dusk") end
+            if t.elapsed>=t.nextMay then t.nextMay=t.elapsed+math.max(0.05,_UtilLogic:RandomDouble()*30) self:SpawnDew("may") end
+        end
+        if isvalid(t.healEffect) then
+            local age=t.elapsed-t.healStarted
+            t.healEffect.SpriteRendererComponent.Color=Color(1,1,1,math.max(0,math.min(1,age/0.6,(3-age)/0.8)))
+            if age>=3 then t.healEffect:Destroy() t.healEffect=nil end
+        end
+        if t.healing then self:AdvanceHealing(player) end
+        if t.healing and t.elapsed>=t.untilTime then
+            local fixed=self.Entity.TransformComponent.WorldPosition
+            t.healing=false self.Entity.RigidbodyComponent.KinematicMove=false
+            self.Entity.RigidbodyComponent:SetWorldPosition(Vector2(fixed.x,fixed.y))
+        end
+        if isvalid(t.speedIcon) then
+            if t.elapsed>=t.speedUntil then t.speedIcon:Destroy() t.speedIcon=nil
+            else
+                local p=self.Entity.TransformComponent.WorldPosition
+                t.speedIcon.TransformComponent.WorldPosition=Vector3(p.x-0.26,p.y+1.25,p.z)
+            end
+        end
+        local mode=t.mode
+        if not self.CombatActive and (mode=="opening" or mode=="rest" or mode=="flee" or mode=="seek" or (mode=="drink" and t.elapsed>=t.untilTime)) then
+            self.Entity.MovementComponent:Stop()
+            self.Entity.SpriteRendererComponent.SpriteRUID="e035bb90c053401b88de2159dfa230eb"
+            return
+        end
+        if mode=="opening" then
+            -- The manager already waited 1.5 seconds after the screen reveal.
+            self:StartSummon(_UtilLogic:RandomDouble()<0.5 and 3 or 1)
+            t.nextSpecial=t.elapsed+(20+_UtilLogic:RandomDouble()*10)/1.5
+            log("[BossStage] opening pattern started")
+        elseif mode=="summon" then
+            t.actionAge=math.min(t.duration,t.actionAge+delta)
+            local expected=math.floor(t.count*t.actionAge/t.duration)
+            while t.emitted<expected do
+                self:SummonOne()
+                local run=(_BossStageManager._T.runs or {})[self.OwnerId]
+                if not isvalid(self.Entity) or not _BossStageManager:IsEncounterVisible(run) or run.boss~=self.Entity then return end
+                t.emitted=t.emitted+1
+            end
+            if t.actionAge>=t.duration then
+                log("[BossStage] summon end count="..tostring(t.emitted))
+                t.mode="rest" t.untilTime=t.elapsed+0.6
+            end
+        elseif mode=="teleport1" or mode=="teleport2" then
+            t.actionAge=t.actionAge+delta
+            if t.actionAge>=0.8 then
+                t.actionAge=0
+                if mode=="teleport1" then
+                    t.mode="teleport2" _BossStageManager:ManoEffect(self.Entity,"4b482b706462493198a9a09a1e7355a0",false,self.OwnerId)
+                else
+                    self.Entity.RigidbodyComponent:SetWorldPosition(Vector2(self:EscapeX(player),0.1))
+                    t.mode="rest" t.untilTime=t.elapsed+1 t.nextTeleport=t.elapsed+30
+                    log("[BossStage] teleport moved")
+                end
+            end
+        elseif (mode=="rest" or mode=="drink") and t.elapsed<t.untilTime then
+            self.Entity.MovementComponent:Stop()
+        else
+            local dew=self:NearestDew()
+            -- Commit casts to completion; choose the next action only at a decision boundary.
+            if mode=="rest" or mode=="drink" or t.elapsed>=t.untilTime or (mode=="seek" and not isvalid(dew)) then
+                self:ChooseAction(player,dew)
+            elseif mode=="flee" and isvalid(dew) then
+                t.mode="seek" t.untilTime=t.elapsed+3+_UtilLogic:RandomDouble()*2
+            end
+            if t.mode=="flee" or t.mode=="seek" then
+                local bp=self.Entity.TransformComponent.WorldPosition
+                local direction=player.TransformComponent.WorldPosition.x>=bp.x and -1 or 1
+                if t.mode=="seek" and isvalid(dew) then
+                    local dx=dew.TransformComponent.WorldPosition.x-bp.x
+                    direction=math.abs(dx)<0.08 and 0 or (dx>0 and 1 or -1)
+                elseif self:IsCornered(player) then
+                    self:StartTeleport()
+                    direction=0
+                end
+                self.Entity.MovementComponent.InputSpeed=t.elapsed<t.speedUntil and 1.3 or 1
+                self.Entity.MovementComponent:MoveToDirection(Vector2(direction,0),0)
+                if direction~=0 then self.Entity.TransformComponent.Scale=Vector3(-direction,1,1) end
+            else
+                self.Entity.MovementComponent:Stop()
+            end
+        end
+        local visual=(t.mode=="flee" or t.mode=="seek") and "1b787a72c5a74cbf84af29880ed40e0e" or t.mode=="summon" and "1609b1cdb35a4a3e806c1e9a7e56224d" or "e035bb90c053401b88de2159dfa230eb"
+        if (t.mode=="flee" or t.mode=="seek" or t.mode=="rest") and _UtilLogic.ServerElapsedSeconds-self.HitAt<0.4 then visual="3ffc4aa431ff49f598205f93c0157c40" end
+        self.Entity.SpriteRendererComponent.SpriteRUID=visual
+        for i=#t.snails,1,-1 do if not isvalid(t.snails[i]) then table.remove(t.snails,i) end end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        -- Complete an in-flight summon, teleport or heal without deleting the scenery.
+        self:Tick(player,delta)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        -- Idempotent on victory, timeout, leave and component destruction.
+        self._T.healing=false self.Entity.RigidbodyComponent.KinematicMove=false
+        self.Entity.MovementComponent:Stop()
+        for _,e in pairs(self._T.dews or {}) do
+            if isvalid(e) then
+                local d=e:GetComponent("script.ManoDew")
+                if isvalid(d) then d:BeginDisappear() else e:Destroy() end
+            end
+        end
+        for _,list in ipairs({self._T.snails or {},self._T.props or {}}) do
+            for _,e in pairs(list) do if isvalid(e) then e:Destroy() end end
+        end
+        self._T.dews={} self._T.snails={} self._T.props={}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- Own all spawned entities within the boss lifetime.
+        self:Cleanup()
+    end
+    @ExecSpace("ServerOnly")
+    method boolean CanDrink()
+        -- Eating is its own action, never an effect layered over a summon or teleport.
+        return self._T.mode=="seek" or self._T.mode=="flee"
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity NearestDew()
+        -- Choose among all unclaimed drops, including older drops of the same kind.
+        local chosen=nil local distance=100000
+        local x=self.Entity.TransformComponent.WorldPosition.x
+        for _,e in pairs(self._T.dews or {}) do
+            if isvalid(e) then
+                local d=e:GetComponent("script.ManoDew")
+                local dx=math.abs(e.TransformComponent.WorldPosition.x-x)
+                if isvalid(d) and not d.Claimed and dx<distance then chosen=e distance=dx end
+            end
+        end
+        return chosen
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ChooseAction(Entity player, Entity dew)
+        -- One weighted draw per completed action. Cooldowns only make skills eligible.
+        local t=self._T
+        if t.pendingBurst>0 then
+            t.pendingBurst=t.pendingBurst-1 self:StartSummon(17) return
+        end
+        if not isvalid(dew) and self:IsCornered(player) then self:StartTeleport() return end
+        local choices={{action=isvalid(dew) and "seek" or "flee",weight=60},{action="rest",weight=15}}
+        if t.elapsed>=t.nextSummon then table.insert(choices,{action="summon",weight=60}) end
+        if t.elapsed>=t.nextTeleport then table.insert(choices,{action="teleport",weight=25}) end
+        if t.elapsed>=t.nextSpecial then table.insert(choices,{action="special",weight=35}) end
+        local total=0
+        for _,v in ipairs(choices) do total=total+v.weight end
+        local roll=_UtilLogic:RandomDouble()*total
+        local action=choices[#choices].action
+        for _,v in ipairs(choices) do roll=roll-v.weight if roll<0 then action=v.action break end end
+        if action=="summon" then self:StartSummon(3)
+        elseif action=="teleport" then self:StartTeleport()
+        elseif action=="special" then
+            t.nextSpecial=t.elapsed+(20+_UtilLogic:RandomDouble()*10)/1.5
+            self:StartSummon(1)
+            _BossStageManager:WarningText("특수 달팽이가 나타납니다. 돌진을 피하세요!",self.OwnerId)
+        else
+            t.mode=action
+            local duration=action=="rest" and (0.7+_UtilLogic:RandomDouble()*0.5) or (3+_UtilLogic:RandomDouble()*2)
+            if t.elapsed>=t.nextSummon or t.elapsed>=t.nextTeleport then duration=math.min(duration,1) end
+            t.untilTime=t.elapsed+duration
+        end
+        log("[BossStage] action="..action)
+    end
+
+end
