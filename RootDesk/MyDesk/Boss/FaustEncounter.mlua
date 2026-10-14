@@ -1,0 +1,1225 @@
+@Component
+script FaustEncounter extends Component
+    property string OwnerId = ""
+    property number ZombieBananaRange = 2.5
+    property number LadyLaserShotSoundTime = 4.23
+    @Sync property boolean LadyAlive = false
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- All summoned actors and curses belong to this one fight.
+        self._T.rituals={} self._T.actors={} self._T.clock=0 self._T.nextGhost=5
+        self._T.nextZombie=9
+        self:LoadAttackTimelines()
+        self._T.nextMelody=0 self._T.ladySummoned=false self._T.cleaned=false
+        if Environment:IsMakerPlay() then log("[VRF] Faust encounter ready") end
+    end
+
+    method table Species(string kind)
+        -- Resources are from the requested ghost/lady and matching Melody packs.
+        if kind=="zombie" then return {hp=1000,name="좀비루팡",fly="0c805e8052c14fbda03173990bf2d2b8",stand="c86800e208dc4de4a8cf71b51778a2fb",die="3a426a5dd5c0474fa95a83778ce87da7",attack="45e0a175e4b2491296f244b893c6ee98"} end
+        if kind=="lady" then return {hp=30000,name="의문의 숙녀",fly="f767184f745e40f4a7c526850bbceae7",stand="5f0861e6bbb44dacb7c5f55145cb2adc",die="1e2a030302a94b1485907bc9ce719eb5"} end
+        if kind=="melody" then return {hp=3000,name="멜러디",fly="9f0ce35330b745ba86f09151139d499a",stand="9f0ce35330b745ba86f09151139d499a",die="ce2e5b9a226e4b6a8a2b921ad5b7ff40"} end
+        return {hp=2000,name="망령",fly="248d2c4adc65485fb4b47f51a6f6d4a1",stand="e8ae083a1ee948c78c7f2aaa1889a153",die="a507fe0f27a246469ff7bab9681f8820"}
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity Effect(string ruid, Vector3 position)
+        -- Native-size effect sprites preserve their original proportions.
+        local e=_SpawnService:SpawnByModelId("stumpyball","FaustEffect",position,self.Entity.CurrentMap)
+        if not isvalid(e) then return nil end
+        local s=e.SpriteRendererComponent
+        s.SpriteRUID=ruid s.SortingLayer="MapLayer7" s.OrderInLayer=16
+        s.StartFrameIndex=0 s.EndFrameIndex=2147483647
+        s.Color=Color.white e.TransformComponent.Scale=Vector3.one
+        return e
+    end
+
+    @ExecSpace("ServerOnly")
+    method Vector3 GhostSpawnPosition()
+        -- Overlapping summons share the first cast anchor, even if physics settles Faust.
+        if self:IsSummoning() and self._T.summonAnchor~=nil then return self._T.summonAnchor end
+        local hit=self.Entity.HitComponent
+        local headY=hit.ColliderOffset.y+hit.BoxSize.y*0.5+0.2
+        return self.Entity.TransformComponent:ToWorldPoint(Vector3(0,headY,0))
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsSummoning()
+        -- All overlapping rituals must end before normal movement resumes.
+        if self._T.cleaned then return false end
+        for _,ritual in ipairs(self._T.rituals or {}) do if ritual.kind~="melody" then return true end end
+        return false
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HoldSummon()
+        -- Stop input and residual motion without relocating the fixed ritual.
+        self.Entity.MovementComponent:Stop()
+        self.Entity.RigidbodyComponent.MoveVelocity=Vector2.zero
+        self.Entity.RigidbodyComponent:SetForce(Vector2.zero)
+        local sprite=self.Entity.SpriteRendererComponent
+        sprite.SpriteRUID="681d4068577d4610945b63da43f48b9f"
+        sprite.StartFrameIndex=0 sprite.EndFrameIndex=12 sprite.PlayRate=0.55
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean OutsideFlightArea(Vector3 position)
+        -- A full-length dash may leave the arena, but cannot start another there.
+        local d=_RegionalBossCatalog:Stage(6)
+        return position.x<d.left+0.4 or position.x>d.right-0.4 or position.y<d.floor+0.35 or position.y>d.floor+4.2
+    end
+
+    @ExecSpace("ServerOnly")
+    method integer GhostCount()
+        -- Pending rituals reserve a slot, so overlapping casts cannot exceed two ghosts.
+        local count=0
+        for _,a in ipairs(self._T.actors or {}) do
+            if a.kind=="ghost" and isvalid(a.entity) and not a.entity.Monster.IsDead then count=count+1 end
+        end
+        for _,r in ipairs(self._T.rituals or {}) do if r.kind=="ghost" then count=count+1 end end
+        return count
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Summon(string kind, Entity player)
+        if self._T.cleaned or self.Entity.Monster.IsDead or self.Entity.Monster.Hp<=0 then return end
+        if kind=="ghost" and self:GhostCount()>=2 then return end
+        -- Ritual: one-second fade in, one-second hold, one-second fade out.
+        local p=self:GhostSpawnPosition()
+        if kind=="melody" then
+            local d=_RegionalBossCatalog:Stage(6)
+            p=Vector3(d.left+0.7+_UtilLogic:RandomDouble()*(d.right-d.left-1.4),d.floor+0.45+_UtilLogic:RandomDouble()*3.2,0)
+        end
+        local sigil=self:Effect(kind=="melody" and "d5fc95edba314acea050a7a45a1bd55f" or "8abe28da0a4d492c95d89f0501177a3b",p)
+        if not isvalid(sigil) then return end
+        sigil.SpriteRendererComponent.Color=Color(1,1,1,0)
+        local starting=kind~="melody" and not self:IsSummoning()
+        if starting then self._T.summonAnchor=p end
+        table.insert(self._T.rituals,{kind=kind,position=p,age=0,sigil=sigil,casterId=self.Entity.Id})
+        if starting then self:Sound("0e3a97f6a83844859166d34a5a56b507",self.OwnerId) end
+        if kind~="melody" then self:HoldSummon() end
+        if Environment:IsMakerPlay() then log("[VRF] Faust ritual kind="..kind.." anchor="..tostring(p)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method Vector3 ZombieSpawnPosition(Vector3 anchor)
+        local d=_RegionalBossCatalog:Stage(6)
+        -- Spread one summoned wave beside Faust; never choose unrelated map-wide spawn points.
+        local center=math.max(d.left+0.9,math.min(d.right-0.9,anchor.x))
+        local left=math.max(d.left+0.9,center-1.35) local right=math.min(d.right-0.9,center+1.35)
+        local bestX=center local bestScore=-10000
+        for i=0,12 do
+            local x=left+(right-left)*i/12
+            local clearance=3
+            for _,a in ipairs(self._T.actors or {}) do
+                if a.kind=="zombie" and isvalid(a.entity) and not a.entity.Monster.IsDead then
+                    clearance=math.min(clearance,math.abs(x-a.entity.TransformComponent.WorldPosition.x))
+                end
+            end
+            local score=clearance*4-math.abs(x-anchor.x)*0.25
+            if score>bestScore then bestScore=score bestX=x end
+        end
+        return Vector3(bestX,self:ZombieStableSurfaceY(bestX,anchor.y)+0.05,anchor.z)
+    end
+
+    @ExecSpace("ServerOnly")
+    method number ZombieStableSurfaceY(number x, number fromY)
+        -- Only permanent terrain can be a zombie spawn surface, even while a branch is solid.
+        local best=nil
+        for _,foot in ipairs(self.Entity.CurrentMap.FootholdComponent:GetFootholdAll()) do
+            if not foot:IsVertical() and not foot.IsDynamic and x>=foot.StartPoint.x and x<=foot.EndPoint.x then
+                local owner=_EntityService:GetEntity(foot.OwnerId)
+                local temporary=isvalid(owner) and string.sub(owner.Name,1,17)=="FaustFadingBranch"
+                local y=foot:GetYByX(x)
+                if not temporary and y<=fromY+0.2 and (best==nil or y>best) then best=y end
+            end
+        end
+        return best or _RegionalBossCatalog:Stage(6).floor
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SpawnActor(table ritual, Entity player)
+        -- The creature becomes targetable after its own one-second appearance.
+        local kind=ritual.kind local spec=self:Species(kind)
+        if kind=="zombie" then
+            if ritual.casterId~=self.Entity.Id or (ritual.age or 0)<3 or self._T.cleaned
+                or self.Entity.Monster.IsDead or self.Entity.Monster.Hp<=0 then return end
+            ritual.position=self:ZombieSpawnPosition(ritual.position)
+        end
+        local e=_SpawnService:SpawnByModelId("faustsummon",spec.name,ritual.position,self.Entity.CurrentMap)
+        if not isvalid(e) then return end
+        local m=e.Monster
+        m.MaxHp=spec.hp m.Hp=spec.hp m.MinimumHitDamage=0 m.IsBossSummon=true
+        m._T.faustKind=kind -- These actors only deal damage through their encounter state machine.
+        m.MonsterDisplayName=spec.name m.MonsterLevel=33 m.DestroyDelay=1.2
+        m:SetupMonsterNameTag()
+        e.HitComponent.Enable=false m._T.spawnHitEnabled=false m:BeginSpawnFade()
+        if kind=="melody" then m.DeathSoundRUID="24d67c21f6304b86b31f4ee71106e20a" end
+        e.MonsterAttack.BossOwner=self.OwnerId e.MonsterAttack:SetMapActivity(false)
+        e.HitComponent.Enable=false e.HitComponent.ColliderOffset=Vector2.zero
+        e.HitComponent.BoxSize=kind=="lady" and Vector2(0.8,1.4) or kind=="melody" and Vector2(0.65,0.65) or Vector2(0.36,0.4)
+        e.SpriteRendererComponent.SpriteRUID=spec.stand
+        e.RigidbodyComponent.KinematicMove=true e.RigidbodyComponent.IgnoreMoveBoundary=true e.RigidbodyComponent.MoveVelocity=Vector2.zero
+        e.RigidbodyComponent:SetWorldPosition(Vector2(ritual.position.x,ritual.position.y))
+        local actor={entity=e,kind=kind,age=0,mode="appear",hits={},roam=0,nextDash=6+_UtilLogic:RandomDouble()*4,nextSpecial=7+_UtilLogic:RandomDouble()*8,nextBasic=3,attack=2}
+        table.insert(self._T.actors,actor)
+        if kind=="lady" then self.LadyAlive=true self:PrepareLadyLaser(e,self.OwnerId) end
+        if kind=="zombie" then
+            m.RespawnOn=false m.GroupRespawn=false
+            m.IsUndead=true m.Stationary=false m.DeathSoundRUID="4ba44ff83cb3471b84f9035c9a8ee64f"
+            e.HitComponent.BoxSize=Vector2(0.6,0.7) e.HitComponent.ColliderOffset=Vector2(0,0.35)
+            e.RigidbodyComponent.KinematicMove=false e.RigidbodyComponent.IgnoreMoveBoundary=false
+            e.RigidbodyComponent.Gravity=1 e.RigidbodyComponent.WalkSpeed=1.1 e.MovementComponent.InputSpeed=1
+            actor.nextBasic=2+_UtilLogic:RandomDouble()*2
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Faust actor kind="..kind.." hp="..tostring(m.Hp).." x="..tostring(ritual.position.x).." y="..tostring(ritual.position.y)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickRituals(Entity player, number delta)
+        -- Only frames 0..7 of the second apparition are ever played.
+        for i=#self._T.rituals,1,-1 do
+            local r=self._T.rituals[i] r.age=r.age+delta
+            if r.age>=2 and r.kind~="melody" and not r.secondStarted then
+                r.secondStarted=true r.second=self:Effect("ba1872fe7b014d04a65685fb6ecfb783",r.position)
+                if isvalid(r.second) then r.second.SpriteRendererComponent.EndFrameIndex=7 r.second.SpriteRendererComponent.PlayRate=1 end
+            end
+            if isvalid(r.sigil) then r.sigil.SpriteRendererComponent.Color=Color(1,1,1,math.max(0,math.min(1,r.age,3-r.age))) end
+            if isvalid(r.second) then r.second.SpriteRendererComponent.Color=Color(1,1,1,math.max(0,3-r.age)) end
+            if r.age>=3 then
+                if isvalid(r.sigil) then r.sigil:Destroy() end
+                if isvalid(r.second) then r.second:Destroy() end
+                self:SpawnActor(r,player) table.remove(self._T.rituals,i)
+                if r.kind=="lady" then self._T.waitLady=false self._T.nextGhost=self._T.clock+5+_UtilLogic:RandomDouble()*3 end
+                if Environment:IsMakerPlay() then log("[VRF] Faust ritual complete kind="..r.kind.." frames=0..7") end
+            end
+        end
+        if not self:IsSummoning() then
+            self._T.summonAnchor=nil
+            self.Entity.SpriteRendererComponent.PlayRate=1
+            self.Entity.SpriteRendererComponent.EndFrameIndex=2147483647
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Strike(Vector2 center, Vector2 size, string kind, table hits, boolean ground)
+        if self._T.defeated then return end
+        -- Native attack filtering supplies shields, hit immunity and owner checks.
+        local a=self.Entity.MonsterAttack
+        a._T.stumpyHits=hits a._T.regionalGround=ground
+        a:AttackFast(BoxShape(center,size,0),"boss.faust."..kind,CollisionGroups.HitBox)
+        a._T.stumpyHits=nil a._T.regionalGround=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsGhostContactTarget(Entity player)
+        -- A two-pixel point must actually cross the visible body, not the broad phase box.
+        local segment=self._T.ghostContact if segment==nil then return false end
+        local p=player.TransformComponent.WorldPosition
+        local crouch=isvalid(player.StateComponent) and player.StateComponent.CurrentStateName=="CROUCH"
+        local low={p.x-0.15,p.y+0.01} local high={p.x+0.15,p.y+(crouch and 0.33 or 0.63)}
+        local origin={segment.from.x,segment.from.y} local direction={segment.to.x-segment.from.x,segment.to.y-segment.from.y}
+        local enter=0 local leave=1
+        for axis=1,2 do
+            if math.abs(direction[axis])<0.000001 then
+                if origin[axis]<low[axis] or origin[axis]>high[axis] then return false end
+            else
+                local a=(low[axis]-origin[axis])/direction[axis] local b=(high[axis]-origin[axis])/direction[axis]
+                if a>b then a,b=b,a end
+                enter=math.max(enter,a) leave=math.min(leave,b)
+                if enter>leave then return false end
+            end
+        end
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void GhostContact(Vector2 from, Vector2 to, table hits, boolean dash)
+        -- Broad phase finds candidates; the exact segment filter rejects corner near misses.
+        self._T.ghostContact={from=from,to=to}
+        self:Strike((from+to)*0.5,Vector2(math.abs(to.x-from.x)+0.02,math.abs(to.y-from.y)+0.02),dash and "ghostdash" or "ghost",hits,false)
+        self._T.ghostContact=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void WarnDash(table a, Entity player)
+        -- Snapshot the target when the warning begins; do not track it afterward.
+        local e=a.entity
+        a.mode="windup" a.windup=0
+        a.dashTarget=player.TransformComponent.WorldPosition+Vector3(0,0.35,0)
+        e.RigidbodyComponent.MoveVelocity=Vector2.zero e.RigidbodyComponent:SetForce(Vector2.zero)
+        e.SpriteRendererComponent.SpriteRUID=self:Species("ghost").stand
+        e.SpriteRendererComponent.FlipX=a.dashTarget.x>e.TransformComponent.WorldPosition.x
+        e.Monster.FaustDashAura=true
+        if Environment:IsMakerPlay() then log("[VRF] Faust ghost windup seconds=3 alpha=1 target="..tostring(a.dashTarget)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginDash(table a, Entity player)
+        -- Launch toward the position captured at the start of the three-second warning.
+        local p=a.entity.TransformComponent.WorldPosition local q=a.dashTarget or player.TransformComponent.WorldPosition+Vector3(0,0.35,0)
+        local dx=q.x-p.x local dy=q.y-p.y local distance=math.sqrt(dx*dx+dy*dy)
+        a.direction=distance>0.001 and Vector2(dx/distance,dy/distance) or Vector2(1,0)
+        a.travel=distance+0.6 a.travelled=0 a.mode="dash" a.hits={} a.dashSpeed=5.6
+        a.dashOrigin=Vector2(p.x,p.y) a.dashLast=a.dashOrigin a.dashAge=0
+        a.entity.RigidbodyComponent.MoveVelocity=a.direction*a.dashSpeed
+        a.entity.SpriteRendererComponent.SpriteRUID=self:Species(a.kind).fly
+        if math.abs(a.direction.x)>0.001 then a.entity.SpriteRendererComponent.FlipX=a.direction.x>0 end
+        if Environment:IsMakerPlay() then log("[VRF] Faust ghost dash distance="..tostring(distance).." travel="..tostring(a.travel)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickDash(table a, number delta)
+        -- Measure real body displacement; stop 60 pixels beyond the launch target.
+        local e=a.entity local p=e.TransformComponent.WorldPosition
+        a.dashAge=a.dashAge+delta
+        local travelled=(p.x-a.dashOrigin.x)*a.direction.x+(p.y-a.dashOrigin.y)*a.direction.y
+        a.travelled=math.max(0,travelled)
+        local current=Vector2(p.x,p.y)
+        local sweep=current-a.dashLast
+        self:GhostContact(a.dashLast,current,a.hits,true)
+        a.dashLast=current
+        if a.travelled>=a.travel-0.025 or a.dashAge>=a.travel/a.dashSpeed+2 then
+            e.RigidbodyComponent.MoveVelocity=Vector2.zero
+            a.mode=self:OutsideFlightArea(Vector3(current.x,current.y,0)) and "return" or "roam"
+            a.nextDash=a.age+7+_UtilLogic:RandomDouble()*5 a.target=nil a.roam=0
+            e.Monster.FaustDashAura=false
+            if Environment:IsMakerPlay() then log("[VRF] Faust ghost dash end actual="..tostring(a.travelled).." expected="..tostring(a.travel).." mode="..a.mode) end
+        else
+            local remaining=math.max(0,a.travel-a.travelled)
+            local speed=math.min(a.dashSpeed,math.sqrt(20*remaining),remaining/math.max(0.001,delta))
+            e.RigidbodyComponent.MoveVelocity=a.direction*speed
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void RoamLady(table a, Entity player, number delta)
+        -- Stay outside the syringe tip's minimum reach so attack1 can actually begin.
+        local e=a.entity local p=e.TransformComponent.WorldPosition local q=player.TransformComponent.WorldPosition
+        local d=_RegionalBossCatalog:Stage(6)
+        local stab=(self._T.timelines or {})[1]
+        local tip=stab and stab.tip or Vector2(1.97,0.54)
+        local spacing=tip.x+1.5
+        local side=p.x>=q.x and 1 or -1
+        local x=math.max(d.left+0.7,math.min(d.right-0.7,q.x+side*spacing))
+        if math.abs(x-q.x)<tip.x+0.2 then
+            x=math.max(d.left+0.7,math.min(d.right-0.7,q.x-side*spacing))
+        end
+        local dx=x-p.x local dy=q.y+0.55-tip.y-p.y
+        local length=math.sqrt(dx*dx+dy*dy)
+        local speed=math.max(0.1,player.MovementComponent.InputSpeed*player.RigidbodyComponent.WalkSpeed)*0.7
+        speed=math.min(speed,length/math.max(0.001,delta))
+        e.RigidbodyComponent.MoveVelocity=length>0.08 and Vector2(dx/length*speed,dy/length*speed) or Vector2.zero
+        e.SpriteRendererComponent.FlipX=q.x>p.x
+        e.SpriteRendererComponent.SpriteRUID=self:Species("lady").fly
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Roam(table a, Entity player, number delta)
+        -- Match Seruf sharks: 70% player speed, nearby pursuit, otherwise roaming.
+        if a.kind=="lady" then self:RoamLady(a,player,delta) return end
+        local e=a.entity local p=e.TransformComponent.WorldPosition local q=player.TransformComponent.WorldPosition+Vector3(0,0.35,0)
+        local d=_RegionalBossCatalog:Stage(6)
+        if a.kind=="ghost" then
+            q=Vector3(math.max(d.left+0.7,math.min(d.right-0.7,q.x)),math.max(d.floor+0.65,math.min(d.floor+3.9,q.y)),q.z)
+        end
+        local stab=(self._T.timelines or {})[1]
+        if a.kind=="lady" and stab~=nil and stab.tip~=nil then q=Vector3(q.x,q.y+0.2-stab.tip.y,q.z) end
+        local dx=q.x-p.x local dy=q.y-p.y
+        if a.kind=="ghost" and self:OutsideFlightArea(p) then
+            a.mode="return"
+            dx=math.max(d.left+0.7,math.min(d.right-0.7,p.x))-p.x
+            dy=math.max(d.floor+0.65,math.min(d.floor+3.9,p.y))-p.y
+        elseif a.mode=="return" then
+            a.mode="roam" a.nextDash=math.max(a.nextDash,a.age+1)
+            a.roam=0 a.target=nil
+            if Environment:IsMakerPlay() then log("[VRF] Faust ghost recovered inside arena") end
+        elseif dx*dx+dy*dy>=9 then
+            a.roam=a.roam-delta
+            if a.roam<=0 or a.target==nil then
+                a.roam=2+_UtilLogic:RandomDouble()*2
+                a.target=Vector2(d.left+0.7+_UtilLogic:RandomDouble()*(d.right-d.left-1.4),d.floor+0.45+_UtilLogic:RandomDouble()*3.2)
+            end
+            dx=a.target.x-p.x dy=a.target.y-p.y
+        end
+        local length=math.sqrt(dx*dx+dy*dy)
+        local speed=math.max(0.1,player.MovementComponent.InputSpeed*player.RigidbodyComponent.WalkSpeed)*0.7
+        speed=math.min(speed,length/math.max(0.001,delta))
+        local velocity=length>0.15 and Vector2(dx/length*speed,dy/length*speed) or Vector2.zero
+        e.RigidbodyComponent.MoveVelocity=velocity
+        if math.abs(velocity.x)>0.01 then e.SpriteRendererComponent.FlipX=velocity.x>0 end
+        e.SpriteRendererComponent.SpriteRUID=self:Species(a.kind).fly
+    end
+
+    @ExecSpace("ServerOnly")
+    method void LoadAttackTimelines()
+        self._T.timelines={}
+        local clips={"ed5028331be34ba0848152ae26019093","e55b96c2fde44c6e9fac2e8c9201950b","425c7f1a98004a07b2922ee3202af427","45e0a175e4b2491296f244b893c6ee98","725858b58c524741bc036b7360716de9","6372ef5147db4c60868bdb050d20096e"}
+        _ResourceService:PreloadAsync(clips,function()
+            if not isvalid(self.Entity) or self._T.cleaned then return end
+            for index,ruid in ipairs(clips) do
+                local clip=_ResourceService:LoadAnimationClipAndWait(ruid)
+                if clip~=nil and clip.IsLoadComplete then
+                    local timeline={ends={},duration=0,clip=ruid}
+                    local frames=clip.Frames:ToTable()
+                    for _,frame in ipairs(frames) do
+                        timeline.duration=timeline.duration+frame.Delay/math.max(0.001,clip.PlayRate)
+                        table.insert(timeline.ends,timeline.duration)
+                    end
+                    if index==1 and #frames>=4 then
+                        local frame=frames[4] local sprite=frame.FrameSprite
+                        -- Original fourth frame: syringe point at image pixel (2,97).
+                        timeline.tip=Vector2((sprite.PivotPixel.x-2)/100-frame.Offset.x,(sprite.Height-97-sprite.PivotPixel.y)/100+frame.Offset.y)
+                        local readyFrame=frames[3] local readySprite=readyFrame.FrameSprite
+                        -- Third-frame syringe point is at image pixel (8,103).
+                        timeline.chargeTip=Vector2((readySprite.PivotPixel.x-8)/100-readyFrame.Offset.x,(readySprite.Height-103-readySprite.PivotPixel.y)/100+readyFrame.Offset.y)
+                    elseif index==5 and #frames>0 then
+                        local sprite=frames[1].FrameSprite
+                        timeline.offset=Vector2((sprite.Width-sprite.PivotPixel.x)/100,(sprite.Height/2-sprite.PivotPixel.y)/100)
+                        timeline.range=sprite.Width/100
+                    end
+                    self._T.timelines[index]=timeline
+                    if Environment:IsMakerPlay() then log("[VRF] Faust timeline index="..tostring(index).." frames="..tostring(#frames).." duration="..tostring(timeline.duration)) end
+                end
+            end
+        end)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean CanLadyLaser(table a, Entity player)
+        local timeline=(self._T.timelines or {})[1] local beam=(self._T.timelines or {})[5]
+        if timeline==nil or timeline.tip==nil or beam==nil then return false end
+        local p=a.entity.TransformComponent.WorldPosition local q=player.TransformComponent.WorldPosition
+        local distance=math.abs(q.x-p.x)-timeline.tip.x
+        local y=p.y+timeline.tip.y
+        return distance>=0 and distance<=beam.range and y>=q.y+0.36 and y<=q.y+0.63
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsLadyLaserTarget(Entity player)
+        local ray=self._T.ladyLaser if ray==nil then return false end
+        local p=player.TransformComponent.WorldPosition
+        local crouch=isvalid(player.StateComponent) and player.StateComponent.CurrentStateName=="CROUCH"
+        -- Grounded ducking always clears the syringe-height beam, including the lower floor.
+        if crouch and isvalid(player.RigidbodyComponent) and player.RigidbodyComponent:IsOnGround() then return false end
+        return p.x+0.15>=ray.left and p.x-0.15<=ray.right and ray.y+0.005>=p.y+0.01 and ray.y-0.005<=p.y+(crouch and 0.33 or 0.63)
+    end
+
+    @ExecSpace("ServerOnly")
+    method number LadyLaserRange(Vector3 origin, number direction)
+        -- Extend beyond both the arena and the owning player's actual viewport.
+        local d=_RegionalBossCatalog:Stage(6)
+        local view=self._T.playerView
+        local edge=direction>0 and math.max(d.right,view and view.right or d.right+12.8)+2 or math.min(d.left,view and view.left or d.left-12.8)-2
+        return math.max(self._T.timelines[5].range,(edge-origin.x)*direction)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void FireLadyLaser(table a)
+        -- The damaging line begins at the fourth-frame syringe tip and stays one pixel tall.
+        local timeline=self._T.timelines[1] local beam=self._T.timelines[5]
+        local p=a.entity.TransformComponent.WorldPosition
+        local origin=Vector3(p.x+a.dir*timeline.tip.x,p.y+timeline.tip.y,0)
+        local length=self:LadyLaserRange(origin,a.dir)
+        self._T.ladyLaser={left=math.min(origin.x,origin.x+a.dir*length),right=math.max(origin.x,origin.x+a.dir*length),y=origin.y}
+        self:LaserVisual(a.entity,origin,a.dir,length,beam.offset,beam.range,self.OwnerId)
+        self:Strike(Vector2(origin.x+a.dir*length/2,origin.y),Vector2(length,0.01),"lady1",a.hits,false)
+        self._T.ladyLaser=nil
+        if Environment:IsMakerPlay() then log("[VRF] Faust laser frame=4 height=0.01 length="..tostring(length).." origin="..tostring(origin)) end
+    end
+
+    @ExecSpace("Client")
+    method void LaserVisual(Entity lady, Vector3 origin, number direction, number length, Vector2 offset, number nativeRange)
+        -- One RPC aligns the visible shot and the measured discharge in the original sound.
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap or not isvalid(lady) or lady.Monster.IsDead then return end
+        if self._T.laserCharge then _EffectService:RemoveEffect(self._T.laserCharge) self._T.laserCharge=nil end
+        local lower=_UILogic:ScreenToWorldPosition(Vector2.zero)
+        local upper=_UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight))
+        local edge=direction>0 and math.max(lower.x,upper.x)+2 or math.min(lower.x,upper.x)-2
+        local scale=math.max(length,(edge-origin.x)*direction)/nativeRange
+        local position=Vector3(origin.x+direction*offset.x*scale,origin.y-offset.y,0)
+        if self._T.laserBeam then _EffectService:RemoveEffect(self._T.laserBeam) end
+        self._T.laserBeam=_EffectService:PlayEffect("725858b58c524741bc036b7360716de9",self.Entity.CurrentMap,position,0,Vector3(scale,1,1),false,{FlipX=direction>0,SortingLayer="MapLayer7",OrderInLayer=17})
+        self:PlayLadyLaserSound(lady,self.LadyLaserShotSoundTime)
+        if Environment:IsMakerPlay() then log("[VRF] Faust laser visual length="..tostring(scale*nativeRange).." soundShot="..tostring(self.LadyLaserShotSoundTime)) end
+    end
+
+    @ExecSpace("Client")
+    method void PrepareLadyLaser(Entity lady)
+        -- Preload the original cue before the first stab; the sound belongs to the summon.
+        if not isvalid(lady) then return end
+        if self._T.laserActor==lady and isvalid(self._T.laserSound) then return end
+        self:ClearLaserPresentation()
+        local host=_SpawnService:SpawnByModelId("stumpyball","LadyLaserAudio",Vector3.zero,self.Entity.CurrentMap)
+        if not isvalid(host) then return end
+        host.SpriteRendererComponent.Enable=false
+        local sound=host:AddComponent("MOD.Core.SoundComponent")
+        if not isvalid(sound) then host:Destroy() return end
+        self._T.laserActor=lady
+        sound.PlayOnEnable=false sound.Loop=false sound.Bgm=false sound.HearingDistance=10000
+        sound.AudioClipRUID="b9153096b4104c139239d1873b7c28d2"
+        self._T.laserSound=sound
+        _ResourceService:PreloadAsync({sound.AudioClipRUID,"6372ef5147db4c60868bdb050d20096e","725858b58c524741bc036b7360716de9"},function() end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlayLadyLaserSound(Entity lady, number offset)
+        -- Start near the discharge, skipping the cue's four-second lead-in.
+        if self._T.laserActor~=lady or not isvalid(self._T.laserSound) then self:PrepareLadyLaser(lady) end
+        local sound=self._T.laserSound
+        if not isvalid(sound) then return end
+        self._T.laserAudioToken=(self._T.laserAudioToken or 0)+1
+        local token=self._T.laserAudioToken local started=_UtilLogic.ElapsedSeconds
+        local play=function()
+            local player=_UserService.LocalPlayer
+            if not isvalid(sound) or token~=self._T.laserAudioToken or not isvalid(lady) or lady.Monster.IsDead or not isvalid(player) or player.CurrentMap~=lady.CurrentMap then return end
+            if not sound:IsAudioClipLoaded() then return end
+            sound.Volume=_GameAudio:GetBossSfxVolume(1) sound.Mute=_GameAudio.muted
+            sound:Stop() sound:Play()
+            sound:SetTimePosition(math.min(sound:GetTotalTime()-0.01,offset+_UtilLogic.ElapsedSeconds-started))
+            if Environment:IsMakerPlay() then log("[VRF] Faust laser audio offset="..tostring(sound:GetTimePosition())) end
+        end
+        if sound:IsAudioClipLoaded() then play()
+        else _ResourceService:PreloadAsync({sound.AudioClipRUID},play) end
+    end
+
+    @ExecSpace("Client")
+    method void LaserChargeVisual(Entity lady, Vector3 tip, number direction, number duration)
+        -- The third frame holds for one complete charge-effect cycle.
+        local player=_UserService.LocalPlayer
+        if not isvalid(lady) or lady.Monster.IsDead or not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then return end
+        if self._T.laserCharge then _EffectService:RemoveEffect(self._T.laserCharge) end
+        self._T.laserCharge=_EffectService:PlayEffect("6372ef5147db4c60868bdb050d20096e",self.Entity.CurrentMap,tip,0,Vector3.one,false,{FlipX=direction>0,SortingLayer="MapLayer7",OrderInLayer=18})
+        self:PlayLadyLaserSound(lady,math.max(0,self.LadyLaserShotSoundTime-duration))
+        if Environment:IsMakerPlay() then log("[VRF] Faust laser charge frame=3 duration="..tostring(duration).." tip="..tostring(tip)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearLaserPresentation()
+        -- Cancel pending loading callbacks and remove charge/beam/audio on death or exit.
+        self._T.laserAudioToken=(self._T.laserAudioToken or 0)+1
+        if self._T.laserCharge then _EffectService:RemoveEffect(self._T.laserCharge) end
+        if self._T.laserBeam then _EffectService:RemoveEffect(self._T.laserBeam) end
+        if isvalid(self._T.laserSound) then
+            local host=self._T.laserSound.Entity
+            self._T.laserSound:Stop()
+            if isvalid(host) then host:Destroy() end
+        end
+        self._T.laserCharge=nil self._T.laserBeam=nil self._T.laserSound=nil self._T.laserActor=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickLadyAttack(table a, number delta)
+        a.actionAge=a.actionAge+delta
+        local e=a.entity local timeline=self._T.timelines[a.currentAttack]
+        e.RigidbodyComponent.MoveVelocity=Vector2.zero
+        local motionAge=a.actionAge
+        if a.currentAttack==1 then
+            local charge=self._T.timelines[6]
+            local start=timeline.ends[2] local duration=charge and charge.duration or 1.32
+            local extra=math.max(0,duration-(timeline.ends[3]-start))
+            if a.actionAge>=start and not a.chargeStarted then
+                a.chargeStarted=true
+                local p=e.TransformComponent.WorldPosition local tip=timeline.chargeTip
+                self:LaserChargeVisual(e,Vector3(p.x+a.dir*tip.x,p.y+tip.y,0),a.dir,duration,self.OwnerId)
+            end
+            if a.actionAge>=start and a.actionAge<start+duration then motionAge=start
+            elseif a.actionAge>=start+duration then motionAge=a.actionAge-extra end
+        end
+        local frame=#timeline.ends-1
+        for i,finish in ipairs(timeline.ends) do if motionAge<finish then frame=i-1 break end end
+        if e.SpriteRendererComponent.StartFrameIndex~=frame or e.SpriteRendererComponent.EndFrameIndex~=frame then
+            e.SpriteRendererComponent.EndFrameIndex=2147483647
+            e.SpriteRendererComponent.StartFrameIndex=frame e.SpriteRendererComponent.EndFrameIndex=frame
+        end
+        local damageFrame=a.currentAttack==1 and 3 or 10
+        if not a.struck and motionAge>=timeline.ends[damageFrame] then
+            a.struck=true
+            if a.currentAttack==1 then self:FireLadyLaser(a)
+            else
+                local p=e.TransformComponent.WorldPosition
+                self:Strike(Vector2(a.slamTarget.x,a.floor+0.2),Vector2(3.8,0.4),"lady"..tostring(a.currentAttack),a.hits,true)
+                if Environment:IsMakerPlay() then log("[VRF] Faust ground hit frame=11 attack="..tostring(a.currentAttack)) end
+            end
+        end
+        if motionAge>=timeline.duration then
+            a.mode="roam" a.nextBasic=a.age+2.5
+            e.SpriteRendererComponent.StartFrameIndex=0 e.SpriteRendererComponent.EndFrameIndex=2147483647
+            e.SpriteRendererComponent.SpriteRUID=self:Species("lady").fly
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickZombie(table a, Entity player, number delta)
+        local e=a.entity local p=e.TransformComponent.WorldPosition local q=player.TransformComponent.WorldPosition
+        local spec=self:Species("zombie") local rb=e.RigidbodyComponent
+        if a.mode=="zombieAttack" then
+            a.actionAge=a.actionAge+delta e.MovementComponent:Stop()
+            if not a.struck and a.actionAge>=0.8 then
+                a.struck=true
+                local x=p.x+a.dir*0.35 local y=p.y+0.45
+                local dx=a.target.x-x local dy=a.target.y+0.35-y local length=math.max(0.01,math.sqrt(dx*dx+dy*dy))
+                self.Entity.RegionalBossEncounter:Hazard("zombieBanana",x,y,dx/length*3.3,dy/length*3.3,0.02,0.02,self.ZombieBananaRange/3.3+0.5,0.2,0)
+                if Environment:IsMakerPlay() then log("[VRF] Faust zombie banana rate=0.2 range="..tostring(self.ZombieBananaRange)) end
+            end
+            if a.actionAge>=2.25 then a.mode="roam" a.nextBasic=a.age+2.5+_UtilLogic:RandomDouble()*2 end
+        else
+            local dx=q.x-p.x local direction=dx>=0 and 1 or -1
+            local separate=0
+            for _,other in ipairs(self._T.actors) do
+                if other~=a and other.kind=="zombie" and isvalid(other.entity) and not other.entity.Monster.IsDead then
+                    local op=other.entity.TransformComponent.WorldPosition local gap=p.x-op.x
+                    if math.abs(op.y-p.y)<0.7 and math.abs(gap)<0.95 then
+                        local side=gap==0 and (e.Id<other.entity.Id and -1 or 1) or (gap>0 and 1 or -1)
+                        separate=separate+side*(0.95-math.abs(gap))
+                    end
+                end
+            end
+            if math.abs(separate)>0.05 then direction=separate>0 and 1 or -1 end
+            e.SpriteRendererComponent.FlipX=direction>0
+            if math.abs(separate)<=0.05 and rb:IsOnGround() and a.age>=a.nextBasic and math.sqrt(dx*dx+(q.y-p.y)^2)<=self.ZombieBananaRange then
+                a.mode="zombieAttack" a.actionAge=0 a.struck=false a.dir=direction a.target=q
+                e.MovementComponent:Stop() e.SpriteRendererComponent.SpriteRUID=spec.attack
+                self:Sound("1be7a0a705ee45dea337c9d0ceda28c9",self.OwnerId)
+            elseif (math.abs(separate)>0.05 or math.abs(dx)>2) and (not rb:IsOnGround() or rb:PredictFootholdEnd(0.4,direction>0)) then
+                e.SpriteRendererComponent.SpriteRUID=spec.fly e.MovementComponent:MoveToDirection(Vector2(direction,0),0)
+            else e.MovementComponent:Stop() e.SpriteRendererComponent.SpriteRUID=spec.stand end
+        end
+        if a.age>=(a.contactAt or 0) then
+            a.contactAt=a.age+0.15
+            self:Strike(Vector2(p.x,p.y+0.3),Vector2(0.5,0.55),"zombie",{},false)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void LadyAttack(table a, Entity player, integer attack)
+        if (self._T.timelines or {})[attack]==nil then return end
+        if attack==1 and not self:CanLadyLaser(a,player) then return end
+        -- Specials first descend to the player's floor; the stab can be used in flight.
+        if attack>1 and a.mode~="groundApproach" then
+            local q=player.TransformComponent.WorldPosition local p=a.entity.TransformComponent.WorldPosition
+            local floor=self.Entity.RegionalBossEncounter:SurfaceY(q.x,q.y)
+            local foot=player.RigidbodyComponent:GetCurrentFoothold()
+            if foot~=nil and not foot:IsVertical() then floor=foot:GetYByX(q.x) end
+            a.slamTarget=Vector2(q.x,floor) a.slamDirection=q.x>=p.x and 1 or -1
+            a.mode="groundApproach" a.pendingAttack=attack
+            if Environment:IsMakerPlay() then log("[VRF] Faust lady flight locked="..tostring(a.slamTarget)) end
+            a.entity.SpriteRendererComponent.SpriteRUID=self:Species("lady").fly
+            return
+        end
+        a.mode="attack" a.actionAge=0 a.currentAttack=attack a.struck=false a.chargeStarted=false a.hits={}
+        local p=a.entity.TransformComponent.WorldPosition local q=player.TransformComponent.WorldPosition
+        a.dir=attack>1 and a.slamDirection or (q.x>=p.x and 1 or -1)
+        if attack==1 then a.floor=self.Entity.RegionalBossEncounter:SurfaceY(q.x,q.y+0.1) end
+        local clips={"ed5028331be34ba0848152ae26019093","e55b96c2fde44c6e9fac2e8c9201950b","425c7f1a98004a07b2922ee3202af427"}
+        local sounds={"6db0e011ba23450b8569a5a789abb1f7","8cbe1fce67ef4328a91623de29aa1ee4","348b89874d0e4c6cb22582549bfe5b4b"}
+        a.entity.RigidbodyComponent.MoveVelocity=Vector2.zero
+        a.entity.SpriteRendererComponent.SpriteRUID=clips[attack] a.entity.SpriteRendererComponent.FlipX=a.dir>0
+        a.entity.SpriteRendererComponent.StartFrameIndex=0 a.entity.SpriteRendererComponent.EndFrameIndex=0
+        if attack>1 then self:Sound(sounds[attack],self.OwnerId) end
+        if attack>1 then _BossStageManager:WarningText(attack==2 and "의문의 숙녀 · 마력 강탈 — 점프로 피하세요!" or "의문의 숙녀 · 생명 강탈 — 점프로 피하세요!",self.OwnerId) end
+        if Environment:IsMakerPlay() then log("[VRF] Faust lady attack="..tostring(attack)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ApproachLadyFloor(table a, Entity player, number delta)
+        -- Capture once when flight starts. Player movement never redirects this slam.
+        local target=a.slamTarget
+        if target==nil then a.mode="roam" return end
+        local p=a.entity.TransformComponent.WorldPosition
+        local dx=target.x-p.x local dy=target.y-p.y local distance=math.sqrt(dx*dx+dy*dy)
+        if distance<=0.06 then
+            a.entity.RigidbodyComponent:SetWorldPosition(target)
+            a.entity.RigidbodyComponent.MoveVelocity=Vector2.zero
+            a.entity.RigidbodyComponent:SetForce(Vector2.zero)
+            a.floor=target.y self:LadyAttack(a,player,a.pendingAttack)
+            if Environment:IsMakerPlay() then log("[VRF] Faust lady locked landing="..tostring(target).." attack="..tostring(a.currentAttack)) end
+            return
+        end
+        local speed=math.min(3.2,distance/math.max(0.001,delta))
+        a.entity.RigidbodyComponent.MoveVelocity=Vector2(dx/distance*speed,dy/distance*speed)
+        a.entity.SpriteRendererComponent.FlipX=a.slamDirection>0
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsMelodyTarget(Entity player)
+        -- One-pixel horizontal contact line uses the visible standing/crouching body.
+        local line=self._T.melodyContact
+        if line==nil then return false end
+        local p=player.TransformComponent.WorldPosition
+        local crouch=isvalid(player.StateComponent) and player.StateComponent.CurrentStateName=="CROUCH"
+        return p.x+0.15>=line.left and p.x-0.15<=line.right and line.y+0.005>=p.y+0.01 and line.y-0.005<=p.y+(crouch and 0.33 or 0.63)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickMelody(table a, number delta)
+        if a.mode~="pass" then return end
+        -- Continue the pass until the whole sprite clears the owner's actual viewport.
+        local e=a.entity local p=e.TransformComponent.WorldPosition
+        local speed=4.9
+        a.passAge=a.passAge+delta
+        e.RigidbodyComponent.MoveVelocity=Vector2(a.dir*speed,0)
+        e.SpriteRendererComponent.SpriteRUID=self:Species("melody").fly
+        e.SpriteRendererComponent.FlipX=a.dir>0
+        self._T.melodyContact={left=math.min(p.x,p.x+a.dir*speed*delta)-0.275,right=math.max(p.x,p.x+a.dir*speed*delta)+0.275,y=p.y}
+        self:Strike(Vector2(p.x+a.dir*speed*delta/2,p.y),Vector2(0.55+speed*delta,0.01),"melody",a.hits,false)
+        self._T.melodyContact=nil
+        local view=self._T.playerView
+        local d=_RegionalBossCatalog:Stage(6)
+        -- A missing client report uses a conservative distance beyond the entire arena.
+        local left=view and view.left or d.left-20
+        local right=view and view.right or d.right+20
+        if (a.dir>0 and p.x-1>right) or (a.dir<0 and p.x+1<left) then
+            e:Destroy()
+            if Environment:IsMakerPlay() then log("[VRF] Melody left camera speed=4.9 direction="..tostring(a.dir)) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePlayerView(number delta)
+        -- Screen conversion includes camera damping, bounds, zoom and device aspect ratio.
+        self._T.viewReportIn=(self._T.viewReportIn or 0)-delta
+        if self._T.viewReportIn>0 then return end
+        self._T.viewReportIn=0.2
+        local lower=_UILogic:ScreenToWorldPosition(Vector2.zero)
+        local upper=_UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth,_UILogic.ScreenHeight))
+        self:ReportPlayerView(math.min(lower.x,upper.x),math.max(lower.x,upper.x))
+    end
+
+    @ExecSpace("Server")
+    method void ReportPlayerView(number left, number right)
+        -- Only the encounter owner may report their camera; never accept other clients' bounds.
+        if self._T.cleaned or senderUserId~=self.OwnerId then return end
+        local player=_UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then return end
+        local width=right-left local center=(left+right)*0.5
+        if left~=left or right~=right or width<2 or width>80 then return end
+        if math.abs(center-player.TransformComponent.WorldPosition.x)>50 then return end
+        self._T.playerView={left=left,right=right}
+        if not self._T.viewReported then
+            self._T.viewReported=true
+            if Environment:IsMakerPlay() then log("[VRF] Faust owner viewport received width="..tostring(width)) end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickActors(Entity player, number delta)
+        -- Bodies perform flight; scripts never teleport an actor every update.
+        for i=#self._T.actors,1,-1 do
+            local a=self._T.actors[i] local e=a.entity
+            if not isvalid(e) then
+                if a.kind=="lady" then self.LadyAlive=false end table.remove(self._T.actors,i)
+            elseif e.Monster.IsDead then
+                e.RigidbodyComponent.MoveVelocity=Vector2.zero
+                if not a.dead then a.dead=true e.SpriteRendererComponent.SpriteRUID=self:Species(a.kind).die end
+                e.Monster.FaustDashAura=false
+                if a.kind=="lady" then self.LadyAlive=false end
+            else
+                a.age=a.age+delta local p=e.TransformComponent.WorldPosition
+                if a.mode=="appear" then
+                    if a.age>=1 then
+                        e.HitComponent.Enable=true a.mode="roam"
+                        if a.kind=="melody" then a.mode="pass" a.dir=player.TransformComponent.WorldPosition.x>=p.x and 1 or -1 a.passAge=0 end
+                    end
+                elseif a.mode=="pass" then
+                    self:TickMelody(a,delta)
+                elseif a.mode=="windup" then
+                    a.windup=a.windup+delta e.RigidbodyComponent.MoveVelocity=Vector2.zero
+                    if a.windup>=3 then self:BeginDash(a,player) end
+                elseif a.mode=="dash" then
+                    self:TickDash(a,delta)
+                elseif a.mode=="groundApproach" then
+                    self:ApproachLadyFloor(a,player,delta)
+                elseif a.mode=="attack" then
+                    self:TickLadyAttack(a,delta)
+                elseif a.kind=="zombie" then
+                    self:TickZombie(a,player,delta)
+                else
+                    self:Roam(a,player,delta)
+                    if a.kind=="ghost" and a.mode=="roam" and a.age>=a.nextDash then
+                        self:WarnDash(a,player)
+                    elseif a.kind=="lady" then
+                        if a.age>=a.nextSpecial then
+                            self:LadyAttack(a,player,a.attack) a.attack=a.attack==2 and 3 or 2
+                            a.nextSpecial=a.age+7+_UtilLogic:RandomDouble()*8
+                        elseif a.age>=a.nextBasic and self:CanLadyLaser(a,player) then self:LadyAttack(a,player,1) end
+                    end
+                end
+                if a.kind=="ghost" and a.mode~="appear" and a.mode~="dash" then
+                    if a.age>=(a.contactAt or 0) then a.contactAt=a.age+0.15 self:GhostContact(Vector2(p.x,p.y),Vector2(p.x,p.y),{},false) end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void AcceptedHit(Entity player, string kind)
+        -- A curse refreshes rather than stacking independent forty-percent drains.
+        if self._T.cleaned or player.PlayerComponent.UserId~=self.OwnerId then return end
+        if kind=="ghost" then
+            self._T.curse={player=player,age=0,ticks=0,total=math.floor(player.PlayerComponent.MaxHp*0.4),dealt=0}
+            self:ShowCurse(player,self.OwnerId)
+            self:Impact(player,kind,self.OwnerId)
+        elseif kind=="ghostdash" then
+            self:ShowCurse(player,self.OwnerId)
+            self:Impact(player,"ghost",self.OwnerId)
+        elseif kind=="zombie" then
+            local p=player.TransformComponent.WorldPosition+Vector3(0,0.35,0)
+            _BossStageManager:BossContactImpact(player,p,_UtilLogic:RandomIntegerRange(0,1)*4,_UtilLogic:RandomDouble()*360,self.OwnerId)
+        elseif kind=="melody" then self:Impact(player,kind,self.OwnerId)
+        elseif kind=="lady2" then self:DrainMp(player,self.OwnerId)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void UseHolyWater(Entity player)
+        local regional=self.Entity.RegionalBossEncounter
+        if self._T.cleaned or not regional.CombatActive or self.Entity.Monster.IsDead or not isvalid(player) then return end
+        if player.CurrentMap~=self.Entity.CurrentMap or player.PlayerComponent.UserId~=self.OwnerId or player.PlayerComponent.Hp<=0 then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        local left=math.max(0,(self._T.holyReadyAt or 0)-now)
+        if left>0 then _BossStageManager:HolyWaterState(self.Entity.CurrentMap.Name,left,false,self.OwnerId) return end
+        self._T.holyReadyAt=now+30
+        self:ClearHolyWater()
+        local p=player.TransformComponent.WorldPosition local direction=player.PlayerControllerComponent.LookDirectionX<0 and -1 or 1
+        local start=p+Vector3(direction*0.25,0.5,0)
+        local e=self:Effect("9873f8d11af348af9abfafd70c001a01",start)
+        if not isvalid(e) then self._T.holyReadyAt=0 return end
+        if self._T.cleaned or not regional.CombatActive then e:Destroy() return end
+        self._T.holyWater={entity=e,player=player,position=start,velocity=Vector2(direction*4.8,4.2),age=0,damage=_UtilLogic:RandomIntegerRange(4444,7777)}
+        _BossStageManager:HolyWaterState(self.Entity.CurrentMap.Name,math.max(0,self._T.holyReadyAt-_UtilLogic.ServerElapsedSeconds),true,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Holy water thrown cooldown=30 damage="..tostring(self._T.holyWater.damage)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsHolyWaterTarget(Entity target)
+        if not isvalid(target) then return false end
+        local monster=target:GetComponent("script.Monster")
+        if not isvalid(monster) or monster.IsDead or monster:IsSpawnProtected() then return false end
+        if target==self.Entity then return true end
+        for _,a in ipairs(self._T.actors or {}) do if a.entity==target and a.mode~="appear" then return true end end
+        return false
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean HitHolyWater(table bottle, Vector3 previous, Vector3 current)
+        local simulator=_CollisionService:GetSimulator(self.Entity.CurrentMap)
+        local from=Vector2(previous.x,previous.y) local to=Vector2(current.x,current.y)
+        local delta=to-from local length=delta:Magnitude()
+        local candidates=length>0.001 and simulator:OverlapLineAll("HitBox",from,to) or simulator:OverlapAll(CollisionGroups.HitBox,CircleShape(to,0.12))
+        local target=nil local closest=math.huge
+        for _,hit in ipairs(candidates) do
+            local e=hit.Entity
+            if self:IsHolyWaterTarget(e) then
+                local p=e.TransformComponent.WorldPosition
+                local distance=(p.x-previous.x)^2+(p.y-previous.y)^2
+                if distance<closest then target=e closest=distance end
+            end
+        end
+        if not isvalid(target) then return false end
+        local attack=bottle.player:GetComponent("script.PlayerAttack")
+        if not isvalid(attack) then return false end
+        attack._T.holyWaterTarget=target attack._T.holyWaterDamage=bottle.damage
+        local hits=attack:Attack(BoxShape((from+to)*0.5,Vector2(math.abs(delta.x)+0.24,math.abs(delta.y)+0.24),0),"boss.faust.holywater",CollisionGroups.HitBox)
+        attack._T.holyWaterTarget=nil attack._T.holyWaterDamage=nil
+        if hits==nil or #hits==0 then return false end
+        local p=target.TransformComponent.WorldPosition local offset=target.HitComponent.ColliderOffset
+        local center=target.TransformComponent:ToWorldPoint(Vector3(offset.x,offset.y,0))
+        local along=length>0.001 and math.max(0,math.min(1,((center.x-previous.x)*delta.x+(center.y-previous.y)*delta.y)/(length*length))) or 1
+        local contact=previous+(current-previous)*along
+        self:HolyWaterImpact(contact,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Holy water hit target="..target.Name.." damage="..tostring(bottle.damage)) end
+        self:ClearHolyWater()
+        return true
+    end
+
+    @ExecSpace("Client")
+    method void HolyWaterImpact(Vector3 position)
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then return end
+        _EffectService:PlayEffect("2a98813a77154e8e8871c8c1d0b7ea80",self.Entity.CurrentMap,position,0,Vector3.one,false,{SortingLayer="MapLayer7",OrderInLayer=18})
+        if Environment:IsMakerPlay() then log("[VRF] Holy water impact effect played") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickHolyWater(number delta)
+        local bottle=self._T.holyWater if bottle==nil then return end
+        if not isvalid(bottle.entity) or not isvalid(bottle.player) or bottle.player.CurrentMap~=self.Entity.CurrentMap then self:ClearHolyWater() return end
+        bottle.age=bottle.age+delta
+        local previous=bottle.position local current=previous
+        if bottle.landed then
+            local age=bottle.age-bottle.landedAt
+            if age>=3.8 then self:ClearHolyWater() return end
+            current=bottle.landing+Vector3(0,0.18+math.sin(age*1.8)*0.04,0)
+            local alpha=age<=3 and 1 or math.max(0,1-(age-3)/0.8)
+            bottle.entity.SpriteRendererComponent.Color=Color(1,1,1,alpha)
+            if isvalid(bottle.aura) then bottle.aura.SpriteRendererComponent.Color=Color(1,1,1,alpha) end
+        else
+            local d=_RegionalBossCatalog:Stage(6)
+            current=previous+Vector3(bottle.velocity.x*delta,bottle.velocity.y*delta-5*delta*delta,0)
+            bottle.velocity=Vector2(bottle.velocity.x,bottle.velocity.y-10*delta)
+            current.x=math.max(d.left+0.4,math.min(d.right-0.4,current.x))
+            if bottle.velocity.y<0 then
+                local foot=self.Entity.CurrentMap.FootholdComponent:Raycast(Vector2(current.x,previous.y+0.16),Vector2(0,-1),math.abs(current.y-previous.y)+0.34)
+                if foot~=nil and not foot:IsVertical() and current.y<=foot:GetYByX(current.x)+0.16 then
+                    bottle.landing=Vector3(current.x,foot:GetYByX(current.x),0)
+                    current=bottle.landing+Vector3(0,0.18,0) bottle.landed=true bottle.landedAt=bottle.age
+                end
+            end
+            if current.y<d.floor-2 or bottle.age>8 then self:ClearHolyWater() return end
+        end
+        bottle.entity.TransformComponent.WorldPosition=current bottle.position=current
+        bottle.entity.TransformComponent.ZRotation=bottle.landed and 0 or -bottle.velocity.x*bottle.age*60
+        if self:HitHolyWater(bottle,previous,current) then return end
+        if bottle.landed and not bottle.auraStarted then
+            bottle.auraStarted=true
+            local aura=self:Effect("cb4b8f3451bb4f0dab53327cce29c873",current)
+            if self._T.holyWater~=bottle or self._T.cleaned then if isvalid(aura) then aura:Destroy() end return end
+            bottle.aura=aura
+            if isvalid(aura) then aura.TransformComponent.Scale=Vector3(0.75,0.75,1) aura.SpriteRendererComponent.OrderInLayer=15 end
+            if Environment:IsMakerPlay() then log("[VRF] Holy water landed float=0.04 hold=3 fade=0.8") end
+        end
+        if isvalid(bottle.aura) then bottle.aura.TransformComponent.WorldPosition=current+Vector3(0.14075,-0.246,0) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ClearHolyWater()
+        local bottle=self._T.holyWater self._T.holyWater=nil
+        if bottle==nil then return end
+        if isvalid(bottle.entity) then bottle.entity:Destroy() end
+        if isvalid(bottle.aura) then bottle.aura:Destroy() end
+        if Environment:IsMakerPlay() then log("[VRF] Holy water removed") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickCurse(number delta)
+        -- Ten one-second ticks, including integer remainder, total exactly 40%.
+        local c=self._T.curse if c==nil then return end
+        local p=c.player
+        if not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap or p.PlayerComponent.Hp<=0 then
+            self:ClearCurse(self.OwnerId) self._T.curse=nil return
+        end
+        c.age=c.age+delta
+        while c.ticks<10 and c.age>=c.ticks+1 do
+            c.ticks=c.ticks+1
+            local target=math.floor(c.total*c.ticks/10) local amount=target-c.dealt c.dealt=target
+            if not p.PlayerHit:IsFinalAttackInvincible() then
+                p.PlayerComponent.Hp=math.max(0,p.PlayerComponent.Hp-amount) p.PlayerHit:ShowTakenDamage(amount)
+            end
+            if Environment:IsMakerPlay() then log("[VRF] Faust curse tick="..tostring(c.ticks).." damage="..tostring(amount)) end
+        end
+        if c.ticks>=10 then self:ClearCurse(self.OwnerId) self._T.curse=nil end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickForestPlatforms(number clock, boolean reset)
+        if self._T.forestPlatforms==nil then
+            self._T.forestPlatforms={}
+            for i=1,3 do
+                local e=self.Entity.CurrentMap:GetChildByName("FaustFadingBranch"..tostring(i))
+                if isvalid(e) then table.insert(self._T.forestPlatforms,{entity=e}) end
+            end
+        end
+        local player=_UserService:GetUserEntityByUserId(self.OwnerId)
+        local foot=nil
+        if not reset and isvalid(player) and player.PlayerComponent.Hp>0 and player.RigidbodyComponent:IsOnGround() then foot=player.RigidbodyComponent:GetCurrentFoothold() end
+        for _,p in ipairs(self._T.forestPlatforms) do
+            local e=p.entity
+            if isvalid(e) then
+                if reset then p.steppedAt=nil
+                elseif p.steppedAt==nil and foot~=nil and foot.OwnerId==e.Id then p.steppedAt=clock end
+                local age=p.steppedAt~=nil and clock-p.steppedAt or -1
+                if age>=7.6 then p.steppedAt=nil age=-1 end
+                local enabled=age<2.6
+                local alpha=age<2 and 1 or math.max(0,1-(age-2)/0.6)
+                if p.solid~=enabled then
+                    p.solid=enabled
+                    e.CustomFootholdComponent.edgeLists:Clear()
+                    if enabled then
+                        e.CustomFootholdComponent.edgeLists:Add({Vector2(-0.49,0.054108),Vector2(-0.27,0.1),Vector2(0.02,0.06),Vector2(0.32,0.06),Vector2(0.43,0.08),Vector2(0.555,0.061536)})
+                    end
+                    e.Visible=enabled
+                    if Environment:IsMakerPlay() then log("[VRF] Faust branch "..e.Name.." solid="..tostring(enabled)) end
+                end
+                e.SpriteRendererComponent.Color=Color(1,1,1,alpha)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CheckForestLanding(number delta)
+        self._T.landingPoll=(self._T.landingPoll or 0)-delta
+        if self._T.landingPoll>0 then return end
+        self._T.landingPoll=0.2
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 or p.CurrentMap~=self.Entity.CurrentMap then return end
+        local rb=p.RigidbodyComponent
+        if not rb:IsOnGround() then return end
+        local foot=rb:GetCurrentFoothold()
+        local e=foot~=nil and _EntityService:GetEntity(foot.OwnerId) or nil
+        if isvalid(e) and string.sub(e.Name,1,17)=="FaustFadingBranch" then self:ReportForestLanding(e.Id) end
+    end
+
+    @ExecSpace("Server")
+    method void ReportForestLanding(string id)
+        if senderUserId~=self.OwnerId or self._T.defeated or self._T.cleaned then return end
+        local p=_UserService:GetUserEntityByUserId(self.OwnerId)
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 or p.CurrentMap~=self.Entity.CurrentMap then return end
+        local pos=p.TransformComponent.WorldPosition
+        for _,slot in ipairs(self._T.forestPlatforms or {}) do
+            local e=slot.entity
+            if isvalid(e) and e.Id==id and slot.solid and slot.steppedAt==nil then
+                local q=e.TransformComponent.WorldPosition
+                if math.abs(pos.x-q.x)<=0.85 and math.abs(pos.y-q.y-0.1)<0.18 then
+                    slot.steppedAt=self._T.clock
+                    if Environment:IsMakerPlay() then log("[VRF] Faust branch landed owner="..self.OwnerId) end
+                end
+                return
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        if self._T.cleaned then return end
+        self._T.defeated=true self._T.curse=nil
+        self._T.clock=self._T.clock+delta
+        self:TickForestPlatforms(self._T.clock,false)
+        self:TickRituals(player,delta)
+        for _,a in ipairs(self._T.actors) do
+            if isvalid(a.entity) and not a.entity.Monster.IsDead then
+                local e=a.entity
+                a.age=a.age+delta
+                e.HitComponent.Enable=false
+                if a.kind=="melody" then
+                    if a.mode=="appear" and a.age>=1 then
+                        a.mode="pass" a.passAge=0
+                        a.dir=player.TransformComponent.WorldPosition.x>=e.TransformComponent.WorldPosition.x and 1 or -1
+                    end
+                    self:TickMelody(a,delta)
+                elseif a.mode=="dash" then self:TickDash(a,delta)
+                elseif a.kind=="zombie" then
+                    e.MovementComponent:Stop() e.SpriteRendererComponent.SpriteRUID=self:Species(a.kind).stand
+                else
+                    a.mode="roam" e.Monster.FaustDashAura=false
+                    e.SpriteRendererComponent.EndFrameIndex=2147483647
+                    e.SpriteRendererComponent.StartFrameIndex=0
+                    self:Roam(a,player,delta)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        -- Thresholds are one-shot for the lady; ghosts resume after her ritual.
+        if self._T.cleaned then return end
+        self._T.clock=self._T.clock+delta
+        self:TickForestPlatforms(self._T.clock,false)
+        local ratio=self.Entity.Monster.Hp/math.max(1,self.Entity.Monster.MaxHp)
+        if ratio<0.5 and not self._T.ladySummoned then
+            self._T.ladySummoned=true self._T.waitLady=true self:Summon("lady",player)
+        end
+        if not self._T.waitLady and self._T.clock>=self._T.nextGhost then
+            self._T.nextGhost=self._T.clock+5+_UtilLogic:RandomDouble()*3
+            if self:GhostCount()<2 then self:Summon("ghost",player) end
+        end
+        if ratio<0.5 and self._T.clock>=self._T.nextMelody then
+            self._T.nextMelody=self._T.clock+8+_UtilLogic:RandomDouble()*4 self:Summon("melody",player)
+        end
+        if self._T.clock>=self._T.nextZombie then
+            self._T.nextZombie=self._T.clock+12+_UtilLogic:RandomDouble()*4
+            local count=_UtilLogic:RandomIntegerRange(2,3)
+            for i=1,count do self:Summon("zombie",player) end
+            if Environment:IsMakerPlay() then log("[VRF] Faust zombie wave count="..tostring(count).." hp=1000") end
+        end
+        self:TickRituals(player,delta) self:TickActors(player,delta) self:TickCurse(delta) self:TickHolyWater(delta)
+    end
+
+    @ExecSpace("Client")
+    method void ShowCurse(Entity player)
+        -- Native attachment follows the local avatar smoothly; hits refresh one effect.
+        if player~=_UserService.LocalPlayer then return end
+        self._T.curseVisualSerial=(self._T.curseVisualSerial or 0)+1
+        local serial=self._T.curseVisualSerial
+        if (self._T.curseEffectId or 0)==0 then
+            self._T.curseEffectId=_EffectService:PlayEffectAttached("182001a35e4d4cddabb9ee5968da1198",player,Vector3(0,0.1,0),0,Vector3.one,true,{SortingLayer="MapLayer7",OrderInLayer=16,SyncFlip=false,Alpha=1})
+        end
+        local id=self._T.curseEffectId
+        _TimerService:SetTimerOnce(function()
+            if not isvalid(self.Entity) then if id~=0 then _EffectService:RemoveEffect(id) end return end
+            if self._T.curseVisualSerial==serial then self:ClearCurse() end
+        end,10)
+        if Environment:IsMakerPlay() then log("[VRF] Faust curse attached id="..tostring(id).." refresh="..tostring(serial)) end
+    end
+
+    @ExecSpace("Client")
+    method void ClearCurse()
+        -- Expiry, death and map departure remove the attached effect immediately.
+        self._T.curseVisualSerial=(self._T.curseVisualSerial or 0)+1
+        if (self._T.curseEffectId or 0)~=0 then _EffectService:RemoveEffect(self._T.curseEffectId) end
+        self._T.curseEffectId=0
+    end
+
+    @ExecSpace("Client")
+    method void DrainMp(Entity player)
+        -- MP is owned by the existing client-side MpManager; server confirms hit.
+        if player~=_UserService.LocalPlayer then return end
+        local amount=math.floor(_MpManager:GetMaxMp()*0.5)
+        local before=_MpManager:GetCurrentMp()
+        _MpManager.currentMp=math.max(0,before-amount)
+        if _MpManager.currentMp<before then _MapleHUDManager:FlashRecoveryBar("mp") end
+        _MpManager:RefreshHud()
+        if Environment:IsMakerPlay() then log("[VRF] Faust lady MP drain="..tostring(amount)) end
+    end
+
+    @ExecSpace("Client")
+    method void Sound(string ruid)
+        -- Keep boss SFX on the established volume channel.
+        _GameAudio:PlayBossSound(ruid,1)
+    end
+
+    @ExecSpace("Client")
+    method void Impact(Entity player, string kind)
+        -- Full canvas effect; it is decorative and cannot intercept UI input.
+        if player~=_UserService.LocalPlayer then return end
+        local root=_EntityService:GetEntityByPath("/ui/BossStage") local template=_BossStageManager:UI("SerufBloodTemplate")
+        if not isvalid(root) or not isvalid(template) then return end
+        for _,old in ipairs(self._T.screens or {}) do if isvalid(old) then old:Destroy() end end
+        self._T.screens={}
+        local effect=_SpawnService:SpawnByEntity(template,"FaustImpact",Vector3.zero,root)
+        if not isvalid(effect) then return end
+        effect.UITransformComponent.anchoredPosition=Vector2.zero effect.UITransformComponent.RectSize=root.UITransformComponent.RectSize
+        local s=effect.SpriteGUIRendererComponent
+        s.ImageRUID=DataRef("0b579fe17d524e59badc9afddc2ba641") s.PreserveSprite=PreserveSpriteType.None
+        -- Ghost impact: 70% transparency means alpha 0.3, enlarged around screen center.
+        s.LocalScale=kind=="ghost" and Vector2(1.5,1.5) or Vector2.one
+        s.Color=Color(1,1,1,kind=="ghost" and 0.3 or 0.7) s.RaycastTarget=false s.AnimClipPlayType=SpriteAnimClipPlayType.Onetime
+        effect.Enable=true _UILogic:SetSiblingIndex(effect.UITransformComponent,1000000)
+        self._T.screens=self._T.screens or {} table.insert(self._T.screens,effect)
+        effect:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function() if isvalid(effect) then effect:Destroy() end end)
+        _TimerService:SetTimerOnce(function() if isvalid(effect) then effect:Destroy() end end,3)
+        _GameAudio:PlayBossSound("f10ce91969e2454a99186b594f9de6a8",2)
+        if Environment:IsMakerPlay() then log("[VRF] Faust impact kind="..kind.." alpha="..tostring(s.Color.a).." scale="..tostring(s.LocalScale.x)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateLadyDarkness(number delta)
+        local target=self.LadyAlive and 0.2 or 0
+        local alpha=self._T.ladyDarkAlpha or 0
+        alpha=target>alpha and math.min(target,alpha+delta*0.1) or math.max(target,alpha-delta*0.1)
+        self._T.ladyDarkAlpha=alpha
+        if alpha>0 and not isvalid(self._T.ladyDarkness) and not self._T.ladyDarkLoading then
+            self._T.ladyDarkLoading=true
+            local generation=self._T.ladyDarkGeneration or 0
+            local position=self.Entity.TransformComponent.WorldPosition
+            local e=_SpawnService:SpawnByModelId("regionalhazard","FaustLadyDarkness",position,self.Entity.CurrentMap)
+            self._T.ladyDarkLoading=false
+            if not isvalid(e) then return end
+            if generation~=(self._T.ladyDarkGeneration or 0) then e:Destroy() return end
+            local s=e.SpriteRendererComponent
+            -- RegionalHazard disables its sprite in favor of telegraph pixels by default.
+            s.Enable=true
+            if isvalid(e.PixelRendererComponent) then e.PixelRendererComponent.Enable=false end
+            s.Color=Color(0,0,0,alpha)
+            s.DrawMode=SpriteDrawMode.Sliced s.TiledSize=Vector2(100,100)
+            s.SortingLayer="MapLayer7" s.OrderInLayer=30000 s.IgnoreMapLayerCheck=true
+            e.TransformComponent.Scale=Vector3.one
+            self._T.ladyDarkness=e
+            if Environment:IsMakerPlay() then log("[VRF] Faust darkness begin brightness=100 target=80 spriteEnabled="..tostring(s.Enable)) end
+        end
+        if isvalid(self._T.ladyDarkness) then
+            self._T.ladyDarkness.SpriteRendererComponent.Color=Color(0,0,0,alpha)
+            if alpha==0 then self._T.ladyDarkness:Destroy() self._T.ladyDarkness=nil end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Crossfade the lady's theme using the same BGM gain as the arena music.
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then
+            self:ClearLaserPresentation() self:ClearLadyMusic() return
+        end
+        if self._T.laserActor~=nil then
+            if not isvalid(self._T.laserActor) or self._T.laserActor.Monster.IsDead then self:ClearLaserPresentation()
+            elseif isvalid(self._T.laserSound) then self._T.laserSound.Volume=_GameAudio:GetBossSfxVolume(1) self._T.laserSound.Mute=_GameAudio.muted end
+        end
+        self:CheckForestLanding(delta)
+        self:UpdatePlayerView(delta)
+        self:UpdateLadyDarkness(delta)
+        if self.LadyAlive and not isvalid(self._T.ladySound) then
+            local e=_SpawnService:SpawnByModelId("stumpyball","FaustLadyMusic",Vector3.zero,self.Entity.CurrentMap)
+            if not isvalid(e) then return end
+            e.SpriteRendererComponent.Enable=false
+            local sound=e:AddComponent("MOD.Core.SoundComponent")
+            sound.AudioClipRUID="b0ab2d0776484a1ba79998d4bdeaded1"
+            sound.Bgm=false sound.Loop=true sound.HearingDistance=10000 sound.Volume=0
+            self._T.ladySound=sound self._T.ladyMix=0
+            _ResourceService:PreloadAsync({sound.AudioClipRUID},function()
+                if isvalid(sound) and self.LadyAlive then sound:Play() end
+            end)
+        end
+        local sound=self._T.ladySound if not isvalid(sound) then return end
+        local target=self.LadyAlive and 1 or 0 local mix=self._T.ladyMix or 0
+        mix=target>mix and math.min(target,mix+delta/2) or math.max(target,mix-delta/2)
+        self._T.ladyMix=mix
+        sound.Volume=mix*_GameAudio:GetBgmGain()*(_UIAudio._T.mapGain or 1)
+        sound.Mute=_GameAudio.muted
+        local bgm=_BossStageManager._T.bossMusic
+        if isvalid(bgm) and bgm.Entity.CurrentMap==self.Entity.CurrentMap then bgm.Volume=1-mix end
+        if not self.LadyAlive and mix==0 then self:ClearLadyMusic() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearLadyMusic()
+        -- Leave no replacement music behind after the lady dies or the encounter ends.
+        if isvalid(self._T.ladyDarkness) then self._T.ladyDarkness:Destroy() end
+        self._T.ladyDarkness=nil self._T.ladyDarkAlpha=0
+        self._T.ladyDarkGeneration=(self._T.ladyDarkGeneration or 0)+1
+        if isvalid(self._T.ladySound) then self._T.ladySound:Stop() self._T.ladySound.Entity:Destroy() end
+        self._T.ladySound=nil self._T.ladyMix=0
+        local bgm=_BossStageManager._T.bossMusic
+        if isvalid(bgm) and bgm.Entity.CurrentMap==self.Entity.CurrentMap then bgm.Volume=1 end
+    end
+
+    @ExecSpace("Client")
+    method void ClearPresentation()
+        -- Clear any impact even when leaving during its animation.
+        self:ClearLaserPresentation()
+        for _,e in ipairs(self._T.screens or {}) do if isvalid(e) then e:Destroy() end end
+        self._T.screens={}
+        self:ClearCurse()
+        self:ClearLadyMusic()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        -- No ritual, moving summon, curse or screen effect outlives the encounter.
+        if self._T.cleaned then return end self._T.cleaned=true
+        self:TickForestPlatforms(0,true)
+        self:ClearHolyWater()
+        for _,r in ipairs(self._T.rituals or {}) do
+            if isvalid(r.sigil) then r.sigil:Destroy() end if isvalid(r.second) then r.second:Destroy() end
+        end
+        for _,a in ipairs(self._T.actors or {}) do
+            if isvalid(a.entity) then a.entity.Monster.FaustDashAura=false a.entity:Destroy() end
+        end
+        self._T.rituals={} self._T.actors={} self._T.curse=nil self.LadyAlive=false
+        self:ClearPresentation(self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Faust cleanup summons=0 curse=nil") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- Destruction also covers abnormal departure and interrupted fights.
+        self:Cleanup()
+    end
+    @ExecSpace("Client")
+    method void FlashSlamBar(string resource)
+        _MapleHUDManager:FlashRecoveryBar(resource)
+        if Environment:IsMakerPlay() then log("[VRF] Lady slam resource blink="..resource.." count=2") end
+    end
+end

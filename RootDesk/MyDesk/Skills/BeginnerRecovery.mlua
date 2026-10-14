@@ -1,0 +1,333 @@
+@Logic
+script BeginnerRecovery extends Logic
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        if Environment:IsMakerPlay() then log("[VRF] Beginner recovery ready HP/MP active and passive") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TryUse(string kind)
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 then return end
+        local name=kind=="hp" and "HP 회복" or "MP 회복"
+        if _SkillManager:GetHeroSkillLevelByName(name)<1 then return end
+        if self._T.channel==kind or self._T.pending then return end
+        if (self._T.cooldowns or {})[kind]~=nil and self._T.cooldowns[kind]>_UtilLogic.ServerElapsedSeconds then return end
+        if not self:IsResting(p) then return end
+        self:Cancel()
+        self._T.pending=true
+        self:LockStartup(p)
+        p.PlayerHit:RequestRecovery(kind)
+    end
+
+    method boolean IsResting(Entity p)
+        if not isvalid(p) or not isvalid(p.PlayerComponent) or p.PlayerComponent.Hp<=0 then return false end
+        local state=p.StateComponent.CurrentStateName
+        if state~="IDLE" and state~="STAND" and state~="ALERT" then return false end
+        return p.RigidbodyComponent:IsOnGround()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BeginLocal(string kind, number ready, number cooldown)
+        if not self._T.pending then
+            local p=_UserService.LocalPlayer
+            if isvalid(p) then p.PlayerHit:RequestCancelRecovery() end
+            return
+        end
+        self._T.pending=false
+        if kind=="" then self:ReleaseStartup() return end
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) then return end
+        self:LockStartup(p)
+        p.RigidbodyComponent:SetForce(Vector2.zero)
+        p.RigidbodyComponent:SetForceReserve(Vector2.zero)
+        self._T.channel=kind self._T.ready=ready
+        self._T.anchor=p.TransformComponent.WorldPosition self._T.map=p.CurrentMap
+        self._T.cooldowns=self._T.cooldowns or {}
+        self._T.cooldowns[kind]=cooldown
+        self:StartRecoveryPose(p)
+        self:PlayRecoveryEffect(p,kind)
+        self:StartSound(p)
+        if Environment:IsMakerPlay() then log("[VRF] Recovery start "..kind.." warmup=0.5 multiplier=5 cooldown=3") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Cancel()
+        local active=self._T.channel~=nil or self._T.pending==true
+        self._T.channel=nil self._T.pending=false
+        self:StopRecoveryPose()
+        self:ReleaseStartup()
+        if self._T.effect~=nil then _EffectService:RemoveEffect(self._T.effect) self._T.effect=nil end
+        if active then
+            local p=_UserService.LocalPlayer
+            if isvalid(p) then p.PlayerHit:RequestCancelRecovery() end
+            if isvalid(self._T.sound) then self._T.soundFadeAt=_UtilLogic.ElapsedSeconds self._T.fadeVolume=self._T.sound.Volume end
+            if Environment:IsMakerPlay() then log("[VRF] Recovery cancelled; passive regeneration retained") end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method number Multiplier(string kind)
+        if self._T.channel~=kind then return 1 end
+        local p=_UserService.LocalPlayer
+        if not self:StillResting(p) then self:Cancel() return 1 end
+        return _UtilLogic.ServerElapsedSeconds>=(self._T.ready or math.huge) and 5 or 1
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean StillResting(Entity p)
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 or p.CurrentMap~=self._T.map then return false end
+        if self:IsStartupLocked() then return true end
+        if not self:IsResting(p) then return false end
+        local q=p.TransformComponent.WorldPosition local a=self._T.anchor
+        if a==nil or math.abs(q.x-a.x)>0.025 or math.abs(q.y-a.y)>0.025 then return false end
+        if _SkillManager:GetHeroSkillLevelByName(self._T.channel=="hp" and "HP 회복" or "MP 회복")<1 then return false end
+        if (_MobileUIManager._T.stickX or 0)~=0 or (_MobileUIManager._T.stickY or 0)~=0 then return false end
+        if _LoginFlow._T.fullScreenFade~=nil or _BossStageManager._T.destination~=nil then return false end
+        for _,key in ipairs({KeyboardKey.LeftArrow,KeyboardKey.RightArrow,KeyboardKey.UpArrow,KeyboardKey.DownArrow}) do
+            if _InputService:IsKeyPressed(key) then return false end
+        end
+        if _KeySettingManager:IsFuncKeyPressed("attack") or _KeySettingManager:IsFuncKeyPressed("jump") then return false end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StartSound(Entity p)
+        -- The outside character and carnival reuse the same presentation implementation.
+        self:StartSoundForState(p,self._T)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TickSound()
+        -- The outside character and carnival reuse the same presentation implementation.
+        self:TickSoundForState(self._T)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TickCooldowns()
+        if _SkillManager._T.barPositions==nil then return end
+        for _,pos in ipairs(_SkillManager._T.barPositions) do
+            local key=_SkillManager._T.barKeys[pos]
+            local slot=key~=nil and _SkillManager:GetSkillOnKey(key) or nil
+            local kind=slot~=nil and (slot.name=="HP 회복" and "hp" or slot.name=="MP 회복" and "mp" or "") or ""
+            local remain=math.max(0,((self._T.cooldowns or {})[kind] or 0)-_UtilLogic.ServerElapsedSeconds)
+            local root=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_"..pos.."/RecoveryCooldown")
+            if isvalid(root) then
+                root.Enable=remain>0
+                if remain>0 then
+                    local shade=root:GetChildByName("Shade").SpriteGUIRendererComponent
+                    shade.Type=ImageType.Filled shade.FillMethod=FillMethodType.Vertical shade.FillAmount=remain/3
+                    root:GetChildByName("Time").TextGUIRendererComponent.Text=tostring(math.ceil(remain))
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TickMobileCooldowns()
+        for i=1,8 do
+            local slot=_MobileUIManager:GetMobileSlot(_MobileUIManager:MobileKey(i))
+            local kind=slot.name=="HP 회복" and "hp" or slot.name=="MP 회복" and "mp" or ""
+            local remain=math.max(0,((self._T.cooldowns or {})[kind] or 0)-_UtilLogic.ServerElapsedSeconds)
+            local root=_MobileUIManager:UI(_MobileUIManager:ButtonPath(i).."/RecoveryCooldown")
+            if isvalid(root) then
+                root.Enable=remain>0
+                if remain>0 then
+                    local shade=root:GetChildByName("Shade").SpriteGUIRendererComponent
+                    shade.Type=ImageType.Filled shade.FillMethod=FillMethodType.Vertical shade.FillAmount=remain/3
+                    root:GetChildByName("Time").TextGUIRendererComponent.Text=tostring(math.ceil(remain))
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        self:TickStartup()
+        if self._T.channel~=nil then
+            local p=_UserService.LocalPlayer
+            if not self:StillResting(p) then self:Cancel() end
+        end
+        self:TickSound()
+        self._T.uiTick=(self._T.uiTick or 0)+delta
+        if self._T.uiTick>=0.1 then self._T.uiTick=0 self:TickCooldowns() self:TickMobileCooldowns() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        self:StopRecoveryPose()
+        self:ReleaseStartup()
+        if self._T.effect~=nil then _EffectService:RemoveEffect(self._T.effect) end
+        if isvalid(self._T.sound) then self._T.sound:Stop() self._T.sound.Entity:Destroy() end
+    end
+    @ExecSpace("ClientOnly")
+    method boolean IsStartupLocked()
+        -- Shared by keyboard, touch movement and auto-hunt.
+        return (self._T.startupUntil or 0)>_UtilLogic.ElapsedSeconds
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LockStartup(Entity p)
+        -- Stop residual walking before the server accepts the recovery channel.
+        if self._T.startupPlayer==nil then
+            self._T.startupPlayer=p
+            self._T.startupController=p.PlayerControllerComponent.Enable
+        end
+        self._T.startupUntil=_UtilLogic.ElapsedSeconds+0.3
+        self:TickStartup()
+        if Environment:IsMakerPlay() then log("[VRF] Recovery movement lock seconds=0.3") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReleaseStartup()
+        -- Restore only the controller state owned by this brief lock.
+        local p=self._T.startupPlayer
+        if isvalid(p) and self._T.startupController and p.PlayerComponent.Hp>0
+            and not p.PlayerComponent:IsDead() and not _GameSystemMenu.opened
+            and _LoginFlow._T.fullScreenFade==nil and not _SkillManager._T.actionLock
+            and not _AutoHuntManager.autoOn then p.PlayerControllerComponent.Enable=true end
+        self._T.startupPlayer=nil self._T.startupController=nil self._T.startupUntil=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TickStartup()
+        -- Let the initial standing pose settle without treating it as a deliberate move.
+        local p=self._T.startupPlayer
+        if p==nil then return end
+        if not isvalid(p) or p.PlayerComponent.Hp<=0 then self:ReleaseStartup() return end
+        if not self:IsStartupLocked() then
+            self._T.anchor=p.TransformComponent.WorldPosition
+            self:ReleaseStartup()
+            if Environment:IsMakerPlay() then log("[VRF] Recovery movement unlocked") end
+            return
+        end
+        p.PlayerControllerComponent.Enable=false
+        p.MovementComponent:Stop()
+        p.RigidbodyComponent.MoveVelocity=Vector2.zero
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlayRecoveryEffect(Entity p, string kind)
+        -- The outside character and carnival reuse the same presentation implementation.
+        self:PlayRecoveryEffectForState(p,kind,self._T)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StartRecoveryPose(Entity p)
+        -- The outside character and carnival reuse the same presentation implementation.
+        self:StartRecoveryPoseForState(p,self._T)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StopRecoveryPose()
+        -- The outside character and carnival reuse the same presentation implementation.
+        self:StopRecoveryPoseForState(self._T)
+    end
+
+    method boolean IsHuntingMap(Entity map)
+        -- Share the field gate between server healing and client auto recovery; dead mobs still identify a field.
+        if not isvalid(map) then return false end
+        local name=map.Name or ""
+        if _BossStageManager:IsArena(name) or string.find(name,"arena",1,true)~=nil
+            or string.sub(name,1,14)=="regional_boss_" then return false end
+        if self._T.huntingMap==map then return true end
+        local monsters=map:GetChildComponentsByTypeName("script.Monster",true)
+        if monsters~=nil and #monsters>0 then self._T.huntingMap=map return true end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StartSoundForState(Entity p, any state)
+        if isvalid(state.sound) then
+            state.soundFadeAt=nil
+            return
+        end
+        local e=_SpawnService:SpawnByModelId("stumpyball","RecoverySound",p.TransformComponent.WorldPosition,p.CurrentMap)
+        if not isvalid(e) then return end
+        e.SpriteRendererComponent.Enable=false
+        local s=e:AddComponent("MOD.Core.SoundComponent")
+        s.AudioClipRUID="16711e51a0584f2e988e7c41ff2c6502"
+        s.Loop=false s.Bgm=false s.HearingDistance=10000 s.Volume=0
+        state.sound=s state.soundStarted=false state.soundFadeAt=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TickSoundForState(any state)
+        local s=state.sound
+        if not isvalid(s) then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if state.soundFadeAt~=nil or state.channel==nil then
+            local mix=math.max(0,1-(now-(state.soundFadeAt or now))/0.45)
+            s.Volume=(state.fadeVolume or 0)*mix
+            if mix<=0 or state.soundFadeAt==nil then s:Stop() s.Entity:Destroy() state.sound=nil end
+            return
+        end
+        if not s:IsAudioClipLoaded() then return end
+        if not state.soundStarted or not s:IsPlaying() then
+            s:Play() state.soundStarted=true
+            if Environment:IsMakerPlay() then log("[VRF] Recovery sound loop started duration="..tostring(s:GetTotalTime())) end
+        end
+        local length=s:GetTotalTime() local t=s:GetTimePosition()
+        local fade=math.min(0.6,length*0.3)
+        local gain=math.min(1,t/0.12,math.max(0,(length-t)/math.max(0.01,fade)))
+        s.Volume=0.16*gain*_GameAudio:GetBossSfxVolume(1)
+        s.Mute=_GameAudio.muted
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlayRecoveryEffectForState(Entity p, string kind, any state)
+        -- Native ranges are zero-based: HP keeps frames 2-8; MP keeps frames 1-11.
+        local ruid=kind=="hp" and "9acc7ba7139143f9a3077dc9aca435cd" or "4b04baca3edb4130b335d79f0cbb46f9"
+        local first=kind=="hp" and 1 or 0 local last=kind=="hp" and 7 or 10
+        local serial=_CarnivalActorPresentation:PlayEffectAttached(ruid,p,Vector3.zero,0,Vector3.one,true,
+            {SortingLayer="MapLayer7",OrderInLayer=20,StartFrameIndex=first,EndFrameIndex=last})
+        if state.channel~=kind then _CarnivalActorPresentation:RemoveEffect(serial) return end
+        state.effect=serial
+        if Environment:IsMakerPlay() then log("[VRF] Recovery effect playing "..kind.." first="..tostring(first+1).." last="..tostring(last+1).." serial="..tostring(serial)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StartRecoveryPoseForState(Entity p, any state)
+        local attack=p.PlayerAttack
+        if not isvalid(attack) then return end
+        attack._T.breatherToken=(attack._T.breatherToken or 0)+1
+        state.posePlayer=p state.poseToken=attack._T.breatherToken
+        attack:StartBreatherNow(p,state.poseToken)
+        if Environment:IsMakerPlay() then log("[VRF] Recovery breathing pose started "..tostring(state.channel)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void StopRecoveryPoseForState(any state)
+        local p=state.posePlayer local token=state.poseToken
+        state.posePlayer=nil state.poseToken=nil
+        if not isvalid(p) or token==nil then return end
+        local attack=p.PlayerAttack
+        -- Do not restore idle over a new skill that has already taken animation ownership.
+        if not isvalid(attack) or attack._T.breatherToken~=token then return end
+        attack._T.breatherToken=token+1
+        attack._T.isBreatherPlaying=false attack._T.isBreatherArmed=false
+        if not attack:HasActiveCombatMotion() then attack:RestoreBreatherPose() end
+        if Environment:IsMakerPlay() then log("[VRF] Recovery breathing pose released") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method table CreateActorVisuals(Entity actor, string kind)
+        -- Visual state belongs to the casting actor, including pose token and looping sound.
+        local state={channel=kind}
+        self:StartRecoveryPoseForState(actor,state)
+        self:PlayRecoveryEffectForState(actor,kind,state)
+        self:StartSoundForState(actor,state)
+        return state
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RemoveActorVisuals(any state)
+        -- Closing a window must also destroy the actor's independent audio source.
+        if state==nil then return end
+        self:StopRecoveryPoseForState(state)
+        if state.effect~=nil then _CarnivalActorPresentation:RemoveEffect(state.effect) end
+        if isvalid(state.sound) then state.sound:Stop() state.sound.Entity:Destroy() end
+    end
+
+end

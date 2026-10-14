@@ -1,0 +1,381 @@
+@Component
+script SerufEncounter extends Component
+    @Sync property string OwnerId = ""
+    @Sync property boolean CombatActive = false
+    @Sync property number HitAt = -10
+    @Sync property string Phase = "idle"
+    @Sync property number PhaseAt = 0
+    @Sync property boolean Shelled = false
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        self._T.hazards={} self._T.pearls={} self._T.clock=0 self._T.cleaned=false
+        self._T.nextAttack=3 self._T.nextFish=8 self._T.nextShark=24
+        self.Entity.MovementComponent:Stop()
+        self.Entity.RigidbodyComponent.Enable=false
+        if Environment:IsMakerPlay() then log("[VRF] Seruf initialized stationary=true attack1_skip=11") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Decorate()
+        self.Entity.TransformComponent.WorldPosition=Vector3(1.3,0.02,0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Start()
+        local now=_UtilLogic.ServerElapsedSeconds
+        self._T.oxygenAt=now+33 self._T.airReady=now+33
+        self:AirState(33,33,false,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Seruf oxygen first=33 tick=3 airCooldown=33 protection=30") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void UseAir()
+        if not self.CombatActive or self._T.cleaned then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(self._T.airReady or now+33) then return end
+        self._T.airReady=now+33 self._T.oxygenAt=now+30
+        self:AirState(33,30,false,self.OwnerId)
+        self:Sound("6a22834ef8414c809131155793933637",self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Seruf air used protection=30 cooldown=33") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PlayerDamaged(Entity player, string kind)
+        if not self.CombatActive or self._T.cleaned then return end
+        if kind=="boss.seruf.oxygen" then
+            if Environment:IsMakerPlay() then log("[VRF] Seruf oxygen damage: air cooldown unchanged") end
+            return
+        end
+        local now=_UtilLogic.ServerElapsedSeconds
+        self._T.airReady=math.max(now,self._T.airReady or now)+2
+        self:AirState(self._T.airReady-now,math.max(0,(self._T.oxygenAt or now)-now),true,self.OwnerId)
+        if kind=="boss.seruf.shark" then
+            self._T.frenzyUntil=now+6
+            self:SharkImpact(player,self.OwnerId)
+        elseif kind=="boss.seruf.melee" then
+            self:KnockAway(player,self.Entity.TransformComponent.WorldPosition.x,self.OwnerId)
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Seruf damage="..tostring(kind).." cooldown+2 remaining="..tostring(self._T.airReady-now)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Strike(Vector2 center, Vector2 size, string kind, table hits)
+        if not self.CombatActive or self._T.cleaned then return end
+        local attack=self.Entity.MonsterAttack
+        attack._T.stumpyHits=hits
+        attack:AttackFast(BoxShape(center,size,0),"boss.seruf."..kind,CollisionGroups.HitBox)
+        attack._T.stumpyHits=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SetPhase(string phase)
+        self.Phase=phase self.PhaseAt=_UtilLogic.ServerElapsedSeconds
+        self._T.actionAge=0 self._T.struck=false
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ThrowPearls()
+        local p=self.Entity.TransformComponent.WorldPosition+Vector3(0,0.85,0)
+        local count=_UtilLogic:RandomIntegerRange(9,12)
+        for i=1,count do
+            -- Even angular sectors plus random jitter avoid an unreadable single clump.
+            local angle=((i-1)/count*math.pi*2)+(_UtilLogic:RandomDouble()-0.5)*0.5
+            local e=_SpawnService:SpawnByModelId("stumpyball","SerufPearl",p,self.Entity.CurrentMap)
+            if isvalid(e) then
+                e.SpriteRendererComponent.SpriteRUID="d9e4401850e845289a3822e4a76ad830"
+                table.insert(self._T.pearls,{entity=e,x=p.x,y=p.y,vx=math.cos(angle)*2.8,vy=math.sin(angle)*2.8,age=0,hits={}})
+            end
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Seruf pearls count="..tostring(count).." damage=10%") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity SpawnHazard(string kind, number x, number y, number direction)
+        local e=_SpawnService:SpawnByModelId("serufhazard",kind,Vector3(x,y,0),self.Entity.CurrentMap)
+        if not isvalid(e) then return nil end
+        local m=e.Monster
+        m.MaxHp=kind=="shark" and 50000 or 10 m.Hp=m.MaxHp
+        if kind=="shark" then m.MonsterLevel=100 m.NameTagLevel=100 end
+        m.MinimumHitDamage=kind=="shark" and 1000 or 0
+        m.MonsterDisplayName=kind=="shark" and "상어" or "물고기 떼" m:SetupMonsterNameTag()
+        m._T.serufKind=kind m._T.serufEncounter=self
+        e.MonsterAttack.BossOwner=self.OwnerId e.MonsterAttack:SetMapActivity(false)
+        e.SpriteRendererComponent.SpriteRUID=kind=="shark" and "a92b48ab44934b9d8fd6ac83459e27d7" or (_UtilLogic:RandomIntegerRange(0,1)==0 and "322b457a7f3748c498a1ac117fd7d3ef" or "c00545950fdc40b1bf77f4f873e8c101")
+        local scale=kind=="shark" and 1 or 0.28
+        e.TransformComponent.Scale=Vector3(scale,scale,1)
+        e.HitComponent.BoxSize=kind=="shark" and Vector2(0.24,0.16) or Vector2(3.8,2.2)
+        e.SpriteRendererComponent.FlipX=direction>0
+        table.insert(self._T.hazards,{entity=e,kind=kind,dir=direction,age=0,x=x,y=y,roam=0,hits={}})
+        return e
+    end
+
+    @ExecSpace("ServerOnly")
+    method void FishWave()
+        local dir=_UtilLogic:RandomIntegerRange(0,1)==0 and 1 or -1
+        local height=0.6+_UtilLogic:RandomDouble()*4.5
+        for i=1,3 do self:SpawnHazard("fish",-dir*(8+(i-1)*1.4),height+(i%2)*0.35,dir) end
+        if Environment:IsMakerPlay() then log("[VRF] Seruf fish wave hp=10 damage=30% speed=3 height="..tostring(height)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginSharks()
+        self.Shelled=true self.Entity.HitComponent.Enable=false
+        self:SetPhase("shell") self._T.sharkAge=0
+        for _,side in ipairs({-1,1}) do
+            for i=1,2 do self:SpawnHazard("shark",side*(7+i*0.3),0.8+i*1.1,-side) end
+        end
+        self:SharkMusic(true,self.OwnerId)
+        self:Sound("47e5c29a4d7b468098ba40bf24ca42cd",self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Seruf sharks count=4 level=100 hp=50000 threshold=1000 timeout=30 speedRatio=0.7") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickHazards(Entity player, number delta)
+        local now=_UtilLogic.ServerElapsedSeconds
+        local target=player.TransformComponent.WorldPosition+Vector3(0,0.35,0)
+        local sharks=0
+        for i=#self._T.hazards,1,-1 do
+            local h=self._T.hazards[i] local e=h.entity
+            h.age=h.age+delta
+            if not isvalid(e) or e.Monster.IsDead then
+                if isvalid(e) and h.kind=="fish" and not h.deathFx then
+                    h.deathFx=true self:FishDeath(e.TransformComponent.WorldPosition,self.OwnerId)
+                    e:Destroy()
+                end
+                table.remove(self._T.hazards,i)
+            elseif h.fading then
+                h.fading=h.fading+delta
+                e.SpriteRendererComponent.Color=Color(1,1,1,math.max(0,1-h.fading))
+                if h.fading>=1 then e:Destroy() table.remove(self._T.hazards,i) else sharks=sharks+1 end
+            elseif h.kind=="shark" and (self._T.sharkAge or 0)>=30 then
+                h.fading=0.001 e.HitComponent.Enable=false e.Monster._T.serufInactive=true sharks=sharks+1
+            else
+                local oldX=h.x local oldY=h.y
+                if h.kind=="fish" then h.x=h.x+h.dir*3*delta
+                else
+                    sharks=sharks+1 h.roam=h.roam-delta
+                    local dx=target.x-h.x local dy=target.y-h.y
+                    local chase=dx*dx+dy*dy<9 or now<(self._T.frenzyUntil or 0)
+                    if not chase and h.roam<=0 then
+                        h.tx=-6.5+_UtilLogic:RandomDouble()*13 h.ty=0.6+_UtilLogic:RandomDouble()*4.7 h.roam=2+_UtilLogic:RandomDouble()*2
+                    end
+                    if not chase then dx=(h.tx or 0)-h.x dy=(h.ty or 2)-h.y end
+                    local length=math.max(0.01,math.sqrt(dx*dx+dy*dy))
+                    local speed=math.max(0.1,player.MovementComponent.InputSpeed*player.RigidbodyComponent.WalkSpeed)*0.7
+                    local step=math.min(length,speed*delta)
+                    h.x=h.x+dx/length*step h.y=h.y+dy/length*step
+                    h.dir=dx>=0 and 1 or -1
+                    e.SpriteRendererComponent.FlipX=h.dir>0
+                end
+                e.TransformComponent.WorldPosition=Vector3(h.x,h.y,0)
+                self:Strike(Vector2((oldX+h.x)/2,(oldY+h.y)/2),Vector2((h.kind=="shark" and 0.24 or 0.9)+math.abs(h.x-oldX),(h.kind=="shark" and 0.16 or 0.5)+math.abs(h.y-oldY)),h.kind,h.kind=="fish" and h.hits or nil)
+                if h.kind=="fish" and (math.abs(h.x)>14 or h.age>10) then e:Destroy() table.remove(self._T.hazards,i) end
+            end
+        end
+        if self.Shelled and sharks==0 then
+            self.Shelled=false self.Entity.HitComponent.Enable=true self:SetPhase("idle")
+            self._T.nextAttack=self._T.clock+2 self._T.nextShark=self._T.clock+35
+            self:SharkMusic(false,self.OwnerId)
+            if Environment:IsMakerPlay() then log("[VRF] Seruf sharks gone; shell and music restored") end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        if not self.CombatActive or self._T.cleaned or self.Entity.Monster.IsDead then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        self._T.clock=self._T.clock+delta
+        if self._T.oxygenAt==nil then self:Start() end
+        if now>=self._T.oxygenAt then
+            self._T.oxygenAt=self._T.oxygenAt+3
+            if not player.PlayerHit:IsFinalAttackInvincible() then
+            local damage=math.max(1,math.floor(player.PlayerComponent.MaxHp*0.1))
+            player.PlayerComponent.Hp=math.max(0,player.PlayerComponent.Hp-damage)
+            player.PlayerHit:ShowTakenDamage(damage)
+            self:PlayerDamaged(player,"boss.seruf.oxygen")
+            if Environment:IsMakerPlay() then log("[VRF] Seruf oxygen damage="..tostring(damage)) end
+            end
+        end
+        if self.Shelled then self._T.sharkAge=self._T.sharkAge+delta end
+        self:TickHazards(player,delta)
+        for i=#self._T.pearls,1,-1 do
+            local b=self._T.pearls[i] b.age=b.age+delta
+            if not isvalid(b.entity) or b.age>6 or math.abs(b.x)>9 or b.y< -0.3 or b.y>7.2 then
+                if isvalid(b.entity) then b.entity:Destroy() end table.remove(self._T.pearls,i)
+            else
+                local x=b.x+b.vx*delta local y=b.y+b.vy*delta
+                self:Strike(Vector2((x+b.x)/2,(y+b.y)/2),Vector2(0.22+math.abs(x-b.x),0.22+math.abs(y-b.y)),"pearl",b.hits)
+                b.x=x b.y=y b.entity.TransformComponent.WorldPosition=Vector3(x,y,0)
+                if next(b.hits)~=nil then b.entity:Destroy() table.remove(self._T.pearls,i) end
+            end
+        end
+        if self._T.clock>=self._T.nextFish then self._T.nextFish=self._T.clock+9 self:FishWave() end
+        if self.Shelled then return end
+        if self.Phase=="idle" then
+            if self._T.clock>=self._T.nextShark then self:BeginSharks() return end
+            if self._T.clock>=self._T.nextAttack then
+                local p=self.Entity.TransformComponent.WorldPosition
+                local t=player.TransformComponent.WorldPosition
+                self._T.dir=t.x>=p.x and 1 or -1
+                self.Entity.SpriteRendererComponent.FlipX=self._T.dir>0
+                local melee=math.abs(t.x-p.x)<2 and math.abs(t.y-p.y)<1.5 and self._T.lastAttack~="melee"
+                self:SetPhase(melee and "melee" or "pearl") self._T.lastAttack=self.Phase
+                self:Sound(self.Phase=="melee" and "7d0474290d2b4ac6be36c947b14d6e6c" or "f319b180f94046579c1d72a48ef17e6a",self.OwnerId)
+            end
+        else
+            self._T.actionAge=self._T.actionAge+delta
+            if not self._T.struck and self._T.actionAge>=1.05 then
+                self._T.struck=true
+                if self.Phase=="pearl" then self:ThrowPearls()
+                else
+                    local p=self.Entity.TransformComponent.WorldPosition
+                    self:Strike(Vector2(p.x+self._T.dir*0.85,p.y+0.65),Vector2(1.8,1.3),"melee",{})
+                end
+            end
+            if self._T.actionAge>=2.4 then self:SetPhase("idle") self._T.nextAttack=self._T.clock+0.6 end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        if self._T.cleaned then return end
+        self.CombatActive=false
+        self._T.clock=self._T.clock+delta
+        if self.Shelled then self._T.sharkAge=(self._T.sharkAge or 0)+delta end
+        self:TickHazards(player,delta)
+        self.Entity.HitComponent.Enable=false
+        for i=#self._T.pearls,1,-1 do
+            local b=self._T.pearls[i] b.age=b.age+delta
+            if not isvalid(b.entity) or b.age>6 or math.abs(b.x)>9 or b.y< -0.3 or b.y>7.2 then
+                if isvalid(b.entity) then b.entity:Destroy() end table.remove(self._T.pearls,i)
+            else
+                b.x=b.x+b.vx*delta b.y=b.y+b.vy*delta
+                b.entity.TransformComponent.WorldPosition=Vector3(b.x,b.y,0)
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        if self._T.cleaned then return end
+        self._T.cleaned=true self.CombatActive=false
+        for _,list in ipairs({self._T.pearls or {},self._T.hazards or {}}) do for _,h in ipairs(list) do if isvalid(h.entity) then h.entity:Destroy() end end end
+        self._T.pearls={} self._T.hazards={}
+        self:StopPresentation(self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Seruf cleanup hazards=0") end
+    end
+
+    @ExecSpace("Client")
+    method void AirState(number cooldown, number oxygen, boolean penalty)
+        local b=_BossStageManager
+        if b._T.stage~=5 then return end
+        b._T.targetCooldownUntil=_UtilLogic.ElapsedSeconds+cooldown
+        b._T.airMaskDuration=math.max(33,cooldown)
+        if penalty then
+            b._T.airPenalties=b._T.airPenalties or {}
+            local e=b:UI("TargetControl/Penalty"):Clone("AirPenalty") e.Enable=true
+            table.insert(b._T.airPenalties,{entity=e,at=_UtilLogic.ElapsedSeconds})
+        end
+    end
+
+    @ExecSpace("Client")
+    method void Sound(string ruid)
+        _GameAudio:PlayBossSound(ruid,0.8)
+    end
+
+    @ExecSpace("Client")
+    method void FishDeath(Vector3 position)
+        _EffectService:PlayEffect("625692ea34c24e24bdb1033a02db38bf",self.Entity,position,0,Vector3(0.28,0.28,1),false,{SortingLayer="MapLayer0",OrderInLayer=6})
+    end
+
+    @ExecSpace("Client")
+    method void KnockAway(Entity player, number x)
+        if player~=_UserService.LocalPlayer or player.PlayerComponent.Hp<=0 then return end
+        player.RigidbodyComponent:AddForce(Vector2(player.TransformComponent.WorldPosition.x>=x and 5 or -5,2.5))
+    end
+
+    @ExecSpace("Client")
+    method void SharkMusic(boolean active)
+        if not isvalid(self._T.sharkSound) then
+            local e=_SpawnService:SpawnByModelId("stumpyball","SerufMusic",Vector3.zero,self.Entity.CurrentMap)
+            e.SpriteRendererComponent.Enable=false
+            local sound=e:AddComponent("MOD.Core.SoundComponent")
+            sound.AudioClipRUID="a19fe95385bf47279f25655fc1032c98" sound.Bgm=false sound.Loop=true sound.HearingDistance=10000 sound.Volume=0
+            self._T.sharkSound=sound
+        end
+        if active then self._T.sharkSound:Play() end
+        self._T.musicTarget=active and 1 or 0
+    end
+
+    @ExecSpace("Client")
+    method void SharkImpact(Entity player)
+        if player~=_UserService.LocalPlayer then return end
+        if self._T.mark then _EffectService:RemoveEffect(self._T.mark) end
+        self._T.mark=_EffectService:PlayEffectAttached("d95c7b90545c4cbaa0e449570e39cf1a",player,Vector3(0,0.5,0),0,Vector3.one,true,{SortingLayer="MapLayer0",OrderInLayer=8})
+        self._T.markUntil=_UtilLogic.ElapsedSeconds+6
+        if isvalid(self._T.blood) then self._T.blood:Destroy() end
+        local e=_BossStageManager:UI("SerufBloodTemplate"):Clone("SerufBlood")
+        e.UITransformComponent.RectSize=_EntityService:GetEntityByPath("/ui/BossStage").UITransformComponent.RectSize
+        e.SpriteGUIRendererComponent.AnimClipPlayType=SpriteAnimClipPlayType.Onetime
+        e.Enable=true self._T.blood=e
+        e:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function() if isvalid(e) then e:Destroy() end end)
+        if not isvalid(self._T.heartSound) then
+            local audioEntity=_SpawnService:SpawnByModelId("stumpyball","SerufHeartbeat",Vector3.zero,self.Entity.CurrentMap)
+            audioEntity.SpriteRendererComponent.Enable=false
+            self._T.heartSound=audioEntity:AddComponent("MOD.Core.SoundComponent")
+            self._T.heartSound.AudioClipRUID="24544d2bcabb4339b7264b9091ff09b4"
+            self._T.heartSound.Loop=true self._T.heartSound.HearingDistance=10000
+        end
+        self._T.heartSound:Stop() self._T.heartSound:Play()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        local now=_UtilLogic.ElapsedSeconds
+        if self._T.markUntil~=nil and now>=self._T.markUntil then
+            if self._T.mark then _EffectService:RemoveEffect(self._T.mark) end
+            self._T.mark=nil self._T.markUntil=nil
+            if isvalid(self._T.heartSound) then self._T.heartSound:Stop() end
+        end
+        if self._T.musicTarget~=nil and isvalid(self._T.sharkSound) then
+            local mix=self._T.musicMix or 0 local target=self._T.musicTarget
+            mix=target>mix and math.min(target,mix+delta/2) or math.max(target,mix-delta/2)
+            self._T.musicMix=mix self._T.sharkSound.Volume=mix*_GameAudio:GetBgmGain()*(_UIAudio._T.mapGain or 1)
+            local bgm=_BossStageManager._T.bossMusic
+            if isvalid(bgm) then bgm.Volume=1-mix end
+            if target==0 and mix==0 then self._T.sharkSound:Stop() end
+        end
+        if isvalid(self._T.heartSound) then
+            self._T.heartSound.Volume=_GameAudio:GetBossSfxVolume(0.8)
+            self._T.heartSound.Mute=_GameAudio.muted
+        end
+        if self.Entity.Monster.IsDead then return end
+        local sprite=self.Entity.SpriteRendererComponent
+        local clip=self.Shelled and "789224c8d4d5474191639e008cca1e47" or self.Phase=="melee" and "df67321f4b7348d2a52294a3fd376d35" or "2d5ced662b8848dcbba8dd0e12233f7e"
+        if self.Phase=="pearl" and not self.Shelled then
+            -- Static native frames cannot ever display the excluded eleventh frame, even under lag.
+            local frames={"18e65853f94c4b9d9b37b0ab2952640a","7470ba310a204a7484e9c1a80166fb83","3aa2c95a60634bb8a62cfb108f8018b2","8fbc4228a8d94fba9a35d2c7a4baabdd","87f077dbadb443758b33da8c69b9e77d","4b8c78c9bd5d4859accd0d21fb8a11a6","dbd7e857b55f4f7c912c1e7c5d6e1ece","55afaa693c364b4da8967f5457fd597a","fee86b46d2e44dacb48993bc21337dd1","55a6d197d5e347f99e9910b97cbc556a","38cd586ea3394321b5ef9ce6902be0bc","3666dcc6e22d440bb3dbb1cb5421d67e","59492e3f6d264326a9ee9f618f9700aa","9a8d69de0d9d4c70baa4de6dc398cab4","9f650b557997409c9657c4df3c3fbe00","dd13037d8f3e404ba6f4afce67f1e4ee","7754ffbf5269499183d6dd8fbe2e3284","a750e1d4d104404bbc6d4a0ca7b0f89e","ff0851eb333e4e7b9b39400268950fdc"}
+            local index=math.max(1,math.min(#frames,math.floor((_UtilLogic.ServerElapsedSeconds-self.PhaseAt)/0.11)+1))
+            clip=frames[index]
+        end
+        if sprite.SpriteRUID~=clip then sprite.SpriteRUID=clip end
+    end
+
+    @ExecSpace("Client")
+    method void StopPresentation()
+        if self._T.mark then _EffectService:RemoveEffect(self._T.mark) end
+        self._T.mark=nil self._T.markUntil=nil self._T.musicTarget=nil
+        for _,key in ipairs({"sharkSound","heartSound"}) do
+            local sound=self._T[key]
+            if isvalid(sound) then sound:Stop() sound.Entity:Destroy() end
+            self._T[key]=nil
+        end
+        if isvalid(self._T.blood) then self._T.blood:Destroy() end
+        local bgm=_BossStageManager._T.bossMusic if isvalid(bgm) then bgm.Volume=1 end
+    end
+
+    method void OnEndPlay()
+        if self:IsServer() then self:Cleanup() else self:StopPresentation() end
+    end
+end

@@ -1,0 +1,373 @@
+@Component
+script RegionalBossEncounter extends Component
+    property string OwnerId = ""
+    @Sync property integer StageIndex = 6
+    @Sync property boolean CombatActive = false
+    @Sync property number HitAt = -10
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        self._T.hazards={} self._T.markers={} self._T.serial=0 self._T.clock=0
+        self._T.mode="rest" self._T.remaining=2 self._T.pattern=0 self._T.cleaned=false
+        if Environment:IsMakerPlay() then log("[VRF] Regional encounter boot") end
+    end
+
+    method table Data()
+        return _RegionalBossCatalog:Stage(self.StageIndex)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Decorate()
+        local d=self:Data()
+        if self.StageIndex==6 then
+            self.Entity.Monster.IsUndead=true
+            -- Match Stumpy's narrow horizontal hitbox; preserve Faust's height.
+            local hit=self.Entity.HitComponent
+            hit.BoxSize=Vector2(0.3625,hit.BoxSize.y)
+            if Environment:IsMakerPlay() then log("[VRF] Faust hitbox width="..tostring(hit.BoxSize.x)) end
+            local faust=self.Entity:GetComponent("script.FaustEncounter") or self.Entity:AddComponent("FaustEncounter")
+            faust.OwnerId=self.OwnerId
+        end
+        self.Entity.MovementComponent.InputSpeed=1
+        self.Entity.RigidbodyComponent.WalkSpeed=0.85
+        self.Entity.SpriteRendererComponent.SpriteRUID=d.stand
+        self.Entity.SpriteRendererComponent.OrderInLayer=12
+        self.Entity.SpriteRendererComponent.SortingLayer="MapLayer7"
+        if Environment:IsMakerPlay() then log("[VRF] Regional ready stage="..tostring(self.StageIndex).." name="..d.name.." map="..self.Entity.CurrentMap.Name) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity Visual(string ruid, number x, number y, number width, number height, boolean marker)
+        self._T.serial=self._T.serial+1
+        local e=_SpawnService:SpawnByModelId(marker and "regionalhazard" or "stumpyball","RegionalVisual"..tostring(self._T.serial),Vector3(x,y,0),self.Entity.CurrentMap)
+        if not isvalid(e) then return nil end
+        if self._T.cleaned then e:Destroy() return nil end
+        local s=e.SpriteRendererComponent
+        if not marker then s.SpriteRUID=ruid end
+        s.SortingLayer="MapLayer7" s.OrderInLayer=marker and 8 or 15
+        s.FlipX=false s.PlayRate=1 s.StartFrameIndex=0 s.EndFrameIndex=2147483647
+        if marker then
+            e.TransformComponent.Scale=Vector3(width*6.25,height*6.25,1)
+            e:AddComponent("RegionalHazardVisual")
+            s.Color=Color(1,0.30,0.16,0.40)
+        else
+            s.DrawMode=SpriteDrawMode.Sliced
+            s.TiledSize=Vector2(math.max(0.38,width),math.max(0.38,height))
+            e.TransformComponent.Scale=Vector3.one
+        end
+        return e
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Marker(number x, number y, number width, number height, boolean safe)
+        local e=self:Visual("2860136c06ab075439721c027de365af",x,y,width,height,true)
+        if isvalid(e) then
+            if safe then e.SpriteRendererComponent.Color=Color(0.25,0.95,0.7,0.45) end
+            table.insert(self._T.markers,e)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ClearMarkers()
+        for _,e in ipairs(self._T.markers or {}) do if isvalid(e) then e:Destroy() end end
+        self._T.markers={}
+    end
+
+    @ExecSpace("Client")
+    method void Feedback(string effect, string sound, Vector3 position)
+        if not isvalid(self.Entity.CurrentMap) then return end
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then return end
+        if effect~="" then _EffectService:PlayEffect(effect,self.Entity.CurrentMap,position,0,Vector3.one,false,{SortingLayer="MapLayer7",OrderInLayer=16}) end
+        if sound~="" then _GameAudio:PlayBossSound(sound,1) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Strike(number x, number y, number width, number height, number rate, table hits, boolean ground)
+        if not self.CombatActive or self._T.cleaned or self.Entity.Monster.IsDead then return end
+        local attack=self.Entity.MonsterAttack
+        attack._T.stumpyHits=hits attack._T.regionalGround=ground
+        attack:AttackFast(BoxShape(Vector2(x,y),Vector2(width,height),0),"boss.regional."..tostring(math.floor(rate*100+0.5)),CollisionGroups.HitBox)
+        attack._T.stumpyHits=nil attack._T.regionalGround=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Hazard(string kind, number x, number y, number vx, number vy, number width, number height, number duration, number rate, number delay)
+        local d=self:Data()
+        local solid=kind=="beam" or kind=="pool" or kind=="mine" or kind=="wave"
+        local ruid=solid and d.hitFx or d.ball
+        local size=self.StageIndex==6 and 0.96 or 0.48
+        local e=self:Visual(ruid,x,y,solid and width or size,solid and height or size,false)
+        if not isvalid(e) then return end
+        e.SpriteRendererComponent.Color=Color(1,1,1,0.95)
+        if Environment:IsMakerPlay() then log("[VRF][BossVisual] kind="..kind.." art="..ruid.." layer=MapLayer7") end
+        local h={entity=e,kind=kind,x=x,y=y,vx=vx,vy=vy,width=width,height=height,age=0,life=duration,rate=rate,delay=delay,hits={},pulse=0}
+        if kind=="zombieBanana" then h.reach=self.Entity.FaustEncounter.ZombieBananaRange h.distance=0 end
+        table.insert(self._T.hazards,h)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickHazards(Entity player, number delta)
+        local d=self:Data()
+        for i=#self._T.hazards,1,-1 do
+            local h=self._T.hazards[i]
+            h.age=h.age+delta
+            if not isvalid(h.entity) or h.age>h.life or h.x<d.left-2 or h.x>d.right+2 or h.y<d.floor-2 then
+                if isvalid(h.entity) then h.entity:Destroy() end
+                if h.kind=="zombieBanana" then if Environment:IsMakerPlay() then log("[VRF] Zombie banana removed") end end
+                table.remove(self._T.hazards,i)
+            else
+                local previousX=h.x local previousY=h.y
+                if h.kind=="homing" and h.age<1.2 then
+                    local aim=player.TransformComponent.WorldPosition+Vector3(0,0.4,0)
+                    local dx=aim.x-h.x local dy=aim.y-h.y local length=math.max(0.1,math.sqrt(dx*dx+dy*dy))
+                    local speed=math.sqrt(h.vx*h.vx+h.vy*h.vy)
+                    h.vx=h.vx+(dx/length*speed-h.vx)*math.min(1,delta*2)
+                    h.vy=h.vy+(dy/length*speed-h.vy)*math.min(1,delta*2)
+                end
+                h.x=h.x+h.vx*delta h.y=h.y+h.vy*delta
+                h.entity.TransformComponent.WorldPosition=Vector3(h.x,h.y,0)
+                local strikeX=h.x local strikeY=h.y local canStrike=true
+                if h.reach~=nil then
+                    local speed=math.sqrt(h.vx*h.vx+h.vy*h.vy)
+                    local remaining=math.max(0,h.reach-h.distance)
+                    local damageStep=math.min(delta,remaining/math.max(0.001,speed))
+                    strikeX=previousX+h.vx*damageStep strikeY=previousY+h.vy*damageStep
+                    canStrike=remaining>0
+                    h.distance=h.distance+speed*delta
+                    if h.distance>=h.reach then
+                        local fadeAge=(h.distance-h.reach)/math.max(0.001,speed)
+                        h.entity.SpriteRendererComponent.Color=Color(1,1,1,0.95*math.max(0,1-fadeAge/0.5))
+                        if not h.fading then h.fading=true if Environment:IsMakerPlay() then log("[VRF] Zombie banana range ended damage=off fade=0.5") end end
+                    end
+                end
+                if h.age>=h.delay and canStrike then
+                    if h.kind=="pool" then
+                        h.pulse=h.pulse+delta
+                        if h.pulse>=1 then h.pulse=0 h.hits={} end
+                    end
+                    self:Strike((strikeX+previousX)/2,(strikeY+previousY)/2,h.width+math.abs(strikeX-previousX),h.height+math.abs(strikeY-previousY),h.rate,h.hits,h.kind=="wave")
+                    if h.kind=="mine" then
+                        self:Feedback(d.hitFx,"",Vector3(h.x,h.y,0),self.OwnerId)
+                        h.life=h.age+0.15 h.kind="burst"
+                        h.entity.SpriteRendererComponent.Color=Color(1,0.8,0.2,0.7)
+                    elseif (h.kind=="shot" or h.kind=="homing" or h.kind=="zombieBanana") and next(h.hits)~=nil then h.life=0 end
+                elseif h.kind=="mine" then
+                    h.entity.SpriteRendererComponent.Color=Color(1,0.8,0.65,0.65+0.3*math.abs(math.sin(h.age*8)))
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StartPattern(Entity player, integer index)
+        local d=self:Data() local t=self._T
+        self:ClearMarkers()
+        t.pattern=index t.spec=d.patterns[index] t.mode="tell" t.remaining=math.max(1.25,t.spec.tell) t.age=0
+        t.origin=self.Entity.TransformComponent.WorldPosition
+        t.target=player.TransformComponent.WorldPosition
+        t.dir=t.target.x>=t.origin.x and 1 or -1
+        t.safeX=math.max(d.left+1.4,math.min(d.right-1.4,t.target.x+(_UtilLogic:RandomDouble()-0.5)*2))
+        t.echo={t.target} t.hits={}
+        self.Entity.MovementComponent:Stop()
+        self.Entity.TransformComponent.Scale=Vector3(-t.dir,1,1)
+        self.Entity.SpriteRendererComponent.SpriteRUID=t.spec.clip
+        self.Entity.SpriteRendererComponent.StartFrameIndex=0 self.Entity.SpriteRendererComponent.EndFrameIndex=2147483647
+        local kind=t.spec.kind
+        local hint="붉은 예고 범위를 벗어나세요."
+        if self.StageIndex==6 then
+            hint="바나나를 피하세요."
+        elseif kind=="shock" or kind=="wave" or kind=="dash" then
+            hint="점프해서 피하세요."
+            self:Marker((d.left+d.right)/2,d.floor+0.13,d.right-d.left,0.22,false)
+        elseif kind=="safe" then
+            hint="초록색 안전지대로 이동하세요."
+            self:Marker(t.safeX,d.floor+0.5,2.6,1,true)
+        elseif kind=="beam" or kind=="cross" then
+            hint="광선의 높이를 확인하고 숙이거나 점프하세요."
+            self:Marker((d.left+d.right)/2,t.target.y+0.58,d.right-d.left,0.16,false)
+            if kind=="cross" then self:Marker(t.target.x,t.target.y+2,0.45,4,false) end
+        elseif kind=="melee" then
+            self:Marker(t.origin.x+t.dir*1.25,t.origin.y+0.7,2.5,1.4,false)
+        else
+            self:Marker(t.target.x,t.target.y+0.1,1.5,0.16,false)
+        end
+        _BossStageManager:WarningText(d.name.." · "..t.spec.name.." — "..hint,self.OwnerId)
+        self:Feedback("",t.spec.sound,t.origin,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Regional tell stage="..tostring(self.StageIndex).." pattern="..tostring(index).." kind="..kind) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReleasePattern(Entity player)
+        local d=self:Data() local t=self._T local s=t.spec local kind=s.kind
+        self:ClearMarkers()
+        local count=s.count+(self.StageIndex~=6 and t.enraged and (kind=="fan" or kind=="rain" or kind=="mine") and 1 or 0)
+        local origin=self.Entity.TransformComponent.WorldPosition local target=t.target
+        local width=d.right-d.left
+        if kind=="fan" or kind=="homing" then
+            local start=origin+Vector3(t.dir*0.55,0.8,0)
+            local dx=target.x-start.x local dy=target.y+0.35-start.y
+            local length=math.max(0.1,math.sqrt(dx*dx+dy*dy))
+            for i=1,count do
+                local angle=(i-(count+1)/2)*0.20 local c=math.cos(angle) local sn=math.sin(angle)
+                self:Hazard(kind=="homing" and "homing" or "shot",start.x,start.y,(dx*c-dy*sn)/length*s.speed,(dx*sn+dy*c)/length*s.speed,self.StageIndex==6 and 0.02 or 0.12,self.StageIndex==6 and 0.02 or 0.12,self.StageIndex==6 and 12 or 6,s.rate,0)
+            end
+        elseif kind=="rain" then
+            for i=1,count do
+                local x=d.left+0.5+(width-1)*(i-0.5)/count
+                self:Hazard("shot",x,target.y+4+(i%2)*0.7,0,-s.speed,0.18,0.25,5,s.rate,0)
+            end
+        elseif kind=="pool" or kind=="mine" then
+            for i=1,count do
+                local x=math.max(d.left+0.6,math.min(d.right-0.6,target.x+(i-(count+1)/2)*1.9))
+                local y=self:SurfaceY(x,target.y+0.1)
+                self:Hazard(kind,x,y+(kind=="pool" and 0.12 or 0.6),0,0,kind=="pool" and 1.4 or 1.1,kind=="pool" and 0.24 or 1.4,kind=="pool" and 6 or 2.1,s.rate,kind=="pool" and 0.25 or 1.6)
+            end
+        elseif kind=="echo" then
+            for i,p in ipairs(t.echo) do self:Hazard("mine",p.x,p.y+0.55,0,0,1.25,1.5,1.7+i*0.4,s.rate,0.7+i*0.4) end
+        elseif kind=="beam" or kind=="cross" then
+            self:Hazard("beam",(d.left+d.right)/2,target.y+0.58,0,0,width,0.16,0.4,s.rate,0)
+            if kind=="cross" then
+                for i=1,count do
+                    local x=math.max(d.left+0.5,math.min(d.right-0.5,target.x+(i-(count+1)/2)*2.8))
+                    self:Hazard("beam",x,d.floor+2.5,0,0,0.40,5,0.4,s.rate,0)
+                end
+            elseif count>1 then
+                self:Hazard("mine",(d.left+d.right)/2,target.y+1.45,0,0,width,0.18,1.5,s.rate,1.1)
+            end
+        elseif kind=="safe" then
+            local safeLeft=t.safeX-1.3 local safeRight=t.safeX+1.3
+            if safeLeft>d.left then self:Hazard("beam",(d.left+safeLeft)/2,d.floor+3,0,0,safeLeft-d.left,6,0.6,s.rate,0) end
+            if safeRight<d.right then self:Hazard("beam",(safeRight+d.right)/2,d.floor+3,0,0,d.right-safeRight,6,0.6,s.rate,0) end
+            if count>1 then self:Hazard("mine",t.safeX,d.floor+0.5,0,0,1.3,1.3,2.1,s.rate,1.7) end
+        elseif kind=="wave" then
+            for i=1,count do
+                local dir=i%2==1 and 1 or -1
+                self:Hazard("wave",dir==1 and d.left or d.right,d.floor+0.22,dir*s.speed,0,0.55,0.44,8,s.rate,0)
+            end
+        elseif kind=="melee" then
+            self:Strike(origin.x+t.dir*1.25,origin.y+0.7,2.5,1.4,s.rate,{},false)
+        elseif kind=="blink" then
+            local x=math.max(d.left+0.7,math.min(d.right-0.7,target.x-t.dir*1.8))
+            self.Entity.RigidbodyComponent:SetWorldPosition(Vector2(x,self:SurfaceY(x,target.y)+0.05))
+            self:Hazard("mine",x,target.y+0.65,0,0,2.3,1.5,1.6,s.rate,1.2)
+        elseif kind=="shock" then
+            t.mode="jump" t.age=0 t.jumps=count t.origin=origin
+            self.Entity.RigidbodyComponent.KinematicMove=true
+            self.Entity.SpriteRendererComponent.SpriteRUID=d.jump
+        elseif kind=="dash" then
+            t.mode="dash" t.age=0 t.dashes=count t.hits={}
+            self.Entity.MovementComponent.InputSpeed=s.speed/0.85
+            self.Entity.SpriteRendererComponent.SpriteRUID=d.move
+        end
+        if t.mode=="tell" then t.mode="rest" t.remaining=t.enraged and 1.8 or 2.4 self.Entity.SpriteRendererComponent.SpriteRUID=d.stand end
+        self:Feedback(d.hitFx,"",origin,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Regional release stage="..tostring(self.StageIndex).." pattern="..tostring(t.pattern).." hazards="..tostring(#t.hazards)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method number SurfaceY(number x, number fromY)
+        local d=self:Data()
+        local foot=self.Entity.CurrentMap.FootholdComponent:Raycast(Vector2(x,fromY+0.2),Vector2(0,-1),15)
+        if foot~=nil then
+            local a=foot.StartPoint local b=foot.EndPoint
+            if math.abs(b.x-a.x)>0.001 then return a.y+(b.y-a.y)*math.max(0,math.min(1,(x-a.x)/(b.x-a.x))) end
+        end
+        return d.floor
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        if not self.CombatActive or self._T.cleaned or self.Entity.Monster.IsDead then return end
+        local d=self:Data() local t=self._T local e=self.Entity local rb=e.RigidbodyComponent
+        t.clock=t.clock+delta t.age=(t.age or 0)+delta
+        self:TickHazards(player,delta)
+        local faust=e:GetComponent("script.FaustEncounter")
+        if isvalid(faust) then faust:Tick(player,delta) end
+        local pos=e.TransformComponent.WorldPosition
+        -- Original field maps extend beyond the selected arena. Keep the fight
+        -- inside visible terrain, with a real foothold for fall recovery.
+        local pp=player.TransformComponent.WorldPosition
+        local px=self.StageIndex==6 and pp.x or math.max(d.left+0.25,math.min(d.right-0.25,pp.x))
+        if px~=pp.x or pp.y<d.floor-1.5 then
+            local py=pp.y<d.floor-1.5 and self:SurfaceY(px,d.floor+0.5)+0.1 or pp.y
+            player.RigidbodyComponent:SetWorldPosition(Vector2(px,py))
+        end
+        if isvalid(faust) and faust:IsSummoning() then faust:HoldSummon() return end
+        if self.StageIndex~=6 and not t.enraged and e.Monster.Hp<=e.Monster.MaxHp*0.5 then
+            t.enraged=true
+            _BossStageManager:WarningText(d.name.."의 기세가 거세집니다! 공격 간격과 탄막 수가 변합니다.",self.OwnerId)
+            if Environment:IsMakerPlay() then log("[VRF] Regional phase2 stage="..tostring(self.StageIndex)) end
+        end
+        if t.mode=="tell" then
+            t.remaining=t.remaining-delta
+            if t.spec.kind=="echo" and #t.echo<3 and t.age>=#t.echo*0.45 then
+                local p=player.TransformComponent.WorldPosition table.insert(t.echo,p) self:Marker(p.x,p.y+0.1,1.25,0.15,false)
+            end
+            if t.remaining<=0 then self:ReleasePattern(player) end
+        elseif t.mode=="jump" then
+            local u=math.max(0,math.min(1,t.age/0.9))
+            rb.MoveVelocity=Vector2.zero rb:SetForce(Vector2.zero)
+            rb:SetWorldPosition(Vector2(t.origin.x,t.origin.y+math.sin(u*math.pi)*2.2))
+            if u>=1 then
+                rb.KinematicMove=false
+                self:Strike((d.left+d.right)/2,t.origin.y+0.25,d.right-d.left,0.6,t.spec.rate,{},true)
+                self:Feedback(d.hitFx,t.spec.sound,t.origin,self.OwnerId)
+                t.jumps=t.jumps-1
+                if t.jumps>0 then rb.KinematicMove=true t.age=-0.5 else t.mode="rest" t.remaining=2 e.SpriteRendererComponent.SpriteRUID=d.stand end
+            end
+        elseif t.mode=="dash" then
+            local nextX=pos.x+t.dir*t.spec.speed*delta
+            if t.age>=1.15 or nextX<d.left+0.3 or nextX>d.right-0.3 then
+                e.MovementComponent:Stop() t.dashes=t.dashes-1
+                if t.dashes>0 then t.dir=-t.dir t.age=-0.7 t.hits={} e.TransformComponent.Scale=Vector3(-t.dir,1,1)
+                else t.mode="rest" t.remaining=2 e.MovementComponent.InputSpeed=1 e.SpriteRendererComponent.SpriteRUID=d.stand end
+            elseif t.age>=0 then
+                e.MovementComponent:MoveToDirection(Vector2(t.dir,0),0)
+                self:Strike(pos.x,pos.y+0.35,1.2+t.spec.speed*delta,0.65,t.spec.rate,t.hits,false)
+            end
+        else
+            t.remaining=t.remaining-delta
+            local dx=player.TransformComponent.WorldPosition.x-pos.x
+            if not d.stationary and math.abs(dx)>2.4 and pos.x>d.left+0.4 and pos.x<d.right-0.4 then
+                local dir=dx>0 and 1 or -1
+                e.TransformComponent.Scale=Vector3(-dir,1,1)
+                e.SpriteRendererComponent.SpriteRUID=d.move
+                e.MovementComponent:MoveToDirection(Vector2(dir,0),0)
+            else e.MovementComponent:Stop() e.SpriteRendererComponent.SpriteRUID=d.stand end
+            if t.remaining<=0 then self:StartPattern(player,t.pattern%#d.patterns+1) end
+        end
+        if pos.y<d.floor-2 or pos.x<d.left-0.5 or pos.x>d.right+0.5 then
+            rb:SetWorldPosition(Vector2(math.max(d.left+0.6,math.min(d.right-0.6,pos.x)),d.floor+0.1))
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        -- Defeat ends damage, not the existence of the monsters already on screen.
+        self.CombatActive=false
+        local faust=self.Entity:GetComponent("script.FaustEncounter")
+        if isvalid(faust) then faust:TickAfterDefeat(player,delta) end
+        self:TickHazards(player,delta)
+        self.Entity.MovementComponent:Stop()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        if self._T.cleaned then return end
+        self._T.cleaned=true self.CombatActive=false
+        local faust=self.Entity:GetComponent("script.FaustEncounter")
+        if isvalid(faust) then faust:Cleanup() end
+        self:ClearMarkers()
+        for _,h in ipairs(self._T.hazards or {}) do if isvalid(h.entity) then h.entity:Destroy() end end
+        self._T.hazards={}
+        if isvalid(self.Entity.MovementComponent) then self.Entity.MovementComponent:Stop() end
+        if isvalid(self.Entity.RigidbodyComponent) then self.Entity.RigidbodyComponent.KinematicMove=false end
+        if Environment:IsMakerPlay() then log("[VRF] Regional cleanup stage="..tostring(self.StageIndex)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        self:Cleanup()
+    end
+end

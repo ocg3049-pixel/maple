@@ -1,0 +1,943 @@
+@Logic
+script CarnivalView extends Logic
+    property boolean autoOn = true
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.lobby=_CarnivalBattle:NewActor("","")
+        self._T.expand=0 self._T.sequence=0 self._T.touch={} self._T.models={} self._T.hit={} self._T.links=self._T.links or {}
+        self.autoOn=true self._T.blocked={} self._T.fingers={}
+        self._T.keys=_InputService:ConnectEvent(KeyDownEvent,function(e)
+            if not self:CanInput() or self:BlockedKey(e.key) then return end
+            local func=_KeySettingManager:GetFuncForKeyEnum(e.key)
+            if func=="autohunt" and not self._T.autoHeld then self._T.autoHeld=true self:ToggleAuto() end
+            local key=_SkillManager:GetSkillKeyName(e.key)
+            _CarnivalSkills:Press(key)
+        end)
+        self._T.hold=_InputService:ConnectEvent(ScreenTouchHoldEvent,function(e) self:TouchMove(e) end)
+        self._T.release=_InputService:ConnectEvent(ScreenTouchReleaseEvent,function(e) if self._T.hudTouchId==e.TouchId then self:ReleaseHUDSlot() end self._T.fingers[e.TouchId]=nil self:ReadTouches() end)
+        self._T.down=_InputService:ConnectEvent(ScreenTouchEvent,function(e) self:TouchStart(e) end)
+        log("[VRF] Carnival window view boot")
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        return _CarnivalUI:UI(path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BindHold(string name, string key)
+        self._T.links=self._T.links or {} self._T.touch=self._T.touch or {}
+        local e=self:UI("Lobby/Controls/"..name)
+        if not isvalid(e) then return end
+        local down=e:ConnectEvent(UITouchDownEvent,function()
+            if not _CarnivalUI.focused or self:UI("Summons").Enable or self:UI("Upgrades").Enable or self:UI("ConfirmLeave").Enable then return end
+            self._T.touch[key]=true
+        end)
+        local up=e:ConnectEvent(UITouchUpEvent,function() self._T.touch[key]=nil end)
+        local leave=e:ConnectEvent(UITouchExitEvent,function() self._T.touch[key]=nil end)
+        table.insert(self._T.links,{e=e,down=down,up=up,leave=leave})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetMatch()
+        self:ClearOpponent()
+        -- A match transition also ends any held shortcut.
+        self:ReleaseHUDSlot()
+        -- Clear display and prediction state when changing matches.
+        if self._T.prediction~=nil then _CarnivalPhysics:Dispose(self._T.prediction) self._T.prediction=nil end
+        self._T.cameraX=nil self._T.cameraY=nil self._T.manualUntil=0 self._T.localDisplay=nil self._T.wasManual=false
+        self._T.lastAxis=nil self._T.lastAttack=nil self._T.lastCrouch=nil
+        self._T.expand=0 self._T.sequence=0 self._T.hit={} self._T.models={} self._T.mobVisuals={}
+        self._T.positions={} self._T.touch={} self._T.jumpHeld=false self._T.downHeld=false self.autoOn=true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SendInput(number axis, boolean jump, boolean down, boolean attack)
+        local state=_CarnivalUI.state
+        if state.id==nil or state.id=="" or state.state~="active" then return end
+        self._T.sequence=(self._T.sequence or 0)+1
+        _CarnivalManager:RequestInput(state.id,axis,jump,down,attack,self.autoOn,self._T.sequence,self._T.crouching==true)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Neutral()
+        -- Release HUD holds together with keyboard focus.
+        self._T.hudHeld=nil
+        _CarnivalReplica:EndSprint()
+        -- Release the native lobby actor before switching input ownership.
+        _CarnivalReplica:Input(0,false,false,false,false)
+        if self._T.prediction~=nil then _CarnivalPhysics:Dispose(self._T.prediction) self._T.prediction=nil end
+        self._T.lastAxis=nil self._T.manualUntil=0 self._T.wasManual=false
+        self._T.touch={} self._T.fingers={} self._T.pendingJump=false self._T.pendingDown=false
+        self._T.jumpHeld=false self._T.downHeld=false self._T.sendAt=0
+        local lobby=self._T.lobby
+        if lobby~=nil and lobby.physics~=nil and isvalid(lobby.physics.body) then lobby.physics.body.MovementComponent:Stop() end
+        local state=_CarnivalUI.state
+        if state.id~=nil and state.id~="" and state.state=="active" then
+            self._T.sequence=(self._T.sequence or 0)+1
+            _CarnivalManager:RequestReleaseInput(state.id,self._T.sequence)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleAuto()
+        self.autoOn=not self.autoOn self:SendInput(0,false,false,false)
+        _CarnivalUI:Text("Lobby/Controls/Auto",self.autoOn and "자동전투 ON" or "자동전투 OFF")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Layout(number delta, boolean battle)
+        -- Show 1.5 times the world extent with uniform scaling for actors, terrain and effects.
+        local wanted=battle and 1 or 0
+        local t=self._T.expand or 0
+        if t<wanted then t=math.min(wanted,t+delta/0.35) elseif t>wanted then t=math.max(wanted,t-delta/0.35) end
+        self._T.expand=t
+        local eased=t*t*(3-2*t)
+        local w=680+504*eased local h=500+30*eased
+        local scene=self:UI("Lobby/Scene").UITransformComponent
+        scene.RectSize=Vector2(w,h) scene.anchoredPosition=Vector2(-240*(1-eased),25+6*eased)
+        local source=_UserService.LocalPlayer
+        if isvalid(source) then
+            local pos=source.TransformComponent.WorldPosition
+            local left=_UILogic:ScreenToLocalUIPosition(_UILogic:WorldToScreenPosition(Vector2(pos.x,pos.y)),scene)
+            local right=_UILogic:ScreenToLocalUIPosition(_UILogic:WorldToScreenPosition(Vector2(pos.x+1,pos.y)),scene)
+            self._T.originalScale=math.max(1,math.abs(right.x-left.x))
+            self._T.scale=self._T.originalScale/1.5
+        else self._T.originalScale=self._T.originalScale or 100 self._T.scale=self._T.originalScale/1.5 end
+        self._T.baseY=-(self._T.cameraY or 0)*self._T.scale
+        local backing=self:UI("Lobby/Scene/Backing").UITransformComponent
+        backing.RectSize=Vector2(w,h) backing.anchoredPosition=Vector2.zero
+        _CarnivalUI:Show("Lobby/Help",false)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CopyAvatar(Entity avatar, table data, boolean localActor)
+        local costume=avatar.CostumeManagerComponent
+        if not isvalid(costume) then return end
+        local player=_UserService.LocalPlayer
+        if localActor and isvalid(player) then
+            local source=player.CostumeManagerComponent
+            if costume.UseCustomEquipOnly~=source.UseCustomEquipOnly then costume.UseCustomEquipOnly=source.UseCustomEquipOnly end
+            local owner=source.DefaultEquipUserId~="" and source.DefaultEquipUserId or player.PlayerComponent.UserId
+            if costume.DefaultEquipUserId~=owner then costume.DefaultEquipUserId=owner end
+            for _,key in ipairs(_CarnivalBattle:EquipKeys()) do if costume[key]~=source[key] then costume[key]=source[key] end end
+            self:CopyEquippedAppearance(avatar,player)
+        else
+            if costume.UseCustomEquipOnly~=data.custom then costume.UseCustomEquipOnly=data.custom end
+            if costume.DefaultEquipUserId~=data.owner then costume.DefaultEquipUserId=data.owner end
+            for i,key in ipairs(_CarnivalBattle:EquipKeys()) do
+                local value=(data.equip or {})[i] or ""
+                if costume[key]~=value then costume[key]=value end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Actor(integer slot, table data, boolean localActor, number delta, boolean battle)
+        -- Draw local predicted positions directly and smooth received server positions.
+        local root=self:UI("Lobby/Scene/Actor"..tostring(slot))
+        root.Enable=data~=nil
+        if data==nil then return end
+        self._T.positions=self._T.positions or {}
+        local pos=self._T.positions[slot]
+        if pos==nil or not battle then pos={x=data.x,y=data.y} self._T.positions[slot]=pos end
+        local alpha=data.predicted and 1 or 1-math.exp(-18*delta)
+        pos.x=pos.x+(data.x-pos.x)*alpha pos.y=pos.y+(data.y-pos.y)*alpha
+        root.UITransformComponent.anchoredPosition=self:Project(pos.x,pos.y)
+        local body=root:GetChildByName("Body")
+        self:SizeAvatar(body)
+        if _UtilLogic.ElapsedSeconds>=(self._T.copyAt or 0) then self:CopyAvatar(body,data,localActor) end
+        body.AvatarGUIRendererComponent.FlipX=data.face>0
+        body.AvatarGUIRendererComponent.Color=data.dead and Color(0.6,0.65,0.7,0.5) or Color.white
+        local action=data.dead and "prone" or (data.action or "stand1")
+        local avatar=body.AvatarGUIRendererComponent:GetBodyEntity()
+        local old=self._T.models[slot]
+        local player=_UserService.LocalPlayer
+        local rate=data.skillRate or 1
+        if action=="walk1" and localActor and isvalid(player) then rate=math.max(0.1,1.2*player.RigidbodyComponent.WalkSpeed*player.MovementComponent.InputSpeed) end
+        if isvalid(avatar) and (old==nil or old.entity~=avatar or old.action~=action or old.rate~=rate) then
+            avatar:SendEvent(ActionStateChangedEvent(action,action,rate,SpriteAnimClipPlayType.Loop))
+            self._T.models[slot]={entity=avatar,action=action,rate=rate}
+        end
+        local label=root:GetChildByName("Name")
+        label.Enable=not localActor
+        if not localActor then label.TextGUIRendererComponent.Text=(data.name or "아군")..(data.dead and " · 사망" or "") end
+        root:GetChildByName("HP").Enable=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Monsters(table monsters, number delta)
+        -- Bind native monsters so original target-attached effects keep their pivots and scale.
+        local now=_UtilLogic.ServerElapsedSeconds
+        self._T.mobVisuals=self._T.mobVisuals or {}
+        for i=1,math.max(36,#monsters,self._T.monsterSlots or 0) do
+            local root=self:UI("Lobby/Scene/Mob"..tostring(i)) local m=monsters[i]
+            if not isvalid(root) and m~=nil then
+                root=_SpawnService:SpawnByEntity(self:UI("Lobby/Scene/Mob1"),"Mob"..tostring(i),Vector3.zero,self:UI("Lobby/Scene"),true)
+                self._T.monsterSlots=i
+            end
+            if not isvalid(root) then continue end
+            root.Enable=m~=nil and (not m.dead or m.training==true or now<(m.deathAt or 0)+1)
+            if m~=nil then
+                local previous=self._T.mobVisuals[i]
+                if previous==nil or previous.life~=m.life or previous.nativeId~=m.nativeId then previous={life=m.life,nativeId=m.nativeId,x=m.x,y=m.y,hitSeq=m.hitSeq or 0} self._T.mobVisuals[i]=previous end
+                local blend=1-math.exp(-20*delta)
+                if math.abs(previous.x-m.x)>4 then previous.x=m.x previous.y=m.y end
+                previous.x=previous.x+(m.x-previous.x)*blend previous.y=previous.y+(m.y-previous.y)*blend
+                root.UITransformComponent.anchoredPosition=self:Project(previous.x,previous.y)
+                local native=m.nativeId~=nil and _EntityService:GetEntity(m.nativeId) or nil
+                if isvalid(native) then
+                    local replica=_CarnivalReplica._T.client
+                    local point=native.TransformComponent.WorldPosition
+                    local origin=replica~=nil and replica.origin or Vector2(point.x-m.x,point.y-m.y)
+                    _CarnivalActorPresentation:Bind(native,root,self._T.scale,origin)
+                end
+                local body=root:GetChildByName("Body") body.Enable=not m.dead or now<(m.deathAt or 0)+1
+                body.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
+                body.UITransformComponent.anchoredPosition=Vector2.zero
+                body.UITransformComponent.UIScale=Vector3(self._T.scale/100,self._T.scale/100,1)
+                local row=_MonsterCodexCatalog:Get(m.id)
+                local profile=m.training~=true and _CarnivalCatalog:FieldProfile(row) or nil
+                local motion=m.dead and "die" or (m.motion or "stand")
+                local sprite=m.sprite or (profile~=nil and (profile[motion] or profile.stand)) or (row~=nil and row.sprite or "")
+                local alpha=m.dead and math.max(0,1-(now-(m.deathAt or -99))) or math.min(1,math.max(0,now-(m.bornAt or -99)))
+                body.SpriteGUIRendererComponent.Color=Color(1,1,1,alpha)
+                if previous.motion~=motion or previous.sprite~=sprite then
+                    body.SpriteGUIRendererComponent.AnimClipPlayType=(motion=="die" or motion=="hit") and SpriteAnimClipPlayType.Onetime or SpriteAnimClipPlayType.Loop
+                    body.SpriteGUIRendererComponent.EndFrameIndex=2147483647
+                    body.SpriteGUIRendererComponent.PlayRate=isvalid(native) and native.SpriteRendererComponent.PlayRate or 1
+                    if sprite~="" then body.SpriteGUIRendererComponent.ImageRUID=DataRef(sprite) end
+                    previous.motion=motion previous.sprite=sprite
+                end
+                if previous~=nil and previous.life==m.life and profile~=nil then
+                    local sound=""
+                    if m.dead and not previous.dead then sound=profile.dieSound
+                    elseif (m.hitSeq or 0)>previous.hitSeq then sound=profile.hitSound end
+                    if sound~="" then _GameAudio:PlaySound(sound,1) end
+                end
+                previous.dead=m.dead previous.hitSeq=m.hitSeq or 0
+                if sprite~="" and body.SpriteGUIRendererComponent.ImageRUID.DataId~=sprite then body.SpriteGUIRendererComponent.ImageRUID=DataRef(sprite) end
+                body.SpriteGUIRendererComponent.FlipX=m.face>0
+                self:MonsterHealthBar(root,native,m.dead)
+                local waitText=root:GetChildByName("Wait")
+                waitText.Enable=m.training==true
+                if m.dead then waitText.TextGUIRendererComponent.Text=tostring(math.ceil(m.respawn)).."초"
+                elseif m.training then
+                    waitText.UITransformComponent.RectSize=Vector2(240,44)
+                    waitText.UITransformComponent.anchoredPosition=Vector2(0,-28-((m.slot or i)-1)*42)
+                    waitText.TextGUIRendererComponent.FontSize=13
+                    waitText.TextGUIRendererComponent.FontColor=Color.white
+                    waitText.TextGUIRendererComponent.Text="허수아비 "..tostring(m.slot or i) end
+                -- Each native hit has its own original damage-skin line.
+                root:GetChildByName("Hit").Enable=false
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Frame(number delta)
+        -- Keep carnival state and execution isolated from the outside character.
+        self._T.frameDelta=delta
+        if _UtilLogic.ElapsedSeconds>=(self._T.hudAt or 0) then self._T.hudAt=_UtilLogic.ElapsedSeconds+0.1 self:RefreshPlayerHUD() end
+        local state=_CarnivalUI.state local battle=state.id~=nil and state.id~=""
+        -- Match actors stay alive while minimized; the native binding follows the snapshot.
+        self:Layout(delta,battle)
+        local canInput=self:CanInput()
+        if canInput and _UtilLogic.ElapsedSeconds>=(self._T.skillPollAt or 0) then
+            self._T.skillPollAt=_UtilLogic.ElapsedSeconds+0.1
+            if self._T.hudHeld~=nil and self._T.hudHeld.func=="" then _CarnivalSkills:Press(self._T.hudHeld.key) end
+            for _,kd in ipairs(_KeySettingManager:GetBindKeyDefs()) do if self:Pressed(kd.keyEnum) then _CarnivalSkills:Press(kd.name) end end
+        end
+        local touch=self._T.touch or {}
+        local left=canInput and (touch.left or self:Pressed(KeyboardKey.LeftArrow))
+        local right=canInput and (touch.right or self:Pressed(KeyboardKey.RightArrow))
+        local jumping=canInput and (touch.jump or self:FunctionPressed("jump"))
+        local down=canInput and (touch.down or self:Pressed(KeyboardKey.DownArrow))
+        local attack=canInput and (touch.attack or self:FunctionPressed("attack"))
+        local axis=(right and 1 or 0)-(left and 1 or 0)
+        if not _CarnivalReplica:InLobby() and _UtilLogic.ElapsedSeconds<(_CarnivalSkills._T.lockUntil or 0) then axis=0 jumping=false attack=false end
+        local jumpEdge=jumping and not self._T.jumpHeld
+        local downEdge=jumpEdge and down
+        self._T.crouching=down==true and not jumping
+        self._T.jumpHeld=jumping self._T.downHeld=down
+        if down then jumpEdge=false end
+        if battle then
+            local changed=axis~=self._T.lastAxis or attack~=self._T.lastAttack or self._T.crouching~=self._T.lastCrouch
+            if changed or jumpEdge or downEdge or _UtilLogic.ElapsedSeconds>=(self._T.sendAt or 0) then
+                self._T.sendAt=_UtilLogic.ElapsedSeconds+0.1
+                self._T.lastAxis=axis self._T.lastAttack=attack self._T.lastCrouch=self._T.crouching
+                self:SendInput(axis,jumpEdge==true,downEdge==true,attack==true)
+            end
+            local scene=state.scene or {} local me=_UserService.LocalPlayer
+            local uid=isvalid(me) and me.PlayerComponent.UserId or ""
+            local actors=scene.actors or {} local display={}
+            for i,a in ipairs(actors) do
+                display[i]=a.uid==uid and self:PredictActor(a,axis,jumpEdge==true,downEdge==true,delta,canInput) or a
+                if a.uid==uid then self:Camera(display[i].x,display[i].y,state.layout or 1) end
+            end
+            for i=1,2 do
+                local a=display[i]
+                if a~=nil and a.uid==uid and _CarnivalReplica:BindBattle(i,a) then
+                    local native=_CarnivalReplica._T.client
+                    native.prediction=a native.axis=a.action=="walk1" and a.face or 0 native.crouch=a.action=="prone"
+                    _CarnivalReplica:Draw(delta)
+                else self:Actor(i,a,a~=nil and a.uid==uid,delta,true) end
+            end
+            self:Monsters(scene.monsters or {},delta)
+            for _,a in ipairs(actors) do if a.uid==uid then self:DrawSkillVisuals(a.visuals or {}) end end
+        else
+            if _CarnivalReplica:InLobby() then
+            _CarnivalReplica:EnsureView()
+            _CarnivalReplica:Input(axis,jumpEdge==true,downEdge==true,attack==true,self._T.crouching==true)
+            _CarnivalReplica:Draw(delta)
+            self:Actor(2,nil,false,delta,false)
+            local replica=_CarnivalReplica._T.client
+            local scene=replica~=nil and replica.lobbyScene or {}
+            self:Monsters(scene.monsters or {},delta)
+            local actor=(scene.actors or {})[1]
+            self:DrawSkillVisuals(actor~=nil and actor.visuals or {})
+            else
+            local a=self._T.lobby
+            if a.physics==nil then local spawn=_CarnivalTerrain:Data(0).spawn a.x=spawn.x a.y=spawn.y end
+            local now=_UtilLogic.ElapsedSeconds
+            if now>=(a.clientStatsAt or 0) then
+                if a.clientStatsAt==nil then a.hp=_UserService.LocalPlayer.PlayerComponent.Hp end
+                a.clientStatsAt=now+0.25 a.regen=_SkillManager:GetBeginnerHpRegenPct()
+                a.maxHp=_UserService.LocalPlayer.PlayerComponent.MaxHp
+            end
+            a.hp=math.min(a.maxHp,a.hp+a.maxHp*(a.regen or 0)/100*delta*_CarnivalSkills:RecoveryMultiplier("hp"))
+            _CarnivalPhysics:Ensure(a,_UserService.LocalPlayer,_CarnivalTerrain:Data(0).platforms)
+            _CarnivalBattle:Move(a,_CarnivalTerrain:Data(0).platforms,self._T.crouching and 0 or axis,jumpEdge,downEdge,math.min(0.05,delta))
+            a.action=not a.ground and "jump" or (self._T.crouching and "prone" or (axis~=0 and "walk1" or "stand1"))
+            if attack then a.recovery=nil a.action="swingO1" end
+            _CarnivalSkills:Advance(a,{monsters={},platforms=_CarnivalTerrain:Data(0).platforms},_UtilLogic.ElapsedSeconds,delta,nil,nil)
+            if (a.skillUntil or 0)>_UtilLogic.ElapsedSeconds then a.action=a.skillAction end
+            self:DrawSkillVisuals(_CarnivalSkills:Visuals(a))
+            self:Camera(a.x,a.y,0)
+            self:Actor(1,a,true,delta,false) self:Actor(2,nil,false,delta,false)
+            self:Monsters({},delta)
+            end
+        end
+        local rect=self:UI("Lobby/Scene").UITransformComponent.RectSize
+        _CarnivalTerrain:Background(rect.x,rect.y,self._T.scale,self._T.cameraX or 0,self._T.cameraY or 0)
+        _CarnivalTerrain:Draw(battle and (state.layout or 1) or 0,self._T.scale,self._T.cameraX or 0,self._T.cameraY or 0)
+        if _UtilLogic.ElapsedSeconds>=(self._T.copyAt or 0) then self._T.copyAt=_UtilLogic.ElapsedSeconds+0.5 end
+        _CarnivalActorPresentation:DrawFrame(delta)
+        if battle then self:DrawOpponent(delta) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        self:ClearOpponent()
+        -- Disconnect the isolated HUD controls on shutdown.
+        for _,link in ipairs(self._T.hudLinks or {}) do if isvalid(link.entity) then link.entity:DisconnectEvent(UITouchDownEvent,link.down) link.entity:DisconnectEvent(UITouchUpEvent,link.up) link.entity:DisconnectEvent(UITouchExitEvent,link.leave) end end
+        self._T.hudLinks={}
+        _CarnivalPhysics:Dispose(self._T.lobby)
+        if self._T.prediction~=nil then _CarnivalPhysics:Dispose(self._T.prediction) end
+        for _,v in ipairs(self._T.links or {}) do if isvalid(v.e) then
+            v.e:DisconnectEvent(UITouchDownEvent,v.down) v.e:DisconnectEvent(UITouchUpEvent,v.up) v.e:DisconnectEvent(UITouchExitEvent,v.leave)
+        end end
+        self._T.links={}
+        if self._T.keys then _InputService:DisconnectEvent(KeyDownEvent,self._T.keys) end
+        if self._T.hold then _InputService:DisconnectEvent(ScreenTouchHoldEvent,self._T.hold) end
+        if self._T.release then _InputService:DisconnectEvent(ScreenTouchReleaseEvent,self._T.release) end
+        if self._T.down then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.down) end
+    end
+    @ExecSpace("ClientOnly")
+    method boolean CanInput()
+        return _CarnivalUI.opened and _CarnivalUI.focused and not self:UI("Summons").Enable and not self:UI("Upgrades").Enable and not self:UI("ConfirmLeave").Enable and not self:UI("Result").Enable and not _MapleHUDManager:IsChatTyping() and not _GameSystemMenu:BlocksGameplayInput() and not _SkillManager:BlocksAmountInput() and not _KeySettingManager._T.dialogOpen
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlockedKey(any key)
+        return (self._T.blocked or {})[key]==true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Pressed(any key)
+        return not self:BlockedKey(key) and _InputService:IsKeyPressed(key)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean FunctionPressed(string func)
+        local name=_KeySettingManager:GetKeyForFunc(func)
+        for _,kd in ipairs(_KeySettingManager:GetBindKeyDefs()) do
+            if kd.name==name then return self:Pressed(kd.keyEnum) end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BlockHeldKeys()
+        self._T.blocked=self._T.blocked or {}
+        for _,kd in ipairs(_KeySettingManager:GetBindKeyDefs()) do
+            if _InputService:IsKeyPressed(kd.keyEnum) then self._T.blocked[kd.keyEnum]=true end
+        end
+        for _,key in ipairs({KeyboardKey.LeftArrow,KeyboardKey.RightArrow,KeyboardKey.UpArrow,KeyboardKey.DownArrow}) do
+            if _InputService:IsKeyPressed(key) then self._T.blocked[key]=true end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void InputTick()
+        local changed=false
+        for key,_ in pairs(self._T.blocked or {}) do
+            if not _InputService:IsKeyPressed(key) then self._T.blocked[key]=nil changed=true end
+        end
+        if changed then _KeySettingManager:ApplyPlayerActionKeys() end
+        if not self:FunctionPressed("autohunt") then self._T.autoHeld=false end
+        if not _CarnivalUI.opened or not _CarnivalUI.focused then return end
+        if self._T.wasInput and not self:CanInput() then self:Neutral() end
+        self._T.wasInput=self:CanInput()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TouchStart(any e)
+        _CarnivalUI:PointerDown(e.TouchPoint)
+        if not self:CanInput() then return end
+        for _,item in ipairs(self._T.hudSlots or {}) do
+            if _UIClickArbiter:ContainsScreenPoint(self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..item.pos),e.TouchPoint) then self:PressHUDSlot(item.pos,e.TouchId) return end
+        end
+        if not _MobileUIManager:IsMobile() then return end
+        local name=""
+        for _,v in ipairs({{"Lobby/Touch/Stick","stick"},{"Lobby/Controls/Left","left"},{"Lobby/Controls/Right","right"},{"Lobby/Controls/Jump","jump"},{"Lobby/Controls/Attack","attack"}}) do
+            if _UIClickArbiter:ContainsScreenPoint(self:UI(v[1]),e.TouchPoint) then name=v[2] break end
+        end
+        if name=="" then return end
+        self._T.fingers[e.TouchId]={name=name,x=0,y=0}
+        self:TouchMove(e)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TouchMove(any e)
+        local finger=(self._T.fingers or {})[e.TouchId]
+        if finger==nil or not self:CanInput() then return end
+        if finger.name=="stick" then
+            local q=_UICursorManager:ScreenToElementPoint(self:UI("Lobby/Touch/Stick"),e.TouchPoint)
+            finger.x=math.abs(q.x)<18 and 0 or (q.x>0 and 1 or -1)
+            finger.y=math.abs(q.y)<28 and 0 or (q.y>0 and 1 or -1)
+            local length=math.sqrt(q.x*q.x+q.y*q.y) local factor=length>48 and 48/length or 1
+            self:UI("Lobby/Touch/Stick/Knob").UITransformComponent.anchoredPosition=Vector2(q.x*factor,q.y*factor)
+        end
+        self:ReadTouches()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReadTouches()
+        local touch={} local stick=false
+        for _,finger in pairs(self._T.fingers or {}) do
+            if finger.name=="stick" then
+                stick=true touch.left=finger.x<0 touch.right=finger.x>0 touch.down=finger.y<0
+            else touch[finger.name]=true end
+        end
+        self._T.touch=touch
+        if not stick then
+            local knob=self:UI("Lobby/Touch/Stick/Knob") if isvalid(knob) then knob.UITransformComponent.anchoredPosition=Vector2.zero end
+        end
+    end
+    @ExecSpace("ClientOnly")
+    method void DrawSkillVisuals(table data)
+        -- Render the existing projectile art and independent summoned avatars inside the scene.
+        self._T.skillNodes=self._T.skillNodes or {} self._T.summonNodes=self._T.summonNodes or {} self._T.summonActions=self._T.summonActions or {}
+        local parent=self:UI("Lobby/Scene")
+        local effects=data.effects or {}
+        for i=1,math.max(#effects,#self._T.skillNodes) do
+            local e=effects[i] local node=self._T.skillNodes[i]
+            if e~=nil and not isvalid(node) then
+                node=_SpawnService:SpawnByEntity(self:UI("Lobby/Scene/EffectTemplate"),"SkillEffect"..tostring(i),Vector3.zero,parent,false)
+                self._T.skillNodes[i]=node
+            end
+            if isvalid(node) then
+                local visible=e~=nil and e.sprite~=""
+                if visible then
+                    if node.SpriteGUIRendererComponent.ImageRUID.DataId~=e.sprite then node.SpriteGUIRendererComponent.ImageRUID=DataRef(e.sprite) end
+                    node.SpriteGUIRendererComponent.FlipX=e.face>0
+                    node.UITransformComponent.RectSize=Vector2(80,50)
+                    node.UITransformComponent.anchoredPosition=self:Project(e.x,e.y)
+                end
+                if node.Enable~=visible then node.Enable=visible end
+            end
+        end
+        local summons=data.summons or {}
+        for i=1,math.max(#summons,#self._T.summonNodes) do
+            local s=summons[i] if s~=nil and s.native then s=nil end local node=self._T.summonNodes[i]
+            if s~=nil and not isvalid(node) then
+                node=_SpawnService:SpawnByEntity(self:UI("Lobby/Scene/Actor1"),"SkillSummon"..tostring(i),Vector3.zero,parent,true)
+                self._T.summonNodes[i]=node
+            end
+            if isvalid(node) then
+                node.Enable=s~=nil
+                if s~=nil then
+                    node.UITransformComponent.anchoredPosition=self:Project(s.x,s.y)
+                    local body=node:GetChildByName("Body") self:CopyAvatar(body,{},true)
+                    body.AvatarGUIRendererComponent.FlipX=s.face>0
+                    local avatar=body.AvatarGUIRendererComponent:GetBodyEntity()
+                    if isvalid(avatar) and self._T.summonActions[i]~=s.action then avatar:SendEvent(ActionStateChangedEvent(s.action,s.action,1,SpriteAnimClipPlayType.Loop)) self._T.summonActions[i]=s.action end
+                    node:GetChildByName("Name").TextGUIRendererComponent.Text=s.name.." Lv."..tostring(s.level)
+                    node:GetChildByName("HP").Enable=false
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector2 Project(number x, number y)
+        -- Actors, monsters, effects and map art share a single world-to-window projection.
+        return Vector2((x-(self._T.cameraX or 0))*self._T.scale,(y-(self._T.cameraY or 0))*self._T.scale)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SizeAvatar(Entity avatar)
+        -- Account for every UI ancestor through local projection and preserve the world actor's scale.
+        local source=_UserService.LocalPlayer
+        local size=isvalid(source) and source.TransformComponent.Scale or Vector3.one
+        local factor=self._T.scale/100
+        avatar.AvatarGUIRendererComponent.PreserveAvatar=PreserveSpriteType.NativeSize
+        avatar.UITransformComponent.anchoredPosition=Vector2.zero
+        avatar.UITransformComponent.UIScale=Vector3(factor*math.abs(size.x),factor*math.abs(size.y),1)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Camera(number x, number y, integer layout)
+        -- Pan inside the source map instead of scaling its character or flattening its platforms.
+        local data=_CarnivalTerrain:Data(layout)
+        local rect=self:UI("Lobby/Scene").UITransformComponent.RectSize
+        local halfX=rect.x/(2*self._T.scale) local halfY=rect.y/(2*self._T.scale)
+        local cameraX=self._T.cameraX local cameraY=self._T.cameraY
+        if self._T.cameraLayout~=layout or cameraX==nil then cameraX=x cameraY=y+0.8 self._T.cameraLayout=layout end
+        local deadX=halfX*0.35 local deadY=halfY*0.25
+        if x-cameraX>deadX then cameraX=x-deadX elseif x-cameraX< -deadX then cameraX=x+deadX end
+        local targetY=y+0.8
+        if targetY-cameraY>deadY then cameraY=targetY-deadY elseif targetY-cameraY< -deadY then cameraY=targetY+deadY end
+        local bounds=data.bounds
+        cameraX=halfX*2>=bounds.maxX-bounds.minX and (bounds.maxX+bounds.minX)/2 or math.max(bounds.minX+halfX,math.min(bounds.maxX-halfX,cameraX))
+        cameraY=data.flat and (data.floorY+halfY*0.68) or math.max(bounds.minY+halfY-0.5,math.min(bounds.maxY+halfY,cameraY))
+        self._T.cameraX=cameraX self._T.cameraY=cameraY self._T.baseY=-cameraY*self._T.scale
+    end
+
+    @ExecSpace("ClientOnly")
+    method table PredictActor(table data, number axis, boolean jump, boolean down, number delta, boolean canInput)
+        -- Preserve a continuous display position when local input hands control back to auto hunting.
+        local now=_UtilLogic.ElapsedSeconds
+        local replica=_CarnivalReplica._T.client
+        if replica~=nil and replica.battle==_CarnivalUI.state.id and isvalid(replica.actor) then
+            local position=replica.actor.TransformComponent.WorldPosition
+            local copy={} for key,value in pairs(data) do copy[key]=value end
+            copy.x=position.x-replica.origin.x copy.y=position.y-replica.origin.y
+            data=copy
+        end
+        if axis~=0 or jump or down then self._T.manualUntil=now+0.3 end
+        if replica~=nil and replica.rushMotion~=nil and _CarnivalReplica:UpdateRushMotion() then
+            local moved={} for key,value in pairs(data) do moved[key]=value end
+            moved.x=replica.prediction.x moved.y=replica.prediction.y moved.predicted=true
+            self._T.localDisplay={uid=data.uid,x=moved.x,y=moved.y} self._T.wasManual=false
+            return moved
+        end
+        if replica~=nil and now>=(replica.skillState.actionLockUntil or 0) and (axis~=0 or jump or down or self._T.crouching) then _CarnivalReplica:CancelActorRecovery() end
+        local manual=canInput and not data.dead and not data.forcedMotion and (not self.autoOn or now<(self._T.manualUntil or 0) or (self._T.wasManual and self._T.prediction~=nil and not self._T.prediction.ground))
+        local predicted=self._T.prediction
+        local display=self._T.localDisplay
+        if display==nil or display.uid~=data.uid then display={uid=data.uid,x=data.x,y=data.y} self._T.localDisplay=display end
+        local view={} for key,value in pairs(data) do view[key]=value end
+        if manual then
+            if predicted==nil then
+                predicted={x=display.x,y=display.y,face=data.face,ground=data.ground,hp=data.hp,maxHp=data.maxHp}
+                self._T.prediction=predicted
+            elseif not self._T.wasManual then
+                _CarnivalPhysics:Warp(predicted,display.x,display.y)
+                predicted.offsetX=0 predicted.offsetY=0 predicted.settled=false
+            end
+            local sprinting=replica~=nil and replica.skillState.sprintActive==true
+            predicted.sprintMultiplier=sprinting and 2 or 1
+            if sprinting and canInput and (axis~=replica.skillState.sprintAxis or self._T.crouching) then _CarnivalReplica:EndSprint() predicted.sprintMultiplier=1 end
+            local castLocked=data.locked or (replica~=nil and (((replica.skillState.actionLockUntil or 0)>now) or replica.actor:GetComponent("PlayerAttack"):IsAutoAttackMotionLocked()))
+            if castLocked and not predicted.castLocked and predicted.physics~=nil then predicted.physics.body.MovementComponent:Stop() end
+            predicted.castLocked=castLocked
+            _CarnivalPhysics:Predict(predicted,(replica~=nil and isvalid(replica.actor)) and replica.actor or _UserService.LocalPlayer,_CarnivalBattle:Platforms(_CarnivalUI.state.layout or 1),data,(castLocked or self._T.crouching) and 0 or axis,jump and not castLocked,down and not castLocked,delta)
+            display.x=predicted.viewX or predicted.x display.y=predicted.viewY or predicted.y view.face=predicted.face view.ground=predicted.ground
+            if data.action=="stand1" or data.action=="walk1" or data.action=="jump" or data.action=="prone" then
+                view.action=not predicted.ground and "jump" or (self._T.crouching and "prone" or (axis~=0 and "walk1" or "stand1"))
+            end
+        else
+            if predicted~=nil and predicted.physics~=nil and isvalid(predicted.physics.body) then
+                predicted.physics.body.MovementComponent:MoveToDirection(Vector2.zero,0)
+            end
+            if replica~=nil and replica.landing~=nil then
+                local landing=replica.landing
+                if now<landing.untilTime and math.abs(data.x-landing.x)>0.2 then data.x=landing.x data.y=landing.y else replica.landing=nil end
+            end
+            local dx=data.x-display.x local dy=data.y-display.y
+            local alpha=dx*dx+dy*dy>9 and 1 or 1-math.exp(-18*delta)
+            display.x=display.x+dx*alpha display.y=display.y+dy*alpha
+        end
+        self._T.wasManual=manual
+        view.x=display.x view.y=display.y view.predicted=true
+        return view
+    end
+
+    @ExecSpace("ClientOnly")
+    method void WirePlayerHUD()
+        -- Reuse the player's slot artwork with isolated carnival touch handlers.
+        self._T.hudSlots={} self._T.hudLinks={}
+        for index,pos in ipairs(_SkillManager._T.barPositions or {}) do
+            local node=self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..pos)
+            if isvalid(node) then
+                local item={node=node,pos=pos,index=index,key=pos,func=""}
+                table.insert(self._T.hudSlots,item)
+                local touch=node:GetChildByName("Touch")
+                local down=touch:ConnectEvent(UITouchDownEvent,function(e) self:PressHUDSlot(pos,e.TouchId) end)
+                local release=function() self:ReleaseHUDSlot() end
+                table.insert(self._T.hudLinks,{entity=touch,down=down,up=touch:ConnectEvent(UITouchUpEvent,release),leave=touch:ConnectEvent(UITouchExitEvent,release)})
+            end
+        end
+        log("[VRF] Carnival player HUD wired slots="..tostring(#self._T.hudSlots))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshPlayerHUD()
+        -- Lobby resources belong to the replica; key bindings remain shared.
+        if self._T.hudSlots==nil or #self._T.hudSlots==0 then self:WirePlayerHUD() end
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) then return end
+        local hp=player.PlayerComponent.Hp local maxHp=player.PlayerComponent.MaxHp
+        local state=_CarnivalUI.state
+        if state.id~=nil and state.id~="" then
+            for _,a in ipairs((state.scene or {}).actors or {}) do
+                if a.uid==player.PlayerComponent.UserId then hp=a.hp maxHp=a.maxHp break end
+            end
+        end
+        local mp=_MpManager:GetCurrentMp() local maxMp=_MpManager:GetMaxMp()
+        local replica=_CarnivalReplica._T.client
+        if replica~=nil and isvalid(replica.actor) then
+            hp=replica.actor.PlayerComponent.Hp maxHp=replica.actor.PlayerComponent.MaxHp
+            mp=_CarnivalReplica:GetCurrentMp() maxMp=_CarnivalReplica:GetMaxMp()
+        end
+        for _,v in ipairs({{"HpBar",hp,maxHp},{"MpBar",mp,maxMp}}) do
+            local bar=self:UI("Lobby/PlayerHUD/"..v[1])
+            local current=math.max(0,math.floor(v[2] or 0)) local maximum=math.max(0,math.floor(v[3] or 0))
+            bar:GetChildByName("Fill").SpriteGUIRendererComponent.FillAmount=maximum>0 and math.min(1,current/maximum) or 0
+            bar:GetChildByName("Text").TextComponent.Text=tostring(current).." / "..tostring(maximum)
+        end
+        local mobile=_MobileUIManager:IsMobile()
+        for _,item in ipairs(self._T.hudSlots) do
+            local node=self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..item.pos)
+            item.key=mobile and ("mobile:"..tostring(math.floor((item.index-1)/6)+1)..":"..tostring((item.index-1)%6+1)) or _SkillManager:GetKeyForBarPos(item.pos)
+            local slot=_SkillManager:GetSkillOnKey(item.key)
+            item.func=mobile and _MobileUIManager:GetMobileSlot(item.key).func or ((slot.ruid or "")=="" and _KeySettingManager:GetFuncOnKey(item.key) or "")
+            local hiddenFunc=item.func~="" and item.func~="autohunt" and item.func~="jump" and item.func~="attack" and item.func~="hp" and item.func~="mp"
+            if mobile then
+                local icon=node:GetChildByName("Icon")
+                local ruid=hiddenFunc and "" or (item.func~="" and _KeySettingManager:GetFuncIconRUID(item.func) or (slot.ruid or ""))
+                local signature=ruid..":"..item.func
+                if item.signature~=signature then
+                    item.signature=signature
+                    _RecoveryPotionManager:FitIcon(icon,ruid,item.func~="" and 32 or 46,item.func~="" and 32 or 46)
+                    icon.SpriteGUIRendererComponent.Color=Color(1,1,1,ruid~="" and 1 or 0)
+                    _SkillManager:UpdateQuickslotBackdrop(node,slot.name or "",item.func)
+                end
+                node:GetChildByName("KeyLabel").TextComponent.Text=tostring(math.floor((item.index-1)/6)+1).."-"..tostring((item.index-1)%6+1)
+                local label=node:GetChildByName("FuncLabel") label.Enable=item.func~="" label.TextComponent.Text=_KeySettingManager:GetFuncIdLabel(item.func)
+            else
+                local original=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_"..item.pos)
+                if isvalid(original) then
+                    for _,name in ipairs({"SlotBG","IconBackdrop","Icon","KeyLabel","FuncLabel","RecoveryCooldown"}) do
+                        local sourcePart=_EntityService:GetEntityByPath(original.Path.."/"..name)
+                        local targetPart=self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..item.pos.."/"..name)
+                        if not hiddenFunc or name=="SlotBG" or name=="KeyLabel" then self:MirrorHUDPart(sourcePart,targetPart) end
+                    end
+                end
+            end
+            item.hiddenFunc=hiddenFunc
+            if hiddenFunc then
+                node:GetChildByName("Icon").Enable=false
+                node:GetChildByName("FuncLabel").Enable=false
+                node:GetChildByName("KeyLabel").Enable=true
+                node:GetChildByName("Icon").SpriteGUIRendererComponent.Color=Color(1,1,1,0)
+                node:GetChildByName("RecoveryCooldown").Enable=false
+                item.readyUntil=0
+                node:GetChildByName("IconBackdrop").Enable=false
+            else
+                node:GetChildByName("Icon").Enable=true
+                node:GetChildByName("KeyLabel").Enable=true
+            end
+            local remain=hiddenFunc and 0 or self:SlotCooldown(slot.name or "")
+            local signature=(slot.name or "")..":"..item.key
+            if item.cooldownSignature~=signature or remain>(item.lastRemain or 0)+0.2 then
+                item.cooldownSignature=signature item.cooldownTotal=remain
+            end
+            if (item.lastRemain or 0)>0 and remain<=0 then item.readyUntil=_UtilLogic.ElapsedSeconds+0.45 end
+            item.lastRemain=remain
+            local shade=node:GetChildByName("CooldownShade").SpriteGUIRendererComponent
+            shade.Type=ImageType.Filled shade.FillMethod=FillMethodType.Vertical
+            shade.FillAmount=remain>0 and math.min(1,remain/math.max(item.cooldownTotal or remain,0.001)) or 0
+            node:GetChildByName("CooldownShade").Enable=remain>0
+            local label=node:GetChildByName("CooldownTime") label.Enable=remain>0
+            label.TextGUIRendererComponent.Text=remain>0 and tostring(math.ceil(remain)) or ""
+            if not hiddenFunc then
+                local icon=node:GetChildByName("Icon").SpriteGUIRendererComponent
+                local c=icon.Color local t=(item.readyUntil or 0)-_UtilLogic.ElapsedSeconds
+                local alpha=(t>0.30 or (t>0 and t<=0.15)) and 0.25 or 1
+                icon.Color=Color(c.r,c.g,c.b,((slot.ruid or "")~="" or item.func~="") and alpha or 0)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void MirrorHUDPart(Entity source, Entity target)
+        -- Copy original rendered icons, labels, potion counts and style without copying events.
+        if not isvalid(source) or not isvalid(target) then return end
+        target.Enable=source.Enable
+        target.UITransformComponent.anchoredPosition=source.UITransformComponent.anchoredPosition
+        target.UITransformComponent.RectSize=source.UITransformComponent.RectSize
+        local sprite=source.SpriteGUIRendererComponent local output=target.SpriteGUIRendererComponent
+        if isvalid(sprite) and isvalid(output) then
+            if output.ImageRUID.DataId~=sprite.ImageRUID.DataId then output.ImageRUID=sprite.ImageRUID end
+            output.Color=sprite.Color output.Type=sprite.Type output.PreserveSprite=sprite.PreserveSprite
+            output.FillAmount=sprite.FillAmount
+        end
+        if isvalid(source.TextComponent) and isvalid(target.TextComponent) then target.TextComponent.Text=source.TextComponent.Text end
+        if isvalid(source.TextGUIRendererComponent) and isvalid(target.TextGUIRendererComponent) then target.TextGUIRendererComponent.Text=source.TextGUIRendererComponent.Text end
+        for _,child in pairs(source.Children) do self:MirrorHUDPart(child,_EntityService:GetEntityByPath(target.Path.."/"..child.Name)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method number SlotCooldown(string name)
+        -- The same native deadlines drive only this actor's cooldown shade and countdown.
+        local now=_UtilLogic.ElapsedSeconds
+        local remaining=math.max(0,((_CarnivalSkills._T.cooldowns or {})[name] or 0)-now)
+        local replica=_CarnivalReplica._T.client local cast=replica~=nil and replica.skillState or nil
+        if replica~=nil and (name=="HP 회복" or name=="MP 회복") then
+            local kind=name=="HP 회복" and "hp" or "mp"
+            remaining=math.max(remaining,((replica.recoveryCooldowns or {})[kind] or 0)-_UtilLogic.ServerElapsedSeconds)
+        end
+        if cast~=nil then
+            local fields={["암행"]="amhaengCooldownUntil",["암행2"]="amhaeng2CooldownUntil",["다크사이트"]="darkSightCooldownUntil",["궁병 지원"]="archerSupportCooldownUntil",["샤이닝 레이"]="shiningRayCooldownUntil",["아이스 스트라이크"]="iceStrikeCooldownUntil",["아이스 데몬"]="iceDemonCooldownUntil",["파이어데몬"]="fireDemonCooldownUntil",["리스토네이션"]="restorationCooldownUntil",["섬광"]="flashCooldownUntil",["가드"]="guardCooldownUntil",["패링"]="parryCooldownUntil",["차지 블로우"]="chargeBlowCooldownUntil",["드래곤 라이딩"]="dragonRideCooldownUntil",["바하뮤트"]="bahamutCooldownUntil",["이프리트"]="ifritCooldownUntil",["엘퀴네스"]="elquinesCooldownUntil",["홀리 매직쉘"]="holyShellCooldownUntil",["리커버리 오로라"]="recoveryAuraCooldownUntil",["리커버리 마나"]="recoveryAuraCooldownUntil",["용 소환"]="sixDragonsCooldownUntil",["힐러 소환"]="healerSummonCooldownUntil",["리저렉션"]="resurrectionCooldownUntil",["드레인 샷"]="drainShotCooldownUntil",["각성"]="awakeningCooldownUntil",["매직 미사일"]="magicMissileCooldownUntil",["불꽃 파도"]="fireWaveCooldownUntil",["암살"]="assassinateCooldownUntil",["연막"]="smokeScreenCooldownUntil",["쉐도우 파트너"]="shadowPartnerCooldownUntil",["서먼 다크드래곤"]="darkDragonCooldownUntil",["포이즌 미스트"]="poisonMistCooldownUntil",["익스플로젼"]="explosionCooldownUntil",["블리자드"]="blizzardCooldownUntil",["메테오"]="meteorCooldownUntil",["제네시스"]="genesisCooldownUntil",["기사 소환"]="knightSummonCooldownUntil",["스나이핑"]="snipingCooldownUntil",["체인샷"]="chainShotCooldownUntil",["더블 점프"]="doubleJumpCooldownUntil",["러시"]="dashCooldownUntil"}
+            fields["대쉬"]="dashCooldownUntil" fields["플래시"]="flashCooldownUntil" fields["패리"]="parryCooldownUntil" fields["다크 드래곤"]="darkDragonCooldownUntil" fields["용 6마리"]="sixDragonsCooldownUntil" fields["다크 사이트"]="darkSightCooldownUntil" fields["분신 소환"]="shadowCloneSwapUntil"
+            local key=fields[name]
+            if key~=nil then remaining=math.max(remaining,(cast[key] or 0)-now) end
+            if name=="기사 소환" or name=="궁수 소환" or name=="도적 소환" then remaining=math.max(remaining,(cast.summonUntil or 0)-now) end
+        end
+        return remaining
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void PressHUDSlot(string position, integer touchId)
+        -- Window shortcuts are deliberately inactive in this combat HUD.
+        -- Both screen touches and UI events enter once, without changing saved bindings.
+        local now=_UtilLogic.ElapsedSeconds
+        if self._T.hudPressedPos==position and now<(self._T.hudPressedAt or 0)+0.1 then return end
+        self._T.hudPressedPos=position self._T.hudPressedAt=now
+        _CarnivalUI:SetFocus(true)
+        if not self:CanInput() then return end
+        for _,item in ipairs(self._T.hudSlots or {}) do if item.pos==position then
+            if item.hiddenFunc then return end
+            self._T.hudHeld=item self._T.hudTouchId=touchId
+            if item.func=="autohunt" then self:ToggleAuto()
+            elseif item.func=="attack" or item.func=="jump" then self._T.touch[item.func]=true
+            elseif item.func~="" then _MobileUIManager:UseFunction(item.func)
+            else _CarnivalSkills:Press(item.key) end
+            if Environment:IsMakerPlay() then log("[VRF] Carnival HUD press key="..item.key.." function="..item.func) end
+            return
+        end end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReleaseHUDSlot()
+        -- End only the held carnival shortcut and leave other fingers alone.
+        local item=self._T.hudHeld
+        if item~=nil and (item.func=="attack" or item.func=="jump") then self._T.touch[item.func]=false end
+        self._T.hudHeld=nil self._T.hudTouchId=nil
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void MonsterHealthBar(Entity root, Entity native, boolean dead)
+        -- Draw the same 52 by 9 pixel pattern used by field Monster.PaintHealthBar.
+        local hp=root:GetChildByName("HP")
+        local monster=isvalid(native) and native:GetComponent("Monster") or nil
+        local visible=not dead and isvalid(monster) and monster.Hp>0 and monster.HealthBarUntil>_UtilLogic.ServerElapsedSeconds
+        if hp.Enable~=visible then hp.Enable=visible end
+        if not visible then return end
+        local style=monster:GetHealthBarStyle()
+        local pixel=hp.PixelGUIRendererComponent
+        if not isvalid(pixel) then pixel=hp:AddComponent("PixelGUIRendererComponent") pixel.RaycastTarget=false end
+        hp.SpriteGUIRendererComponent.Enable=false
+        for _,child in pairs(hp.Children) do if child.Enable then child.Enable=false end end
+        local scale=self._T.scale/100
+        hp.UITransformComponent.UIScale=Vector3(scale,scale,1)
+        hp.UITransformComponent.anchoredPosition=Vector2(0,monster:GetHealthBarHeight()*self._T.scale)
+        hp.UITransformComponent.RectSize=Vector2(style.width*style.scale,style.height*style.scale)
+        self._T.hpPixels=self._T.hpPixels or {}
+        local signature=tostring(style.fillWidth)..":"..tostring(style.band)
+        if self._T.hpPixels[hp.Id]~=signature then
+            local pixels={}
+            for y=0,8 do for x=0,51 do
+                local color=Color.black
+                if x>=1 and x<=50 and y>=1 and y<=7 then color=Color.white end
+                if x>=2 and x<=49 and y>=2 and y<=6 then color=Color.black end
+                if x>=3 and x<3+style.fillWidth and y>=3 and y<=5 then color=style.fillColor end
+                table.insert(pixels,color)
+            end end
+            pixel:ResetWithColors(52,9,pixels)
+            self._T.hpPixels[hp.Id]=signature
+        end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void EnsureMonsterHealthLayers(Entity hp, table style)
+        -- Upgrade retained Maker UI instances using the authored fill template.
+        self._T.healthLayers=self._T.healthLayers or {}
+        if self._T.healthLayers[hp.Id] then return end
+        local fill=hp:GetChildByName("Fill")
+        if not isvalid(fill) then return end
+        hp.SpriteGUIRendererComponent.Type=ImageType.Simple
+        for index,layer in ipairs(style.layers) do
+            local part=hp:GetChildByName(layer.name)
+            if not isvalid(part) then part=_SpawnService:SpawnByEntity(fill,layer.name,Vector3.zero,hp,false) end
+            if not isvalid(part) then return end
+            local transform=part.UITransformComponent
+            transform.AnchorsMin=Vector2(0.5,0.5) transform.AnchorsMax=Vector2(0.5,0.5)
+            transform.Pivot=Vector2(0.5,0.5) transform.anchoredPosition=Vector2.zero
+            transform.UIScale=Vector3.one
+            part.SpriteGUIRendererComponent.Type=ImageType.Simple
+            part.SpriteGUIRendererComponent.RaycastTarget=false
+            part.Enable=true
+            _UILogic:SetSiblingIndex(transform,index-1)
+        end
+        self._T.healthLayers[hp.Id]=true
+        if Environment:IsMakerPlay() then log("[VRF] Carnival monster HP original layers ready") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CopyEquippedAppearance(Entity target, Entity source)
+        if not isvalid(target) or not isvalid(source) then return end
+        local from=source.CostumeManagerComponent local to=target.CostumeManagerComponent
+        if not isvalid(from) or not isvalid(to) then return end
+        for _,category in ipairs({MapleAvatarItemCategory.Body,MapleAvatarItemCategory.Cap,MapleAvatarItemCategory.Cape,MapleAvatarItemCategory.Coat,MapleAvatarItemCategory.EarAccessory,MapleAvatarItemCategory.Ear,MapleAvatarItemCategory.EyeAccessory,MapleAvatarItemCategory.FaceAccessory,MapleAvatarItemCategory.Face,MapleAvatarItemCategory.Glove,MapleAvatarItemCategory.Hair,MapleAvatarItemCategory.Longcoat,MapleAvatarItemCategory.OneHandedWeapon,MapleAvatarItemCategory.Pants,MapleAvatarItemCategory.Shoes,MapleAvatarItemCategory.SubWeapon,MapleAvatarItemCategory.TwoHandedWeapon}) do
+            local item=from:GetEquip(category) or ""
+            if (to:GetEquip(category) or "")~=item then to:SetEquip(category,item) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearOpponent()
+        -- Detach native animation listeners when the match or displayed enemy changes.
+        for _,record in pairs(self._T.enemyActors or {}) do
+            if isvalid(record.source) and record.event~=nil then record.source:DisconnectEvent(ActionStateChangedEvent,record.event) end
+            if isvalid(record.native) and record.engineEvent~=nil then record.native:DisconnectEvent(BodyActionStateChangeEvent,record.engineEvent) end
+            if isvalid(record.node) then _EntityService:Destroy(record.node) end
+        end
+        for _,record in pairs(self._T.enemyMobs or {}) do if isvalid(record.node) then _EntityService:Destroy(record.node) end end
+        self._T.enemyActors={} self._T.enemyMobs={}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawOpponent(number delta)
+        -- Read-only miniature view: its camera and animation state never affect either player.
+        local state=_CarnivalUI.state local scene=state.opponent
+        local parent=self:UI("Lobby/Opponent/Preview")
+        if scene==nil or not isvalid(parent) then return end
+        self._T.enemyActors=self._T.enemyActors or {} self._T.enemyMobs=self._T.enemyMobs or {}
+        local now=_UtilLogic.ElapsedSeconds local scale=262/18
+        local focus=(scene.actors or {})[1]
+        local camera=focus~=nil and math.max(-9,math.min(9,focus.x)) or 0
+        local floor=-36
+        local terrain=parent:GetChildByName("Terrain")
+        if self._T.enemyTerrain==nil then
+            self._T.enemyTerrain={}
+            for i,art in ipairs(_CarnivalTerrain:Data(state.layout or 1).arts) do
+                local tile=_SpawnService:SpawnByEntity(parent:GetChildByName("SpriteTemplate"),"Floor"..tostring(i),Vector3.zero,terrain,false)
+                tile.SpriteGUIRendererComponent.ImageRUID=DataRef(art.ruid)
+                tile.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
+                tile.UITransformComponent.anchoredPosition=Vector2(art.x*scale,art.y*scale+floor)
+                tile.UITransformComponent.UIScale=Vector3(scale/100,scale/100,1)
+                tile.Enable=true self._T.enemyTerrain[i]=tile
+            end
+        end
+        terrain.UITransformComponent.anchoredPosition=Vector2(-camera*scale,0)
+        for i=1,2 do
+            local a=(scene.actors or {})[i] local record=self._T.enemyActors[i]
+            _CarnivalUI:Show("Lobby/Opponent/Member"..tostring(i),a~=nil)
+            _CarnivalUI:Show("Lobby/Opponent/HP"..tostring(i),a~=nil)
+            if a==nil then if record~=nil and isvalid(record.node) then record.node.Enable=false end continue end
+            _CarnivalUI:Text("Lobby/Opponent/Member"..tostring(i),(a.name or "상대").."\nLv."..tostring(a.level or 1).." ".._UIMyInfoManager:GetClassNameForLevel(a.job or 1,a.level or 1))
+            local ratio=math.max(0,math.min(1,a.hp/math.max(1,a.maxHp)))
+            self:UI("Lobby/Opponent/HP"..tostring(i).."/Fill").UITransformComponent.RectSize=Vector2(math.max(.001,248*ratio),13)
+            _CarnivalUI:Text("Lobby/Opponent/HP"..tostring(i).."/Text",a.dead and "사망" or (tostring(a.hp).." / "..tostring(a.maxHp)))
+            if record==nil then
+                local node=_SpawnService:SpawnByEntity(parent:GetChildByName("AvatarTemplate"),"Enemy"..tostring(i),Vector3.zero,parent,false)
+                record={node=node,x=a.x,y=a.y} self._T.enemyActors[i]=record
+                node.AvatarGUIRendererComponent.PreserveAvatar=PreserveSpriteType.NativeSize
+                node.UITransformComponent.UIScale=Vector3(scale/100,scale/100,1)
+            end
+            local node=record.node local renderer=node.AvatarGUIRendererComponent
+            if now>=(record.appearanceAt or 0) then self:CopyAvatar(node,a,false) record.appearanceAt=now+.5 end
+            local native=a.nativeId~=nil and _EntityService:GetEntity(a.nativeId) or nil
+            local source=isvalid(native) and isvalid(native.AvatarRendererComponent) and native.AvatarRendererComponent:GetBodyEntity() or nil
+            local body=renderer:GetBodyEntity()
+            record.gui=body
+            if source~=record.source then
+                if isvalid(record.source) and record.event~=nil then record.source:DisconnectEvent(ActionStateChangedEvent,record.event) end
+                if isvalid(record.native) and record.engineEvent~=nil then record.native:DisconnectEvent(BodyActionStateChangeEvent,record.engineEvent) end
+                record.source=source record.native=native
+                if isvalid(source) then
+                    record.event=source:ConnectEvent(ActionStateChangedEvent,function(e)
+                        if isvalid(record.gui) then
+                            record.gui:SendEvent(ActionStateChangedEvent(e.CoreActionName,e.PartsActionName,e.PlayRate,e.PlayType,e.StartFrameIndex,e.EndFrameIndex))
+                            record.motionUntil=_UtilLogic.ElapsedSeconds+.7
+                        end
+                    end)
+                    record.engineEvent=native:ConnectEvent(BodyActionStateChangeEvent,function(e)
+                        if isvalid(record.node) then
+                            local copy=BodyActionStateChangeEvent() copy.ActionState=e.ActionState copy.needResetAction=e.needResetAction
+                            record.node:SendEvent(copy) record.motionUntil=_UtilLogic.ElapsedSeconds+.7
+                        end
+                    end)
+                end
+            end
+            local action=a.dead and "prone" or (a.action or "stand1")
+            if isvalid(body) and now>=(record.motionUntil or 0) and record.action~=action then
+                body:SendEvent(ActionStateChangedEvent(action,action,a.skillRate or 1,SpriteAnimClipPlayType.Loop)) record.action=action
+            end
+            local blend=1-math.exp(-20*delta)
+            record.x=record.x+(a.x-record.x)*blend record.y=record.y+(a.y-record.y)*blend
+            node.UITransformComponent.anchoredPosition=Vector2((record.x-camera)*scale,record.y*scale+floor)
+            renderer.FlipX=a.face>0 renderer.Color=a.dead and Color(.6,.6,.6,.5) or Color.white
+            if not node.Enable then node.Enable=true end
+        end
+        local monsters=scene.monsters or {}
+        for i=1,math.max(#monsters,#self._T.enemyMobs) do
+            local m=monsters[i] local record=self._T.enemyMobs[i]
+            if m==nil then if record~=nil and isvalid(record.node) then record.node.Enable=false end continue end
+            if record==nil then
+                local node=_SpawnService:SpawnByEntity(parent:GetChildByName("SpriteTemplate"),"EnemyMob"..tostring(i),Vector3.zero,parent,false)
+                record={node=node,x=m.x,y=m.y} self._T.enemyMobs[i]=record
+                node.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
+                node.UITransformComponent.UIScale=Vector3(scale/100,scale/100,1)
+            end
+            local node=record.node local renderer=node.SpriteGUIRendererComponent
+            local profile=_CarnivalCatalog:FieldProfile(_MonsterCodexCatalog:Get(m.id))
+            local motion=m.dead and "die" or (m.motion or "stand")
+            local clip=profile~=nil and (profile[motion] or profile.stand) or m.sprite or ""
+            if record.clip~=clip or record.life~=m.life then
+                renderer.AnimClipPlayType=m.dead and SpriteAnimClipPlayType.Onetime or SpriteAnimClipPlayType.Loop
+                if clip~="" then renderer.ImageRUID=DataRef(clip) end
+                record.clip=clip record.life=m.life record.x=m.x record.y=m.y
+            end
+            local blend=1-math.exp(-20*delta)
+            record.x=record.x+(m.x-record.x)*blend record.y=record.y+(m.y-record.y)*blend
+            node.UITransformComponent.anchoredPosition=Vector2((record.x-camera)*scale,record.y*scale+floor)
+            renderer.FlipX=m.face>0
+            local time=_UtilLogic.ServerElapsedSeconds
+            local alpha=m.dead and math.max(0,1-(time-(m.deathAt or -99))) or math.min(1,math.max(0,time-(m.bornAt or -99)))
+            renderer.Color=Color(1,1,1,alpha)
+            local visible=alpha>0 if node.Enable~=visible then node.Enable=visible end
+        end
+        _CarnivalUI:Text("Lobby/Opponent/Count","몬스터 "..tostring(state.enemyMonsterCount or 0).." / 150")
+        if not self._T.enemyVerified then self._T.enemyVerified=true log("[VRF] Carnival opponent preview actors="..tostring(#(scene.actors or {})).." monsters="..tostring(#monsters)) end
+    end
+
+end

@@ -12,12 +12,18 @@ script PlayerHit extends HitComponent
 
     -- HP 자연 회복. 소모/피격 후에도 멈추지 않는다 - 멈춤을 되살리려면 HpRegenTick에 게이트를 추가할 것.
     -- (요청 2026-08-12 4차) **기본값 0 = 공짜 회복 없음.** 초보자 스킬 "HP 회복"에 분배한 만큼만 채워진다
-    -- (분배 1포인트당 0.1%, 마스터 200 = 20%). 값은 클라 SkillManager.RequestSyncHpRegen이 밀어 넣는다.
+    -- (분배 1포인트당 0.05%, 마스터 200 = 10%). 값은 클라 SkillManager.RequestSyncHpRegen이 밀어 넣는다.
     -- ⚠ 종전에는 MP와 같은 초당 1% 고정이었다.
     property number HpRegenPercentPerSecond = 0.0
+    property number BeginnerHpRegenPercentPerSecond = 0.0
+    property number HpPotionRegenPercentPerSecond = 0.0
     property number HpRegenTickSeconds = 0.25
 
     method void OnBeginPlay()
+        local attack=self.Entity:GetComponent("PlayerAttack")
+        if isvalid(attack) and (attack._T.carnivalPreview or (isvalid(self.Entity.PlayerComponent) and self.Entity.PlayerComponent.UserId=="")) then
+            self.Enable=false return
+        end
         -- 피격 숫자는 아래 확정된 OnHit 경로에서만 표시한다. 엔진 HitEvent 자동 표시와 중복 방지.
         local skinSpawner = self.Entity.DamageSkinSpawnerComponent
         if isvalid(skinSpawner) then skinSpawner.Enable = false end
@@ -109,8 +115,13 @@ script PlayerHit extends HitComponent
         end
 
         -- pc.Hp는 정수라 틱당 회복량이 1 미만이면 매번 버려진다. 소수부를 모아 1 이상일 때만 반영한다.
+        self:ValidateRecovery()
+        local rate=self.HpRegenPercentPerSecond
+        rate=rate+self.BeginnerHpRegenPercentPerSecond*(_BossStageManager:BattleBuffMultiplier("hpRecovery",self.Entity)-1)
+        if not _RecoveryPotionManager:IsBossRestricted(self.Entity) then rate=rate+self.HpPotionRegenPercentPerSecond end
+        if self._T.recovery~=nil and self._T.recovery.kind=="hp" and _UtilLogic.ServerElapsedSeconds>=self._T.recovery.ready then rate=rate*5 end
         self._T.hpRegenAccum = (self._T.hpRegenAccum or 0)
-            + maxHp * (self.HpRegenPercentPerSecond / 100) * self.HpRegenTickSeconds
+            + maxHp * (rate / 100) * self.HpRegenTickSeconds
         local gain = math.floor(self._T.hpRegenAccum)
         if gain < 1 then return end
         self._T.hpRegenAccum -= gain
@@ -129,7 +140,7 @@ script PlayerHit extends HitComponent
             self._T.climbInvincible = true
             self._T.climbInvincibleFor = 0
             self.IsInvincible = true
-            log("[PlayerHit] 로프 등반 무적 ON")
+            if Environment:IsMakerPlay() then log("[PlayerHit] 로프 등반 무적 ON") end
         else
             if self._T.climbInvincible ~= true then return end
             self._T.climbInvincible = false
@@ -139,13 +150,15 @@ script PlayerHit extends HitComponent
                 self.IsInvincible = false
                 self.Enable = true
             end
-            log("[PlayerHit] 로프 등반 무적 OFF")
+            if Environment:IsMakerPlay() then log("[PlayerHit] 로프 등반 무적 OFF") end
         end
     end
 
     @ExecSpace("ServerOnly")
     method void ServerWatchdogTick()
+        self:ValidateRecovery()
         self:EnsureRespawn()
+        self:TickDeadMineLava()
         -- 무적이 비정상적으로 오래 지속되면(= 해제 타이머 유실) 강제로 되돌린다.
         if not isvalid(self.Entity) then return end
         -- 로프 등반 무적은 의도된 장기 무적이라 아래 강제 해제 대상이 아니다 - 대신 자체 상한을 둔다.
@@ -193,7 +206,7 @@ script PlayerHit extends HitComponent
             self._T.avatarLayerMap = map
             self._T.avatarLayerName = layerName
             self._T.entryFaceResetPending = true
-            log("[PlayerLayer] map=" .. map.Name .. " avatar=" .. layerName)
+            if Environment:IsMakerPlay() then log("[PlayerLayer] map=" .. map.Name .. " avatar=" .. layerName) end
         end
         -- 맵 진입/발판 동기화가 늦게 도착해도 낮은 레이어로 다시 내려가지 않는다.
         if body.LayerSettingType ~= AutomaticLayerOption.None then body.LayerSettingType = AutomaticLayerOption.None end
@@ -206,7 +219,7 @@ script PlayerHit extends HitComponent
             and state.CurrentStateName ~= "HIT" and state.CurrentStateName ~= "DEAD" then
             avatar:PlayEmotion(EmotionalType.Default, 0.1)
             self._T.entryFaceResetPending = false
-            log("[PlayerFace] neutral face restored on map entry " .. map.Name)
+            if Environment:IsMakerPlay() then log("[PlayerFace] neutral face restored on map entry " .. map.Name) end
         end
     end
 
@@ -246,7 +259,7 @@ script PlayerHit extends HitComponent
             if self.Entity.StateComponent.CurrentStateName == "IDLE" then
                 if cap == "aeb1286a232949c98b4dc07ab8d2c14e" then
                     body:SendEvent(ActionStateChangedEvent("alert", "alert", 1, SpriteAnimClipPlayType.Loop))
-                    log("[HatIdle] soccer cap fallback applied")
+                    if Environment:IsMakerPlay() then log("[HatIdle] soccer cap fallback applied") end
                 elseif previous == "aeb1286a232949c98b4dc07ab8d2c14e" then
                     local reset = BodyActionStateChangeEvent()
                     reset.ActionState = MapleAvatarBodyActionState.Stand
@@ -304,15 +317,16 @@ script PlayerHit extends HitComponent
         -- (개편) 성공 시 감소율 = 5% × 분배 포인트 (마스터 10 = 50%) - 레벨을 함께 기억한다.
         self._T.guardSkillLv = math.max(1, math.min(guardLv or 1, 10))
         self._T.guardParryUntil = _UtilLogic.ElapsedSeconds + 1.2
-        log("[PlayerHit] 가드 패링 창 오픈(1.2초, Lv." .. tostring(self._T.guardSkillLv) .. ")")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 가드 패링 창 오픈(1.2초, Lv." .. tostring(self._T.guardSkillLv) .. ")") end
     end
 
     -- (자동사냥) 서버가 자동 가드 판정에 쓰는 상태 동기화 - 자동사냥 토글/가드 투자 레벨.
     @ExecSpace("ServerOnly")
     method void SetAutoHuntGuardState(boolean autoOn, integer guardLv)
+        if self._T.autoHuntOn ~= autoOn then self._T.lavaHits = 0 end
         self._T.autoHuntOn = autoOn
         self._T.guardSkillLv = math.max(0, math.min(guardLv or 0, 10))
-        log("[PlayerHit] 자동 가드 상태: auto=" .. tostring(autoOn) .. " 가드 Lv." .. tostring(self._T.guardSkillLv))
+        if Environment:IsMakerPlay() then log("[PlayerHit] 자동 가드 상태: auto=" .. tostring(autoOn) .. " 가드 Lv." .. tostring(self._T.guardSkillLv)) end
     end
 
     -- (자동사냥) 서버에서 이 플레이어가 자동사냥 중인지 - 조작 잠금 감시
@@ -336,7 +350,7 @@ script PlayerHit extends HitComponent
         if isvalid(paVisual) then
             paVisual:PlayParryCounterVisuals()
         end
-        log("[PlayerHit] 패링 시전 - 즉시 이펙트 + 가드 창 오픈(1.5초) combatPower=" .. tostring(combatPower))
+        if Environment:IsMakerPlay() then log("[PlayerHit] 패링 시전 - 즉시 이펙트 + 가드 창 오픈(1.5초) combatPower=" .. tostring(combatPower)) end
     end
 
     @ExecSpace("ServerOnly")
@@ -348,8 +362,8 @@ script PlayerHit extends HitComponent
         self._T.powerGuardUntil = _UtilLogic.ElapsedSeconds + duration
         self._T.powerGuardHealPct = healPct
         self._T.powerGuardReducePct = reducePct
-        log("[PlayerHit] 파워가드 창 오픈(" .. tostring(duration) .. "초) - 피격 후 지연 회복 " .. tostring(healPct)
-            .. "% + 받는 피해 " .. tostring(reducePct) .. "% 감소")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 파워가드 창 오픈(" .. tostring(duration) .. "초) - 피격 후 지연 회복 " .. tostring(healPct)
+            .. "% + 받는 피해 " .. tostring(reducePct) .. "% 감소") end
     end
 
     @ExecSpace("ServerOnly")
@@ -369,7 +383,7 @@ script PlayerHit extends HitComponent
                 -- 쿨타임 5초 단축"을 그대로 반영해 다음 자동 가드까지 5초만 기다린다.
                 self._T.autoGuardReadyAt = now + 5.0
                 self._T.guardParryUntil = now + 0.1
-                log("[PlayerHit] 자동 가드 발동(25%) - 성공 단축 반영, 다음 자동 가드까지 5초")
+                if Environment:IsMakerPlay() then log("[PlayerHit] 자동 가드 발동(25%) - 성공 단축 반영, 다음 자동 가드까지 5초") end
             end
         end
         -- ① 패링 창(1초) 안에 공격이 들어오면: 그 공격을 무시하고 2초 무적 시작 + 클라이언트에 성공 통지.
@@ -381,10 +395,13 @@ script PlayerHit extends HitComponent
             self._T.guardShieldPct = 5 * math.max(1, self._T.guardSkillLv or 1)
             local pc = self.Entity.PlayerComponent
             if isvalid(pc) then
-                _SkillManager:NotifyGuardParrySuccess(pc.UserId)
+                local attack=self.Entity:GetComponent("PlayerAttack")
+                if isvalid(attack) and attack._T.carnivalPreview then
+                    _CarnivalReplica:NotifyDefence(self.Entity.Id,"guard",attack._T.carnivalOwnerUid)
+                else _SkillManager:NotifyGuardParrySuccess(pc.UserId) end
             end
             self:PlayGuardSuccessEffects()
-            log("[PlayerHit] 가드 패링 성공! 2초 무적 + 10초 피해 " .. tostring(self._T.guardShieldPct) .. "% 감소")
+            if Environment:IsMakerPlay() then log("[PlayerHit] 가드 패링 성공! 2초 무적 + 10초 피해 " .. tostring(self._T.guardShieldPct) .. "% 감소") end
             return true
         end
         return false
@@ -416,19 +433,19 @@ script PlayerHit extends HitComponent
     method void StartIronWall(number duration, integer reducePct)
         self._T.ironWallUntil = _UtilLogic.ElapsedSeconds + duration
         self._T.ironWallReducePct = reducePct
-        log("[PlayerHit] 아이언 월 " .. tostring(duration) .. "초 - 받는 피해 " .. tostring(reducePct) .. "% 감소")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 아이언 월 " .. tostring(duration) .. "초 - 받는 피해 " .. tostring(reducePct) .. "% 감소") end
     end
 
     @ExecSpace("ServerOnly")
     method void CancelIronWall()
         self._T.ironWallUntil = 0
-        log("[PlayerHit] 아이언 월 취소")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 아이언 월 취소") end
     end
 
     @ExecSpace("ServerOnly")
     method void CancelGuardShield()
         self._T.guardShieldUntil = 0
-        log("[PlayerHit] 가드 피해 감소 버프 취소")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 가드 피해 감소 버프 취소") end
     end
 
     @ExecSpace("Multicast")
@@ -440,25 +457,25 @@ script PlayerHit extends HitComponent
         -- (팔라딘 개편) 가드 성공 사운드/이펙트 교체 - 사운드 e1dacc28···, 이펙트는 기존 베리어 대신 fd0e7aeb···
         _GameAudio:PlaySound("e1dacc286f764f13bc578bcdb2d1ec1e", 1.0)
         -- (피드백) 방패 이펙트 높이: -0.3 (사용자 지정값)
-        _EffectService:PlayEffectAttached("fd0e7aeb826f4a5486af1a03dfbf592e", self.Entity, Vector3(0, -0.3, 0), 0, Vector3(1, 1, 1), false)
+        _CarnivalActorPresentation:PlayEffectAttached("fd0e7aeb826f4a5486af1a03dfbf592e", self.Entity, Vector3(0, -0.3, 0), 0, Vector3(1, 1, 1), false,{})
         -- 엔진 데미지 스킨의 "Guard" 텍스트(피격 스킨 RUID 기반) - 데미지 숫자 대신 Guard가 뜬다.
         if not _AutoHuntPowerSave.active then
-        _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        _CarnivalDamageSkin:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
         end
         -- (팔라딘 개편) 머리 위 상태 아이콘(29dc0219···)을 감소 버프 지속(10초) 동안 루프 표시.
         -- 재가드로 갱신되면 기존 아이콘을 지우고 새로 건다(토큰으로 옛 제거 타이머 무효화).
         self._T.guardHeadToken = (self._T.guardHeadToken or 0) + 1
         local headTok = self._T.guardHeadToken
         if self._T.guardHeadSerial ~= nil then
-            _EffectService:RemoveEffect(self._T.guardHeadSerial)
+            _CarnivalActorPresentation:RemoveEffect(self._T.guardHeadSerial)
             self._T.guardHeadSerial = nil
         end
         -- (피드백) 머리 위 아이콘 높이: 0 (사용자 지정값)
-        self._T.guardHeadSerial = _EffectService:PlayEffectAttached("29dc0219becf49a9b3ef6fadfb888350", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), true)
+        self._T.guardHeadSerial = _CarnivalActorPresentation:PlayEffectAttached("29dc0219becf49a9b3ef6fadfb888350", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), true,{})
         _TimerService:SetTimerOnce(function()
             if self._T.guardHeadToken ~= headTok then return end
             if self._T.guardHeadSerial ~= nil then
-                _EffectService:RemoveEffect(self._T.guardHeadSerial)
+                _CarnivalActorPresentation:RemoveEffect(self._T.guardHeadSerial)
                 self._T.guardHeadSerial = nil
             end
         end, 10)
@@ -472,7 +489,7 @@ script PlayerHit extends HitComponent
     method void GrantHolyShell(integer count)
         -- 쉴드 부여(재시전하면 남은 개수와 무관하게 새로 count개로 채운다).
         self._T.holyShellCount = count
-        log("[PlayerHit] 홀리 매직쉘 " .. tostring(count) .. "회 부여")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 홀리 매직쉘 " .. tostring(count) .. "회 부여") end
     end
 
     @ExecSpace("ServerOnly")
@@ -493,7 +510,7 @@ script PlayerHit extends HitComponent
         self._T.holyShellCount = n
         self._T.holyShellInvulnUntil = now + 1.5
         self:PlayHolyShellBlockEffects(n)
-        log("[PlayerHit] 홀리 매직쉘 방어! 남은 쉴드 " .. tostring(n) .. " (1.5초 무적)")
+        if Environment:IsMakerPlay() then log("[PlayerHit] 홀리 매직쉘 방어! 남은 쉴드 " .. tostring(n) .. " (1.5초 무적)") end
         return true
     end
 
@@ -503,17 +520,17 @@ script PlayerHit extends HitComponent
         -- (피드백) 막을 때 사운드는 재생하지 않는다(요청). 이펙트 높이도 0.2 → -0.1로 더 내렸다.
         if not self:IsClient() then return end
         if not isvalid(self.Entity) then return end
-        local serial = _EffectService:PlayEffectAttached("ec0acf34d59043f695f43c55222a7b0e", self.Entity, Vector3(0, -0.1, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Alpha"] = 0.5 })
+        local serial = _CarnivalActorPresentation:PlayEffectAttached("ec0acf34d59043f695f43c55222a7b0e", self.Entity, Vector3(0, -0.1, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Alpha"] = 0.5 })
         _TimerService:SetTimerOnce(function()
-            _EffectService:RemoveEffect(serial)
+            _CarnivalActorPresentation:RemoveEffect(serial)
         end, 1.2)
         -- 가드 표시(가드/패링과 같은 엔진 텍스트 데미지스킨).
         if not _AutoHuntPowerSave.active then
-        _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        _CarnivalDamageSkin:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
         end
         -- 남은 쉴드 개수를 머리 위에 숫자로 표시(힐과 같은 파란 스킨 재사용).
         if not _AutoHuntPowerSave.active then
-        _DamageSkinService:Play(
+        _CarnivalDamageSkin:Play(
             self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0,
             { remain }, DamageSkinTweenType.Default, false,
             Vector2(0, 0.35), Vector2(1, 1), 1.0, 1.0, LitMode.Default
@@ -536,15 +553,18 @@ script PlayerHit extends HitComponent
             self._T.parryInvulnUntil = now + 3.0
             local pc = self.Entity.PlayerComponent
             if isvalid(pc) then
-                _SkillManager:NotifyParrySuccess(pc.UserId)
+                local attack=self.Entity:GetComponent("PlayerAttack")
+                if isvalid(attack) and attack._T.carnivalPreview then
+                    _CarnivalReplica:NotifyDefence(self.Entity.Id,"parry",attack._T.carnivalOwnerUid)
+                else _SkillManager:NotifyParrySuccess(pc.UserId) end
             end
             self:PlayParrySuccessEffects()
             -- (요청) 가드 표시 0.5초 뒤 주변 최대 6명에게 전투력의 500~700% 반격 피해.
             local combatPower = self._T.parryCombatPower or 0
             _TimerService:SetTimerOnce(function()
-                self:FireParryCounter(combatPower)
+                if isvalid(self.Entity) then self:FireParryCounter(combatPower) end
             end, 0.5)
-            log("[PlayerHit] 패링 가드 성공! 피해 무시 + 3초 무적 + 0.5초 뒤 반격 예약")
+            if Environment:IsMakerPlay() then log("[PlayerHit] 패링 가드 성공! 피해 무시 + 3초 무적 + 0.5초 뒤 반격 예약") end
             return true
         end
         return false
@@ -579,7 +599,7 @@ script PlayerHit extends HitComponent
         if not isvalid(self.Entity) then return end
         _GameAudio:PlaySound("dca3f8aa0f524bf59e85ff44792b1860", 1.0)
         if not _AutoHuntPowerSave.active then
-        _DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+        _CarnivalDamageSkin:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
         end
         self:PlayParryShimmer()
     end
@@ -600,8 +620,8 @@ script PlayerHit extends HitComponent
         local wp = self.Entity.TransformComponent.WorldPosition
         local shimmerColor = Color(1.0, 1.7, 0.55, 1)
         local shimmerOpts = { ["Color"] = shimmerColor, ["Alpha"] = 0.7 }
-        _EffectService:PlayEffect("7344e61864444842b917cb4be91e548e", self.Entity, Vector3(wp.x - 3.2, wp.y + 0.5, 0), 0, Vector3(1.0, 1.0, 1), false, shimmerOpts)
-        _EffectService:PlayEffect("7344e61864444842b917cb4be91e548e", self.Entity, Vector3(wp.x + 3.2, wp.y + 0.5, 0), 0, Vector3(1.0, 1.0, 1), false, shimmerOpts)
+        _CarnivalActorPresentation:PlayEffect(self.Entity,"7344e61864444842b917cb4be91e548e", self.Entity, Vector3(wp.x - 3.2, wp.y + 0.5, 0), 0, Vector3(1.0, 1.0, 1), false, shimmerOpts)
+        _CarnivalActorPresentation:PlayEffect(self.Entity,"7344e61864444842b917cb4be91e548e", self.Entity, Vector3(wp.x + 3.2, wp.y + 0.5, 0), 0, Vector3(1.0, 1.0, 1), false, shimmerOpts)
     end
 
     @ExecSpace("Multicast")
@@ -661,12 +681,32 @@ script PlayerHit extends HitComponent
         end, duration)
     end
 
+    @ExecSpace("ServerOnly")
+    method void BeginFinalAttackInvincibility(number duration)
+        if not isvalid(self.Entity.PlayerComponent) or self.Entity.PlayerComponent.Hp<=0 then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if self._T.finalAttackMap~=self.Entity.CurrentMap then self._T.finalAttackUntil=0 end
+        self._T.finalAttackMap=self.Entity.CurrentMap
+        self._T.finalAttackUntil=math.max(self._T.finalAttackUntil or 0,now+math.max(0,math.min(duration,5)))
+        if Environment:IsMakerPlay() then log("[VRF] FinalAttack invincible duration="..tostring(duration)) end
+    end
+
+    method boolean IsFinalAttackInvincible()
+        return self:IsServer() and self._T.finalAttackMap==self.Entity.CurrentMap
+            and self.Entity.PlayerComponent.Hp>0 and _UtilLogic.ServerElapsedSeconds<(self._T.finalAttackUntil or 0)
+    end
+
     method boolean IsHitTarget(string attackInfo)
         -- 무적 상태면 판정을 거부한다 - 실측 결과 이 프로젝트의 몬스터 근접공격(MonsterAttack)에는 이 훅이
         -- 전혀 호출되지 않는 것으로 확인됐지만, 다른 공격 경로가 이 훅을 실제로 참조할 경우를 대비한
         -- 보조 방어선으로 남겨둔다 - 주 방어선은 MonsterAttack.IsAttackTarget의 IsInvincible 체크.
-        if self._T.climbInvincible then return false end
+        if self:IsFinalAttackInvincible() or self._T.climbInvincible then return false end
         if attackInfo=="boss.mano.dash" then return true end
+        if self:IsServer() and string.sub(attackInfo or "",1,11)=="boss.thief." then
+            local r=(_BossStageManager._T.runs or {})[self.Entity.PlayerComponent.UserId]
+            local ai=r~=nil and isvalid(r.boss) and r.boss:GetComponent("script.ThiefEncounter") or nil
+            if isvalid(ai) and ai:CanContinueCombo(self.Entity,attackInfo) then return true end
+        end
         if self.IsInvincible or self._T.invincible then return false end
         return true
     end
@@ -675,11 +715,18 @@ script PlayerHit extends HitComponent
         -- 서버가 유일한 권위 - OnHit의 부모 ExecSpace가 미지정(=All)이라 클라이언트에서도 호출될 수 있어
         -- 클라이언트 쪽 실행은 맨 앞에서 걸러낸다.
         if not self:IsServer() then return end
-        if _BossStageManager:IsStumpyParryInvincible(self.Entity) then return end
+        -- Benchmark-only unlimited HP; normal worlds keep the original hit pipeline.
+        if _TestCommandManager:IsHuntBenchmarkActor(self.Entity) then
+            self.Entity.PlayerComponent.Hp = self.Entity.PlayerComponent.MaxHp
+            return
+        end
+        if self:IsFinalAttackInvincible() or _BossStageManager:IsStumpyParryInvincible(self.Entity) then return end
         local snail=isvalid(attacker) and attacker:GetComponent("script.ManoSnail") or nil
         local dash=attackInfo=="boss.mano.dash" and isvalid(snail) and snail.Special and snail.Phase=="flight" and snail.OwnerId==self.Entity.PlayerComponent.UserId
-        -- Only a validated special-snail dash bypasses the ordinary hit cooldown.
-        if self._T.climbInvincible or ((self.IsInvincible or self._T.invincible) and not dash) then return end
+        local thieves=isvalid(attacker) and attacker:GetComponent("script.ThiefEncounter") or nil
+        local combo=isvalid(thieves) and thieves:CanContinueCombo(self.Entity,attackInfo)
+        -- Same-cast continuation is validated by the server encounter and hit generation.
+        if self._T.climbInvincible or ((self.IsInvincible or self._T.invincible) and not dash and not combo) then return end
         self._T.hitImmuneGeneration=(self._T.hitImmuneGeneration or 0)+1
         local generation=self._T.hitImmuneGeneration
         self._T.invincible = true
@@ -688,33 +735,29 @@ script PlayerHit extends HitComponent
         self._T.invincibleFor = 0
 
         __base:OnHit(attacker, damage, isCritical, attackInfo, hitCount)
-        self:ShowTakenDamage(damage)
-        if damage>0 then _BossStageManager:BossContactHit(attacker,self.Entity,attackInfo) end
-        if dash and damage>0 then _BossStageManager:PlayDashImpact(self.Entity,self.Entity.PlayerComponent.UserId) end
+        if string.sub(attackInfo or "",1,11)=="boss.faust." and isvalid(attacker) then
+            local faust=attacker:GetComponent("script.FaustEncounter")
+            if isvalid(faust) then
+                faust:AcceptedHit(self.Entity,string.sub(attackInfo,12))
+                if attackInfo=="boss.faust.lady3" and damage>0 then faust:FlashSlamBar("hp",self.Entity.PlayerComponent.UserId) end
+            end
+        end
+        if isvalid(thieves) then thieves:ShowHitDamage(self.Entity,damage,attackInfo)
+        elseif damage>0 or (attackInfo~="boss.faust.ghost" and attackInfo~="boss.faust.lady2") then self:ShowTakenDamage(damage) end
+        if damage>0 then
+            _BossStageManager:BossContactHit(attacker,self.Entity,attackInfo)
+            if isvalid(thieves) then thieves:AcceptedHit(self.Entity,attackInfo) end
+        end
+        if damage>0 and (dash or attackInfo=="boss.seruf.fish" or attackInfo=="boss.stumpy.bats") then
+            _BossStageManager:PlayDashImpact(self.Entity,self.Entity.PlayerComponent.UserId)
+            if Environment:IsMakerPlay() then log("[VRF] Shared dash impact accepted tag="..tostring(attackInfo)) end
+        end
 
         -- (개편 2026-08-12, 표시 조정) 파워가드 버프 중이면 **3초에 한 번씩 총 3틱**으로
         -- 입은 피해의 healPct%(분배당 2%, 마스터 40%)를 회복한다. 표시는 힐 데미지 스킨.
         -- (피드백) 1초 간격 10틱은 숫자가 너무 자주 떠 보기 불편 - 3초×3틱으로 큼직하게.
         -- ⚠ damage는 ApplyDamageReduction(파워가드 상시 감소 포함)을 거친 실피해 - 회복도 실피해 기준.
-        if (self._T.powerGuardUntil or 0) >= _UtilLogic.ElapsedSeconds and damage > 0 then
-            local totalHeal = math.floor(damage * (self._T.powerGuardHealPct or 10) / 100)
-            if totalHeal > 0 then
-                local tickHeal = math.max(1, math.floor(totalHeal / 3))
-                local ent = self.Entity
-                for tick = 1, 3 do
-                    _TimerService:SetTimerOnce(function()
-                        if not isvalid(ent) then return end
-                        local pcT = ent.PlayerComponent
-                        if not isvalid(pcT) or pcT.Hp <= 0 then return end
-                        pcT.Hp = math.min(pcT.Hp + tickHeal, pcT.MaxHp)
-                        ---@type PlayerAttack
-                        local paT = ent:GetComponent("script.PlayerAttack")
-                        if isvalid(paT) then paT:ShowHealDamageSkin(ent, tickHeal) end
-                    end, tick * 3.0)   -- 3초 뒤부터 3초 간격 3틱 (3/6/9초)
-                end
-                log("[PlayerHit] 파워가드 지연 회복 예약: 피해 " .. tostring(damage) .. " -> 총 +" .. tostring(totalHeal) .. " HP (3초 간격 3틱)")
-            end
-        end
+        self:SchedulePowerGuardRecovery(self.Entity,damage)
 
         -- (요청) 스킬 시전 중 피격이면 몸동작은 그대로 두고 표정만 피격 표정으로 바꾼다.
         -- 시전 중인지 판단과 표정 재생은 그 상태를 들고 있는 PlayerAttack이 담당한다(시전 중이 아니면
@@ -743,19 +786,33 @@ script PlayerHit extends HitComponent
     end
 
     @ExecSpace("Client")
+    method void ShowThiefTakenDamage(integer damage, integer hitIndex, integer lineCount)
+        -- Match player multi-hit spacing and use the currently equipped attack damage skin.
+        if not isvalid(self.Entity) then return end
+        local skin=self.Entity.PlayerAttack:GetHitDamageSkinId()
+        local offset=lineCount==2 and (-0.2+(hitIndex-1)*0.4) or (lineCount==6 and (-0.2+(hitIndex-1)*0.3) or 0)
+        if not _AutoHuntPowerSave.active then
+            _CarnivalDamageSkin:Play(self.Entity,skin,0,{damage>0 and damage or DamageSkinTextType.Miss},DamageSkinTweenType.Default,false,
+                Vector2(0,offset),Vector2(1,1),1,1,LitMode.Default)
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Thief damage display line="..tostring(hitIndex).."/"..tostring(lineCount).." damage="..tostring(damage).." offset="..tostring(offset).." skin="..skin) end
+    end
+
+    @ExecSpace("Client")
     method void ShowTakenDamage(integer damage)
         if not isvalid(self.Entity) then return end
         if not _AutoHuntPowerSave.active then
-        _DamageSkinService:Play(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", 0,
+        _CarnivalDamageSkin:Play(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", 0,
             { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, false,
             Vector2(0, 0), Vector2(1, 1), 1, 1, LitMode.Default)
         end
         self._T.takenDamageDisplayCount = (self._T.takenDamageDisplayCount or 0) + 1
-        log("[PlayerDamageSkin] accepted hit=" .. tostring(self._T.takenDamageDisplayCount) .. " damage=" .. tostring(damage) .. " skin=02c22d93421b4038b3c413b3e40b57ec")
+        if Environment:IsMakerPlay() then log("[PlayerDamageSkin] accepted hit=" .. tostring(self._T.takenDamageDisplayCount) .. " damage=" .. tostring(damage) .. " skin=02c22d93421b4038b3c413b3e40b57ec") end
     end
 
     @ExecSpace("ServerOnly")
     method void EnsureRespawn()
+        if isvalid(self.Entity.CurrentMap) and (_BossStageManager:IsArena(self.Entity.CurrentMap.Name) or _CarnivalRules:IsArena(self.Entity.CurrentMap.Name)) then self._T.respawnDeadline=nil return end
         local pc=self.Entity.PlayerComponent
         if not isvalid(pc) then return end
         if pc.Hp>0 then self._T.respawnDeadline=nil return end
@@ -772,11 +829,12 @@ script PlayerHit extends HitComponent
         pc.Hp=math.max(1,pc.MaxHp)
         pc:ProcessRevive(pc.UserId)
         self._T.respawnDeadline=nil
-        log("[RespawnRecovery] overdue respawn completed")
+        if Environment:IsMakerPlay() then log("[RespawnRecovery] overdue respawn completed") end
     end
 
     @ExecSpace("Server")
     method void RequestRespawnRecovery()
+        if isvalid(self.Entity.CurrentMap) and (_BossStageManager:IsArena(self.Entity.CurrentMap.Name) or _CarnivalRules:IsArena(self.Entity.CurrentMap.Name)) then return end
         local pc=self.Entity.PlayerComponent
         if not isvalid(pc) or senderUserId~=pc.UserId then return end
         local now=_UtilLogic.ServerElapsedSeconds
@@ -786,4 +844,151 @@ script PlayerHit extends HitComponent
         if pc.Hp>0 then pc:ProcessRevive(pc.UserId) end
     end
 
+    method boolean IsInDeadMineLava()
+        local map=self.Entity.CurrentMap
+        if not isvalid(map) then return false end
+        local name=_ChannelManager:BaseName(map.Name)
+        -- MoltenRock lava pools lie below the 1.50-high rock rims (pool floor 0.93~0.98).
+        if name~="211042000" and name~="211042100" and name~="211042101" and name~="211042200"
+            and name~="211042300" and name~="211042400" and name~="211042401" and name~="211042402" then return false end
+        return self.Entity.TransformComponent.WorldPosition.y < 1.45
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickDeadMineLava()
+        local pc=self.Entity.PlayerComponent
+        local map=self.Entity.CurrentMap
+        if self._T.lavaMap~=map then
+            self._T.lavaMap=map self._T.lavaTime=0 self._T.lavaHits=0
+        end
+        if not isvalid(pc) or pc.Hp<=0 or not self:IsInDeadMineLava() or self:IsFinalAttackInvincible() then
+            self._T.lavaTime=0 self._T.lavaHits=0
+            return
+        end
+        self._T.lavaTime=(self._T.lavaTime or 0)+0.25
+        if self._T.lavaTime<1 then return end
+        self._T.lavaTime=0
+        local damage=_UtilLogic:RandomIntegerRange(1,3)
+        -- Use the native HitEvent HP/death route, without granting monster-hit invulnerability.
+        __base:OnHit(self.Entity,damage,false,"field.lava",1)
+        self:ShowTakenDamage(damage)
+        self._T.lavaHits=self._T.autoHuntOn and ((self._T.lavaHits or 0)+1) or 0
+        if Environment:IsMakerPlay() then log("[VRF] Lava tick map="..map.Name.." damage="..tostring(damage).." autoHits="..tostring(self._T.lavaHits).." hp="..tostring(pc.Hp)) end
+        if pc.Hp<=0 or self._T.lavaHits<5 then return end
+        local fc=map.FootholdComponent
+        if not isvalid(fc) then return end
+        local spawn=map:GetChildByName("SpawnLocation",true)
+        local origin=isvalid(spawn) and spawn.TransformComponent.WorldPosition or self.Entity.TransformComponent.WorldPosition
+        local safe=nil
+        local best=math.huge
+        for _,fh in ipairs(fc:GetFootholdAll()) do
+            if fh:GetWidth()>=0.6 and math.min(fh.StartPoint.y,fh.EndPoint.y)>=2 then
+                local center=fh:GetCenter()
+                local score=(center.x-origin.x)^2+(center.y-origin.y)^2
+                if score<best then best=score safe=center end
+            end
+        end
+        if safe==nil then return end
+        self._T.lavaHits=0
+        self:EscapeDeadMineLava(map.Id,Vector2(safe.x,safe.y+0.15),pc.UserId)
+    end
+
+    @ExecSpace("Client")
+    method void EscapeDeadMineLava(string mapId, Vector2 position)
+        local player=self.Entity
+        if player~=_UserService.LocalPlayer or not _AutoHuntManager.autoOn or player.PlayerComponent.Hp<=0
+            or not isvalid(player.CurrentMap) or player.CurrentMap.Id~=mapId or not self:IsInDeadMineLava() then return end
+        _AutoHuntManager:ClearRopeState(player,"용암 탈출",true)
+        _AutoHuntManager:StopMoving()
+        _AutoHuntManager._T.target=nil
+        _AutoHuntManager._T.nextScan=0
+        _AutoHuntManager._T.intermediateHop=nil
+        _AutoHuntManager._T.combatJump=nil
+        _AutoHuntManager._T.holdMoveUntil=_UtilLogic.ElapsedSeconds+0.5
+        player.RigidbodyComponent:SetWorldPosition(position)
+        _UIToast:ShowMessage("용암 피해가 5회 연속 발생하여 안전한 발판으로 이동했습니다.")
+        if Environment:IsMakerPlay() then log("[VRF] Lava escape map="..player.CurrentMap.Name.." x="..tostring(position.x).." y="..tostring(position.y)) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestRecovery(string kind)
+        if senderUserId~=self.Entity.PlayerComponent.UserId then return end
+        if kind~="hp" and kind~="mp" then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        self._T.recoveryCooldowns=self._T.recoveryCooldowns or {}
+        if not _BeginnerRecovery:IsResting(self.Entity) or (self._T.recoveryCooldowns[kind] or 0)>now then
+            self:ReceiveRecovery("",0,0,senderUserId) return
+        end
+        local p=self.Entity.TransformComponent.WorldPosition
+        self._T.recovery={kind=kind,ready=now+0.5,settleUntil=now+0.3,position=p,map=self.Entity.CurrentMap}
+        self._T.recoveryCooldowns[kind]=now+3
+        self:ReceiveRecovery(kind,now+0.5,now+3,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveRecovery(string kind, number ready, number cooldown)
+        if self.Entity==_UserService.LocalPlayer then _BeginnerRecovery:BeginLocal(kind,ready,cooldown) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestCancelRecovery()
+        if senderUserId==self.Entity.PlayerComponent.UserId then self._T.recovery=nil end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ValidateRecovery()
+        local r=self._T.recovery
+        if r==nil then return end
+        local p=self.Entity.TransformComponent.WorldPosition
+        if _UtilLogic.ServerElapsedSeconds<(r.settleUntil or 0) and self.Entity.PlayerComponent.Hp>0 and self.Entity.CurrentMap==r.map then
+            r.position=p return
+        end
+        if not _BeginnerRecovery:IsResting(self.Entity) or self.Entity.CurrentMap~=r.map or math.abs(p.x-r.position.x)>0.025 or math.abs(p.y-r.position.y)>0.025 then
+            self._T.recovery=nil
+            self:StopRecoveryLocal(self.Entity.PlayerComponent.UserId)
+        end
+    end
+
+    @ExecSpace("Client")
+    method void StopRecoveryLocal()
+        if self.Entity==_UserService.LocalPlayer then _BeginnerRecovery:Cancel() end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SchedulePowerGuardRecovery(Entity target, integer damage)
+        if (self._T.powerGuardUntil or 0) >= _UtilLogic.ElapsedSeconds and damage > 0 then
+            local totalHeal = math.floor(damage * (self._T.powerGuardHealPct or 10) / 100)
+            if totalHeal > 0 then
+                local tickHeal = math.max(1, math.floor(totalHeal / 3))
+                local ent = target
+                for tick = 1, 3 do
+                    _TimerService:SetTimerOnce(function()
+                        if not isvalid(ent) then return end
+                        local pcT = ent.PlayerComponent
+                        if not isvalid(pcT) or pcT.Hp <= 0 then return end
+                        local native = ent:GetComponent("PlayerAttack")
+                        if isvalid(native) and native._T.carnivalPreview then
+                            _CarnivalReplica:HealActor(ent,tickHeal)
+                        else pcT.Hp = math.min(pcT.Hp + tickHeal, pcT.MaxHp) end
+                        ---@type PlayerAttack
+                        local paT = ent:GetComponent("script.PlayerAttack")
+                        if isvalid(paT) then paT:ShowHealDamageSkin(ent, tickHeal) end
+                    end, tick * 3.0)   -- 3초 뒤부터 3초 간격 3틱 (3/6/9초)
+                end
+                if Environment:IsMakerPlay() then log("[PlayerHit] 파워가드 지연 회복 예약: 피해 " .. tostring(damage) .. " -> 총 +" .. tostring(totalHeal) .. " HP (3초 간격 3틱)") end
+            end
+        end
+    end
+
+    method boolean BlocksSkillContact()
+        -- Shared with normal monsters: immunity, stealth, evade, parry, then expendable shields.
+        if self:IsFinalAttackInvincible() then return true end
+        local pa=self.Entity:GetComponent("PlayerAttack")
+        if isvalid(pa) then
+            if pa:IsDarkSightActive() then return true end
+            if pa:IsSmokeScreenActive() then pa:NotifySmokeScreenMiss(self.Entity) return true end
+            if pa:RollFakeMiss(self.Entity) then return true end
+        end
+        return self:CheckGuardBlock() or self:CheckParryBlock() or self:CheckHolyShellBlock()
+    end
 end

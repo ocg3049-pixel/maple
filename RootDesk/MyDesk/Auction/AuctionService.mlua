@@ -1,0 +1,237 @@
+@Logic
+script AuctionService extends Logic
+    @ExecSpace("ServerOnly")
+    method integer TradingLevel(table sv, string snapshot)
+        -- Only a server-approved Maker command can override the saved-level gate.
+        local temporary=tonumber(sv.testLevel) or 0
+        if Environment:IsMakerPlay() and temporary>=1 and temporary<=200 then return math.floor(temporary) end
+        return tonumber(string.match("\n"..snapshot,"\nLV\t(%d+)")) or 0
+    end
+
+    @ExecSpace("ServerOnly")
+    method any Store()
+        return _DataStorageService:GetGlobalDataStorage("auction_v1")
+    end
+
+    method table Decode(string raw)
+        local ok,t=pcall(function() return _HttpService:JSONDecode(raw or "") end)
+        if ok and type(t)=="table" then return t end return {}
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Accept(table sv, string snapshot)
+        local old=_AuctionRules:State(sv.saves[sv.activeId] or "") local incoming=_AuctionRules:State(snapshot)
+        return not sv.auctionBusy and old.pending==nil and incoming.pending==nil and (old.rev or 0)==(incoming.rev or 0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Save(table sv, string id, string snapshot)
+        sv.saves[id]=snapshot sv.dirtySaves[id]=true
+        return _CharacterPersistence:WriteCharacterSaves(sv,true)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Recover(table sv, string uid, string id, string snapshot)
+        -- A durable debit/escrow always precedes a global mutation. Ambiguous errors
+        -- leave the journal intact: retry reads the same operation before any refund.
+        local state=_AuctionRules:State(snapshot) local op=state.pending
+        if op==nil then return {snapshot=snapshot} end
+        local store=self:Store()
+        if op.kind=="sell" and (op.listing==nil or op.listing=="") then
+            -- MSW CAS cannot create a missing key. Allocate a fresh, unpublished
+            -- draft on EVERY initialization attempt; a timed-out draft is never reused.
+            local key=_UtilLogic:NewGuid()
+            local draft={id=key,seller=uid,character=id,item=op.item,price=op.price,created=op.time,expires=op.time+op.hours*3600000,status="draft"}
+            if store:SetByInfoAndWait(DataStorageKeyInfo(key,"","listing"),_HttpService:JSONEncode(draft))~=0 then return {error="판매 등록을 준비 중입니다."} end
+            op.listing=key state.pending=op snapshot=_AuctionRules:Write(snapshot,state)
+            -- Only a durably journaled draft may become visible to buyers.
+            if not self:Save(sv,id,snapshot) then return {error="판매 등록을 저장 중입니다."} end
+        end
+        local ec,raw=store:GetAndWait(op.listing)
+        if ec~=0 and ec~=1000002 then return {error="경매 거래를 확인 중입니다. 잠시 후 다시 시도해주세요."} end
+        local row=self:Decode(raw) local now=DateTime.UtcNow.Elapsed
+        local outcome="" local delta=0 local item="" local tab="" local index=0
+        if op.kind=="sell" then
+            if row.id==nil or row.seller~=uid or row.character~=id then return {error="거래 식별자를 확인하지 못했습니다."} end
+            if row.status=="draft" then
+                row.status="active"
+                if store:UpdateAndWait(op.listing,raw,_HttpService:JSONEncode(row))~=0 then return {error="판매 등록을 확인 중입니다."} end
+            end
+            outcome="판매 등록이 완료되었습니다."
+        elseif op.kind=="buy" then
+            if row.buyOp==op.token and row.buyer==uid and row.buyerCharacter==id then
+                outcome="구매했습니다. 완료 탭에서 아이템을 받아주세요."
+            elseif row.status=="active" and (row.expires or 0)>now and row.seller~=uid and row.price==op.price then
+                row.status="sold" row.buyer=uid row.buyerCharacter=id row.buyOp=op.token row.soldAt=now
+                local code=store:UpdateAndWait(op.listing,raw,_HttpService:JSONEncode(row))
+                if code~=0 then return {error="구매 결과를 확인 중입니다. 다시 시도해주세요."} end
+                outcome="구매했습니다. 완료 탭에서 아이템을 받아주세요."
+            else
+                delta=op.price outcome="이미 판매되었거나 만료된 상품입니다. 메소를 돌려드렸습니다."
+            end
+        elseif op.kind=="cancel" then
+            if row.seller~=uid or row.character~=id then outcome="본인의 판매 상품이 아닙니다."
+            elseif row.status=="active" then
+                row.status="cancelled" row.cancelOp=op.token
+                if store:UpdateAndWait(op.listing,raw,_HttpService:JSONEncode(row))~=0 then return {error="취소 결과를 확인 중입니다."} end
+                outcome="취소했습니다. 완료 탭에서 아이템을 받아주세요."
+            else outcome="완료 탭에서 거래 결과를 확인해주세요." end
+        elseif op.kind=="claim" then
+            local field="" local money=0 local grant=""
+            if row.seller==uid and row.character==id then
+                if row.status=="sold" then field="sellerClaim" money=_AuctionRules:Net(row.price)
+                elseif row.status=="cancelled" or row.status=="expired" or row.status=="active" and (row.expires or 0)<=now then field="sellerClaim" grant=row.item end
+            elseif row.buyer==uid and row.buyerCharacter==id and row.status=="sold" then field="buyerClaim" grant=row.item end
+            if field=="" then outcome="수령할 거래가 없습니다."
+            elseif row[field]~=nil and row[field]~=op.token then outcome="이미 수령한 거래입니다."
+            else
+                if grant~="" then
+                    tab=_AuctionRules:InventoryTab(grant) index=_AuctionRules:EmptySlot(snapshot,tab)
+                    if index==0 then return {error="아이템을 받을 인벤토리 공간이 필요합니다."} end
+                end
+                if row[field]==nil then
+                    row[field]=op.token
+                    if row.status=="active" then row.status="expired" end
+                    if store:UpdateAndWait(op.listing,raw,_HttpService:JSONEncode(row))~=0 then return {error="수령 결과를 확인 중입니다."} end
+                end
+                item=grant delta=money outcome="수령이 완료되었습니다."
+            end
+        else return {error="알 수 없는 경매 작업입니다."} end
+        if item~="" then snapshot=_AuctionRules:Put(snapshot,tab,index,item) end
+        if delta~=0 then snapshot=_AuctionRules:SetMeso(snapshot,_AuctionRules:Meso(snapshot)+delta) end
+        state.ids=state.ids or {} state.ids[op.listing]=true
+        state.pending=nil state.rev=(state.rev or 0)+1
+        state.receipt={token=op.token,message=outcome,meso=delta,item=item,tab=tab,index=index}
+        snapshot=_AuctionRules:Write(snapshot,state)
+        if not self:Save(sv,id,snapshot) then return {error="거래 내용을 저장 중입니다. 다시 시도해주세요."} end
+        if Environment:IsMakerPlay() then log("[VRF][Auction] committed "..op.kind.." rev="..tostring(state.rev)) end
+        return {snapshot=snapshot,state=state}
+    end
+
+    @ExecSpace("Server")
+    method void Request(string character, string snapshot, string request)
+        local uid=senderUserId self._T.locks=self._T.locks or {}
+        if self._T.locks[uid] then return end
+        self._T.locks[uid]=true
+        local ok,err=pcall(function() self:Process(uid,character,snapshot,request) end)
+        self._T.locks[uid]=nil
+        local current=_CharacterPersistence._T.sv[uid] if current then current.auctionBusy=false end
+        if not ok then
+            local sv=_CharacterPersistence._T.sv[uid] if sv then sv.auctionBusy=false end
+            log_error("[Auction] operation interrupted: "..tostring(err))
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Process(string uid, string character, string snapshot, string request)
+        local sv=_CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId~=character or sv.auctionBusy or sv.eventBusy or sv.restBusy or #request>4096 then return end
+        local req=self:Decode(request) local token=tostring(req.token or "")
+        if #token~=32 or string.find(token,"[^%x]") then return end
+        local state=_AuctionRules:State(sv.saves[character] or "")
+        if state.pending==nil and state.receipt and state.receipt.token==token then
+            sv.auctionBusy=true
+            local saved=_CharacterPersistence:WriteCharacterSaves(sv,true) sv.auctionBusy=false
+            if saved then self:Reply(character,token,"ok",_HttpService:JSONEncode(state),uid) end return
+        end
+        if state.pending~=nil and state.pending.token~=token then self:Reply(character,token,"reject","이전 거래를 먼저 완료해주세요.",uid) return end
+        if state.pending==nil then
+            if #snapshot>1000000 or not _CharacterPersistence:AcceptCharacterSnapshot(uid,snapshot,"auction_prepare") then self:Reply(character,token,"reject","저장 상태가 변경되었습니다. 다시 접속해주세요.",uid) return end
+            sv.auctionBusy=true
+            snapshot=sv.saves[character] state=_AuctionRules:State(snapshot)
+            if self:TradingLevel(sv,snapshot)<70 then self:Reply(character,token,"reject","경매장은 70레벨부터 이용할 수 있습니다.",uid) return end
+            local op={token=token,kind=req.kind,listing=tostring(req.listing or ""),time=DateTime.UtcNow.Elapsed}
+            if req.kind=="sell" then
+                local tab=tostring(req.tab or "") local index=tonumber(req.index) or 0
+                local owned=_AuctionRules:ItemAt(snapshot,tab,index) local reason=_AuctionRules:Rejection(owned)
+                local count=tonumber(req.count) or 0 local price=tonumber(req.price) or 0
+                -- Old in-flight requests retain their total; new requests send a unit price.
+                if req.unitPrice~=nil then price=_AuctionRules:SaleTotal(count,tonumber(req.unitPrice) or 0) end
+                if reason~="" then self:Reply(character,token,"reject",reason,uid) return end
+                if index<1 or index>128 or index~=math.floor(index) or count<1 or count>_AuctionRules:Count(owned) or count~=math.floor(count) or price<1 or price>1000000000000 or price~=math.floor(price) then self:Reply(character,token,"reject","수량과 가격을 확인해주세요.",uid) return end
+                if req.hours~=24 and req.hours~=48 then self:Reply(character,token,"reject","등록시간을 선택해주세요.",uid) return end
+                op.listing="" op.item=_AuctionRules:WithCount(owned,count) op.price=price op.hours=req.hours
+                snapshot=_AuctionRules:Put(snapshot,tab,index,_AuctionRules:WithCount(owned,_AuctionRules:Count(owned)-count))
+            elseif req.kind=="buy" or req.kind=="cancel" or req.kind=="claim" then
+                if #op.listing~=32 or string.find(op.listing,"[^%x]") then return end
+                local ec,raw=self:Store():GetAndWait(op.listing) local row=self:Decode(raw)
+                if ec~=0 or row.id==nil then self:Reply(character,token,"reject","상품을 불러오지 못했습니다.",uid) return end
+                if (req.kind=="cancel" and (row.seller~=uid or row.character~=character)) or (req.kind=="claim" and not (row.seller==uid and row.character==character or row.buyer==uid and row.buyerCharacter==character)) then self:Reply(character,token,"reject","본인의 거래만 처리할 수 있습니다.",uid) return end
+                if req.kind=="buy" then
+                    if row.status~="active" or row.expires<=DateTime.UtcNow.Elapsed or row.seller==uid or row.price~=req.price then self:Reply(character,token,"reject","구매할 수 없는 상품입니다. 목록을 새로고침해주세요.",uid) return end
+                    if _AuctionRules:Meso(snapshot)<row.price then self:Reply(character,token,"reject","메소가 부족합니다.",uid) return end
+                    op.price=row.price snapshot=_AuctionRules:SetMeso(snapshot,_AuctionRules:Meso(snapshot)-row.price)
+                elseif req.kind=="claim" then
+                    local money=row.seller==uid and row.character==character and row.status=="sold"
+                    if not money and _AuctionRules:EmptySlot(snapshot,_AuctionRules:InventoryTab(row.item or ""))==0 then self:Reply(character,token,"reject","인벤토리의 빈 칸이 필요합니다.",uid) return end
+                end
+            else return end
+            state.pending=op snapshot=_AuctionRules:Write(snapshot,state)
+            sv.auctionBusy=true
+            if not self:Save(sv,character,snapshot) then sv.auctionBusy=false self:Reply(character,token,"retry","거래 준비를 저장 중입니다.",uid) return end
+        else sv.auctionBusy=true snapshot=sv.saves[character] end
+        -- Reflush the journal after a prior write timeout before touching global data.
+        if not _CharacterPersistence:WriteCharacterSaves(sv,true) then sv.auctionBusy=false self:Reply(character,token,"retry","저장 서버의 응답을 기다리고 있습니다.",uid) return end
+        local result=self:Recover(sv,uid,character,snapshot) sv.auctionBusy=false
+        if result.error then self:Reply(character,token,"retry",result.error,uid)
+        else self:Reply(character,token,"ok",_HttpService:JSONEncode(result.state or _AuctionRules:State(result.snapshot)),uid) end
+    end
+
+    @ExecSpace("Client")
+    method void Reply(string character, string token, string status, string payload)
+        _AuctionHouse:Receive(character,token,status,payload)
+    end
+
+    @ExecSpace("Server")
+    method void Query(string character, integer sequence)
+        local uid=senderUserId local sv=_CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId~=character or sv.auctionQuery then return end
+        if _UtilLogic.ElapsedSeconds<(sv.auctionQueryAt or 0) then return end
+        if self:TradingLevel(sv,sv.saves[character] or "")<70 then self:Results(character,sequence,"[]","경매장은 70레벨부터 이용할 수 있습니다.",uid) return end
+        sv.auctionQuery=true sv.auctionQueryAt=_UtilLogic.ElapsedSeconds+1
+        local ec,pages=self:Store():GetPagesAndWait("listing") local rows={} local message=""
+        if ec==0 and pages~=nil then
+            local n=0 local now=DateTime.UtcNow.Elapsed
+            while true do
+                for _,entry in pairs(pages:GetCurrentPageDatas()) do
+                    local r=self:Decode(entry.Value)
+                    if r.id~=nil and r.status~="draft" then
+                        local mine=r.seller==uid and r.character==character local bought=r.buyer==uid and r.buyerCharacter==character
+                        if mine or bought or r.status=="active" and r.expires>now or r.status=="sold" and now-(r.soldAt or 0)<2592000000 then
+                            table.insert(rows,{id=r.id,item=r.item,price=r.price,expires=r.expires,status=r.status,soldAt=r.soldAt,mine=mine,bought=bought,ownAccount=r.seller==uid,claimed=(mine and r.sellerClaim~=nil or bought and r.buyerClaim~=nil)})
+                        end
+                    end
+                end
+                n=n+1 if pages.IsLastPage then break end
+                if n>=50 then message="최근 상품 목록입니다. 잠시 후 새로고침해주세요." break end
+                if pages:LoadNextPageAndWait()~=0 then message="일부 상품을 불러오지 못했습니다." break end pages:MoveToNextPageAndWait()
+            end
+        elseif ec~=1000002 then message="경매장 목록을 불러오지 못했습니다. 새로고침해주세요." end
+        -- Personal receipts must remain reachable even beyond the public scan limit.
+        local seen={} for _,r in ipairs(rows) do seen[r.id]=true end
+        local missing={} for key,_ in pairs(_AuctionRules:State(sv.saves[character] or "").ids or {}) do if not seen[key] then table.insert(missing,key) end end
+        if #missing>0 then
+            local ownCode,ownPages=self:Store():BatchGetAndWait(missing)
+            if ownCode==0 and ownPages~=nil then
+                while true do
+                    for _,entry in pairs(ownPages:GetCurrentPageDatas()) do
+                        local r=self:Decode(entry.Value)
+                        if r.id~=nil and not seen[r.id] then
+                            local mine=r.seller==uid and r.character==character local bought=r.buyer==uid and r.buyerCharacter==character
+                            if mine or bought then table.insert(rows,{id=r.id,item=r.item,price=r.price,expires=r.expires,status=r.status,soldAt=r.soldAt,mine=mine,bought=bought,ownAccount=r.seller==uid,claimed=(mine and r.sellerClaim~=nil or bought and r.buyerClaim~=nil)}) seen[r.id]=true end
+                        end
+                    end
+                    if ownPages.IsLastPage then break end
+                    if ownPages:LoadNextPageAndWait()~=0 then message="일부 거래 기록을 불러오지 못했습니다." break end ownPages:MoveToNextPageAndWait()
+                end
+            else message="일부 거래 기록을 불러오지 못했습니다. 다시 새로고침해주세요." end
+        end
+        sv.auctionQuery=false
+        self:Results(character,sequence,_HttpService:JSONEncode(rows),message,uid)
+    end
+
+    @ExecSpace("Client")
+    method void Results(string character, integer sequence, string rows, string message)
+        _AuctionHouse:Results(character,sequence,rows,message)
+    end
+end

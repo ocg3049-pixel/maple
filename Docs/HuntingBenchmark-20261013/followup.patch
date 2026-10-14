@@ -1,0 +1,364 @@
+--- before/AutoHunt/AutoHuntManager.mlua
++++ after/AutoHunt/AutoHuntManager.mlua
+@@ -319,5 +319,5 @@
+ 		local pa = player:GetComponent("script.PlayerAttack")
+ 		if not isvalid(rb) or not rb:IsOnGround() or not isvalid(ctrl) or not isvalid(mv) or pa == nil then return false end
+-		if _SkillManager:IsDragonRideMounted() then return false end
++		if _SkillManager:IsDragonRideMounted() or self:HasMageAirBlockedSkill() then return false end
+ 		if (self._T.ropeState or "") ~= "" or (self._T.jumpAtkUntil or 0) > now or pa:IsAutoAttackMotionLocked() then return false end
+ 		local pp = player.TransformComponent.WorldPosition
+@@ -344,5 +344,7 @@
+         local retreat = (closing and strong or nearby>=3) and distance <= 2.3
+ 		local ranged=_SkillManager:IsClawEquipped() or _SkillManager:IsArcherJob()
+-        local reach=ranged and pa:GetBasicProjectileRange() or 1.3
++        local airSkill = self:PickCombatJumpSkill(player, target, false)
++        if airSkill == nil then return false end
++        local reach=ranged and math.min(pa:GetBasicProjectileRange(), 4.5) or 1.3
+         local advance = distance > reach - 0.15 and distance <= reach + 1.1
+ 			and not self:HasUsableAttackInRange(player, target)
+@@ -405,13 +407,23 @@
+ 			local dx = tp.x - pp.x
+ 			if dx * jump.face > 0 and math.abs(dx) <= (jump.reach or pa:GetBasicProjectileRange()) - 0.15 then
+-				local claw = _SkillManager:IsClawEquipped()
+-				if claw then pa:CastClawBasicAttack()
+-                elseif _SkillManager:IsArcherJob() then _SkillManager:DoArcherBasicAttack()
+-                else ctrl:ActionAttack() end
+-				jump.fired = true
+-				jump.releaseAt = age + (claw and 0.72 or math.max(0.45, 0.8 * _CharInfoManager:GetAttackSpeedMultiplier()))
+-				self._T.nextAtk = now + (claw and 0.72 or 0.8)
+-				self._T.lastAttackTime = now
+-				if Environment:IsMakerPlay() then log("[JumpCombat] 자동 공중 발사 move=" .. tostring(jump.move) .. " face=" .. tostring(jump.face)) end
++                local skill = self:PickCombatJumpSkill(player, jump.target, true)
++                if skill ~= nil then
++                    local duration = math.max(0.8, 1.1 * _CharInfoManager:GetAttackSpeedMultiplier())
++                    pa:BeginBasicAirMotion(duration)
++                    pa._T.basicAirMotion.x = inputX
++                    ctrl.LookDirectionX = jump.face
++                    _SkillManager:UseSkillInSlot(skill.key)
++                    -- GetEffectiveCombatPower consumes this reservation only after the cast is accepted.
++                    if _SkillManager._T.castingSkillName == nil and _SkillManager._T.skillOnCooldown then
++                        jump.fired = true
++                        jump.releaseAt = age + duration
++                        self._T.nextAtk = now + duration
++                        self._T.lastAttackTime = now
++                        self:BeginAttackProbe(now, jump.target)
++                        if Environment:IsMakerPlay() then log("[VRF] JumpCombat skill=" .. skill.name .. " move=" .. tostring(jump.move) .. " face=" .. tostring(jump.face)) end
++                    else
++                        pa._T.basicAirMotion = nil
++                    end
++                end
+ 			end
+ 		end
+@@ -420,4 +432,27 @@
+ 		return true
+ 	end
++
++	@ExecSpace("ClientOnly")
++    method table PickCombatJumpSkill(Entity player, Entity target, boolean requireRange)
++        -- Only immediate airborne attacks; charge, channel and teleport attacks stay on the ground.
++        local priority = {["쿼드러플 스로우"]=40,["트리플 스로우"]=30,["럭키세븐"]=20,
++            ["스트레이프"]=30,["파이어 샷"]=35,["아이스 샷"]=35,["에로우 봄"]=25,
++            ["더블샷"]=20,["에로우 블로우"]=10,["브랜디쉬"]=30,["스피어 버스터"]=30,
++            ["차지 블로우"]=30,["부메랑 스탭"]=30,["새비지블로우"]=20,["더블스탭"]=10,
++            ["파워스트라이크"]=10,["슬래시블러스트"]=15}
++        if _SkillManager._T.skillOnCooldown or (_SkillManager._T.actionLockUntil or 0) > _UtilLogic.ElapsedSeconds then return nil end
++        local selected = nil
++        local score = 0
++        for _, slots in ipairs({self._T.slotSingles or {}, self._T.slotAoes or {}}) do
++            for _, slot in ipairs(slots) do
++                local rank = priority[slot.name] or 0
++                if rank > score and self:IsAttackSkillReady(slot.name)
++                    and (not requireRange or self:CanSkillReachTarget(slot.name, player, target)) then
++                    selected, score = slot, rank
++                end
++            end
++        end
++        return selected
++    end
+ 
+ 	@ExecSpace("ClientOnly")
+@@ -1182,23 +1217,9 @@
+ 				if Environment:IsMakerPlay() then log("[AutoHunt] 대시 접근 (dx=" .. string.format("%.2f", dx) .. ")") end
+ 			end
+-			-- (나이트로드·섀도어, 요청) 플래시 점프는 **필요한 두 상황에서만** 쓴다.
+-			--   ① 위 발판 대상: 그냥 점프로는 못 닿는 높이도 점프+플래시 점프면 올라간다(사거리 안일 때만).
+-			--      가로로도 밀려나지만 그 위 발판에 올라서기만 하면 나머지는 걷기가 마무리한다.
+-			--   ② 같은 층 먼 대상: 이 두 직업은 러시(대시)가 없어 접근이 느리다 - 3유닛 이상 벌어졌고
+-			--      대시 슬롯도 없을 때만 가속용으로 쓴다(가까운 대상엔 절대 안 쓴다).
+-			if self:GetFlashJumpLevel() > 0 then
+-				local fjReach = self:GetFlashJumpReach()
+-				if dy >= 1.2 and dy <= fjReach then
+-					if self:TryFlashJumpMove(now, player, dir, "위 발판 추적 (dy=" .. string.format("%.2f", dy)
+-						.. " 사거리=" .. string.format("%.2f", fjReach) .. ")") then
+-						return
+-					end
+-				elseif math.abs(dy) < 0.8 and math.abs(dx) >= 3.0
+-					and (self._T.slotDashes == nil or #self._T.slotDashes == 0) then
+-					if self:TryFlashJumpMove(now, player, dir, "같은 층 가속 접근 (dx=" .. string.format("%.2f", dx) .. ")") then
+-						return
+-					end
+-				end
+-			end
++            -- Flash Jump accelerates horizontally; upper platforms use jumps, ropes or another route.
++            if self:GetFlashJumpLevel() > 0 and math.abs(dy) < 0.3 and math.abs(dx) >= 3.0
++                and (self._T.slotDashes == nil or #self._T.slotDashes == 0) then
++                if self:TryFlashJumpMove(now, player, dir, "같은 층 가속 접근") then return end
++            end
+ 			-- (신궁, 요청 2026-08-06) 더블 점프도 플래시 점프와 **같은 두 상황**에서만 쓴다.
+ 			-- 두 스킬을 동시에 가진 직업은 없지만, 만에 하나 겹쳐도 플래시 점프가 먼저 소비되므로
+@@ -3390,4 +3411,9 @@
+ 		-- 잠금이 풀릴 때까지 공격 틱과 걷기를 함께 미뤄, 로테이션 자체가 돌지 않게 한다
+ 		-- (그냥 시전만 막으면 뽑힌 스킬의 자체 간격 게이트 - 돌진 12초 등 - 이 헛되이 소모된다).
++        if pick.name == "어썰터" then
++            -- Vanish (0.8s) + arrival hold (2.1s) + RPC margin; no attack during the invisible gap.
++            self._T.holdMoveUntil = now + 3.1
++            self._T.nextAtk = now + 3.1
++        end
+         if pick.name == "힐" then
+             local lock = math.max(0.8, 0.85 * _CharInfoManager:GetAttackSpeedMultiplier() + 0.15)
+@@ -5394,11 +5420,6 @@
+ 	@ExecSpace("ClientOnly")
+ 	method number GetFlashJumpReach()
+-		local lv = self:GetFlashJumpLevel()
+-		if lv <= 0 then return 0 end
+-		local base = 1.194
+-		local hasteReach = self:GetHasteJumpReach()
+-		if hasteReach + 0.15 > base then base = hasteReach + 0.15 end
+-		local scale = _SkillManager:GetFlashJumpForceScale(lv)
+-		return base + 0.4 * scale * scale - 0.2
++        -- Horizontal mobility is never a vertical route or a reason to skip a rope.
++        return 0
+ 	end
+ 
+@@ -5410,5 +5431,10 @@
+ 	method boolean TryFlashJumpMove(number now, Entity player, number dirX, string reason)
+ 		if self:GetFlashJumpLevel() <= 0 then return false end
+-		-- 스킬 자체엔 쿨타임이 없지만(체공 1회 제한뿐) 자동사냥이 매 프레임 남발하지 않도록 간격을 둔다.
++        local target = self._T.target
++        if not isvalid(target) or target.CurrentMap ~= player.CurrentMap or self:GetTargetRemainHp(target) <= 0 then return false end
++        local pp, tp = player.TransformComponent.WorldPosition, target.TransformComponent.WorldPosition
++        if math.abs(tp.y - pp.y) > 0.3 or (tp.x - pp.x) * dirX < 3.0 then return false end
++        local originMap, targetY = player.CurrentMap, tp.y
++        -- 스킬 자체엔 쿨타임이 없지만(체공 1회 제한뿐) 자동사냥이 매 프레임 남발하지 않도록 간격을 둔다.
+ 		if (self._T.nextFlashJump or 0) > now then return false end
+ 		local rb = player.RigidbodyComponent
+@@ -5429,6 +5455,9 @@
+ 			if self.autoOn ~= true then return end
+ 			local p = _UserService.LocalPlayer
+-			if not isvalid(p) then return end
+-			-- 시전 직전에 방향을 다시 못박는다(플래시 점프는 LookDirectionX로 도약 방향을 정한다).
++			if not isvalid(p) or p.CurrentMap ~= originMap or not isvalid(target) or target.CurrentMap ~= originMap then return end
++            local currentTarget = target.TransformComponent.WorldPosition
++            if self:GetTargetRemainHp(target) <= 0 or math.abs(currentTarget.y - targetY) > 0.3
++                or (currentTarget.x - p.TransformComponent.WorldPosition.x) * dirX < 1.0 then return end
++            -- 시전 직전에 방향을 다시 못박는다(플래시 점프는 LookDirectionX로 도약 방향을 정한다).
+ 			local pcc2 = p.PlayerControllerComponent
+ 			if isvalid(pcc2) then pcc2.LookDirectionX = dirX end
+--- before/Combat/PlayerAttack.mlua
++++ after/Combat/PlayerAttack.mlua
+@@ -282,5 +282,5 @@
+ 		if math.abs(vx) > 0.001 then inputX = ((vx > 0) and 1 or -1) * mv.InputSpeed end
+ 		self._T.basicAirMotion = {x = inputX, untilTime = _UtilLogic.ElapsedSeconds + duration, map = self.Entity.CurrentMap}
+-		if Environment:IsMakerPlay() then log("[JumpCombat] 공중 기본공격 move=" .. tostring(inputX) .. " look=" .. tostring(self.Entity.PlayerControllerComponent.LookDirectionX)) end
++		if Environment:IsMakerPlay() then log("[JumpCombat] 공중 공격 이동 유지 move=" .. tostring(inputX) .. " look=" .. tostring(self.Entity.PlayerControllerComponent.LookDirectionX)) end
+ 	end
+ 
+@@ -19857,19 +19857,11 @@
+ 					-- 마지막 프레임 값으로 자동 보정한다(공식 문서 명시) - 두 값을 동일하게 최대치로 주면
+ 					-- swingO1 애니메이션의 "끝 프레임 한 장"만 정지된 상태로 보여줄 수 있다.
+-					local motionEvent = ActionStateChangedEvent("swingO1", "swingO1", 1.0, SpriteAnimClipPlayType.Onetime, 2147483647, 2147483647)
++					local motionEvent = ActionStateChangedEvent("swingO1", "swingO1", 1.0, SpriteAnimClipPlayType.Loop, 2147483647, 2147483647)
+ 					body:SendEvent(motionEvent)
+ 				end
+ 			end, 0.1)
+-			-- (기능 수정) "끝 모션의 길이를 1초 늘려달라"는 요청 - 1초 → 2초 고정 후 stand1로 복귀한다.
+-			self:SetActorTimerOnce(function()
+-				if not self:IsCurrentCombatMotion(combatMotionGeneration) then return end
+-				if not isvalid(attacker) then return end
+-				if self._T.assaulterMotionSerial ~= motionSerial then return end
+-				local body = avatarRenderer:GetBodyEntity()
+-				if isvalid(body) then
+-					local resetEvent = ActionStateChangedEvent("stand1", "stand1", 1.0, SpriteAnimClipPlayType.Loop)
+-					body:SendEvent(resetEvent)
+-				end
+-			end, 2.1)
++            -- BeginCombatMotion owns the deadline and restores the actual walk/fall/idle state.
++            -- A second stand1 timer here used to overwrite that restoration.
++
+ 		end
+ 	end
+@@ -23093,5 +23085,5 @@
+ 			end
+ 			comp.Lifetime = 300
+-			-- 용사 HP = 주인 최대 HP의 2/3 (머리 위 HP바 표시용 - HeroSummon.SpawnHpBar)
++			-- 비숍의 용사/궁수/도적 소환 HP를 기존(주인 최대 HP의 2/3)의 절반으로 줄인다.
+ 			local ownerMaxHp = 50
+ 			if isvalid(self.Entity.PlayerComponent) then
+@@ -23099,4 +23091,6 @@
+ 			end
+ 			comp.HeroMaxHp = math.max(1, math.floor(ownerMaxHp * 2 / 3))
++            if self._T.archerJobIdx == 4 then comp.HeroMaxHp = math.max(1, math.floor(comp.HeroMaxHp * 0.5)) end
++            if Environment:IsMakerPlay() then log("[VRF] Hero summon ownerJob=" .. tostring(self._T.archerJobIdx) .. " class=" .. cls .. " ownerMaxHp=" .. tostring(ownerMaxHp) .. " summonMaxHp=" .. tostring(comp.HeroMaxHp)) end
+ 			comp.HeroHp = comp.HeroMaxHp
+ 		end
+--- before/Skills/HeroSummon.mlua
++++ after/Skills/HeroSummon.mlua
+@@ -29,5 +29,5 @@
+ 	-- (요청 2026-08-11) 소환수 파티 UI(SummonPartyUI)가 클라에서 HP를 읽어야 해서 @Sync로 승격.
+ 	-- 대입은 전부 서버라 단방향 동기화 규칙에 안전하다.
+-	@Sync property number HeroMaxHp = 100        -- 최대 HP(일반 용사 소환은 주인 최대 HP의 2/3, 기사 소환은 1/2)
++	@Sync property number HeroMaxHp = 100        -- 최대 HP(비숍 소환은 기존 2/3 HP의 절반, 기사 소환은 1/2)
+ 	@Sync property number HeroHp = 100           -- 현재 HP
+ 	@Sync property number HeroLevel = 1          -- 용사 레벨(주인 레벨의 N% - 용사 소환 투자 레벨이 정한다: 1레벨 50% → 마스터 30에서 65%)
+--- before/Carnival/CarnivalUI.mlua
++++ after/Carnival/CarnivalUI.mlua
+@@ -14,4 +14,5 @@
+     method Entity UI(string path)
+         -- All Carnival UI entities are local to this client.
++        if path == "Entry" then return _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnPvp") end
+         return _EntityService:GetEntityByPath("/ui/CarnivalUI/"..path)
+     end
+@@ -20,5 +21,7 @@
+     method void Text(string path, string value)
+         -- Update text only when its content changes.
+-        local e=self:UI(path) if isvalid(e) and e.TextGUIRendererComponent.Text~=value then e.TextGUIRendererComponent.Text=value end
++        local e=self:UI(path)
++        if path=="Entry" and isvalid(e) then e=e:GetChildByName("Label") value="PvP" end
++        if isvalid(e) and e.TextGUIRendererComponent.Text~=value then e.TextGUIRendererComponent.Text=value end
+     end
+ 
+@@ -34,5 +37,5 @@
+         local e=self:UI(path)
+         if not isvalid(e) then log_warning("[CarnivalUI] missing "..path) return end
+-        table.insert(self._T.events,{e=e,h=e:ConnectEvent(ButtonClickEvent,function() if _UIClickArbiter:AcceptClickAt("/ui/CarnivalUI/"..string.match(path,"^[^/]+"),_InputService:GetCursorPosition()) then _UIAudio:Play("Tab") action() end end)})
++        table.insert(self._T.events,{e=e,h=e:ConnectEvent(ButtonClickEvent,function() if _UIClickArbiter:AcceptClickAt(path=="Entry" and "/ui/DefaultGroup/MapleHUD/BtnPvp" or ("/ui/CarnivalUI/"..string.match(path,"^[^/]+")),_InputService:GetCursorPosition()) then _UIAudio:Play("Tab") action() end end)})
+     end
+ 
+@@ -42,5 +45,5 @@
+         self._T.character=nil self._T.viewCharacter=nil self.focused=false self.minimized=false
+         for _,name in ipairs({"Lobby","Summons","Result","Notice","Entry","ConfirmLeave","Upgrades"}) do self:Show(name,false) end
+-        self:Bind("Entry",function() self:Open() end)
++        self:Bind("Entry",function() _GameSystemMenu:Close() self:Open() end)
+         self:Bind("Lobby/Close",function() self:Close() end)
+         self:Bind("Lobby/Minimize",function() self:Minimize() end)
+@@ -72,4 +75,10 @@
+         self:Bind("Result/Close",function() self:Show("Result",false) _CarnivalManager:RequestLeave() end)
+         self._T.key=_InputService:ConnectEvent(KeyDownEvent,function(e)
++            if _LoginFlow:IsInGame() and not _MapleHUDManager:IsChatTyping() and not _KeySettingManager:IsCapturingKey()
++                and not _KeySettingManager:IsWindowOpen() and not _SkillManager:BlocksAmountInput()
++                and not _MapleIslandTutorial:IsTyping() and _KeySettingManager:GetFuncForKeyEnum(e.key)=="pvp" then
++                if self.opened then self:Close() elseif not _GameSystemMenu:BlocksInput() then self:Open() end
++                return
++            end
+             if e.key==KeyboardKey.Escape and self.focused and not _MapleHUDManager:IsChatTyping() then
+                 if self:UI("Summons").Enable then self:Show("Summons",false)
+@@ -237,5 +246,5 @@
+         _CarnivalView:InputTick()
+         local inGame=_LoginFlow:IsInGame()
+-        self:Show("Entry",inGame)
++        self:Show("Entry",inGame and not _MobileUIManager:IsMobile())
+         if not inGame then
+             if self.opened then self:Close() end
+@@ -260,5 +269,5 @@
+     method string WindowAt(Vector2 point)
+         for _,name in ipairs({"ConfirmLeave","Result","Upgrades","Summons","Lobby","Entry"}) do
+-            if _UIClickArbiter:ContainsScreenPoint(self:UI(name),point) then return "/ui/CarnivalUI/"..name end
++            if _UIClickArbiter:ContainsScreenPoint(self:UI(name),point) then return name=="Entry" and "/ui/DefaultGroup/MapleHUD/BtnPvp" or ("/ui/CarnivalUI/"..name) end
+         end
+         return ""
+@@ -324,5 +333,5 @@
+         if not self.opened then return end
+         local window=self:WindowAt(point)
+-        self:SetFocus(window~="" and window~="/ui/CarnivalUI/Entry")
++        self:SetFocus(window~="" and window~="/ui/DefaultGroup/MapleHUD/BtnPvp")
+     end
+ 
+--- before/UI/KeySettingManager.mlua
++++ after/UI/KeySettingManager.mlua
+@@ -247,4 +247,5 @@
+             { id = "boss", label = "보스 도전", defaultKey = "" },
+             { id = "auction", label = "경매장", defaultKey = "" },
++            { id = "pvp", label = "PvP", defaultKey = "" },
+             { id = "interact", label = "상호작용", defaultKey = "Space" },
+             { id = "menu", label = "메뉴", defaultKey = "Esc" },
+@@ -294,4 +295,5 @@
+             shop = "bf6bf6cdc64f4118a606535bc4c7da58",
+             auction = "bf6bf6cdc64f4118a606535bc4c7da58",
++            pvp = "b22a3be87961469db5e0ba1a0119de9b",
+             codex = "aac592d0168348b1b0ff8e85c0f225bf",
+             equip = "70534ea0485f4cd6a6f3eab75be354f9",
+--- before/UI/MobileUIManager.mlua
++++ after/UI/MobileUIManager.mlua
+@@ -90,5 +90,5 @@
+         self:Bind("Skills/Edit",function() self:ReleaseControls() self._T.quickEditing=not self._T.quickEditing self:RefreshSkills() end)
+         for i = 1, 6 do local index = i self:Bind("Skills/Slot" .. tostring(i), function() if not self:SkillClickWasHandled(index) then self:PressSkill(index) end end) end
+-        for _, key in ipairs({"Inventory","Equip","Skill","Enhance","Map","Codex","Shop","Cash","Character","Social","Deco","Info","Event","Boss","Auction","Battle","Hunt","Settings","Close"}) do
++        for _, key in ipairs({"Inventory","Equip","Skill","Enhance","Map","Codex","Shop","Cash","Character","Social","Deco","Info","Event","Boss","Auction","Pvp","Battle","Hunt","Settings","Close"}) do
+             local action = key self:Bind("MenuPanel/" .. key, function() self:OpenMenuAction(action) end)
+         end
+@@ -589,4 +589,5 @@
+         elseif action=="Boss" then _BossStageManager:Toggle()
+         elseif action=="Auction" then _AuctionHouse:Open()
++        elseif action=="Pvp" then _CarnivalUI:Open()
+         elseif action=="Battle" then _BattleStatsManager:ToggleWindow()
+         
+@@ -680,5 +681,5 @@
+         end
+         if now < (self._T.nextRefresh or 0) then return end self._T.nextRefresh=now+0.15
+-        for _, name in ipairs({"BtnEvent","BtnBoss","BtnAuction","BtnReward","BtnAutoHunt","BtnCashShop","BtnCharInfo","BtnCodex","BtnEnhance","BtnEquip","BtnInven","BtnKeySetting","BtnMap","BtnShop","BtnSkill"}) do self:HidePC(_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..name)) end
++        for _, name in ipairs({"BtnEvent","BtnBoss","BtnAuction","BtnPvp","BtnReward","BtnAutoHunt","BtnCashShop","BtnCharInfo","BtnCodex","BtnEnhance","BtnEquip","BtnInven","BtnKeySetting","BtnMap","BtnShop","BtnSkill"}) do self:HidePC(_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..name)) end
+         self:HidePC(_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar"))
+         local p=_UserService.LocalPlayer
+@@ -927,5 +928,5 @@
+     @ExecSpace("ClientOnly")
+     method void UseFunction(string func)
+-        local actions={inven="Inventory",equip="Equip",skill="Skill",enhance="Enhance",worldmap="Map",codex="Codex",shop="Shop",auction="Auction",cashshop="Cash",character="Character",information="Info",event="Event",reward="Reward",boss="Boss",battlestats="Battle"}
++        local actions={inven="Inventory",equip="Equip",skill="Skill",enhance="Enhance",worldmap="Map",codex="Codex",shop="Shop",auction="Auction",pvp="Pvp",cashshop="Cash",character="Character",information="Info",event="Event",reward="Reward",boss="Boss",battlestats="Battle"}
+         if func=="uivisibility" then _KeySettingManager:SetUIHidden(not _KeySettingManager._T.uiHidden)
+         elseif func=="party" then _SocialManager:Open("party")
+--- before/UI/MiniMapUIManager.mlua
++++ after/UI/MiniMapUIManager.mlua
+@@ -220,5 +220,42 @@
+ 		self:FollowPosition(pos.x, pos.y)
+ 		self:UpdateMarkers(map, player)
+-	end
++        self:UpdateCameraFrame(map)
++	end
++
++    @ExecSpace("ClientOnly")
++    method void UpdateCameraFrame(Entity map)
++        -- Project the actual rendered camera corners into the same coordinates as the preview tiles.
++        local viewport = self._T.viewport
++        local scale = self._T.mapScale
++        if not isvalid(viewport) or scale == nil or scale <= 0 then return end
++        local a = _UILogic:ScreenToWorldPosition(Vector2.zero)
++        local b = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
++        local left = (math.min(a.x,b.x) - self._T.mapCx) * scale
++        local right = (math.max(a.x,b.x) - self._T.mapCx) * scale
++        local bottom = (math.min(a.y,b.y) - self._T.mapCy) * scale
++        local top = (math.max(a.y,b.y) - self._T.mapCy) * scale
++        local hw, hh = self._T.halfW, self._T.halfH
++        local lx, rx = math.max(-hw,left), math.min(hw,right)
++        local by, ty = math.max(-hh,bottom), math.min(hh,top)
++        local edges = {
++            {"CameraTop",(lx+rx)/2,top,rx-lx,1.5,top>=-hh and top<=hh and rx>lx},
++            {"CameraBottom",(lx+rx)/2,bottom,rx-lx,1.5,bottom>=-hh and bottom<=hh and rx>lx},
++            {"CameraLeft",left,(by+ty)/2,1.5,ty-by,left>=-hw and left<=hw and ty>by},
++            {"CameraRight",right,(by+ty)/2,1.5,ty-by,right>=-hw and right<=hw and ty>by}}
++        for _,edge in ipairs(edges) do
++            local e=viewport:GetChildByName(edge[1])
++            if isvalid(e) then
++                e.Enable=edge[6]
++                if e.Enable then
++                    e.UITransformComponent.anchoredPosition=Vector2(edge[2],edge[3])
++                    e.UITransformComponent.RectSize=Vector2(edge[4],edge[5])
++                end
++            end
++        end
++        if Environment:IsMakerPlay() and self._T.cameraFrameMap~=map then
++            self._T.cameraFrameMap=map
++            log("[VRF] MiniMap camera frame map="..map.Name.." worldWidth="..tostring(math.abs(b.x-a.x)).." worldHeight="..tostring(math.abs(b.y-a.y)))
++        end
++    end
+ 
+ 	@ExecSpace("ClientOnly")

@@ -131,7 +131,7 @@ script OfflineRestRewards extends Logic
         state.seq=state.seq+1
         pending.id=state.seq
         state.pending=pending
-        log("[OfflineRest] settled seconds="..tostring(seconds).." meso="..tostring(pending.meso))
+        if Environment:IsMakerPlay() then log("[OfflineRest] settled seconds="..tostring(seconds).." meso="..tostring(pending.meso)) end
     end
 
     @ExecSpace("ServerOnly")
@@ -236,20 +236,41 @@ script OfflineRestRewards extends Logic
         end
     end
 
+    method boolean ValidReceipt(table state, table pending, table client)
+        if client==nil or pending==nil or client.rev~=state.rev+1 then return false end
+        if state.character~=nil and client.character~=state.character then return false end
+        local claim=client.claim
+        if claim==nil or (claim.id~=pending.id and (pending.sourceBatch==nil or claim.id~=pending.sourceBatch)) then return false end
+        if type(claim.meso)~="number" or claim.meso<0 or claim.meso>pending.meso or claim.meso~=math.floor(claim.meso) then return false end
+        if type(claim.items)~="table" then return false end
+        for item,count in pairs(claim.items) do
+            if type(count)~="number" or count<=0 or count~=math.floor(count) or count>(pending.items[item] or 0) then return false end
+        end
+        return true
+    end
+
+    method table MergeAccountSnapshot(table account, string id, string incoming)
+        -- Validate the server-generated preview before reserving; no preparation RPC is needed.
+        local state=account and account.characters[id] or nil
+        if state==nil then return {ok=false} end
+        local client=self:ReadState(incoming)
+        if client~=nil and client.rev>state.rev and state.pending==nil then
+            local preview=self:PreviewReward(account,id)
+            if not self:ValidReceipt(state,preview,client) then return {ok=false} end
+            if not self:ReserveReward(account,id,client.claim.id) then return {ok=false} end
+        end
+        return self:MergeSnapshot(state,incoming)
+    end
+
     method table MergeSnapshot(table state, string incoming)
-        -- A receipt revision prevents older inventory snapshots undoing a claimed reward.
+        -- The receipt revision prevents retries or stale snapshots granting the same batch twice.
         local client=self:ReadState(incoming)
         if client==nil or client.rev<state.rev then return {ok=false} end
         if state.character~=nil and client.character~=state.character then return {ok=false} end
         if client.rev>state.rev then
             local claim=client.claim
             local pending=state.pending
-            if client.rev~=state.rev+1 or claim==nil or pending==nil or claim.id~=pending.id then return {ok=false} end
-            if type(claim.meso)~="number" or claim.meso<0 or claim.meso>pending.meso or claim.meso~=math.floor(claim.meso) then return {ok=false} end
-            if type(claim.items)~="table" then return {ok=false} end
-            for item,count in pairs(claim.items) do
-                if type(count)~="number" or count<0 or count~=math.floor(count) or count>(pending.items[item] or 0) then return {ok=false} end
-            end
+            if not self:ValidReceipt(state,pending,client) then return {ok=false} end
             pending.meso=pending.meso-claim.meso
             for item,count in pairs(claim.items) do
                 pending.items[item]=pending.items[item]-count
@@ -257,7 +278,7 @@ script OfflineRestRewards extends Logic
             end
             state.rev=client.rev
             if pending.meso==0 and next(pending.items)==nil then state.pending=nil
-            else state.seq=state.seq+1 pending.id=state.seq end
+            else state.seq=state.seq+1 pending.id=state.seq pending.sourceBatch=nil end
         end
         return {ok=true,snapshot=self:WriteState(incoming,state)}
     end
@@ -279,7 +300,7 @@ script OfflineRestRewards extends Logic
         self:GrantWeekly(sv.restAccount,self:Now())
         local ok=_CharacterPersistence:WriteCharacterSaves(sv,true)
         sv.restBusy=false self:SendStatus(sv,senderUserId,"weekly",ok)
-        log("[OfflineRest] account weekly saved="..tostring(ok))
+        if Environment:IsMakerPlay() then log("[OfflineRest] account weekly saved="..tostring(ok)) end
     end
 
     @ExecSpace("Server")
@@ -292,7 +313,7 @@ script OfflineRestRewards extends Logic
         local ok=accepted and sv.rest.rev==revision and _CharacterPersistence:WriteCharacterSaves(sv,true)
         sv.restBusy=false
         self:SendStatus(sv,senderUserId,"claim",ok)
-        log("[OfflineRest] claim revision="..tostring(revision).." saved="..tostring(ok))
+        if Environment:IsMakerPlay() then log("[OfflineRest] claim revision="..tostring(revision).." saved="..tostring(ok)) end
     end
 
     method void OnBeginPlay()
@@ -301,7 +322,7 @@ script OfflineRestRewards extends Logic
             self._T.timer=_TimerService:SetTimerRepeat(function()
                 for uid,sv in pairs(_CharacterPersistence._T.sv or {}) do self:TickUser(uid,sv) end
             end,1)
-            log("[OfflineRest] server ready")
+            if Environment:IsMakerPlay() then log("[OfflineRest] server ready") end
             return
         end
         self._T.links={}
@@ -312,7 +333,7 @@ script OfflineRestRewards extends Logic
         self:Bind("Modal/Panel/Prev",function() self:Page(-1) end)
         self:Bind("Modal/Panel/Next",function() self:Page(1) end)
         self:UI("Modal").Enable=false
-        log("[OfflineRest] client ready")
+        if Environment:IsMakerPlay() then log("[OfflineRest] client ready") end
     end
 
     @ExecSpace("ClientOnly")
@@ -478,32 +499,49 @@ script OfflineRestRewards extends Logic
     end
 
     method table PlanGrant(table slots, table pending)
-        -- Fill compatible stacks first, retain every item that does not fit.
-        local inv=_UIEquipInventoryManager
+        -- Parse each distinct item once per grant; retain the original sorted, first-slot allocation order.
         local result={slots={},items={},meso=pending.meso}
         for i=1,128 do result.slots[i]=slots[i] or "" end
-        local keys={}
-        for item,_ in pairs(pending.items) do table.insert(keys,item) end
-        table.sort(keys)
+        if next(pending.items)==nil then return result end
+        local parsed={}
+        local function info(item)
+            local cached=parsed[item] if cached~=nil then return cached end
+            local fields={}
+            for value in string.gmatch(item.."|","(.-)|") do table.insert(fields,value) end
+            local stackable=fields[3]~="deco" and (tonumber(fields[3]) or 0)==0
+            local count=stackable and math.max(1,math.floor(tonumber(fields[7]) or 1)) or 1
+            while #fields<7 do table.insert(fields,"0") end
+            local prefix=table.concat(fields,"|",1,6).."|"
+            local suffix=#fields>7 and "|"..table.concat(fields,"|",8,#fields) or ""
+            cached={key=stackable and prefix.."1"..suffix or item,count=count,prefix=prefix,suffix=suffix,ruid=fields[2] or "",locked=string.find(item.."|","|locked:1|",1,true)~=nil}
+            parsed[item]=cached
+            return cached
+        end
+        local metadata={}
+        for i=1,128 do if result.slots[i]~="" then metadata[i]=info(result.slots[i]) end end
+        local keys={} for item,_ in pairs(pending.items) do table.insert(keys,item) end table.sort(keys)
+        local nextEmpty=1 local stackLimits={}
         for _,item in ipairs(keys) do
-            local left=pending.items[item]
-            local maxStack=inv:GetItemMaxStack(_RecoveryManager:Fields(item)[2] or "")
-            local key=_RecoveryManager:Identity(item)
+            local left=pending.items[item] local source=info(item)
+            local maxStack=stackLimits[source.ruid]
+            if maxStack==nil then maxStack=_UIEquipInventoryManager:GetItemMaxStack(source.ruid) stackLimits[source.ruid]=maxStack end
             for i=1,128 do
-                local current=result.slots[i]
-                if current~="" and key~="" and _RecoveryManager:Identity(current)==key and not inv:IsItemLocked(current) then
-                    local count=_RecoveryManager:Count(current)
-                    local add=math.min(left,math.max(0,maxStack-count))
-                    if add>0 then result.slots[i]=self:WithCount(current,count+add) left=left-add end
+                local current=metadata[i]
+                if current~=nil and source.key~="" and current.key==source.key and not current.locked then
+                    local add=math.min(left,math.max(0,maxStack-current.count))
+                    if add>0 then
+                        result.slots[i]=self:WithCount(result.slots[i],current.count+add)
+                        metadata[i]=info(result.slots[i]) left=left-add
+                    end
                 end
                 if left==0 then break end
             end
-            for i=1,128 do
-                if left==0 then break end
-                if result.slots[i]=="" then
-                    local add=math.min(left,maxStack)
-                    result.slots[i]=self:WithCount(item,add) left=left-add
-                end
+            while left>0 do
+                while nextEmpty<=128 and result.slots[nextEmpty]~="" do nextEmpty=nextEmpty+1 end
+                if nextEmpty>128 then break end
+                local add=math.min(left,maxStack)
+                result.slots[nextEmpty]=self:WithCount(item,add)
+                metadata[nextEmpty]=info(result.slots[nextEmpty]) left=left-add nextEmpty=nextEmpty+1
             end
             if left<pending.items[item] then result.items[item]=pending.items[item]-left end
         end
@@ -517,12 +555,11 @@ script OfflineRestRewards extends Logic
         if self._T.busy or cl==nil or not cl.entered or cl.flushing then return end
         local recipient=self:DisplayCharacter()
         local view=self._T.view
-        if recipient.pending and recipient.pending.preview and view.claim==nil then
-            self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
-            self:RequestPrepareClaim(self._T.id,recipient.pending.id) self:Draw() return
-        end
+        -- A claim never holds a modal or a gameplay input lock while the server replies.
+        self:UI("Modal").Enable=false
+        self._T.inputUntil=0
         if view.claim==nil then
-            local pending=view.pending
+            local pending=view.pending or recipient.pending
             if pending==nil then self:UI("Modal").Enable=false return end
             local inv=_UIEquipInventoryManager
             local before={}
@@ -535,13 +572,16 @@ script OfflineRestRewards extends Logic
                 return
             end
             for i=1,128 do if inv:GetTabItem("consume",i)~=before[i] then return end end
-            for i=1,128 do inv:SetTabItem("consume",i,plan.slots[i]) end
+            self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
+            for i=1,128 do if plan.slots[i]~=before[i] then inv:SetTabItem("consume",i,plan.slots[i]) end end
             inv.meso=inv.meso+plan.meso
             self._T.lastReceipt={seconds=pending.seconds,meso=plan.meso,items=plan.items}
             view.rev=view.rev+1 view.claim={id=pending.id,meso=plan.meso,items=plan.items}
             _CharacterPersistence:MarkDirty("offline_rest_claim")
-            inv:RefreshUI()
+            -- A consume/meso grant does not change equipment, avatar appearance or derived stats.
+            inv:UpdateInvenUI()
             inv:UpdateMesoUI()
+            if Environment:IsMakerPlay() then log("[VRF][RewardClaim] rest delivered revision="..tostring(view.rev).." inputBlocked="..tostring(self:BlocksInput())) end
         end
         self._T.busy=true self._T.deadline=_UtilLogic.ElapsedSeconds+20
         self:RequestClaim(self._T.id,_CharacterPersistence:BuildSaveString(),view.rev)
@@ -600,7 +640,7 @@ script OfflineRestRewards extends Logic
             if not account.characters[account.target] then account.target=sv.list[1] and sv.list[1].id or "" end
             local chosen=account.characters[account.target]
             account.last=chosen and chosen.last or 0
-            log("[OfflineRest] migrated legacy time without removing balances")
+            if Environment:IsMakerPlay() then log("[OfflineRest] migrated legacy time without removing balances") end
         end
         self:ShareTime(account)
         sv.restAccount=account sv.restOffline=false
@@ -624,7 +664,7 @@ script OfflineRestRewards extends Logic
         account.batchSeq=(account.batchSeq or 0)+1
         local waiting=account.waiting
         account.waiting={id=-account.batchSeq,seconds=seconds+(waiting and waiting.seconds or 0),previews={}}
-        log("[OfflineRest] shared offline seconds="..tostring(account.waiting.seconds))
+        if Environment:IsMakerPlay() then log("[OfflineRest] shared offline seconds="..tostring(account.waiting.seconds)) end
     end
 
     method table PreviewReward(table account, string id)
@@ -660,7 +700,7 @@ script OfflineRestRewards extends Logic
         state.seq=state.seq+1
         preview.sourceBatch=batchId preview.id=state.seq preview.preview=nil
         state.pending=preview account.waiting=nil
-        log("[OfflineRest] reserved recipient="..id.." batch="..tostring(batchId))
+        if Environment:IsMakerPlay() then log("[OfflineRest] reserved recipient="..id.." batch="..tostring(batchId)) end
         return true
     end
 
@@ -689,13 +729,13 @@ script OfflineRestRewards extends Logic
 
     @ExecSpace("Server")
     method void RequestPrepareClaim(string activeId, integer batchId)
-        -- Persist assignment before the active client applies an inventory receipt.
+        -- Reserve from the loaded account immediately; Claim commits assignment and inventory together.
         local sv=_CharacterPersistence._T.sv[senderUserId]
         if sv==nil or sv.activeId~=activeId or sv.restId~=activeId or sv.restBusy or sv.recoveryApplying then return end
         sv.restBusy=true
         local reserved=self:ReserveReward(sv.restAccount,activeId,batchId)
-        local ok=reserved and _CharacterPersistence:WriteCharacterSaves(sv,true)
-        sv.restBusy=false self:SendStatus(sv,senderUserId,"prepare",ok)
+        if reserved then sv.dirtySaves[activeId]=true end
+        sv.restBusy=false self:SendStatus(sv,senderUserId,"prepare",reserved)
     end
 
     @ExecSpace("Server")
@@ -725,7 +765,7 @@ script OfflineRestRewards extends Logic
             ok=_CharacterPersistence:WriteCharacterSaves(sv,true)
         end
         sv.restBusy=false self:SendStatus(sv,senderUserId,"claim",ok)
-        log("[OfflineRest] remote claim saved="..tostring(ok))
+        if Environment:IsMakerPlay() then log("[OfflineRest] remote claim saved="..tostring(ok)) end
     end
 
     method table GrantSnapshot(string snapshot, table state)

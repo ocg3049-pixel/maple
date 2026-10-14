@@ -1,0 +1,579 @@
+@Logic
+script CarnivalManager extends Logic
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- The coordinator owns queues and independent window-battle sessions.
+        self._T.queue={} self._T.users={} self._T.matches={} self._T.profiles={} self._T.loading={} self._T.serial=0
+        self._T.storage=_DataStorageService:GetGlobalDataStorage("MapleEasyCarnivalV1")
+        self._T.tick=0 self._T.closing=false self._T.nextBroadcast=0 self._T.nextQueue=0
+        log("[VRF] Carnival coordinator boot queues=3")
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Profile(string id)
+        -- Read once per character; a failed read must never overwrite a saved rating with 100.
+        local saved=self._T.profiles[id]
+        if saved~=nil then return saved end
+        if self._T.loading[id] then return nil end
+        self._T.loading[id]=true
+        local ec,raw=self._T.storage:GetAndWait("character_"..id)
+        self._T.loading[id]=nil
+        if ec~=0 and ec~=1000002 then return nil end
+        local p={rating=_CarnivalRules.InitialRating,wins1=0,losses1=0,wins2=0,losses2=0,history={}}
+        if raw~=nil and raw~="" then
+            local ok,data=pcall(function() return _HttpService:JSONDecode(raw) end)
+            if not ok or type(data)~="table" or type(data.rating)~="number" or data.rating<0 then return nil end
+            p=data
+        end
+        self._T.profiles[id]=p
+        return p
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Player(string uid)
+        -- Resolve authoritative character identity, level, party and loaded persistent rating.
+        local rec=_SocialManager:Record(uid)
+        local session=_LoginFlow._T.sessions and _LoginFlow._T.sessions[uid]
+        if rec==nil or session==nil or not session.entered or not isvalid(rec.player.CurrentMap) then return nil end
+        local profile=self:Profile(rec.id)
+        if profile==nil then return nil end
+        local sv=_CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId~=rec.id then return nil end
+        return {uid=uid,id=rec.id,name=rec.name,level=rec.level,job=rec.job,rating=profile.rating,player=rec.player,party=rec.party,profile=profile}
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Busy(string uid)
+        -- Blocks external teleports while a match is preparing, active, or being settled.
+        return (self._T.users or {})[uid]~=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsActive(string matchId)
+        -- Only active matches award currency and respawn monsters.
+        local r=(self._T.matches or {})[matchId]
+        return r~=nil and r.state=="active"
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean SameTeam(string a, string b)
+        -- Temporary battle teams do not alter the player's persistent party membership.
+        local ra=(self._T.users or {})[a] local rb=(self._T.users or {})[b]
+        return ra~=nil and ra==rb and ra.members[a]~=nil and ra.members[b]~=nil and ra.members[a].team==ra.members[b].team
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Ready(table p)
+        return p~=nil and not self:Busy(p.uid) and isvalid(p.player) and not _BossStageManager:IsInBattle(p.uid)
+    end
+
+    @ExecSpace("Server")
+    method void RequestStatus()
+        -- RPC identity comes only from the sender; clients cannot query or change another rating.
+        local p=self:Player(senderUserId)
+        if p==nil then self:Notice("캐릭터 정보를 불러오는 중입니다. 잠시 후 다시 시도해 주세요.",senderUserId) return end
+        self:SendProfile(p)
+        local q=self:Queued(senderUserId)
+        if q~=nil then self:QueueState(q.mode,math.floor(_UtilLogic.ServerElapsedSeconds-q.at),senderUserId) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendProfile(table p)
+        -- Supply the registered collection and public statistics without exposing storage objects.
+        local sv=_CharacterPersistence._T.sv[p.uid]
+        local registered=_MonsterCodex:ReadState(sv.saves[p.id] or "")
+        local ids={}
+        for _,row in ipairs(_MonsterCodexCatalog:All()) do if registered[row.id] and _CarnivalCatalog:Model(row)~="" then table.insert(ids,row.id) end end
+        self:ReceiveProfile(p.id,p.profile,ids,p.uid)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Queued(string uid)
+        -- Return the entire queue unit so cancelling a premade removes both members atomically.
+        for _,q in ipairs(self._T.queue or {}) do for _,p in ipairs(q.players) do if p.uid==uid then return q end end end
+        return nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cancel(string uid)
+        -- A party unit is indivisible in the queue.
+        local q=self:Queued(uid)
+        if q==nil then return end
+        for i,v in ipairs(self._T.queue) do if v==q then table.remove(self._T.queue,i) break end end
+        for _,p in ipairs(q.players) do self:QueueState("",0,p.uid) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestCancel()
+        -- Cancelling a search never counts as a loss.
+        self:Cancel(senderUserId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestQueue(integer size)
+        -- Two-person parties can only enter the premade queue, and must both be online and ready.
+        if size~=1 and size~=2 then return end
+        local p=self:Player(senderUserId)
+        if not self:Ready(p) or self:Queued(senderUserId)~=nil then return end
+        local players={p} local mode=size==1 and "duel" or "solo2"
+        if size==2 and p.party~=nil then
+            if #p.party.members~=2 then self:Notice("2:2 파티 매칭은 정확히 2명으로 구성해 주세요.",senderUserId) return end
+            if p.party.leader~=senderUserId then self:Notice("파티장이 2:2 매칭을 신청해 주세요.",senderUserId) return end
+            players={} mode="party2"
+            for _,uid in ipairs(p.party.members) do
+                local mate=self:Player(uid)
+                if not self:Ready(mate) or self:Queued(uid)~=nil or mate.party~=p.party then self:Notice("두 파티원이 모두 접속해 전투 가능한 상태여야 합니다.",senderUserId) return end
+                table.insert(players,mate)
+            end
+        end
+        local q={players=players,mode=mode,at=_UtilLogic.ServerElapsedSeconds,rating=0,level=0,party=p.party and p.party.id or ""}
+        for _,v in ipairs(players) do
+            if not self:Ready(v) or self:Queued(v.uid)~=nil then return end
+            q.rating=q.rating+v.rating q.level=q.level+v.level
+        end
+        q.rating=q.rating/#players q.level=q.level/#players
+        table.insert(self._T.queue,q)
+        for _,v in ipairs(players) do self:SendProfile(v) self:QueueState(mode,0,v.uid) end
+        log("[VRF] Carnival queued mode="..mode.." members="..tostring(#players))
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean ValidQueue(table q)
+        -- Gear level, character switching, death and party changes invalidate stale searches.
+        for _,old in ipairs(q.players) do
+            local sv=_CharacterPersistence._T.sv[old.uid]
+            local p=_UserService:GetUserEntityByUserId(old.uid)
+            local rec=(_SocialManager._T.records or {})[old.uid]
+            if sv==nil or sv.activeId~=old.id or not isvalid(p) or p~=old.player or self:Busy(old.uid) or _BossStageManager:IsInBattle(old.uid) then return false end
+            if _RegionTierLogic:GetServerLevelOf(p)~=old.level then return false end
+            if q.mode=="party2" then
+                if rec==nil or rec.party==nil or rec.party.id~=q.party or #rec.party.members~=2 or rec.party.busy then return false end
+                for _,mate in ipairs(q.players) do if rec.party.profiles[mate.uid]==nil or rec.party.profiles[mate.uid].id~=mate.id then return false end end
+            elseif q.mode=="solo2" and rec~=nil and rec.party~=nil then return false end
+        end
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void MatchQueues()
+        -- Match the oldest compatible candidates, preferring the smallest level and rating distance.
+        for i=#self._T.queue,1,-1 do
+            local q=self._T.queue[i]
+            if not self:ValidQueue(q) then self:Cancel(q.players[1].uid) end
+        end
+        local now=_UtilLogic.ServerElapsedSeconds
+        for _,q in ipairs(self._T.queue) do
+            local choices={}
+            for _,other in ipairs(self._T.queue) do
+                if other~=q and _CarnivalRules:Compatible(q,other,now) then table.insert(choices,other) end
+            end
+            table.sort(choices,function(a,b)
+                local da=math.abs(q.rating-a.rating)+math.abs(q.level-a.level)*10
+                local db=math.abs(q.rating-b.rating)+math.abs(q.level-b.level)*10
+                if da==db then return a.at<b.at end return da<db
+            end)
+            local needed=q.mode=="solo2" and 3 or 1
+            if #choices>=needed then
+                local units={q} for j=1,needed do table.insert(units,choices[j]) end
+                local teams={q.players,choices[1].players}
+                if needed==3 then teams=_CarnivalRules:SoloTeams({q.players[1],choices[1].players[1],choices[2].players[1],choices[3].players[1]}) end
+                for _,unit in ipairs(units) do self:Cancel(unit.players[1].uid) end
+                self:Begin(teams,q.mode)
+                return
+            end
+        end
+        for _,q in ipairs(self._T.queue) do for _,p in ipairs(q.players) do self:QueueState(q.mode,math.floor(now-q.at),p.uid) end end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Begin(table teams, string mode)
+        local size=mode=="duel" and 1 or 2
+        if #teams~=2 or #teams[1]~=size or #teams[2]~=size then return end
+        for _,team in ipairs(teams) do for _,p in ipairs(team) do if not self:Ready(p) then return end end end
+        self._T.serial=self._T.serial+1
+        local id=tostring(math.floor(DateTime.UtcNow.Elapsed)).."_"..tostring(self._T.serial)
+        local layout=_UtilLogic:RandomIntegerRange(1,3)
+        local r={id=id,teams=teams,members={},mode=mode,state="creating",at=_UtilLogic.ServerElapsedSeconds,clock=0,layout=layout,rooms={},cp={0,0},summons={0,0},kills={0,0}}
+        self._T.matches[id]=r
+        local level=0 local count=0
+        for team,list in ipairs(teams) do
+            r.rooms[team]={platforms=_CarnivalBattle:Platforms(layout),monsters={}}
+            for index,p in ipairs(list) do
+                p.team=team p.dead=false p.left=false p.returned=false
+                p.profile=_CarnivalRules:CopyProfile(p.profile)
+                p.rating=p.profile.rating
+                p.actor=_CarnivalBattle:NewActor(p.uid,p.name)
+                _CarnivalBattle:RefreshStats(p)
+                local spawn=_CarnivalTerrain:Data(layout).spawn
+                p.actor.hp=p.actor.maxHp p.actor.x=spawn.x+(index-1)*0.6 p.actor.y=spawn.y
+                r.members[p.uid]=p self._T.users[p.uid]=r
+                level=level+p.level count=count+1
+            end
+        end
+        for team=1,2 do for i=1,_CarnivalRules.BaseMonsters do _CarnivalBattle:AddSpawn(r.rooms[team],_CarnivalCatalog:Base(i)) end end
+        r.state="active"
+        self:Broadcast(r)
+        log("[VRF] Carnival window match started layout="..tostring(layout).." participants="..tostring(count).." worldTeleport=false")
+    end
+
+    @ExecSpace("Server")
+    method void RequestReady(string id)
+        -- Compatibility endpoint: a window match never teleports or waits for a world-map load.
+        local r=(self._T.users or {})[senderUserId]
+        if r~=nil and r.id==id then self:Broadcast(r) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void AwardKill(string id, integer team, Entity killer, integer level)
+        -- Only a living participant in this room can earn team summon points, including their pets.
+        local r=(self._T.matches or {})[id]
+        if r==nil or r.state~="active" or r.maps==nil then return end
+        local owner=_BattleStatsManager:ResolveOwner(killer)
+        if not isvalid(owner) or not isvalid(owner.PlayerComponent) then return end
+        local p=r.members[owner.PlayerComponent.UserId]
+        if p==nil or p.dead or p.team~=team or owner.CurrentMap.Name~=r.maps[team] then return end
+        r.cp[team]=r.cp[team]+_CarnivalRules:KillPoints(level) r.kills[team]=r.kills[team]+1
+    end
+
+    @ExecSpace("Server")
+    method void RequestSummon(string id, string codexId)
+        local r=(self._T.users or {})[senderUserId]
+        if r==nil or r.id~=id or r.state~="active" then return end
+        local p=r.members[senderUserId]
+        if p==nil or p.dead or p.left then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(p.nextSummon or 0) then return end
+        p.nextSummon=now+0.25
+        local row=_MonsterCodexCatalog:Get(codexId)
+        local sv=_CharacterPersistence._T.sv[senderUserId]
+        if row==nil or sv==nil or sv.activeId~=p.id or not _MonsterCodex:ReadState(sv.saves[p.id] or "")[codexId] then return end
+        local cost=_CarnivalRules:Cost(row.level) local other=3-p.team
+        if r.cp[p.team]<cost then self:Notice("소환 점수가 부족합니다.",senderUserId) return end
+        if r.summons[other]>=_CarnivalRules.MaxSummons then self:Notice("상대 방의 소환 한도에 도달했습니다.",senderUserId) return end
+        r.cp[p.team]=r.cp[p.team]-cost r.summons[other]=r.summons[other]+1
+        if _CarnivalBattle:AddSpawn(r.rooms[other],row)==nil then
+            r.cp[p.team]=r.cp[p.team]+cost r.summons[other]=r.summons[other]-1 return
+        end
+        self:CheckOutcome(r)
+        self:Broadcast(r)
+        log("[VRF] Carnival window summon opponent="..tostring(other).." cost="..tostring(cost))
+    end
+
+    @ExecSpace("Server")
+    method void RequestLeave()
+        local r=(self._T.users or {})[senderUserId]
+        if r==nil then self:Cancel(senderUserId) return end
+        if r.state=="active" or r.state=="creating" then self:Forfeit(senderUserId,"기권") end
+        local p=r.members[senderUserId]
+        if p~=nil then self:ReturnPlayer(p) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReturnPlayer(table p)
+        -- Close only the window battle. The world character's map, HP, input and hunt stay intact.
+        _CarnivalReplica:Dispose(p.uid)
+        if p.actor~=nil then _CarnivalPhysics:Dispose(p.actor) end
+        p.returned=true
+        if isvalid(_UserService:GetUserEntityByUserId(p.uid)) then self:MatchState({id="",state="outside"},p.uid) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Abort(table r, string reason)
+        if r.state=="settling" or r.state=="preparing_result" or r.state=="result" then return end
+        r.state="result" r.at=_UtilLogic.ServerElapsedSeconds
+        for _,p in pairs(r.members) do self:Notice(reason,p.uid) self:ReturnPlayer(p) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Finish(table r, integer winner)
+        -- Keep carnival state and execution isolated from the outside character.
+        if r.state~="active" then return end
+        for _,room in ipairs(r.rooms or {}) do _CarnivalReplica:DisposeRoom(room) end
+        r.state="preparing_result" r.winner=winner r.at=_UtilLogic.ServerElapsedSeconds
+        self:PrepareSettlement(r)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Settle(table r)
+        if r.state~="settling" or r.saving then return end
+        -- Never commit a partially prepared transaction or an empty transaction.
+        local count=0
+        for _,p in pairs(r.members) do
+            if r.pending==nil or r.updated==nil or r.pending["character_"..p.id]==nil or r.updated[p.id]==nil then
+                r.state="preparing_result" r.retryAt=_UtilLogic.ServerElapsedSeconds+5 return
+            end
+            count=count+1
+        end
+        if count==0 then return end
+        r.saving=true r.retryCount=(r.retryCount or 0)+1
+        r.retryAt=_UtilLogic.ServerElapsedSeconds+math.min(300,5*2^math.min(6,r.retryCount))
+        local ec=self._T.storage:TransactSetAndWait(r.pending)
+        r.saving=false
+        if ec~=0 then
+            log_warning("[Carnival] settlement retry code="..tostring(ec))
+            for uid,_ in pairs(r.members) do if isvalid(_UserService:GetUserEntityByUserId(uid)) then self:Notice("경기 결과를 저장 중입니다. 잠시만 기다려 주세요.",uid) end end
+            return
+        end
+        r.state="result" r.at=_UtilLogic.ServerElapsedSeconds
+        for uid,p in pairs(r.members) do
+            p.profile=r.updated[p.id] self._T.profiles[p.id]=p.profile
+            if isvalid(_UserService:GetUserEntityByUserId(uid)) then
+                self:ReceiveProfile(p.id,p.profile,{},uid)
+                self:Result(p.team==r.winner,r.delta[uid],p.profile.rating,uid)
+            end
+        end
+        log("[VRF] Carnival settlement committed match="..r.id.." participants="..tostring(count))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickMatch(table r)
+        local now=_UtilLogic.ServerElapsedSeconds
+        if r.state=="active" then
+            for uid,p in pairs(r.members) do
+                local player=_UserService:GetUserEntityByUserId(uid)
+                local sv=_CharacterPersistence._T.sv[uid]
+                if not isvalid(player) or sv==nil or sv.activeId~=p.id then
+                    p.dead=true p.left=true p.actor.hp=0
+                end
+            end
+            self:CheckOutcome(r)
+        elseif r.state=="preparing_result" and now>=(r.retryAt or 0) then
+            self:PrepareSettlement(r)
+        elseif r.state=="settling" and now>=(r.retryAt or 0) then
+            self:Settle(r)
+        elseif r.state=="result" and now-r.at>=8 then
+            for uid,p in pairs(r.members) do
+                self:ReturnPlayer(p)
+                if self._T.users[uid]==r then self._T.users[uid]=nil end
+            end
+            self._T.matches[r.id]=nil
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        self._T.tick=(self._T.tick or 0)+math.min(0.25,delta)
+        local steps=0
+        while self._T.tick>=0.05 and steps<5 do
+            self._T.tick=self._T.tick-0.05 steps=steps+1
+            for _,r in pairs(self._T.matches or {}) do
+                self:TickMatch(r)
+                if r.state=="active" then _CarnivalBattle:Tick(r,0.05) self:CheckOutcome(r) end
+            end
+        end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now>=(self._T.nextBroadcast or 0) then
+            self._T.nextBroadcast=now+0.1
+            for _,r in pairs(self._T.matches or {}) do if r.state=="active" then self:Broadcast(r) end end
+        end
+        if now>=(self._T.nextQueue or 0) then self._T.nextQueue=now+1 self:MatchQueues() end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- Keep carnival state and execution isolated from the outside character.
+        self._T.closing=true
+        for _,r in pairs(self._T.matches or {}) do for _,room in ipairs(r.rooms or {}) do _CarnivalReplica:DisposeRoom(room) end end
+        for _,r in pairs(self._T.matches or {}) do for _,p in pairs(r.members or {}) do if p.actor~=nil then _CarnivalPhysics:Dispose(p.actor) end end end
+        for _,r in pairs(self._T.matches or {}) do
+            if r.state=="preparing_result" then self:PrepareSettlement(r)
+            elseif r.state=="settling" then self:Settle(r) end
+        end
+        self._T.queue={} self._T.matches={} self._T.users={} self._T.profiles={}
+    end
+
+    @ExecSpace("Client")
+    method void Notice(string text)
+        -- Render server validation and storage status in the PvP window.
+        _CarnivalUI:Notice(text)
+    end
+
+    @ExecSpace("Client")
+    method void QueueState(string mode, integer elapsed)
+        -- Keep queue state visible even if the lobby window is temporarily closed.
+        _CarnivalUI:QueueState(mode,elapsed)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveProfile(string id, table profile, table registered)
+        -- Statistics have a separate cache from match currency and character save snapshots.
+        _CarnivalUI:ReceiveProfile(id,profile,registered)
+    end
+
+    @ExecSpace("Client")
+    method void MatchState(table state)
+        -- Route server snapshots to the client-only HUD.
+        _CarnivalUI:MatchState(state)
+    end
+
+    @ExecSpace("Client")
+    method void Result(boolean won, integer delta, integer rating)
+        -- Display the committed rating result, never an optimistic local rating change.
+        _CarnivalUI:Result(won,delta,rating)
+    end
+    @ExecSpace("ServerOnly")
+    method void PrepareSettlement(table r)
+        if r.state~="preparing_result" or r.preparing then return end
+        r.preparing=true r.retryAt=_UtilLogic.ServerElapsedSeconds+5
+        local ok,prepared=pcall(function()
+            local delta=_CarnivalRules:Transfers(r.teams[r.winner],r.teams[3-r.winner])
+            local pending={} local updated={}
+            for uid,p in pairs(r.members) do
+                -- Copy only known primitive fields. Encoding a fresh profile with an empty history
+                -- as an intermediate deep copy raises LuaTableToJsonType.UnknownType in MSW.
+                local fresh=_CarnivalRules:CopyProfile(p.profile)
+                fresh.rating=math.max(0,p.rating+delta[uid])
+                local key=(p.team==r.winner and "wins" or "losses")..(r.mode=="duel" and "1" or "2")
+                fresh[key]=fresh[key]+1
+                table.insert(fresh.history,1,{match=tostring(r.id),mode=tostring(r.mode),won=p.team==r.winner,delta=delta[uid],at=DateTime.UtcNow.Elapsed})
+                while #fresh.history>10 do table.remove(fresh.history) end
+                updated[p.id]=fresh
+                pending["character_"..p.id]=_HttpService:JSONEncode(fresh)
+                if pending["character_"..p.id]==nil or pending["character_"..p.id]=="" then error("empty rating payload") end
+            end
+            return {pending=pending,updated=updated,delta=delta}
+        end)
+        r.preparing=false
+        if not ok then log_error("[Carnival] result preparation failed: "..tostring(prepared)) return end
+        r.pending=prepared.pending r.updated=prepared.updated r.delta=prepared.delta r.state="settling"
+        self:Settle(r)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CheckOutcome(table r)
+        if r.state~="active" then return end
+        local alive={0,0}
+        for _,p in pairs(r.members) do if not p.dead and not p.left and p.actor.hp>0 then alive[p.team]=alive[p.team]+1 end end
+        for team=1,2 do
+            if _CarnivalBattle:LivingCount(r.rooms[team])>_CarnivalRules.MonsterLimit then
+                alive[team]=0
+                if not r.rooms[team].overflowLogged then
+                    r.rooms[team].overflowLogged=true
+                    log("[VRF] Carnival overflow defeat team="..tostring(team).." count="..tostring(_CarnivalBattle:LivingCount(r.rooms[team])))
+                end
+            end
+        end
+        if alive[1]==0 and alive[2]==0 then self:Abort(r,"양 팀이 모두 전멸하여 무승부입니다. 승점은 변하지 않습니다.")
+        elseif alive[1]==0 then self:Finish(r,2)
+        elseif alive[2]==0 then self:Finish(r,1) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Forfeit(string uid, string reason)
+        self:Cancel(uid)
+        local r=(self._T.users or {})[uid]
+        if r==nil or (r.state~="active" and r.state~="creating") then return end
+        local p=r.members[uid]
+        if p==nil or p.left then return end
+        p.dead=true p.left=true p.actor.hp=0 p.actor.action="dead"
+        log("[VRF] Carnival forfeit team="..tostring(p.team).." reason="..reason)
+        self:CheckOutcome(r)
+    end
+
+    @ExecSpace("ServerOnly")
+    @EventSender("Service", "UserService")
+    handler HandleCarnivalUserLeave(UserLeaveEvent event)
+        if not self._T.closing then self:Forfeit(event.UserId,"접속 종료") end
+    end
+
+    @ExecSpace("Server")
+    method void RequestInput(string id, number axis, boolean jump, boolean down, boolean attack, boolean auto, integer sequence, boolean crouch)
+        local r=(self._T.users or {})[senderUserId]
+        if r==nil or r.id~=id or r.state~="active" then return end
+        local p=r.members[senderUserId]
+        if p==nil or p.dead or p.left then return end
+        local now=_UtilLogic.ServerElapsedSeconds local a=p.actor
+        if sequence<=a.input.seq or axis~=axis then return end
+        a.input={axis=math.max(-1,math.min(1,axis)),jump=jump or a.input.jump==true,down=down or a.input.down==true,attack=attack,crouch=crouch,at=now,seq=sequence}
+        a.auto=auto
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Broadcast(table r)
+        if r.state~="active" then return end
+        local alive={0,0}
+        for _,p in pairs(r.members) do if not p.dead and not p.left then alive[p.team]=alive[p.team]+1 end end
+        local snapshots={_CarnivalBattle:Snapshot(r,1),_CarnivalBattle:Snapshot(r,2)}
+        for uid,p in pairs(r.members) do
+            if not p.returned and isvalid(_UserService:GetUserEntityByUserId(uid)) then
+                self:MatchState({id=r.id,state="active",team=p.team,layout=r.layout,mode=r.mode,cp=r.cp[p.team],enemyCP=r.cp[3-p.team],alive=alive[p.team],enemyAlive=alive[3-p.team],summons=r.summons[p.team],enemySummons=r.summons[3-p.team],dead=p.dead,monsterCount=_CarnivalBattle:LivingCount(r.rooms[p.team]),monsterLimit=_CarnivalRules.MonsterLimit,upgrades=p.actor.upgrades or {},scene=snapshots[p.team],opponent=snapshots[3-p.team],enemyMonsterCount=_CarnivalBattle:LivingCount(r.rooms[3-p.team])},uid)
+            end
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestReleaseInput(string id, integer sequence)
+        -- A release must bypass the movement packet throttle, but cannot revive old input.
+        local r=(self._T.users or {})[senderUserId]
+        if r==nil or r.id~=id or r.state~="active" then return end
+        local p=r.members[senderUserId]
+        if p==nil or p.dead or p.left or sequence<=p.actor.input.seq then return end
+        p.actor.input={axis=0,jump=false,down=false,attack=false,crouch=false,at=_UtilLogic.ServerElapsedSeconds,seq=sequence}
+    end
+    @ExecSpace("Server")
+    method void RequestSkill(string id, table request, number dx, number dy, integer sequence)
+        -- Sequence, identity, life state, investment and all damage/target limits are server owned.
+        local r=self._T.users[senderUserId]
+        local p=r~=nil and r.members[senderUserId] or nil
+        local accepted=false
+        if r~=nil and r.id==id and r.state=="active" and p~=nil and not p.dead and sequence>(p.actor.skillSequence or 0) and dx==dx and dy==dy then
+            local a=p.actor a.skillSequence=sequence
+            local d=_CarnivalSkills:ServerDefinition(p,request)
+            local now=_UtilLogic.ServerElapsedSeconds
+            a.skillCooldowns=a.skillCooldowns or {}
+            local autoAllowed=true
+            if request.automatic==true then
+                autoAllowed=false
+                if d~=nil and a.auto and now>=(a.manualUntil or 0) then
+                    for _,m in ipairs(r.rooms[p.team].monsters) do
+                        if m.slot==request.autoTarget and _CarnivalBattle:LivingTarget(m) then
+                            autoAllowed=(d.kind=="attack" and math.abs(m.x-a.x)<=d.range and math.abs(m.y-a.y)<=d.height)
+                                or d.kind=="heal" or d.kind=="summon"
+                            if autoAllowed then dx=m.x>=a.x and 1 or -1 end
+                            break
+                        end
+                    end
+                end
+            else a.manualUntil=now+0.3 end
+            if autoAllowed and d~=nil and now>=(a.skillCooldowns[d.name] or 0) and (d.lock==0 or now>=(a.skillLock or 0)) and (not d.airBlock or a.ground) then
+                _CarnivalPhysics:Ensure(a,p.player,r.rooms[p.team].platforms)
+                accepted=_CarnivalSkills:Apply(a,r.rooms[p.team],d,dx<0 and -1 or 1,dy==0 and 0 or (dy<0 and -1 or 1),now)
+                if accepted then a.skillCooldowns[d.name]=now+d.cooldown end
+            end
+        end
+        self:SkillReceipt(sequence,accepted,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void SkillReceipt(integer sequence, boolean accepted)
+        _CarnivalSkills:Receipt(sequence,accepted)
+    end
+
+
+    @ExecSpace("Server")
+    method void RequestUpgrade(string id, string kind)
+        -- Purchase only for the caller's live match actor; no client-supplied prices or amounts.
+        local r=(self._T.users or {})[senderUserId]
+        if r==nil or r.id~=id or r.state~="active" then return end
+        local p=r.members[senderUserId]
+        if p==nil or p.dead or p.left or p.actor.hp<=0 then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(p.nextPurchase or 0) then return end
+        p.nextPurchase=now+0.25
+        local a=p.actor a.upgrades=a.upgrades or {}
+        local cost=_CarnivalRules:UpgradeCost(kind,a.upgrades)
+        if cost<0 then return end
+        if kind=="heal" and a.hp>=a.maxHp then self:Notice("이미 HP가 가득 찼습니다.",senderUserId) return end
+        if kind=="clear" and _CarnivalBattle:LivingCount(r.rooms[p.team])==0 then self:Notice("제거할 몬스터가 없습니다.",senderUserId) return end
+        if r.cp[p.team]<cost then self:Notice("소환 점수가 부족합니다.",senderUserId) return end
+        r.cp[p.team]=r.cp[p.team]-cost
+        if kind=="heal" then
+            a.hp=math.min(a.maxHp,a.hp+math.ceil(a.maxHp*0.3*(1+0.1*(a.upgrades.recovery or 0))))
+            if a.physics~=nil and isvalid(a.physics.body) then a.physics.body.PlayerComponent.Hp=math.floor(a.hp) end
+        elseif kind=="clear" then _CarnivalBattle:ClearRoom(r.rooms[p.team])
+        else a.upgrades[kind]=(a.upgrades[kind] or 0)+1 end
+        self:Broadcast(r)
+        log("[VRF] Carnival upgrade kind="..kind.." cost="..tostring(cost).." remaining="..tostring(r.cp[p.team]))
+    end
+
+end

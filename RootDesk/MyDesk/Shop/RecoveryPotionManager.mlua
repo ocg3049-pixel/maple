@@ -84,47 +84,77 @@ script RecoveryPotionManager extends Logic
         local row = self:Product(key)
         if row == nil then return "" end
         local stat = row.kind == "hp" and "HP" or "MP"
-        return "1시간 동안 초당 최대 " .. stat .. "의 " .. tostring(row.tier) .. "% 추가 회복\n접속 종료 시 남은 시간 보존\n재접속 후 남은 시간부터 적용\n같은 종류 재사용: 효과 교체·1시간 갱신\nHP·MP 동시 사용 가능 / 더블클릭 사용"
+        return "1시간 동안 초당 최대 " .. stat .. "의 " .. tostring(row.tier) .. "% 추가 회복\n접속 종료 시 남은 시간 보존\n재접속 후 남은 시간부터 적용\n같은 종류 재사용: 효과 교체·1시간 갱신\nHP·MP 동시 사용 가능 / 더블클릭 사용\n보스전 사용 불가 / 기존 포션 효과도 보스전 중 적용되지 않음"
+    end
+
+    method boolean IsBossRestricted(Entity player)
+        return isvalid(player) and isvalid(player.CurrentMap) and _BossStageManager:IsArena(player.CurrentMap.Name)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlockUse()
+        if not self:IsBossRestricted(_UserService.LocalPlayer) then return false end
+        _UIToast:ShowMessage("상점 포션은 보스전에서 사용할 수 없습니다.")
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method number RawBonus(string kind)
+        if kind=="hp" then return self.hpRemaining>0 and self.hpTier or 0 end
+        return self.mpRemaining>0 and self.mpTier or 0
     end
 
     @ExecSpace("ClientOnly")
     method number Bonus(string kind)
+        if self:IsBossRestricted(_UserService.LocalPlayer) then return 0 end
         if kind == "hp" then return self.hpRemaining > 0 and self.hpTier or 0 end
         return self.mpRemaining > 0 and self.mpTier or 0
     end
 
     @ExecSpace("ClientOnly")
     method void FitIcon(Entity icon, string ruid, number width, number height)
+        -- Never suspend a viewport refresh; only the current slot binding may apply loaded dimensions.
         if not isvalid(icon) then return end
         local renderer=icon.SpriteGUIRendererComponent
+        local transform=icon.UITransformComponent
         self._T.iconSizes=self._T.iconSizes or {}
         self._T.iconRequests=self._T.iconRequests or {}
-        local request={}
+        local request={ruid=ruid,width=width,height=height}
         self._T.iconRequests[icon.Id]=request
-        icon.UITransformComponent.RectSize=Vector2(width,height)
         renderer.Type=ImageType.Simple
         renderer.PreserveSprite=PreserveSpriteType.AspectOnly
         renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
-        if string.sub(ruid,1,12)=="thumbnail://" then return end
+        transform.Pivot=Vector2(0.5,0.5) transform.UIScale=Vector3.one
+        transform.RectSize=Vector2(width,height)
+        if renderer.ImageRUID.DataId~=ruid then renderer.ImageRUID=DataRef(ruid) end
+        if ruid=="" or string.sub(ruid,1,12)=="thumbnail://" then return end
         local size=self._T.iconSizes[ruid]
-        if size==nil then
+        if size~=nil then self:ApplyIconSize(icon,request,size) return end
+        _ResourceService:PreloadAsync({ruid},function()
+            if not isvalid(icon) or self._T.iconRequests[icon.Id].ruid~=request.ruid or renderer.ImageRUID.DataId~=ruid then return end
             local sprite=_ResourceService:LoadSpriteAndWait(ruid)
             if sprite==nil or not sprite.IsLoadComplete or sprite.Width<=0 or sprite.Height<=0 then return end
-            size=Vector2(sprite.Width,sprite.Height)
-            self._T.iconSizes[ruid]=size
-        end
-        if not isvalid(icon) or self._T.iconRequests[icon.Id]~=request then return end
-        local scale=math.min(width/size.x,height/size.y)
-        -- None uses the centered UI rectangle, avoiding the source sprite's item origin.
-        icon.UITransformComponent.Pivot=Vector2(0.5,0.5)
+            local loaded=Vector2(sprite.Width,sprite.Height)
+            self._T.iconSizes[ruid]=loaded
+            self:ApplyIconSize(icon,self._T.iconRequests[icon.Id],loaded)
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyIconSize(Entity icon, table request, Vector2 size)
+        -- A delayed image load cannot resize a reused or cleared slot.
+        if not isvalid(icon) or self._T.iconRequests[icon.Id].ruid~=request.ruid then return end
+        local renderer=icon.SpriteGUIRendererComponent
+        if renderer.ImageRUID.DataId~=request.ruid then return end
+        local scale=math.min(request.width/size.x,request.height/size.y)
         icon.UITransformComponent.RectSize=Vector2(size.x*scale,size.y*scale)
         renderer.PreserveSprite=PreserveSpriteType.None
-        renderer.LocalPosition=Vector2.zero
-        renderer.LocalScale=Vector2.one
+        renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
     end
 
     @ExecSpace("ClientOnly")
     method boolean Use(integer slot)
+        if self:BlockUse() then return false end
         local inv=_UIEquipInventoryManager
         local item=inv:GetTabItem("consume",slot)
         local row=self:ByName(inv:ParseName(item))
@@ -141,7 +171,7 @@ script RecoveryPotionManager extends Logic
             panel:GetChildByName("Title").TextGUIRendererComponent.Text="회복 효과 갱신"
             panel:GetChildByName("Message").TextGUIRendererComponent.Text=(current and current.name or string.upper(row.kind)).." 사용 중 ("..tostring(tier).."%, 남은 "..tostring(math.ceil(remaining/60)).."분)\n"..row.name.." ("..tostring(row.tier).."%)로 교체하고\n지속시간을 1시간으로 갱신할까요?"
             _EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal").Enable=true
-            log("[RecoveryPotion] replacement confirmation "..row.kind)
+            if Environment:IsMakerPlay() then log("[RecoveryPotion] replacement confirmation "..row.kind) end
             return true
         end
         return self:Consume(slot,item)
@@ -149,6 +179,7 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method boolean Consume(integer slot, string expected)
+        if self:BlockUse() then return false end
         local inv = _UIEquipInventoryManager
         local item = inv:GetTabItem("consume", slot)
         if item~=expected then _UIToast:ShowMessage("아이템이 변경되어 사용을 취소했습니다.") return false end
@@ -164,7 +195,7 @@ script RecoveryPotionManager extends Logic
         _GameAudio:PlaySound("ad3fde2e53314fe29ec759886bc88e04",1)
         inv:CancelInvenDrag() inv:RefreshUI()
         _CharacterPersistence:MarkDirty("regen_potion_use")
-        log("[RecoveryPotion] used " .. row.key .. " duration=3600")
+        if Environment:IsMakerPlay() then log("[RecoveryPotion] used " .. row.key .. " duration=3600") end
         self._T.using = false
         return true
     end
@@ -172,7 +203,7 @@ script RecoveryPotionManager extends Logic
     @ExecSpace("ClientOnly")
     method void Apply()
         _MpManager.regenPercentPerSecond = _SkillManager:GetBeginnerMpRegenPct()
-        _SkillManager:RequestSyncHpRegen(_SkillManager:GetBeginnerHpRegenPct())
+        _SkillManager:SyncHpRegenSources()
         self:UpdateUI()
         local w = _EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
         if isvalid(w) and w.EnabledInHierarchy then _CharInfoManager:UpdateStats() end
@@ -191,6 +222,11 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
+        local restricted=self:IsBossRestricted(_UserService.LocalPlayer)
+        if self._T.bossRestricted~=restricted then
+            self._T.bossRestricted=restricted self:Apply()
+            if Environment:IsMakerPlay() then log("[VRF] Shop potion boss suppression="..tostring(restricted)) end
+        end
         if self._T.pending~=nil and _LoginFlow.phase~="ingame" then self:CloseConfirmation(false) end
         local cl = _CharacterPersistence._T.cl
         if cl == nil or not cl.entered or _LoginFlow.phase ~= "ingame" or self._T.characterId~=_FieldRecoveryDrops.characterId then return end
@@ -203,7 +239,7 @@ script RecoveryPotionManager extends Logic
             self.mpRemaining = math.max(0, self.mpRemaining - delta)
             if self.mpRemaining == 0 then self.mpTier = 0 expired = true end
         end
-        if expired then self:Apply() _CharacterPersistence:MarkDirty("regen_potion_change") log("[RecoveryPotion] expired") end
+        if expired then self:Apply() _CharacterPersistence:MarkDirty("regen_potion_change") if Environment:IsMakerPlay() then log("[RecoveryPotion] expired") end end
         self._T.uiTick = (self._T.uiTick or 0) + delta
         if self._T.uiTick >= 0.2 then self._T.uiTick = 0 self:UpdateUI() end
         self._T.autoTick=(self._T.autoTick or 0)+delta
@@ -221,11 +257,11 @@ script RecoveryPotionManager extends Logic
                 local row = self:Product("regen_" .. kind .. tostring(tier))
                 icon.Enable = remaining > 0 and row ~= nil
                 if icon.Enable then
-                    icon.SpriteGUIRendererComponent.ImageRUID = row.ruid
-                    self:FitIcon(icon,row.ruid,32,32)
+                    local art=icon:GetChildByName("Icon")
+                    self:FitIcon(art,row.ruid,32,32)
                     local text = _EntityService:GetEntityByPath(path .. "/Text")
                     text.TextGUIRendererComponent.Text = tostring(math.floor(math.ceil(remaining)/60)) .. ":" .. string.format("%02d", math.ceil(remaining)%60)
-                    _EntityService:GetEntityByPath(path .. "/GrayOverlay").SpriteGUIRendererComponent.FillAmount = 1 - remaining/3600
+                    _EntityService:GetEntityByPath(path .. "/GrayOverlay").SpriteGUIRendererComponent.FillAmount = self:IsBossRestricted(_UserService.LocalPlayer) and 1 or 1 - remaining/3600
                 end
             end
         end
@@ -271,7 +307,7 @@ script RecoveryPotionManager extends Logic
         self.hpTier = s.hp.tier self.hpRemaining = s.hp.left
         self.mpTier = s.mp.tier self.mpRemaining = s.mp.left
         self:Apply()
-        log("[RecoveryPotion] restored hp=" .. tostring(self.hpRemaining) .. " mp=" .. tostring(self.mpRemaining))
+        if Environment:IsMakerPlay() then log("[RecoveryPotion] restored hp=" .. tostring(self.hpRemaining) .. " mp=" .. tostring(self.mpRemaining)) end
     end
 
     @ExecSpace("ServerOnly")
@@ -297,7 +333,7 @@ script RecoveryPotionManager extends Logic
         if old == "" then return end
         local updated = self:WriteState(old,r.state)
         if updated ~= old then sv.saves[r.id] = updated sv.dirtySaves[r.id] = true end
-        if final then log("[RecoveryPotion] logout remaining hp=" .. tostring(r.state.hp.left) .. " mp=" .. tostring(r.state.mp.left)) end
+        if final then if Environment:IsMakerPlay() then log("[RecoveryPotion] logout remaining hp=" .. tostring(r.state.hp.left) .. " mp=" .. tostring(r.state.mp.left)) end end
     end
 
     @ExecSpace("ClientOnly")
@@ -323,6 +359,7 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void UseQuickslot(string name, string ruid)
+        if self:BlockUse() then return end
         -- Consume one matching stack without switching the visible inventory tab.
         local p=_UserService.LocalPlayer
         if not isvalid(p) or p.PlayerComponent:IsDead() or _GameSystemMenu:BlocksInput() then return end
@@ -340,7 +377,7 @@ script RecoveryPotionManager extends Logic
                 if count<=1 then inv:SetTabItem("consume",slot,"")
                 else local parts={} for part in string.gmatch(item,"[^|]+") do table.insert(parts,part) end while #parts<7 do table.insert(parts,"0") end parts[7]=tostring(count-1) inv:SetTabItem("consume",slot,table.concat(parts,"|")) end
                 inv:RefreshUI() _CharacterPersistence:MarkDirty("inventory")
-                log("[QuickslotPotion] consumed "..name) return
+                if Environment:IsMakerPlay() then log("[QuickslotPotion] consumed "..name) end return
             end
         end
         _UIToast:ShowMessage("인벤토리에 "..name.."이(가) 없습니다.")
@@ -349,6 +386,7 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void RefreshQuickslotPotions()
+        if self:IsBossRestricted(_UserService.LocalPlayer) then return end
         -- Renew only timed potions registered in the currently used quickslot layout.
         local player=_UserService.LocalPlayer
         if not isvalid(player) or player.PlayerComponent:IsDead() or self._T.pending~=nil then return end
@@ -376,7 +414,7 @@ script RecoveryPotionManager extends Logic
     @ExecSpace("ClientOnly")
     method void RequestCancel(string kind)
         -- 좌/우클릭과 모바일 탭 모두 같은 삭제 확인을 거친다.
-        if self._T.pending~=nil or (kind~="hp" and kind~="mp") or self:Bonus(kind)<=0 then return end
+        if self._T.pending~=nil or (kind~="hp" and kind~="mp") or self:RawBonus(kind)<=0 then return end
         local tier=kind=="hp" and self.hpTier or self.mpTier
         local remaining=kind=="hp" and self.hpRemaining or self.mpRemaining
         local row=self:Product("regen_"..kind..tostring(tier))
@@ -386,7 +424,7 @@ script RecoveryPotionManager extends Logic
         panel:GetChildByName("Message").TextGUIRendererComponent.Text=row.name.." 효과가 "..tostring(math.ceil(remaining/60)).."분 남아 있습니다.\n정말 해당 포션 버프를 삭제할까요?\n삭제한 효과와 남은 시간은 복구되지 않습니다."
         _EntityService:GetEntityByPath("/ui/RecoveryPotionUI/Modal").Enable=true
         _UIAudio:Play("DlgNotice")
-        log("[RecoveryPotion] cancel confirmation "..kind)
+        if Environment:IsMakerPlay() then log("[RecoveryPotion] cancel confirmation "..kind) end
     end
 
     @ExecSpace("ServerOnly")

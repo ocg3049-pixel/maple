@@ -1,0 +1,667 @@
+@Component
+script ThiefEncounter extends Component
+    @Sync property string OwnerId = ""
+    @Sync property boolean CombatActive = false
+    @Sync property number HitAt = -10
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        self._T.fighters={} self._T.stars={} self._T.names={} self._T.clock=0 self._T.cleaned=false
+        self.Entity.SpriteRendererComponent.Enable=false self.Entity.HitComponent.Enable=false self.Entity.Visible=false
+        self.Entity.Monster._T.spawnHitEnabled=false
+        if Environment:IsMakerPlay() then log("[VRF] Thieves controller initialized") end
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method void UseMoneyBag(Entity player)
+        -- The arena interaction spends no inventory mesos; the server owns its ten-second cooldown.
+        if not self.CombatActive or self._T.cleaned or not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then return end
+        if player.PlayerComponent.UserId~=self.OwnerId or player.PlayerComponent.Hp<=0 then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        local left=math.max(0,(self._T.moneyReadyAt or 0)-now)
+        if left>0 then
+            _BossStageManager:MoneyBagState(self.Entity.CurrentMap.Name,left,false,self.OwnerId)
+            return
+        end
+        local p=player.TransformComponent.WorldPosition
+        local dir=player.PlayerControllerComponent.LookDirectionX<0 and -1 or 1
+        -- Power Strike's forward box reaches 2.5 world units; throw 1.5 times that distance.
+        local x=math.max(-14.1,math.min(14.1,p.x+dir*2.5*1.5))
+        local landing=self:GetSurfaceSpawnPosition(Vector3(x,-100,0))
+        if landing.y< -1 then return end
+        self:ClearMoneyBag()
+        self._T.moneyReadyAt=now+10
+        local start=p+Vector3(dir*0.25,0.45,0)
+        local e=_SpawnService:SpawnByModelId("stumpyball","ThiefMoneyBag",start,self.Entity.CurrentMap)
+        if not isvalid(e) then self._T.moneyReadyAt=0 return end
+        if not isvalid(self.Entity) or self._T.cleaned or not self.CombatActive or player.CurrentMap~=self.Entity.CurrentMap then
+            e:Destroy() return
+        end
+        e.SpriteRendererComponent.SpriteRUID="17ae6a22966f45738bb92fb97ecc3e9d"
+        e.SpriteRendererComponent.Color=Color(1,1,1,1)
+        e.TransformComponent.Scale=Vector3(0.85,0.85,1)
+        self._T.moneyBag={entity=e,start=start,landing=landing,age=0,flight=0.55}
+        for _,f in ipairs(self._T.fighters) do
+            if not f.leader and isvalid(f.entity) and not f.entity.Monster.IsDead then self:BeginMoneyChase(f) end
+        end
+        _BossStageManager:MoneyBagState(self.Entity.CurrentMap.Name,math.max(0,self._T.moneyReadyAt-_UtilLogic.ServerElapsedSeconds),true,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Money bag thrown dir="..tostring(dir).." distance="..tostring(math.abs(x-p.x)).." landing="..tostring(landing).." cooldown=10") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginMoneyChase(table fighter)
+        -- Cancel pending melee/combo hits before steering both ranged and melee minions to the bag.
+        fighter.mode="money" fighter.age=0 fighter.second=false fighter.combo=nil fighter.choice=nil
+        fighter.loco=nil fighter.moveIntent="pursue" fighter.jumpReadyAt=nil
+        fighter.moneyHoldUntil=nil
+        if Environment:IsMakerPlay() then log("[VRF] Money bag priority entity="..fighter.entity.Name) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void EndMoneyChase(table fighter)
+        -- Clear lure-only state and resume ordinary spacing and attacks.
+        if fighter.mode~="money" and fighter.mode~="moneyHold" then return end
+        fighter.mode="idle" fighter.age=0 fighter.loco=nil fighter.moveIntent=nil
+        fighter.jumpReadyAt=nil fighter.moneyHoldUntil=nil
+        fighter.nextAttack=self._T.clock+0.35
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ClearMoneyBag()
+        -- Called on replacement, expiry, defeat and arena cleanup; no state survives the encounter.
+        local bag=self._T.moneyBag
+        if bag~=nil and isvalid(bag.entity) then bag.entity:Destroy() end
+        if bag~=nil and isvalid(bag.aura) then bag.aura:Destroy() end
+        self._T.moneyBag=nil
+        for _,f in ipairs(self._T.fighters or {}) do self:EndMoneyChase(f) end
+        if bag~=nil then if Environment:IsMakerPlay() then log("[VRF] Money bag removed") end end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickMoneyBag(number delta)
+        -- Animate an arc, then atomically choose one grounded arrival and fade for its two-second pause.
+        local bag=self._T.moneyBag
+        if bag==nil then return end
+        if not isvalid(bag.entity) then self:ClearMoneyBag() return end
+        bag.age=bag.age+delta
+        local t=math.min(1,bag.age/bag.flight)
+        local finish=bag.landing+Vector3(0,0.18,0)
+        bag.entity.TransformComponent.WorldPosition=bag.start+(finish-bag.start)*t+Vector3(0,math.sin(t*math.pi)*1.1,0)
+        bag.entity.TransformComponent.ZRotation=t<1 and math.sin(t*math.pi)*-30 or 0
+        if t<1 then return end
+        bag.entity.TransformComponent.WorldPosition=finish+Vector3(0,math.sin(self._T.clock*1.8)*0.04,0)
+        if not bag.landed then
+            bag.landed=true
+            local aura=_SpawnService:SpawnByModelId("stumpyball","MoneyBagDropAura",finish,self.Entity.CurrentMap)
+            if self._T.moneyBag~=bag or self._T.cleaned then if isvalid(aura) then aura:Destroy() end return end
+            bag.aura=aura
+            if isvalid(aura) then
+                aura.SpriteRendererComponent.SpriteRUID="cb4b8f3451bb4f0dab53327cce29c873"
+                aura.SpriteRendererComponent.OrderInLayer=bag.entity.SpriteRendererComponent.OrderInLayer-1
+                aura.TransformComponent.Scale=Vector3(0.75,0.75,1)
+            end
+            if Environment:IsMakerPlay() then log("[VRF] Money bag landed scale=0.85 potionAura=true bob=0.04") end
+        end
+        if isvalid(bag.aura) then
+            bag.aura.TransformComponent.WorldPosition=bag.entity.TransformComponent.WorldPosition+Vector3(0.14075,-0.246,0)
+            bag.aura.SpriteRendererComponent.Color=bag.entity.SpriteRendererComponent.Color
+        end
+        if bag.claimedAt~=nil then
+            local age=self._T.clock-bag.claimedAt
+            bag.entity.SpriteRendererComponent.Color=Color(1,1,1,math.max(0,1-age/2))
+            if age>=2 then
+                if Environment:IsMakerPlay() then log("[VRF] Money bag hold complete duration="..tostring(age)) end
+                self:ClearMoneyBag()
+            end
+            return
+        end
+        local winner=nil local closest=math.huge
+        for _,f in ipairs(self._T.fighters) do
+            if not f.leader and isvalid(f.entity) and not f.entity.Monster.IsDead then
+                local p=f.entity.TransformComponent.WorldPosition
+                local dx=math.abs(p.x-bag.landing.x) local dy=math.abs(p.y-bag.landing.y)
+                if f.entity.RigidbodyComponent:IsOnGround() and dx<=0.22 and dy<=0.20 and dx<closest then
+                    winner=f closest=dx
+                end
+            end
+        end
+        if winner~=nil then
+            bag.claimedAt=self._T.clock bag.winner=winner
+            for _,f in ipairs(self._T.fighters) do self:EndMoneyChase(f) end
+            winner.mode="moneyHold" winner.moneyHoldUntil=self._T.clock+2
+            winner.entity.MovementComponent:Stop()
+            winner.entity.RigidbodyComponent:SetWorldPosition(Vector2(bag.landing.x,bag.landing.y))
+            self:Animate(winner.entity,"alert",false)
+            if Environment:IsMakerPlay() then log("[VRF] Money bag claimed entity="..winner.entity.Name.." leader="..tostring(winner.leader).." hold=2") end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean FollowMoneyBag(table fighter, number delta)
+        -- Highest-priority minion action. The leader always keeps fighting the player.
+        if fighter.leader then return false end
+        if fighter.mode=="moneyHold" then
+            if self._T.clock<(fighter.moneyHoldUntil or 0) then
+                fighter.entity.MovementComponent:Stop()
+                return true
+            end
+            self:EndMoneyChase(fighter)
+        end
+        local bag=self._T.moneyBag
+        if bag==nil or bag.claimedAt~=nil then self:EndMoneyChase(fighter) return false end
+        if fighter.mode~="money" then self:BeginMoneyChase(fighter) end
+        self:MoveFighter(fighter,bag.landing,delta)
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Decorate()
+        for i=1,3 do self:SpawnFighter(Vector3(3+(i-1)*2,0.3,0),i==1,false,false) end
+        self:SpawnFighter(Vector3(13,0.3,0),true,true,false)
+        if Environment:IsMakerPlay() then log("[VRF] Thieves count="..tostring(#self._T.fighters).." leaderHP="..tostring(_BossStageManager:Stage(3).hp).." styles=20/20 skill=50 basic=50 range=5/10") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SpawnFighter(Vector3 position, boolean ranged, boolean leader, boolean reinforcement)
+        self._T.spawnSequence=(self._T.spawnSequence or 0)+1
+        local entityName=leader and "ThiefLeader" or ("Thief_"..tostring(self._T.spawnSequence))
+        position=self:GetSurfaceSpawnPosition(position)
+        local e=_SpawnService:SpawnByModelId("thieffighter",entityName,position,self.Entity.CurrentMap)
+        if not isvalid(e) then return end
+        local name="x럭키세븐x"
+        if not leader then
+            repeat name=_ThiefAppearance:RandomName() until not self._T.names[name]
+            self._T.names[name]=true
+        end
+        e.Monster.MonsterLevel=leader and 35 or 15 e.Monster.NameTagLevel=e.Monster.MonsterLevel
+        e.Monster.MaxHp=leader and _BossStageManager:Stage(3).hp or _BossStageManager:ThiefMemberHp()
+        e.Monster.Hp=e.Monster.MaxHp
+        e.Monster.MonsterDisplayName=name e.Monster:SetupMonsterNameTag()
+        e.Monster.EncounterController=self.Entity
+        e.MonsterAttack.BossOwner=self.OwnerId e.MonsterAttack:SetMapActivity(false)
+        e.MovementComponent.InputSpeed=leader and 0.85 or 0.595 e.RigidbodyComponent.WalkSpeed=2
+        e:AddComponent("ThiefFighterMotion")
+        _ThiefAppearance:Apply(e,ranged and 9 or 10,leader)
+        local f={entity=e,ranged=ranged,leader=leader,reinforcement=reinforcement,nextAttack=self._T.clock+2+#self._T.fighters*0.65,mode="idle",dir=-1,age=0,hasteAt=15,summonAt=12,drainAt=8,savageAt=0}
+        table.insert(self._T.fighters,f)
+        if leader then self._T.leader=f end
+        if Environment:IsMakerPlay() then log("[VRF] Thief spawned name="..name.." leader="..tostring(leader).." reinforcement="..tostring(reinforcement).." displayLevel="..tostring(e.Monster.NameTagLevel).." hp="..tostring(e.Monster.MaxHp)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method Vector3 GetSurfaceSpawnPosition(Vector3 position)
+        -- Spawn above the same native footholds used by the player, never inside a prop.
+        local footholds=self.Entity.CurrentMap.FootholdComponent
+        if not isvalid(footholds) then return position end
+        local top=-math.huge
+        for _,foot in pairs(footholds:GetFootholdAll()) do
+            if not foot:IsVertical() and position.x>=foot.StartPoint.x and position.x<=foot.EndPoint.x then
+                top=math.max(top,foot:GetYByX(position.x))
+            end
+        end
+        if top==-math.huge then return position end
+        return Vector3(position.x,math.max(position.y,top+0.05),position.z)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Animate(Entity entity, string motion, boolean once)
+        if not isvalid(entity) then return end
+        local visual=entity:GetComponent("script.ThiefFighterMotion")
+        if isvalid(visual) then visual:SetMotion(motion,once) end
+    end
+
+    method string ChooseAttack(boolean ranged, number roll)
+        if roll<0.50 then return ranged and "lucky" or "double" end
+        return "basic"
+    end
+
+    @ExecSpace("ServerOnly")
+    method string ChooseLeaderAttack(table f, number distance)
+        local now=self._T.clock
+        if now>=f.hasteAt then return "haste" end
+        if now>=f.summonAt then return "summon" end
+        if distance<=1.6 and now>=f.savageAt then return "savage" end
+        if now>=f.drainAt then return "drain" end
+        return self:ChooseAttack(true,_UtilLogic:RandomDouble())
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Launch(table f, integer starIndex, string kind)
+        local p=f.entity.TransformComponent.WorldPosition+Vector3(f.dir*0.4,0.45,0)
+        local e=_SpawnService:SpawnByModelId("stumpyball","ThiefStar",p,self.Entity.CurrentMap)
+        if not isvalid(e) then return end
+        local info=_ShurikenLibrary:Get(starIndex)
+        e.SpriteRendererComponent.SpriteRUID=info.fly~=nil and info.fly~="" and info.fly or info.icon
+        e.SpriteRendererComponent.FlipX=not info.spin and f.dir>0
+        local speed=f.leader and 3.25 or 2.5
+        local b={entity=e,source=f.entity,leader=f.leader,kind=kind,combo=f.combo,skill=f.choice,hitIndex=f.second and 2 or 1,lineCount=f.choice=="lucky" and 2 or 1,x=p.x,y=p.y,speed=speed,starIndex=starIndex,vx=f.dir*speed,vy=math.max(-0.7,math.min(0.7,f.aimY-p.y))*(speed/2.5),age=0,hits={},distance=0,reach=f.leader and 10 or 5,spin=info.spin,ox=info.ox or 0,oy=info.oy or 0}
+        table.insert(self._T.stars,b)
+        if Environment:IsMakerPlay() then log("[VRF] Thief projectile leader="..tostring(f.leader).." skill="..tostring(f.choice).." star="..tostring(starIndex).." line="..tostring(b.hitIndex).." speed="..tostring(speed)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Strike(Vector2 p, Vector2 size, string kind, table hits, table context)
+        local a=self.Entity.MonsterAttack a._T.stumpyHits=hits self._T.strike=context
+        a:AttackFast(BoxShape(p,size,0),"boss.thief."..kind,CollisionGroups.HitBox)
+        a._T.stumpyHits=nil self._T.strike=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StrikeStar(table star)
+        -- Sweep a tiny impact core along its actual direction instead of an axis-aligned envelope.
+        local dx=star.nextX-star.x local dy=star.nextY-star.y
+        local distance=math.sqrt(dx*dx+dy*dy)
+        local angle=distance>0 and math.atan(dy,dx)*180/math.pi or 0
+        local shape=BoxShape(Vector2((star.x+star.nextX)/2,(star.y+star.nextY)/2),Vector2(distance+0.04,0.04),angle)
+        local attack=self.Entity.MonsterAttack
+        attack._T.stumpyHits=star.hits self._T.strike=star
+        attack:AttackFast(shape,"boss.thief."..star.kind,CollisionGroups.HitBox)
+        attack._T.stumpyHits=nil self._T.strike=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsStarTarget(Entity player, string tag)
+        -- The native player hitbox remains standing-height; intersect a crouched body separately for stars.
+        local s=self._T.strike
+        if s==nil or s.speed==nil or tag~="boss.thief."..s.kind then return true end
+        if not isvalid(player.PlayerComponent) or not isvalid(player.StateComponent) or player.StateComponent.CurrentStateName~="CROUCH" then return true end
+        if not isvalid(player.RigidbodyComponent) or not player.RigidbodyComponent:IsOnGround() then return true end
+        local p=player.TransformComponent.WorldPosition
+        local halfWidth=player.HitComponent.BoxSize.x*0.5
+        local entry=0 local leave=1
+        local axes={{s.x,s.nextX or s.x,p.x-halfWidth-0.02,p.x+halfWidth+0.02},{s.y,s.nextY or s.y,p.y-0.02,p.y+0.28+0.02}}
+        local intersects=true
+        for _,axis in ipairs(axes) do
+            local delta=axis[2]-axis[1]
+            if math.abs(delta)<0.000001 then
+                if axis[1]<axis[3] or axis[1]>axis[4] then intersects=false break end
+            else
+                local first=(axis[3]-axis[1])/delta local last=(axis[4]-axis[1])/delta
+                entry=math.max(entry,math.min(first,last)) leave=math.min(leave,math.max(first,last))
+                if entry>leave then intersects=false break end
+            end
+        end
+        if not intersects and not s.crouchDodged then
+            s.crouchDodged=true
+            if Environment:IsMakerPlay() then log("[VRF] Thief star duck dodge kind="..s.kind.." core=0.04 crouchHeight=0.28") end
+        end
+        return intersects
+    end
+
+    -- Only the remaining hit of this same cast can pass its own hit immunity.
+    -- Another attack, parry, climb, dodge, or a new cast never inherits this permission.
+    @ExecSpace("ServerOnly")
+    method boolean CanContinueCombo(Entity player, string tag)
+        local s=self._T.strike
+        if s==nil or s.combo==nil or not isvalid(s.source) or s.source.Monster.IsDead then return false end
+        if not self.CombatActive or self._T.cleaned or not isvalid(player.PlayerComponent) or player.PlayerComponent.UserId~=self.OwnerId or player.CurrentMap~=self.Entity.CurrentMap then return false end
+        if tag~="boss.thief."..s.kind then return false end
+        local previous=s.combo[player.Id]
+        return previous~=nil and previous.generation==player.PlayerHit._T.hitImmuneGeneration and _UtilLogic.ServerElapsedSeconds-previous.at<=0.8
+    end
+
+    @ExecSpace("ServerOnly")
+    method void AcceptedHit(Entity player, string tag)
+        local s=self._T.strike
+        if s==nil or tag~="boss.thief."..s.kind or not isvalid(s.source) or s.source.Monster.IsDead then return end
+        local skill=s.skill or "basic"
+        if skill=="savage" then
+            player.PlayerAttack:SpawnSavageBlowHitEffect(player,s.hitRuid,-s.source.TransformComponent.Scale.x)
+        else
+            self:AttackHitEffect(player,s.source,s.kind,skill,self.OwnerId)
+        end
+        self:PlayAttackHitSound(s.kind,skill,self.OwnerId)
+        if Environment:IsMakerPlay() then log("[VRF] Thief hit accepted skill="..skill.." line="..tostring(s.hitIndex or 1).."/"..tostring(s.lineCount or 1)) end
+        if s.combo~=nil then s.combo[player.Id]={generation=player.PlayerHit._T.hitImmuneGeneration,at=_UtilLogic.ServerElapsedSeconds} end
+        if s.kind=="leader.drain" and not s.healed then
+            s.healed=true
+            local m=s.source.Monster local before=m.Hp
+            m.Hp=math.min(m.MaxHp,m.Hp+math.floor(m.MaxHp*0.10))
+            self:SkillEffect(s.source,"heal",self.OwnerId)
+            if Environment:IsMakerPlay() then log("[VRF] Thief drain accepted heal="..tostring(m.Hp-before).." hp="..tostring(m.Hp)) end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PerformAttack(table f)
+        local e=f.entity local p=e.TransformComponent.WorldPosition local choice=f.choice
+        if f.leader then _ThiefAppearance:Weapon(e,choice=="savage" and 10 or 9) end
+        if choice=="haste" then
+            f.hasteAt=self._T.clock+60
+            self:Animate(e,"heal",true)
+            self:ApplyHaste(f,10)
+            local recipients=0
+            for _,ally in ipairs(self._T.fighters) do
+                if ally~=f and isvalid(ally.entity) and not ally.entity.Monster.IsDead then
+                    local ap=ally.entity.TransformComponent.WorldPosition
+                    if math.abs(ap.x-p.x)<=6 and math.abs(ap.y-p.y)<=2.5 then
+                        self:ApplyHaste(ally,4) recipients=recipients+1
+                    end
+                end
+            end
+            if Environment:IsMakerPlay() then log("[VRF] Thief haste allies="..tostring(recipients).." duration=4") end
+        elseif choice=="summon" then
+            f.summonAt=self._T.clock+18
+            self:Animate(e,"alert",true) self:SkillEffect(e,"summon",self.OwnerId)
+            self:SpawnFighter(Vector3(math.max(-14,math.min(14,p.x-f.dir*1.5)),p.y+0.4,0),_UtilLogic:RandomDouble()<0.5,false,true)
+        elseif choice=="savage" then
+            f.savageAt=self._T.clock+4.5
+            self:Animate(e,"savage",true) self:SkillEffect(e,"savage",self.OwnerId)
+            -- Resolve six real hits on visual frames 2/3/4/5/6/8, dealing 60% total max-HP damage.
+            local combo=f.combo
+            local player=_UserService:GetUserEntityByUserId(self.OwnerId)
+            if not isvalid(player) then return end
+            local hitRuid=player.PlayerAttack:RollSavageBlowHitRuid()
+            for i,frame in ipairs({2,3,4,5,6,8}) do
+                local hitIndex=i
+                _TimerService:SetTimerOnce(function()
+                    if not isvalid(self.Entity) or self._T.cleaned or not self.CombatActive then return end
+                    if not isvalid(e) or e.Monster.IsDead or e.CurrentMap~=self.Entity.CurrentMap or f.combo~=combo then return end
+                    local current=e.TransformComponent.WorldPosition
+                    local context={source=e,kind="leader.savage",skill="savage",combo=combo,hitIndex=hitIndex,lineCount=6,hitRuid=hitRuid}
+                    self:Strike(Vector2(current.x+f.dir*0.8,current.y+0.4),Vector2(1.6,0.8),context.kind,{},context)
+                end,(frame-1)*0.09)
+            end
+        elseif f.ranged then
+            self:Animate(e,"swingO1",true)
+            if choice=="lucky" then f.luckyStarIndex=f.leader and _UtilLogic:RandomIntegerRange(3,4) or 1 end
+            local index=f.leader and (choice=="drain" and 5 or (choice=="lucky" and f.luckyStarIndex or 2)) or 1
+            local kind=f.leader and (choice=="drain" and "leader.drain" or "leader.star") or "star"
+            if choice=="lucky" then self:SkillEffect(e,"lucky",self.OwnerId) end
+            if choice=="drain" then f.drainAt=self._T.clock+6 self:SkillEffect(e,"drain",self.OwnerId) end
+            self:Launch(f,index,kind)
+        else
+            self:Animate(e,"stabO1",true)
+            if choice=="double" then self:SkillEffect(e,"double",self.OwnerId) end
+            local context={source=e,kind="stab",combo=f.combo,skill=choice,hitIndex=1,lineCount=choice=="double" and 2 or 1}
+            self:Strike(Vector2(p.x+f.dir*0.6,p.y+0.4),Vector2(1.15,0.8),"stab",{},context)
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Thief attack leader="..tostring(f.leader).." choice="..choice) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ApplyHaste(table fighter, number duration)
+        -- Refresh a bounded buff; keep the normal speed to restore on expiry.
+        fighter.hasteUntil=self._T.clock+duration
+        fighter.entity.MovementComponent.InputSpeed=(fighter.leader and 0.85 or 0.595)*1.3
+        fighter.entity.MovementComponent.JumpForce=1.2
+        self:SkillEffect(fighter.entity,fighter.leader and "haste" or "hasteAlly",self.OwnerId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ExpireHaste(table fighter)
+        -- Restore both movement and jumping at the encounter-clock deadline.
+        if fighter.hasteUntil==nil or self._T.clock<fighter.hasteUntil then return end
+        fighter.entity.MovementComponent.InputSpeed=fighter.leader and 0.85 or 0.595
+        fighter.entity.MovementComponent.JumpForce=1
+        fighter.hasteUntil=nil
+        if Environment:IsMakerPlay() then log("[VRF] Thief haste expired entity="..fighter.entity.Name) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean TryFighterJump(table fighter, boolean downward)
+        -- Stagger reactions and takeoffs instead of having the whole group jump together.
+        local now=self._T.clock
+        if fighter.jumpReadyAt==nil then fighter.jumpReadyAt=now+0.12+_UtilLogic:RandomDouble()*0.38 end
+        if now<fighter.jumpReadyAt or now<(self._T.nextGroupJumpAt or 0) then return false end
+        if not fighter.entity.RigidbodyComponent:IsOnGround() then return false end
+        fighter.jumpReadyAt=nil fighter.stuckFor=0
+        fighter.jumpAt=now+1.15+_UtilLogic:RandomDouble()*0.85
+        self._T.nextGroupJumpAt=now+0.45+_UtilLogic:RandomDouble()*0.30
+        if downward then fighter.entity.MovementComponent:DownJump() else fighter.entity.MovementComponent:Jump() end
+        if Environment:IsMakerPlay() then log("[VRF] Thief jump entity="..fighter.entity.Name.." at="..tostring(now).." nextGroup="..tostring(self._T.nextGroupJumpAt)) end
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void MoveFighter(table fighter, Vector3 target, number delta)
+        -- Pursue until in position, retreat only when crowded, then hold an attack stance.
+        -- Hysteresis keeps a stationary target from causing frame-by-frame direction reversals.
+        local e=fighter.entity local p=e.TransformComponent.WorldPosition
+        local dx=target.x-p.x local toward=dx>=0 and 1 or -1
+        local distance=math.abs(dx)
+        local near=fighter.leader and 6 or (fighter.ranged and 2.1 or 0.35)
+        local far=fighter.leader and 8.5 or (fighter.ranged and 3.8 or 1.15)
+        local desired=fighter.leader and 7.5 or (fighter.ranged and 3 or 0.8)
+        local intent=fighter.moveIntent or "hold"
+        if math.abs(target.y-p.y)>0.6 then intent="pursue"
+        elseif distance<near then intent="retreat"
+        elseif distance>far then intent="pursue"
+        elseif intent=="pursue" and distance<=desired then intent="hold"
+        elseif intent=="retreat" and distance>=near+0.6 then intent="hold" end
+        if fighter.mode=="money" then intent=distance>0.10 and "pursue" or "hold" end
+        local move=intent=="pursue" and toward or (intent=="retreat" and -toward or 0)
+        if (p.x<=-14.2 and move<0) or (p.x>=14.2 and move>0) then move=0 intent="hold" end
+        fighter.moveIntent=intent
+        fighter.dir=move~=0 and move or toward
+        e.TransformComponent.Scale=Vector3(-fighter.dir,1,1)
+        if move==0 then e.MovementComponent:Stop()
+        else e.MovementComponent:MoveToDirection(Vector2(move,0),delta) end
+        local grounded=e.RigidbodyComponent:IsOnGround()
+        fighter.stuckFor=move~=0 and math.abs(p.x-(fighter.lastMoveX or p.x))<0.004 and (fighter.stuckFor or 0)+delta or 0
+        fighter.lastMoveX=p.x
+        local moneyClimb=fighter.mode=="money" and math.abs(target.y-p.y)>0.20
+        if (move==0 and not moneyClimb) or not grounded then fighter.jumpReadyAt=nil end
+        if (move~=0 or moneyClimb) and grounded and self._T.clock>(fighter.jumpAt or 0) then
+            if self._T.clock>=(fighter.terrainCheckAt or 0) then
+                fighter.terrainCheckAt=self._T.clock+0.15
+                local ahead=self:GetSurfaceSpawnPosition(Vector3(p.x+move*0.55,p.y,0))
+                fighter.obstacleAhead=ahead.y>p.y+0.2 and ahead.y<p.y+1.8
+            end
+            local obstacle=fighter.obstacleAhead==true
+            if target.y>p.y+(moneyClimb and 0.20 or 0.5) or obstacle or fighter.stuckFor>0.45 then
+                if self:TryFighterJump(fighter,false) then grounded=false end
+            elseif target.y<p.y-(moneyClimb and 0.20 or 0.6) then
+                if self:TryFighterJump(fighter,true) then grounded=false end
+            else
+                fighter.jumpReadyAt=nil
+            end
+        end
+        local loco=grounded and (move==0 and "alert" or "walk1") or "jump"
+        if fighter.loco~=loco then fighter.loco=loco self:Animate(e,loco,false) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        if not self.CombatActive or self._T.cleaned or not isvalid(player) then return end
+        self._T.clock=self._T.clock+delta
+        self:TickMoneyBag(delta)
+        local hp=0 local target=player.TransformComponent.WorldPosition
+        for _,f in ipairs(self._T.fighters) do
+            local e=f.entity
+            if isvalid(e) and e.Monster.IsDead and not f.deathRecorded then
+                f.deathRecorded=true
+                if not f.reinforcement then
+                    self._T.lastDefeatedPosition=e.TransformComponent.WorldPosition
+                    if Environment:IsMakerPlay() then log("[VRF] Thief reward death source="..tostring(self._T.lastDefeatedPosition)) end
+                end
+            end
+            if isvalid(e) and not e.Monster.IsDead then
+                if not f.reinforcement then hp=hp+e.Monster.Hp end
+                f.age=f.age+delta
+                self:ExpireHaste(f)
+                local p=e.TransformComponent.WorldPosition local dx=target.x-p.x
+                if self:FollowMoneyBag(f,delta) then
+                    -- Lure movement and the winner pause take priority over attack preparation.
+                elseif f.mode=="tell" then
+                    e.MovementComponent:Stop()
+                    if f.age>=(f.ranged and 0.75 or 0.95) then
+                        f.mode="attack" f.age=0 self:PerformAttack(f)
+                    end
+                elseif f.mode=="attack" then
+                    e.MovementComponent:Stop()
+                    if f.age>=0.25 and not f.second and (f.choice=="lucky" or f.choice=="double") then
+                        f.second=true
+                        if f.choice=="lucky" then
+                            self:Animate(e,"swingO1",true) self:Launch(f,f.luckyStarIndex or 1,f.leader and "leader.star" or "star")
+                        else
+                            self:Animate(e,"stabO2",true) self:SkillEffect(e,"doubleSecond",self.OwnerId)
+                            local context={source=e,kind="stab",combo=f.combo,skill="double",hitIndex=2,lineCount=2}
+                            self:Strike(Vector2(p.x+f.dir*0.6,p.y+0.4),Vector2(1.15,0.8),"stab",{},context)
+                        end
+                    end
+                    local recovery=f.choice=="savage" and 0.8 or ((f.choice=="lucky" or f.choice=="double") and 0.6 or 0.4)
+                    if f.age>=recovery then f.loco=nil f.mode="idle" f.nextAttack=self._T.clock+1.5+_UtilLogic:RandomDouble() f.second=false end
+                else
+                    local toward=dx>=0 and 1 or -1
+                    local range=f.leader and 10 or (f.ranged and 5 or 1.25)
+                    local support=f.leader and (self._T.clock>=f.hasteAt or self._T.clock>=f.summonAt)
+                    if e.RigidbodyComponent:IsOnGround() and self._T.clock>=f.nextAttack and (support or (math.abs(dx)<=range and math.abs(target.y-p.y)<(f.ranged and 2 or 0.8))) then
+                        f.dir=toward e.TransformComponent.Scale=Vector3(-f.dir,1,1)
+                        f.choice=f.leader and self:ChooseLeaderAttack(f,math.abs(dx)) or self:ChooseAttack(f.ranged,_UtilLogic:RandomDouble())
+                        f.combo={} f.second=false f.mode="tell" f.loco=nil f.age=0
+                        local crouched=isvalid(player.StateComponent) and player.StateComponent.CurrentStateName=="CROUCH" and player.RigidbodyComponent:IsOnGround()
+                        f.aimY=target.y+(crouched and 0.15 or 0.4)
+                        e.MovementComponent:Stop() self:Animate(e,"alert",false) self:Tell(e,f.ranged,self.OwnerId)
+                    else
+                        self:MoveFighter(f,target,delta)
+                    end
+                end
+                if p.x< -14.8 or p.x>14.8 or p.y< -0.8 then
+                    local safe=self:GetSurfaceSpawnPosition(Vector3(math.max(-14.6,math.min(14.6,p.x)),0.2,0))
+                    e.RigidbodyComponent:SetWorldPosition(Vector2(safe.x,safe.y))
+                end
+            end
+        end
+        self.Entity.Monster.Hp=hp
+        if hp<=0 then self.Entity.Monster:Dead() return end
+        for i=#self._T.stars,1,-1 do
+            local b=self._T.stars[i] b.age=b.age+delta
+            if not isvalid(b.entity) or b.distance>=b.reach or math.abs(b.x)>17 or b.y< -0.3 or b.y>5 then
+                if isvalid(b.entity) then b.entity:Destroy() end table.remove(self._T.stars,i)
+            else
+                local step=math.min(delta,(b.reach-b.distance)/b.speed)
+                local x=b.x+b.vx*step local y=b.y+b.vy*step b.distance=b.distance+b.speed*step
+                -- A four-pixel core swept along the flight segment avoids tunnelling and oversized lower corners.
+                b.nextX=x b.nextY=y
+                self:StrikeStar(b)
+                b.x=x b.y=y
+                local angle=b.spin and b.age*720 or 0 local rad=angle*math.pi/180
+                local ox=b.spin and (b.ox*math.cos(rad)-b.oy*math.sin(rad)) or 0
+                local oy=b.spin and (b.ox*math.sin(rad)+b.oy*math.cos(rad)) or 0
+                b.entity.TransformComponent.WorldPosition=Vector3(x-ox,y-oy,0) b.entity.TransformComponent.ZRotation=angle
+                if next(b.hits)~=nil then b.entity:Destroy() table.remove(self._T.stars,i) end
+            end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void Tell(Entity fighter, boolean ranged)
+        _EffectService:PlayEffectAttached("19adfadeeb3346558da7f05d182a67dc",fighter,Vector3(0,0.9,0),0,Vector3(0.5,0.5,1),false,{SortingLayer="MapLayer0",OrderInLayer=5})
+    end
+
+    @ExecSpace("Client")
+    method void SkillEffect(Entity fighter, string kind)
+        if not isvalid(fighter) then return end
+        if kind=="lucky" or kind=="double" or kind=="doubleSecond" then
+            local dir=-fighter.TransformComponent.Scale.x
+            local ruid=kind=="lucky" and "0ae88fa494e743158da6ddb81c0c55f2" or "8de01c7022964b1b9d6cf96070073446"
+            local offset=kind=="lucky" and Vector3(0,0.12,0) or Vector3(dir*0.6,0.35,0)
+            local id=_EffectService:PlayEffect(ruid,fighter,fighter.TransformComponent.WorldPosition+offset,0,Vector3.one,false,{FlipX=dir>0,SortingLayer="MapLayer0",OrderInLayer=6})
+            if kind~="doubleSecond" then _GameAudio:PlaySound(kind=="lucky" and "879c81c8fc274aea87dc673de48ab5d1" or "ca4f802052184c0ba47f6971fde80bd0",0.7) end
+            if Environment:IsMakerPlay() then log("[VRF] Thief cast effect="..kind.." serial="..tostring(id)) end
+            _TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(id) end,0.6)
+        elseif kind=="haste" or kind=="hasteAlly" or kind=="heal" or kind=="summon" then
+            local ruid=kind=="hasteAlly" and "009f23ef00f54cb98723740af3d848db" or "410e6a09f8ec471f87bd8d55c34cc48d"
+            local id=_EffectService:PlayEffectAttached(ruid,fighter,Vector3.zero,0,Vector3.one,false,{SortingLayer="MapLayer0",OrderInLayer=5})
+            if kind~="hasteAlly" then _GameAudio:PlaySound("64795afda95e4b7dbdbdfe731e7d405a",0.7) end
+            if Environment:IsMakerPlay() then log("[VRF] Thief buff effect="..kind.." ruid="..ruid.." entity="..fighter.Name.." serial="..tostring(id)) end
+            _TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(id) end,1.5)
+        else
+            local fx=_SpawnService:SpawnByModelId("stumpyball","ThiefSkillFX",fighter.TransformComponent.WorldPosition+Vector3(0,0.45,0),fighter.CurrentMap)
+            if not isvalid(fx) then return end
+            if kind=="savage" then
+                fx.TransformComponent.Position=fx.TransformComponent.Position+Vector3(-fighter.TransformComponent.Scale.x*0.7,0,0)
+                fx:AddComponent("SavageBlowVisual")
+            else
+                local frames={"a570afd728ae461caed63151ad72a181","46f1109c5f144e92a04c75a50089f37b","1a98368791d74f02a96d3d98e53d86d4","59fbbc4d75254b93b9956113dd2349a4","3434358e79084e51910ca3489046cb45","1e2645994d6e47f6a2cb356e9d3f0f62"}
+                for i,ruid in ipairs(frames) do
+                    local frame=ruid
+                    _TimerService:SetTimerOnce(function() if isvalid(fx) then fx.SpriteRendererComponent.SpriteRUID=frame end end,(i-1)*0.07)
+                end
+            end
+            fx.SpriteRendererComponent.FlipX=fighter.TransformComponent.Scale.x<0
+            _TimerService:SetTimerOnce(function() if isvalid(fx) then fx:Destroy() end end,0.85)
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Thief effect="..kind) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ShowHitDamage(Entity player, integer damage, string tag)
+        -- Carry this accepted cast's line index to the player's selected damage skin.
+        local s=self._T.strike
+        local matches=s~=nil and tag=="boss.thief."..s.kind
+        player.PlayerHit:ShowThiefTakenDamage(damage,matches and (s.hitIndex or 1) or 1,matches and (s.lineCount or 1) or 1,self.OwnerId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method integer SavageHitDamage(integer total)
+        -- Integer partitions add up exactly to the 60% skill damage.
+        local s=self._T.strike
+        local index=s~=nil and (s.hitIndex or 1) or 1
+        return math.floor(total*index/6)-math.floor(total*(index-1)/6)
+    end
+
+    @ExecSpace("Client")
+    method void PlayAttackHitSound(string kind, string skill)
+        -- Play impact audio only after accepted damage, once for each real hit.
+        local sound="48c2f4049db54b3b88b9144320d3d41a"
+        if skill=="savage" then sound="b77afdd614194637949c7df3d002fc54"
+        elseif kind=="stab" then sound=skill=="double" and "80ad9290460845f18e49478784bcc1b1" or "956ddfb53d7845ce972acab3e51b05e1" end
+        _GameAudio:PlaySound(sound,skill=="savage" and 0.5 or 0.7)
+        if Environment:IsMakerPlay() then log("[VRF] Thief hit sound skill="..skill.." kind="..kind.." ruid="..sound) end
+    end
+
+    @ExecSpace("Client")
+    method void AttackHitEffect(Entity player, Entity attacker, string kind, string skill)
+        -- Replay the same dagger/star impact clips used by the player's attacks.
+        if not isvalid(player) or not isvalid(attacker) then return end
+        local star=kind~="stab"
+        local ruid=star and "458e72f0720a4584a9a7fc3642b6e601" or "8de01c7022964b1b9d6cf96070073446"
+        local id=_EffectService:PlayEffectAttached(ruid,player,star and Vector3(0,0.35,0) or Vector3.zero,0,Vector3.one,false,{FlipX=attacker.TransformComponent.Scale.x<0,SortingLayer="MapLayer0",OrderInLayer=6})
+        if Environment:IsMakerPlay() then log("[VRF] Thief impact skill="..skill.." kind="..kind.." serial="..tostring(id)) end
+        _TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(id) end,0.5)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        if self._T.cleaned then return end
+        self.CombatActive=false self._T.clock=self._T.clock+delta
+        for _,f in ipairs(self._T.fighters or {}) do
+            if isvalid(f.entity) and not f.entity.Monster.IsDead then
+                f.age=f.age+delta self:ExpireHaste(f)
+                f.entity.HitComponent.Enable=false f.entity.MovementComponent:Stop()
+                if f.mode~="defeatIdle" then f.mode="defeatIdle" self:Animate(f.entity,"alert",false) end
+            end
+        end
+        for i=#self._T.stars,1,-1 do
+            local b=self._T.stars[i] b.age=b.age+delta b.distance=b.distance+b.speed*delta
+            if not isvalid(b.entity) or b.distance>=b.reach then
+                if isvalid(b.entity) then b.entity:Destroy() end table.remove(self._T.stars,i)
+            else
+                b.x=b.x+b.vx*delta b.y=b.y+b.vy*delta
+                b.entity.TransformComponent.WorldPosition=Vector3(b.x,b.y,0)
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        if self._T.cleaned then return end
+        self:ClearMoneyBag()
+        self._T.cleaned=true self.CombatActive=false self._T.strike=nil
+        -- Dead fighters own their three-second ghost lifetime, even after the last kill clears the stage.
+        for _,f in ipairs(self._T.fighters or {}) do
+            if isvalid(f.entity) and not f.entity.Monster.IsDead then f.entity:Destroy() end
+        end
+        for _,star in ipairs(self._T.stars or {}) do if isvalid(star.entity) then star.entity:Destroy() end end
+        self._T.fighters={} self._T.stars={} self._T.leader=nil
+        if Environment:IsMakerPlay() then log("[VRF] Thieves cleanup fighters=0 stars=0") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        self:Cleanup()
+    end
+end

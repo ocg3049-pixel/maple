@@ -28,31 +28,31 @@ script ShadowPartnerVisual extends Component
 		end
 	end
 
-	method void SetupListeners()
-		local parent = self.Entity.Parent
-		if not isvalid(parent) then return end
-
-		local sc = parent.StateComponent
-		if isvalid(sc) then
-			self.parentStateHandler = parent:ConnectEvent(StateChangeEvent, self.OnParentStateChange)
-		end
-
-		local avatarRenderer = parent.AvatarRendererComponent
-		if isvalid(avatarRenderer) then
-			local body = avatarRenderer:GetBodyEntity()
-			if isvalid(body) then
-				self.parentBodyHandler = body:ConnectEvent(ActionStateChangedEvent, self.OnParentBodyAction)
-			end
-		end
-
-		-- 그림자 자신의 프레임 진행을 구독한다 - Onetime 모션을 마지막 프레임에서 멈추는 데 쓴다(아래 참고).
-		self.frameHandler = self.Entity:ConnectEvent(SpriteAnimPlayerChangeFrameEvent, self.OnShadowFrameChanged)
-
-		-- 리스너 연결 시점에 이미 대기 중이던 상태를 한 번 반영해 최초 활성화 직후에도 자세가 어긋나지 않게 한다.
-		if isvalid(sc) then
-			self:ApplyStateSprite(sc.CurrentStateName)
-		end
-	end
+    method void SetupListeners()
+        -- Retry until the avatar is ready; observe the displayed body for a replica.
+        local parent=self.Entity.Parent
+        if not isvalid(parent) then return end
+        local sc=parent.StateComponent
+        if isvalid(sc) and self.parentStateHandler==nil then
+            self.parentStateHandler=parent:ConnectEvent(StateChangeEvent,self.OnParentStateChange)
+        end
+        local avatar=parent.AvatarRendererComponent
+        local body=isvalid(avatar) and avatar:GetBodyEntity() or nil
+        local p=_CarnivalReplica._T.client
+        local replica=p~=nil and p.actor==parent and isvalid(p.gui)
+        if replica then body=p.gui end
+        if isvalid(body) and self._T.listenedBody~=body then
+            if isvalid(self._T.listenedBody) and self.parentBodyHandler~=nil then
+                self._T.listenedBody:DisconnectEvent(ActionStateChangedEvent,self.parentBodyHandler)
+            end
+            self._T.listenedBody=body self._T.replicaBody=replica
+            self.parentBodyHandler=body:ConnectEvent(ActionStateChangedEvent,self.OnParentBodyAction)
+            if replica and p.lastAction~=nil then
+                self:ApplyMotionSprite(p.lastAction,0,2147483647,p.lastRate or 1,false)
+            elseif isvalid(sc) then self:ApplyStateSprite(sc.CurrentStateName) end
+        end
+        if self.frameHandler==nil then self.frameHandler=self.Entity:ConnectEvent(SpriteAnimPlayerChangeFrameEvent,self.OnShadowFrameChanged) end
+    end
 
 	method void OnShadowFrameChanged(SpriteAnimPlayerChangeFrameEvent event)
 		-- (버그 수정) "쉐도우 파트너로 여러 스킬을 쓸 때 그림자 모션이 본체와 다르다(예: 더블스탭)"
@@ -91,7 +91,7 @@ script ShadowPartnerVisual extends Component
 	end
 
 	method void OnParentStateChange(StateChangeEvent event)
-		self:ApplyStateSprite(event.CurrentStateName)
+		if not self._T.replicaBody then self:ApplyStateSprite(event.CurrentStateName) end
 	end
 
 	method void OnParentBodyAction(ActionStateChangedEvent event)
@@ -146,7 +146,11 @@ script ShadowPartnerVisual extends Component
 	end
 
 	method void ApplyMotionSprite(string motionName, integer startFrameIdx, integer endFrameIdx, number playRate, boolean oneShot)
+        local owner=self.Entity.Parent
+        local attack=isvalid(owner) and owner:GetComponent("script.PlayerAttack") or nil
+        if isvalid(attack) and not attack.ShadowPartnerOn then return end
 		local map = {
+            jump = "993820c3b6ea4ec682af47300d366b1c",
 			proneStab = "06184b0d6c0446c6944827222843b399",
 			prone = "d41f649cd95341a29a1bdf24b629b6c1",
 			stand1 = "f4aba8c33f204125a231595006d84b4a",
@@ -200,10 +204,11 @@ script ShadowPartnerVisual extends Component
 	method void OnUpdate(number delta)
 		-- 클라이언트 전용: 매 프레임 본체(부모)가 바라보는 방향의 반대쪽(등뒤)에 붙어있도록 로컬 좌표를 갱신한다.
 		if not self:IsClient() then return end
+        self:SetupListeners()
 		local parent = self.Entity.Parent
 		if not isvalid(parent) then return end
 		local playerCtrl = parent.PlayerControllerComponent
-		local dirX = isvalid(playerCtrl) and playerCtrl.LookDirectionX or 1
+		local dirX = _CarnivalReplica:PresentationFacing(parent)
 		if dirX == 0 then dirX = 1 end
 
 		self.Entity.TransformComponent.Position = Vector3(-0.22 * dirX, -0.02, 0)
@@ -213,6 +218,7 @@ script ShadowPartnerVisual extends Component
 			-- (msw-search 스프라이트 방향 규칙) 리소스는 기본적으로 왼쪽을 보고 있으므로 오른쪽을 볼 때 FlipX=true.
 			sr.FlipX = dirX > 0
 		end
+        _CarnivalActorPresentation:RefreshEntity(self.Entity)
 	end
 
 	method void OnEndPlay()
@@ -225,15 +231,9 @@ script ShadowPartnerVisual extends Component
 				parent:DisconnectEvent(StateChangeEvent, self.parentStateHandler)
 			end
 		end
-		if self.parentBodyHandler then
-			local avatarRenderer = isvalid(parent) and parent.AvatarRendererComponent
-			if isvalid(avatarRenderer) then
-				local body = avatarRenderer:GetBodyEntity()
-				if isvalid(body) then
-					body:DisconnectEvent(ActionStateChangedEvent, self.parentBodyHandler)
-				end
-			end
-		end
-	end
+        if self.parentBodyHandler~=nil and isvalid(self._T.listenedBody) then
+            self._T.listenedBody:DisconnectEvent(ActionStateChangedEvent,self.parentBodyHandler)
+        end
+    end
 
 end

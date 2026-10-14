@@ -1,0 +1,1385 @@
+@Logic
+script CarnivalReplica extends Logic
+    @ExecSpace("ClientOnly")
+    method boolean InLobby()
+        -- A match still owns its existing combat actor until the native match path is migrated.
+        return self._T.enabled~=false and _LoginFlow:IsInGame() and _CarnivalUI.opened and (_CarnivalUI.state.id==nil or _CarnivalUI.state.id=="")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EnsureView()
+        -- Request once per window generation; old replies cannot replace a reopened window.
+        if not self:InLobby() then return end
+        _CarnivalActorPresentation:PreloadSkillResources()
+        local p=self._T.client
+        if p~=nil then return end
+        self._T.generation=(self._T.generation or 0)+1
+        self._T.client={generation=self._T.generation,source=_UserService.LocalPlayer,requested=_UtilLogic.ElapsedSeconds,sequence=0,skillState=_SkillManager:NewActorSkillState(),mp=_MpManager:GetMaxMp()}
+        self:RequestOpen(self._T.generation)
+    end
+
+    @ExecSpace("Server")
+    method void RequestOpen(integer generation)
+        -- Resolve ownership from the authenticated caller, without registering another user entity.
+        local source=_UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(source) or source.PlayerComponent.Hp<=0 or _CarnivalManager:Busy(senderUserId) then return end
+        self._T.cases=self._T.cases or {}
+        local old=self._T.cases[senderUserId]
+        if old~=nil and old.generation>=generation then return end
+        self:Dispose(senderUserId)
+        local terrain=_CarnivalTerrain:Data(0)
+        local a={x=terrain.spawn.x,y=terrain.spawn.y,maxHp=source.PlayerComponent.MaxHp,hp=source.PlayerComponent.MaxHp,face=1,ground=false,input={seq=0},effects={},summons={}}
+        if not _CarnivalPhysics:Ensure(a,source,terrain.platforms) then return end
+        local actor=a.physics.body
+        local p={a=a,actor=actor,source=source,uid=senderUserId,generation=generation,sequence=0,axis=0,attack=false,crouch=false,lastInput=_UtilLogic.ElapsedSeconds,copyAt=0}
+        self._T.cases[senderUserId]=p
+        for _,name in ipairs({"StateComponent","AvatarRendererComponent","CostumeManagerComponent","AvatarStateAnimationComponent","PlayerControllerComponent","PlayerComponent"}) do actor:AddComponent(name) end
+        actor.PlayerControllerComponent.Enable=false
+        actor.PlayerControllerComponent.LookDirectionX=source.PlayerControllerComponent.LookDirectionX
+        -- Native PlayerComponent fields are needed by PlayerAttack, but account respawn must stay disabled.
+        actor.PlayerComponent.Enable=false
+        actor.PlayerComponent.MaxHp=source.PlayerComponent.MaxHp
+        actor.PlayerComponent.Hp=a.hp
+        actor:AddComponent("PlayerAttack")
+        actor:GetComponent("PlayerAttack")._T.carnivalPreview=true
+        actor:GetComponent("PlayerAttack")._T.carnivalOwnerUid=senderUserId
+        if not isvalid(actor:GetComponent("PlayerHit")) then actor:AddComponent("PlayerHit") end
+        actor:GetComponent("PlayerHit").Enable=false
+        self:CopySource(p)
+        _CarnivalPhysics:Warp(a,terrain.spawn.x,terrain.spawn.y)
+        actor.PlayerComponent.RespawnPosition=actor.TransformComponent.Position
+        self:CreateTrainingRoom(p,terrain)
+        self:ReceiveActor(generation,actor,a.physics.origin,senderUserId)
+        log("[VRF] Carnival lobby native created registered="..tostring(_UserService:GetUserEntityByUserId(senderUserId)==source))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CopySource(table p)
+        -- Refresh source settings and equipment while retaining this actor's independent action state.
+        local actor=p.actor local source=p.source
+        if not isvalid(actor) or not isvalid(source)
+            or not isvalid(actor.CostumeManagerComponent) or not isvalid(source.CostumeManagerComponent)
+            or not isvalid(actor.PlayerComponent) or not isvalid(source.PlayerComponent)
+            or not isvalid(actor:GetComponent("PlayerAttack")) then return end
+        _CarnivalPhysics:CopySettings(actor,source)
+        local costume=actor.CostumeManagerComponent local original=source.CostumeManagerComponent
+        if costume.UseCustomEquipOnly~=original.UseCustomEquipOnly then costume.UseCustomEquipOnly=original.UseCustomEquipOnly end
+        local owner=original.DefaultEquipUserId~="" and original.DefaultEquipUserId or p.uid
+        if costume.DefaultEquipUserId~=owner then costume.DefaultEquipUserId=owner end
+        for _,key in ipairs(_CarnivalBattle:EquipKeys()) do if costume[key]~=original[key] then costume[key]=original[key] end end
+        if p.battle==nil then p.a.hp=math.max(0,actor.PlayerComponent.Hp) end
+        p.a.maxHp=source.PlayerComponent.MaxHp
+        p.a.hp=math.min(p.a.maxHp,p.a.hp)
+        actor.PlayerComponent.MaxHp=p.a.maxHp
+        actor.PlayerComponent.Hp=math.floor(p.a.hp)
+        local pa=actor:GetComponent("PlayerAttack") local sourceAttack=source:GetComponent("PlayerAttack")
+        local sourceSkin=source.DamageSkinSettingComponent
+        local activeSkin=false
+        for _,active in pairs(pa._T.skillSkinActive or {}) do if active then activeSkin=true end end
+        if isvalid(sourceSkin) and not activeSkin then
+            if not isvalid(actor.DamageSkinSettingComponent) then actor:AddComponent("DamageSkinSettingComponent") end
+            local skin=actor.DamageSkinSettingComponent
+            skin.DamageSkinId=DataRef(sourceSkin.DamageSkinId.DataId)
+            skin.DamageSkinScale=sourceSkin.DamageSkinScale skin.DelayPerAttack=sourceSkin.DelayPerAttack
+            skin.TweenType=sourceSkin.TweenType skin.PlayRate=sourceSkin.PlayRate skin.Alpha=sourceSkin.Alpha skin.LitMode=sourceSkin.LitMode
+        end
+        local hit=actor:GetComponent("PlayerHit") local sourceHit=source:GetComponent("PlayerHit")
+        if isvalid(hit) and isvalid(sourceHit) then
+            for _,group in ipairs({{"powerGuardUntil","powerGuardReducePct","powerGuardHealPct"},{"ironWallUntil","ironWallReducePct"}}) do
+                if (sourceHit._T[group[1]] or 0)>(hit._T[group[1]] or 0) then
+                    for _,key in ipairs(group) do hit._T[key]=sourceHit._T[key] end
+                end
+            end
+            hit._T.guardSkillLv=sourceHit._T.guardSkillLv
+        end
+        if isvalid(sourceAttack) then
+            pa.CombatLevel=sourceAttack.CombatLevel
+            if p.combatPower==nil then pa._T.currentCombatPower=sourceAttack._T.currentCombatPower end
+            local overrides=pa._T.carnivalSkillOverrides or {}
+            if not overrides.RequestFireShadowPartnerLv then pa.ShadowPartnerOn=sourceAttack.ShadowPartnerOn end
+            for _,key in ipairs({"currentCritRatePercent","currentCritDamagePercent","archerJobIdx","clawEquipped","faSkillLv","comboSkillLv","advComboSkillLv","brandishSkillLv","rushSkillLv","elemAmpLv","shurikenIndex","shadowPartnerActive","shadowPartnerLevel","shadowPartnerFromDragon","awakeningActive","starSpreadEnabled","backstabEnabled","backstabLevel","amhaengEnabled","amhaengLevel","amhaengIsShadower","amhaeng2Enabled","amhaeng2Level","fakeLevel","starSpreadOn","iceDemonEnhanceLevel","fireDemonEnhanceLevel","fireAffinityLevel","doubleJumpSpeedMult"}) do
+                local owner={shadowPartnerActive="RequestFireShadowPartnerLv",shadowPartnerFromDragon="RequestFireShadowPartnerLv",awakeningActive="RequestFireAwakening",amhaengEnabled="RequestSetAmhaengStateForJob",amhaengLevel="RequestSetAmhaengStateForJob",amhaengIsShadower="RequestSetAmhaengStateForJob",amhaeng2Enabled="RequestSetAmhaeng2State",amhaeng2Level="RequestSetAmhaeng2State"}
+                if owner[key]==nil or not overrides[owner[key]] then pa._T[key]=sourceAttack._T[key] end
+            end
+            if p.starSpreadOverride~=nil then pa:SetStarSpreadEnabled(p.starSpreadOverride) end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveActor(integer generation, Entity actor, Vector2 origin)
+        -- Bind the real avatar to the existing lobby surface; ignore stale or closed-window replies.
+        local p=self._T.client
+        if p==nil or p.generation~=generation or (p.battle==nil and not self:InLobby()) then self:RequestClose(generation) return end
+        if not isvalid(actor) then self:CloseView() return end
+        p.actor=actor p.origin=origin
+        p.skillState.heldSkillKeys={}
+        actor:GetComponent("PlayerAttack")._T.carnivalOwnerUid=p.source.PlayerComponent.UserId
+        local pos=actor.TransformComponent.WorldPosition
+        p.prediction={x=pos.x-origin.x,y=pos.y-origin.y,face=actor.PlayerControllerComponent.LookDirectionX,maxHp=actor.PlayerComponent.MaxHp,hp=actor.PlayerComponent.Hp,ground=false}
+        actor:GetComponent("PlayerAttack")._T.carnivalPreview=true
+        actor:GetComponent("PlayerAttack")._T.carnivalRoom=p.battle~=nil and (p.battle..":"..tostring(_CarnivalUI.state.team)) or ("lobby:"..p.source.PlayerComponent.UserId..":"..tostring(generation)..":1")
+        p.view=_CarnivalUI:UI("Lobby/Scene/Actor"..tostring(p.viewIndex or 1))
+        p.avatar=p.view:GetChildByName("Body")
+        p.oldScale=p.avatar.UITransformComponent.UIScale
+        p.oldPosition=p.avatar.UITransformComponent.anchoredPosition
+        p.oldPreserve=p.avatar.AvatarGUIRendererComponent.PreserveAvatar
+        p.view.Enable=true p.avatar.Enable=true
+        p.avatar.AvatarGUIRendererComponent.PreserveAvatar=PreserveSpriteType.NativeSize
+        p.avatar.UITransformComponent.anchoredPosition=Vector2.zero
+        _CarnivalView:CopyAvatar(p.avatar,{},true)
+        log("[VRF] Carnival lobby native bound generation="..tostring(generation))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Input(number axis, boolean jump, boolean down, boolean attack, boolean crouch)
+        -- Send edges immediately and a short heartbeat; focus loss always sends a neutral packet.
+        local p=self._T.client
+        if p==nil or p.battle~=nil or not isvalid(p.actor) then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now>=(p.skillState.actionLockUntil or 0) and (axis~=0 or jump or down or attack or crouch) then self:CancelActorRecovery() end
+        if p.skillState.sprintActive and (axis~=p.skillState.sprintAxis or attack or crouch) then self:EndSprint() end
+        p.prediction.sprintMultiplier=p.skillState.sprintActive and 2 or 1
+        local position=p.actor.TransformComponent.WorldPosition
+        local locked=(p.skillState.actionLockUntil or 0)>_UtilLogic.ElapsedSeconds or p.actor:GetComponent("PlayerAttack"):IsAutoAttackMotionLocked() or ((p.lobbyScene or {}).actors or {{}})[1].locked==true
+        if locked and not p.prediction.castLocked and p.prediction.physics~=nil then p.prediction.physics.body.MovementComponent:Stop() end
+        p.prediction.castLocked=locked
+        local moveAxis=(locked or crouch) and 0 or axis
+        local authority={x=position.x-p.origin.x,y=position.y-p.origin.y,ground=(not p.actor.RigidbodyComponent.KinematicMove and p.actor.RigidbodyComponent:IsOnGround())}
+        if not self:UpdateRushMotion() then
+            _CarnivalPhysics:Predict(p.prediction,p.actor,_CarnivalTerrain:Data(0).platforms,authority,moveAxis,jump and not locked,down and not locked,_CarnivalView._T.frameDelta or 1/60)
+        end
+        if (axis~=p.axis or jump or down) and Environment:IsMakerPlay() then log("[VRF] Carnival immediate input axis="..tostring(axis).." jump="..tostring(jump).." localPhysics=true") end
+        if axis~=p.axis or attack~=p.attack or crouch~=p.crouch or jump or down or now>=(p.sendAt or 0) then
+            p.axis=axis p.attack=attack p.crouch=crouch p.sendAt=now+0.1 p.sequence=p.sequence+1
+            self:RequestInput(p.generation,p.sequence,axis,jump,down,attack,crouch)
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestInput(integer generation, integer sequence, number axis, boolean jump, boolean down, boolean attack, boolean crouch)
+        -- Each generation has its own sequence, preventing delayed packets from reviving released input.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or sequence<=p.sequence or not isvalid(p.actor) then return end
+        p.sequence=sequence p.lastInput=_UtilLogic.ElapsedSeconds
+        p.axis=math.max(-1,math.min(1,axis)) p.attack=attack p.crouch=crouch
+        local pa=p.actor:GetComponent("PlayerAttack")
+        if pa:IsAutoAttackMotionLocked() or (p.a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds then return end
+        if axis~=0 or jump or down or attack or crouch then p.a.recovery=nil end
+        local ctrl=p.actor.PlayerControllerComponent
+        if down then ctrl:ActionDownJump(p.axis) elseif jump then
+            local accepted=ctrl:ActionJump(p.axis)
+            log("[VRF] Carnival lobby native jump="..tostring(accepted))
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Step(table p, number delta)
+        -- Movement, jump and action animation use the native controller/physics stack.
+        local actor=p.actor local pa=actor:GetComponent("PlayerAttack")
+        local now=_UtilLogic.ElapsedSeconds
+        actor.PlayerControllerComponent.Enable=false
+        self:StepTraining(p,delta)
+        if pa:IsDeathBlocked() then
+            actor.MovementComponent:Stop()
+            p.attack=false
+            return
+        end
+        if now>=p.copyAt then
+            p.copyAt=now+0.25 self:CopySource(p)
+            for id,entity in pairs(p.spawned or {}) do if not isvalid(entity) then p.spawned[id]=nil end end
+        end
+        if now-p.lastInput>0.35 then p.axis=0 p.attack=false p.crouch=false end
+        local pos=actor.TransformComponent.WorldPosition local origin=p.a.physics.origin
+        local x=pos.x-origin.x local y=pos.y-origin.y
+        local bounds=p.a.physics.bounds
+        if x<bounds.minX+0.15 or x>bounds.maxX-0.15 then _CarnivalPhysics:Warp(p.a,x,y) end
+        if y<bounds.minY-3 then local spawn=p.a.physics.spawn _CarnivalPhysics:Warp(p.a,spawn.x,spawn.y) end
+        local locked=pa:IsAutoAttackMotionLocked() or (p.a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds
+        p.a.nativeLocked=locked
+        if locked then actor.MovementComponent:MoveToDirection(Vector2.zero,delta) return end
+        local axis=p.crouch and 0 or p.axis
+        actor.MovementComponent:MoveToDirection(Vector2(axis,actor.RigidbodyComponent.KinematicMove and (p.a.flightY or 0) or 0),delta)
+        if axis~=0 then actor.PlayerControllerComponent.LookDirectionX=axis end
+        if p.attack then
+            p.a.recovery=nil
+            actor.PlayerControllerComponent:ActionAttack()
+            -- PlayerActionEvent is handled by the original PlayerAttack component.
+            log("[VRF] Carnival lobby native attack recovery="..tostring(pa:GetBasicAttackRecoveryRemaining()))
+            p.attack=false
+            return
+        end
+        if actor.RigidbodyComponent.KinematicMove then return end
+        local state=actor.StateComponent
+        if actor.RigidbodyComponent:IsOnGround() then
+            local nextState=p.crouch and "CROUCH" or (axis~=0 and "MOVE" or "IDLE")
+            if state.CurrentStateName~=nextState then state:ChangeState(nextState) end
+        elseif state.CurrentStateName~="JUMP" and state.CurrentStateName~="FALL" then state:ChangeState("FALL") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw(number delta)
+        -- Match the original world-to-UI scale and pan within the lobby instead of shrinking movement.
+        self:EnsureView()
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) then _CarnivalUI:Show("Lobby/Scene/Actor1",false) return end
+        local actor=p.actor local avatar=p.avatar
+        if _UtilLogic.ElapsedSeconds>=(p.appearanceAt or 0) then
+            p.appearanceAt=_UtilLogic.ElapsedSeconds+0.5
+            _CarnivalView:CopyEquippedAppearance(actor,p.source)
+        end
+        local combat=actor:GetComponent("PlayerAttack")
+        if p.lastComboOrbs~=combat.ComboOrbCount or _UtilLogic.ElapsedSeconds>=(p.combatStatsAt or 0) then
+            p.lastComboOrbs=combat.ComboOrbCount p.combatStatsAt=_UtilLogic.ElapsedSeconds+1
+            self:SendCombatStats(_SkillManager:GetEffectiveCritRate(),_CharInfoManager:CalcCritDamage(),_SkillManager:PeekCarnivalCombatPower(false))
+        end
+        local sourceBody=actor.AvatarRendererComponent:GetBodyEntity()
+        local displayBody=avatar.AvatarGUIRendererComponent:GetBodyEntity()
+        if p.body~=sourceBody or p.gui~=displayBody or not isvalid(p.body) then
+            if isvalid(p.body) and p.event~=nil then p.body:DisconnectEvent(ActionStateChangedEvent,p.event) end
+            if isvalid(p.gui) and p.guiMotionEvent~=nil then p.gui:DisconnectEvent(ActionStateChangedEvent,p.guiMotionEvent) end
+            p.body=actor.AvatarRendererComponent:GetBodyEntity()
+            p.gui=avatar.AvatarGUIRendererComponent:GetBodyEntity()
+            if isvalid(p.body) and isvalid(p.gui) then
+                -- A GUI avatar has its own native attack completion. Protect the raw final clip
+                -- on this body too; the world-body watchdog cannot observe GUI-only resets.
+                p.guiMotionEvent=p.gui:ConnectEvent(ActionStateChangedEvent,function(e)
+                    local final=p.finalClip
+                    if self._T.client~=p or final==nil or _UtilLogic.ElapsedSeconds>=(p.finalClipUntil or 0) then return end
+                    if e.CoreActionName==final[1] then return end
+                    local pose=e.CoreActionName=="stand1" or e.CoreActionName=="stand2" or e.CoreActionName=="alert"
+                        or e.CoreActionName=="walk1" or e.CoreActionName=="walk2" or e.CoreActionName=="jump" or e.CoreActionName=="prone"
+                    if not pose or p.finalRepairPending then return end
+                    p.finalRepairPending=true
+                    local gui=p.gui local generation=p.finalClipGeneration
+                    _TimerService:SetTimerOnce(function()
+                        p.finalRepairPending=false
+                        if self._T.client~=p or p.gui~=gui or not isvalid(gui) or p.finalClipGeneration~=generation then return end
+                        if not combat:IsCurrentCombatMotion(generation) or _UtilLogic.ElapsedSeconds>=(p.finalClipUntil or 0) then return end
+                        gui:SendEvent(ActionStateChangedEvent(final[1],final[2],final[3],final[4],final[5],final[6]))
+                        if Environment:IsMakerPlay() then log("[VRF] Carnival final GUI reset repaired action="..final[1].." stale="..e.CoreActionName) end
+                    end,0.01)
+                end)
+                p.event=p.body:ConnectEvent(ActionStateChangedEvent,function(e)
+                    if self._T.client~=p or not isvalid(p.gui) then return end
+                    -- Native weapon attacks also emit alert; it must not cancel their engine animation in the UI.
+                    if e.CoreActionName=="alert" and (_UtilLogic.ElapsedSeconds<(p.engineMotionUntil or 0) or (p.finalClip~=nil and _UtilLogic.ElapsedSeconds<(p.finalClipUntil or 0))) then return end
+                    if e.CoreActionName=="stand1" or e.CoreActionName=="stand2" or e.CoreActionName=="walk1" or e.CoreActionName=="walk2" or e.CoreActionName=="jump" or e.CoreActionName=="prone" then p.serverLocomotion=true return end
+                    p.serverLocomotion=e.CoreActionName=="alert"
+                    if not p.serverLocomotion then p.attackFace=actor.PlayerControllerComponent.LookDirectionX end
+                    local isFinal=e.CoreActionName=="swingOF" or e.CoreActionName=="stabOF"
+                    if isFinal then
+                        p.engineMotionUntil=nil
+                        p.finalClip={e.CoreActionName,e.PartsActionName,e.PlayRate,e.PlayType,e.StartFrameIndex,e.EndFrameIndex}
+                        p.finalClipGeneration=combat._T.combatMotionGeneration
+                        p.finalClipUntil=combat._T.finalAttackVisualUntil or 0
+                    else p.finalClip=nil end
+                    if p.enginePlaying then
+                        local cancel=BodyActionStateChangeEvent()
+                        cancel.ActionState=MapleAvatarBodyActionState.Stand cancel.needResetAction=true
+                        p.avatar:SendEvent(cancel)
+                        p.enginePlaying=false
+                    end
+                    p.gui:SendEvent(ActionStateChangedEvent(e.CoreActionName,e.PartsActionName,e.PlayRate,e.PlayType,e.StartFrameIndex,e.EndFrameIndex))
+                    p.lastAction=e.CoreActionName p.lastRate=e.PlayRate
+                    p.resolvedAction={e.CoreActionName,e.PartsActionName,e.PlayRate,e.PlayType,e.StartFrameIndex,e.EndFrameIndex}
+                    if Environment:IsMakerPlay() then log("[VRF] Carnival lobby motion="..e.CoreActionName.." rate="..tostring(e.PlayRate)) end
+                end)
+                if p.engineEvent~=nil then actor:DisconnectEvent(BodyActionStateChangeEvent,p.engineEvent) end
+                p.engineEvent=actor:ConnectEvent(BodyActionStateChangeEvent,function(e)
+                    -- Native weapon attacks do not emit a resolved body-action event.
+                    -- Keep their native selector, then cancel it before an explicit skill clip.
+                    if self._T.client~=p or not isvalid(p.avatar) then return end
+                    local attacking=e.ActionState==MapleAvatarBodyActionState.Attack
+                    if not attacking and not p.enginePlaying then return end
+                    if attacking then
+                        if combat:IsFinalAttackLocked() then return end
+                        p.enginePlaying=true
+                        p.attackFace=actor.PlayerControllerComponent.LookDirectionX
+                        p.engineMotionUntil=math.max(combat._T.combatMotionUntil or 0,_UtilLogic.ElapsedSeconds+0.65/math.max(e.playRate,0.001))
+                        p.lastAction="engineAttack" p.lastRate=e.playRate
+                    else p.enginePlaying=false p.engineMotionUntil=nil end
+                    local copy=BodyActionStateChangeEvent()
+                    copy.ActionState=e.ActionState copy.needResetAction=e.needResetAction
+                    copy.playRate=e.playRate copy.startFrameIndex=e.startFrameIndex copy.endFrameIndex=e.endFrameIndex
+                    p.avatar:SendEvent(copy)
+                    if attacking and Environment:IsMakerPlay() then log("[VRF] Carnival native weapon motion rate="..tostring(e.playRate)) end
+                end)
+                local current=combat:HasActiveCombatMotion() and combat._T.combatMotionClip or p.resolvedAction
+                if current~=nil then p.gui:SendEvent(ActionStateChangedEvent(current[1],current[2],current[3],current[4],current[5],current[6]))
+                else p.gui:SendEvent(ActionStateChangedEvent("stand1","stand1",1,SpriteAnimClipPlayType.ZigzagLoop)) end
+            else p.body=nil end
+        end
+        p.ppu=_CarnivalView._T.scale
+        _CarnivalView:SizeAvatar(avatar)
+        _CarnivalActorPresentation:CopyAvatarAlpha(actor,avatar.AvatarGUIRendererComponent)
+        local predicted=p.prediction
+        local x=predicted.viewX or predicted.x local y=predicted.viewY or predicted.y
+        local held=p.skillState.hurricaneActive or p.skillState.snipingActive or p.skillState.piercingActive
+        local face=held and (p.skillState.hurricaneActive and p.skillState.hurricaneDirX or p.skillState.snipingActive and p.skillState.snipingDirX or p.skillState.piercingDirX) or predicted.face
+        if held and face~=nil then predicted.face=face end
+        local motionLocked=combat:IsAutoAttackMotionLocked() or _UtilLogic.ElapsedSeconds<(p.engineMotionUntil or 0)
+        if motionLocked and not held then face=p.attackFace or face
+        else p.attackFace=nil end
+        avatar.AvatarGUIRendererComponent.FlipX=(face or 1)>0
+        local locked=_UtilLogic.ElapsedSeconds<(p.engineMotionUntil or 0) or p.recoveryVisual~=nil or (p.skillState.actionLockUntil or 0)>_UtilLogic.ElapsedSeconds or actor:GetComponent("PlayerAttack"):IsActorControlLocked() or combat:HasActiveCombatMotion() or held or p.skillState.dragonRideMounted or p.skillState.sprintActive
+        local clip=combat._T.combatMotionClip
+        local revision=combat._T.combatMotionClipRevision
+        if combat:HasActiveCombatMotion() and clip~=nil and p.lastAction==nil and isvalid(p.gui) then
+            p.clipRevision=revision
+            p.gui:SendEvent(ActionStateChangedEvent(clip[1],clip[2],clip[3],clip[4],clip[5],clip[6]))
+            p.lastAction=clip[1]
+            if Environment:IsMakerPlay() then log("[VRF] Carnival clip revision="..tostring(revision).." action="..clip[1]) end
+        end
+        if not locked and isvalid(p.gui) then
+            local action=not predicted.ground and "jump" or (p.crouch and "prone" or ((p.axis or 0)~=0 and "walk1" or "stand1"))
+            local rate=action=="walk1" and math.max(0.1,1.2*actor.RigidbodyComponent.WalkSpeed*actor.MovementComponent.InputSpeed) or 1
+            if p.lastAction~=action or p.lastRate~=rate then
+                p.gui:SendEvent(ActionStateChangedEvent(action,action,rate,SpriteAnimClipPlayType.Loop))
+                p.lastAction=action p.lastRate=rate
+            end
+        end
+        _CarnivalView:Camera(x,y,p.battle~=nil and (_CarnivalUI.state.layout or 1) or 0)
+        p.view.Enable=true
+        p.view.UITransformComponent.anchoredPosition=_CarnivalView:Project(x,y)
+        p.view:GetChildByName("Name").Enable=false
+        p.view:GetChildByName("HP").Enable=false
+        _CarnivalActorPresentation:Bind(actor,p.view,p.ppu,p.origin)
+        if _UtilLogic.ElapsedSeconds>=(p.copyAt or 0) then p.copyAt=_UtilLogic.ElapsedSeconds+0.5 _CarnivalView:CopyAvatar(avatar,{},true) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseView()
+        -- Detach the observer and restore the reusable UI template before a match takes it over.
+        local p=self._T.client
+        if p==nil then return end
+        self:EndSprint()
+        _SkillManager:CloseActorSkills(p.actor,p.skillState)
+        _BeginnerRecovery:RemoveActorVisuals(p.recoveryVisual) p.recoveryVisual=nil
+        self._T.client=nil
+        if p.battle==nil then
+            for seq,pending in pairs(_CarnivalSkills._T.pending or {}) do
+                if pending.lobby and pending.generation==p.generation then _CarnivalSkills._T.pending[seq]=nil end
+            end
+            _CarnivalSkills._T.cooldowns={} _CarnivalSkills._T.lockUntil=0
+        end
+        if p.prediction~=nil then _CarnivalPhysics:Dispose(p.prediction) end
+        if isvalid(p.actor) then p.actor:GetComponent("PlayerAttack")._T.carnivalClosed=true end
+        for _,entity in pairs(p.localSpawned or {}) do if isvalid(entity) then _EntityService:Destroy(entity) end end
+        if isvalid(p.body) and p.event then p.body:DisconnectEvent(ActionStateChangedEvent,p.event) end
+        if isvalid(p.gui) and p.guiMotionEvent then p.gui:DisconnectEvent(ActionStateChangedEvent,p.guiMotionEvent) end
+        if isvalid(p.actor) and p.engineEvent then p.actor:DisconnectEvent(BodyActionStateChangeEvent,p.engineEvent) end
+        if p.actor~=nil then _CarnivalActorPresentation:Unbind(p.actor) end
+        if isvalid(p.avatar) then
+            p.avatar.UITransformComponent.UIScale=p.oldScale
+            p.avatar.UITransformComponent.anchoredPosition=p.oldPosition
+            p.avatar.AvatarGUIRendererComponent.PreserveAvatar=p.oldPreserve
+        end
+        _CarnivalView._T.models={}
+        self:RequestClose(p.generation)
+        log("[VRF] Carnival lobby native detached generation="..tostring(p.generation))
+    end
+
+    @ExecSpace("Server")
+    method void RequestClose(integer generation)
+        -- An old close can never delete a newer reopened actor.
+        local p=(self._T.cases or {})[senderUserId]
+        if p~=nil and p.battle==nil and p.generation==generation then self:Dispose(senderUserId) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Dispose(string uid)
+        -- Physics and entity lifetime are paired, including disconnects and map changes.
+        local p=(self._T.cases or {})[uid]
+        if p==nil then return end
+        self._T.cases[uid]=nil
+        if p.training~=nil then
+            p.training.state="closed"
+            self:DisposeRoom(p.training.rooms[1])
+        end
+        if isvalid(p.actor) then p.actor:GetComponent("PlayerAttack")._T.carnivalClosed=true end
+        for _,entity in pairs(p.spawned or {}) do if isvalid(entity) then _EntityService:Destroy(entity) end end
+        _CarnivalPhysics:Dispose(p.a)
+        log("[VRF] Carnival lobby native disposed")
+    end
+
+    method void OnUpdate(number delta)
+        -- Keep cleanup active even when the window is minimized and CarnivalView.Frame is not called.
+        if self:IsClient() then
+            local p=self._T.client
+            if p==nil then return end
+            if isvalid(p.actor) then _SkillManager:TickActorSkills(p.actor,p.skillState,delta) end
+            self:UpdateRecoveryVisuals(p)
+            if isvalid(p.actor) and p.actor.PlayerComponent.Hp>0 and _UtilLogic.ElapsedSeconds>=(p.mpBlockedUntil or 0) then
+                local maxMp=self:GetMaxMp()
+                p.mp=math.min(maxMp,(p.mp or maxMp)+maxMp*_SkillManager:GetBeginnerMpRegenPct()/100*delta*_CarnivalSkills:RecoveryMultiplier("mp"))
+            end
+            for id,untilTime in pairs(p.pendingEntities or {}) do
+                local entity=_EntityService:GetEntity(id)
+                if isvalid(entity) and isvalid(p.actor) then
+                    _CarnivalActorPresentation:TrackEntity(p.actor,entity) p.pendingEntities[id]=nil
+                elseif _UtilLogic.ElapsedSeconds>untilTime then p.pendingEntities[id]=nil end
+            end
+            for id,entity in pairs(p.localSpawned or {}) do if not isvalid(entity) then p.localSpawned[id]=nil end end
+            if (p.battle~=nil and p.battle~=_CarnivalUI.state.id) or (p.battle==nil and not self:InLobby()) or not isvalid(p.source) or p.source~=_UserService.LocalPlayer or (p.actor~=nil and not isvalid(p.actor)) or (p.battle==nil and isvalid(p.actor) and p.actor.CurrentMap~=p.source.CurrentMap) then self:CloseView()
+            elseif p.actor==nil and _UtilLogic.ElapsedSeconds-p.requested>5 then self:CloseView() end
+            return
+        end
+        local remove={}
+        for uid,p in pairs(self._T.cases or {}) do
+            if not isvalid(p.source) or not isvalid(p.actor) or (p.battle==nil and p.source.CurrentMap~=p.actor.CurrentMap) or _UserService:GetUserEntityByUserId(uid)~=p.source or (p.battle==nil and (_CarnivalManager:Busy(uid) or _UtilLogic.ElapsedSeconds-p.lastInput>8)) or (p.battle~=nil and (p.match.state~="active")) then table.insert(remove,uid)
+            elseif p.battle==nil then self:Step(p,delta)
+            elseif _UtilLogic.ElapsedSeconds>=p.copyAt then p.copyAt=_UtilLogic.ElapsedSeconds+0.25 self:CopySource(p) end
+        end
+        for _,uid in ipairs(remove) do self:Dispose(uid) end
+    end
+
+    method void OnEndPlay()
+        -- Stop releases the same resources as a normal close.
+        if self:IsClient() then self:CloseView() return end
+        local remove={} for uid,_ in pairs(self._T.cases or {}) do table.insert(remove,uid) end
+        for _,uid in ipairs(remove) do self:Dispose(uid) end
+    end
+    @ExecSpace("ClientOnly")
+    method void PressSkill(string key)
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) or not _CarnivalView:CanInput() then return end
+        local slot=_SkillManager:GetSkillOnKey(key)
+        if slot==nil or slot.ruid=="" or _SkillManager:IsPassiveSkillName(slot.name) then return end
+        if not _SkillManager:SupportsActorSkill(slot.name) then _CarnivalSkills:TryCast(key,false,0) return end
+        if p.lobbyScene~=nil and p.lobbyScene.actors[1].dead then return end
+        _SkillManager:UseSkillForActor(key,p.actor,p.skillState,true)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SendBrandish(number combatPower, number atkMultiplier, string weaponClass, boolean enhanced, boolean combo)
+        -- The original SkillManager cast routine supplies the same parameters used by the world actor.
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) then return end
+        p.sent=true
+        self:RequestBrandish(p.generation,combatPower,atkMultiplier,weaponClass,enhanced,combo)
+    end
+
+    @ExecSpace("Server")
+    method void RequestBrandish(integer generation, number combatPower, number atkMultiplier, string weaponClass, boolean enhanced, boolean combo)
+        -- Scope the request to the caller's current preview. The preview target gate rejects every monster.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) or (p.battle==nil and _CarnivalManager:Busy(senderUserId)) or (p.battle~=nil and (p.match.state~="active" or p.match.members[senderUserId].dead)) then return end
+        local pa=p.actor:GetComponent("PlayerAttack")
+        if pa:IsDeathBlocked() or pa:GetBasicAttackRecoveryRemaining()>0 then return end
+        if combo then pa:QueueBrandish2(combatPower,atkMultiplier)
+        elseif not pa._T.isBrandishing then pa:AttackBrandish(combatPower,atkMultiplier,weaponClass,enhanced) end
+        log("[VRF] Carnival lobby original Brandish combo="..tostring(combo))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetPreviewEnabled(boolean enabled)
+        -- Maker debug override; ordinary lobby entry uses the native actor by default.
+        if not Environment:IsMakerPlay() then return end
+        _CarnivalView:Neutral()
+        self:CloseView()
+        local lobby=_CarnivalView._T.lobby
+        if lobby~=nil then _CarnivalPhysics:Dispose(lobby) end
+        self._T.enabled=enabled
+        _CarnivalView._T.models={}
+        if enabled then _CarnivalUI:Open() end
+        log("[VRF] Carnival native preview enabled="..tostring(enabled))
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void SendSkill(string action, table args)
+        -- Sends the cast only to this generation of the owned replica.
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) then return end
+        self:CancelActorRecovery()
+        local duration=0
+        if action=="RequestFireRage" then duration=1.2
+        elseif action=="RequestFireBattojutsu" then duration=0.6*args[3]
+        elseif action=="RequestFireBooster" then duration=0.6*args[2]
+        elseif action=="RequestFirePowerGuardLv" or action=="RequestFireComboAttack" then duration=0.6*args[1] end
+        if duration>0 then p.skillState.actionLockUntil=math.max(p.skillState.actionLockUntil or 0,_UtilLogic.ElapsedSeconds+duration) end
+        if action=="RequestFireHasteLv" then _CarnivalUI:StartBuff("HasteBuffUI",args[2],"헤이스트")
+        elseif action=="RequestFireShadowPartnerLv" then _CarnivalUI:StartBuff("ShadowPartnerBuffUI",args[2],"쉐도우 파트너")
+        elseif action=="RequestFireComboAttack" then _CarnivalUI:StartBuff("ComboBuffUI",args[2],"콤보 어택") end
+        local position=self:PresentationPosition(p.actor)
+        args.carnivalOrigin={position.x,position.y}
+        p.sent=true
+        self:RequestSkill(p.generation,action,args)
+    end
+
+    @ExecSpace("Server")
+    method void RequestSkill(integer generation, string action, table args)
+        -- The client cannot select another entity as the caster.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) or (p.battle==nil and _CarnivalManager:Busy(senderUserId)) or (p.battle~=nil and (p.match.state~="active" or p.match.members[senderUserId].dead)) then return end
+        local pa=p.actor:GetComponent("PlayerAttack")
+        if pa:IsDeathBlocked() or pa._T.carnivalClosed then return end
+        p.lastInput=_UtilLogic.ElapsedSeconds
+        p.a.recovery=nil
+        local origin=args.carnivalOrigin
+        if type(origin)=="table" and type(origin[1])=="number" and type(origin[2])=="number" then
+            local position=p.actor.TransformComponent.WorldPosition
+            local dx=origin[1]-position.x local dy=origin[2]-position.y
+            if dx*dx+dy*dy<=16 then pa:SetCastOrigin(Vector3(origin[1],origin[2],position.z)) end
+        end
+        if action=="RequestSetStarSpread" then
+            if type(args[1])=="boolean" then
+                pa:SetStarSpreadEnabled(args[1])
+                p.starSpreadOverride=args[1]
+            end
+            return
+        end
+        _SkillManager:ExecuteActorSkill(p.actor,action,args)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SendTeleport(string direction, integer castId)
+        -- Keeps teleport reservations separate from the world character.
+        local p=self._T.client
+        if p~=nil and isvalid(p.actor) then p.sent=true self:RequestTeleport(p.generation,direction,castId) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestTeleport(integer generation, string direction, integer castId)
+        -- Uses the original foothold and distance checks on the replica body.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) or (p.battle==nil and _CarnivalManager:Busy(senderUserId)) or (p.battle~=nil and (p.match.state~="active" or p.match.members[senderUserId].dead)) then return end
+        if direction~="left" and direction~="right" and direction~="up" and direction~="down" then return end
+        if castId<=(p.teleportCastId or 0) then return end
+        p.teleportCastId=castId p.lastInput=_UtilLogic.ElapsedSeconds
+        local success=p.actor:GetComponent("PlayerAttack"):AttackTeleport(direction)
+        local pos=p.actor.TransformComponent.WorldPosition
+        self:ReceiveTeleportAt(generation,castId,success,pos.x-p.a.physics.origin.x,pos.y-p.a.physics.origin.y,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveTeleportAt(integer generation, integer castId, boolean success, number x, number y)
+        -- Apply the native landing once to both presentation and prediction, before stale snapshots arrive.
+        local p=self._T.client
+        if p==nil or p.generation~=generation or p.skillState.teleportPendingId~=castId then return end
+        local state=p.skillState local cost=state.teleportReservedMp or 0
+        state.teleportPendingId=nil state.teleportReservedMp=0
+        if success then
+            self:TryConsumeMp(cost)
+            self:AcceptLanding(x,y)
+        else state.teleportOnCooldown=false end
+        log("[VRF] Carnival original teleport success="..tostring(success).." landing="..tostring(x)..","..tostring(y))
+    end
+
+    method Entity SpawnSkillEntity(Entity owner, string modelId, string entityName, Vector3 position, Entity parent)
+        -- Spawns the original projectile/effect and tracks its lifetime and UI projection.
+        if not isvalid(owner) or not isvalid(parent) then return nil end
+        local pa=owner:GetComponent("PlayerAttack")
+        if isvalid(pa) and pa._T.carnivalClosed then return nil end
+        local entity=_SpawnService:SpawnByModelId(modelId,entityName,position,parent)
+        if not isvalid(entity) then return entity end
+        -- Avatar summons/shadow silhouettes keep their character composition. Skill sprites render in front.
+        if modelId~="herosummon" and modelId~="shadowpartnershadow" and modelId~="shadowclone" then
+            _TimerService:SetTimerOnce(function()
+                if isvalid(entity) then
+                    _CarnivalActorPresentation:RaiseSkillEntity(entity)
+                    self:RaiseSkillForeground(entity)
+                end
+            end,0.02)
+        end
+        if self:IsClient() then
+            local p=self._T.client
+            if p~=nil and p.actor==owner then
+                p.localSpawned=p.localSpawned or {} p.localSpawned[entity.Id]=entity
+                _CarnivalActorPresentation:TrackEntity(owner,entity)
+            end
+        elseif isvalid(pa) and pa._T.carnivalPreview then
+            local p=(self._T.cases or {})[pa._T.carnivalOwnerUid]
+            if p~=nil and p.actor==owner then
+                p.spawned=p.spawned or {} p.spawned[entity.Id]=entity
+                if isvalid(entity.RigidbodyComponent) then entity.RigidbodyComponent.IgnoreMoveBoundary=true end
+                self:ReceiveSkillEntityId(p.generation,entity.Id,p.uid)
+            end
+        end
+        return entity
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveSkillEntityId(integer generation, string entityId)
+        -- Entity replication can follow the RPC; retry briefly instead of silently losing its visual.
+        local p=self._T.client if p==nil or p.generation~=generation then return end
+        p.pendingEntities=p.pendingEntities or {}
+        p.pendingEntities[entityId]=_UtilLogic.ElapsedSeconds+2
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void SendCombatStats(number critRate, number critDamage, number combatPower)
+        -- Player-component RPCs require player authority; replica updates go through the owner logic.
+        local p=self._T.client
+        if p~=nil and isvalid(p.actor) then self:RequestCombatStats(p.generation,critRate,critDamage,combatPower) end
+    end
+
+    @ExecSpace("Server")
+    method void RequestCombatStats(integer generation, number critRate, number critDamage, number combatPower)
+        -- Applies the same original cast-time stat sync to the authenticated replica.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) then return end
+        local pa=p.actor:GetComponent("PlayerAttack")
+        p.combatPower=combatPower
+        pa:SyncCritRate(critRate) pa:SyncCritDamage(critDamage) pa:SyncCombatPower(combatPower)
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method void EnsureBattle(table participant, table match, table room)
+        -- Reuse the original player attack stack in an isolated, team-owned native room.
+        self._T.cases=self._T.cases or {}
+        local p=self._T.cases[participant.uid]
+        if p~=nil and p.battle==match.id and isvalid(p.actor) then return end
+        self:Dispose(participant.uid)
+        local a=participant.actor local source=participant.player
+        if isvalid(room.map) then a.arenaMap=room.map end
+        if not _CarnivalPhysics:Ensure(a,source,room.platforms) then return end
+        local actor=a.physics.body
+        if room.origin==nil then room.origin=a.physics.origin room.map=actor.CurrentMap end
+        if actor.CurrentMap~=room.map then return end
+        a.physics.origin=room.origin
+        _CarnivalPhysics:Warp(a,a.x,a.y)
+        p={a=a,actor=actor,source=source,uid=participant.uid,generation=0,battle=match.id,match=match,team=participant.team,sequence=0,axis=0,attack=false,crouch=false,lastInput=_UtilLogic.ElapsedSeconds,copyAt=0}
+        for _,name in ipairs({"StateComponent","AvatarRendererComponent","CostumeManagerComponent","AvatarStateAnimationComponent","PlayerControllerComponent","PlayerComponent"}) do actor:AddComponent(name) end
+        actor.PlayerControllerComponent.Enable=false actor.PlayerControllerComponent.LookDirectionX=a.face
+        actor.PlayerComponent.Enable=false
+        actor:AddComponent("PlayerAttack")
+        local pa=actor:GetComponent("PlayerAttack")
+        pa._T.carnivalPreview=true pa._T.carnivalOwnerUid=participant.uid pa._T.carnivalRoom=match.id..":"..tostring(participant.team)
+        if not isvalid(actor:GetComponent("PlayerHit")) then actor:AddComponent("PlayerHit") end
+        actor:GetComponent("PlayerHit").Enable=false
+        self:CopySource(p)
+        a.nativeId=actor.Id
+        self._T.cases[participant.uid]=p
+        log("[VRF] Carnival battle original actor ready room="..pa._T.carnivalRoom)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SyncMonsters(table match, integer team, table room)
+        -- Original hitboxes receive original skill damage; carnival owns movement, drops and respawn.
+        if room.origin==nil or not isvalid(room.map) then return end
+        self._T.monsters=self._T.monsters or {}
+        for _,m in ipairs(room.monsters) do
+            local entity=m.entity
+            if not isvalid(entity) and not m.dead then
+                entity=_SpawnService:SpawnByModelId("11022563-a6d4-4774-8013-8880e249da44","CarnivalMob_"..tostring(m.slot),Vector3(room.origin.x+m.x,room.origin.y+m.y,0),room.map)
+                if isvalid(entity) then
+                    m.entity=entity
+                    local rb=entity.RigidbodyComponent
+                    rb.Enable=m.training~=true entity.MovementComponent.Enable=m.training~=true
+                    -- AIChase applies these monster-specific values in the original field models.
+                    rb.KinematicMove=false rb.Gravity=1 rb.Mass=100 rb.WalkSpeed=0.5
+                    rb.WalkAcceleration=0.5 rb.WalkDrag=1000 rb.AirAccelerationX=1 rb.AirDecelerationX=1
+                    rb.FallSpeedMaxX=1 rb.FallSpeedMaxY=1
+                    entity.MovementComponent.InputSpeed=m.profile~=nil and m.profile.speed or 1.5
+                    entity.MovementComponent.JumpForce=6
+                    if m.training~=true then rb:SetPosition(Vector2(room.origin.x+m.x,room.origin.y+m.y+0.05)) end
+                    entity:AddComponent("SpriteRendererComponent")
+                    local profile=m.profile
+                    entity.SpriteRendererComponent.SpriteRUID=profile~=nil and profile.stand or m.sprite
+                    entity.SpriteRendererComponent.StartFrameIndex=0 entity.SpriteRendererComponent.EndFrameIndex=2147483647
+                    entity:AddComponent("StateComponent")
+                    entity:AddComponent("HitComponent")
+                    entity.StateComponent:DisconnectHitEvent()
+                    entity.HitComponent.CollisionGroup=CollisionGroups.HitBox
+                    entity.HitComponent.BoxSize=Vector2(0.8,1.0) entity.HitComponent.ColliderOffset=Vector2(0,0.5)
+                    entity:AddComponent("Monster")
+                    local mon=entity:GetComponent("Monster")
+                    mon.CarnivalRoom=match.id..":"..tostring(team) mon.MaxHp=m.maxHp mon.Hp=m.hp
+                    mon.MonsterLevel=m.level mon.NameTagLevel=m.level mon.Stationary=true mon.SpawnFadeStarted=m.bornAt or -1
+                    if profile~=nil then
+                        mon.HitSoundRUID=profile.hitSound mon.DeathSoundRUID=profile.dieSound
+                        entity.HitComponent.BoxSize=Vector2(profile.width,profile.height)
+                        entity.HitComponent.ColliderOffset=Vector2(profile.ox,profile.oy)
+                    end
+                    self._T.monsters[entity.Id]={match=match,team=team,monster=m}
+                end
+            end
+            if isvalid(entity) then
+                local position=entity.TransformComponent.WorldPosition
+                if m.training~=true then
+                    m.x=math.max(m.platform.l+0.15,math.min(m.platform.r-0.15,position.x-room.origin.x))
+                    m.y=position.y-room.origin.y
+                    if math.abs(position.x-room.origin.x-m.x)>0.01 or m.y<m.platform.y-1 then
+                        m.y=m.platform.y+0.05 entity.RigidbodyComponent:SetPosition(Vector2(room.origin.x+m.x,room.origin.y+m.y))
+                    end
+                elseif m.nativeX~=nil and math.abs(position.x-m.nativeX)>0.01 then
+                    m.x=math.max(m.platform.l+0.15,math.min(m.platform.r-0.15,position.x-room.origin.x))
+                end
+                if m.training==true then entity.TransformComponent.WorldPosition=Vector3(room.origin.x+m.x,room.origin.y+m.y,0) end
+                m.nativeX=room.origin.x+m.x
+                local mon=entity:GetComponent("Monster")
+                if m.dead or mon.LifeSerial~=m.life then mon.HealthBarUntil=0 end
+                mon.Hp=m.hp mon.IsDead=m.dead mon.LifeSerial=m.life
+                local profile=m.profile local motion=m.motion or "stand"
+                if profile~=nil and m.nativeMotion~=motion then
+                    local clip=profile[motion] or profile.stand
+                    if clip~="" then entity.SpriteRendererComponent.SpriteRUID=clip end
+                    m.nativeMotion=motion
+                end
+                mon.DeathFadeStarted=m.deathAt or -1 mon.DeathFadeAlpha=1
+                if m.dead and entity.MovementComponent.Enable then entity.MovementComponent:Stop() end
+                entity.SpriteRendererComponent.FlipX=m.face>0
+                entity.HitComponent.Enable=not m.dead
+                entity.Visible=not m.dead or _UtilLogic.ServerElapsedSeconds<(m.deathAt or 0)+1
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void MonsterHit(any monster, HitEvent event)
+        -- Validate the original projectile owner before crediting CP; never enter the field drop pipeline.
+        local entry=(self._T.monsters or {})[monster.Entity.Id]
+        if entry==nil or entry.match.state~="active" or entry.monster.dead then return end
+        local owner=_BattleStatsManager:ResolveOwner(event.AttackerEntity)
+        local pa=isvalid(owner) and owner:GetComponent("PlayerAttack") or nil
+        if not isvalid(pa) or pa._T.carnivalClosed or pa._T.carnivalRoom~=monster.CarnivalRoom then return end
+        local m=entry.monster local damage=math.max(0,event.TotalDamage)
+        m.hp=math.max(0,m.hp-damage) m.hit=damage m.hitSeq=m.hitSeq+1
+        m.hitUntil=_UtilLogic.ServerElapsedSeconds+0.35 m.aggroUntil=_UtilLogic.ServerElapsedSeconds+10 m.motion="hit"
+        monster.Hp=m.hp monster:ConsumeReservedDamage(damage)
+        monster.HealthBarUntil=_UtilLogic.ServerElapsedSeconds+5
+        local direct=isvalid(event.AttackerEntity) and event.AttackerEntity:GetComponent("PlayerAttack") or nil
+        if isvalid(direct) and direct:GetExpectedDamageLineCount(event.Extra or "")>0 then
+            direct:ShowResolvedDamage(monster.Entity,damage,event.IsCritical,direct:GetHitDamageSkinId())
+        end
+        monster:PlayHitSound()
+        if m.hp<=0 then _CarnivalBattle:Kill(entry.match,entry.team,m) monster.IsDead=true monster.Entity.HitComponent.Enable=false end
+        if Environment:IsMakerPlay() then log("[VRF] Carnival native hit damage="..tostring(damage).." slot="..tostring(m.slot).." hp="..tostring(m.hp)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void DisposeRoom(table room)
+        -- Destroy every room-owned hitbox once, including abandoned matches.
+        for _,m in ipairs(room.monsters or {}) do
+            if isvalid(m.entity) then
+                if m.contactHandler~=nil then m.entity:DisconnectEvent(TriggerStayEvent,m.contactHandler) m.contactHandler=nil end
+                if self._T.monsters~=nil then self._T.monsters[m.entity.Id]=nil end
+                _EntityService:Destroy(m.entity)
+            end
+            m.entity=nil
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BindBattle(integer index, table data)
+        -- Bind the synchronized native actor to the existing expanded window, also while auto hunting.
+        local id=_CarnivalUI.state.id
+        if data==nil or data.nativeId==nil or id==nil or id=="" then return false end
+        local actor=_EntityService:GetEntity(data.nativeId)
+        if not isvalid(actor) or not isvalid(actor:GetComponent("PlayerAttack")) then return false end
+        local p=self._T.client
+        if p==nil or p.battle~=id or p.actor~=actor then
+            self:CloseView()
+            p={generation=0,battle=id,source=_UserService.LocalPlayer,requested=_UtilLogic.ElapsedSeconds,sequence=0,skillState=_SkillManager:NewActorSkillState(),mp=self:GetMaxMp()}
+            self._T.client=p
+            p.viewIndex=index
+            self:ReceiveActor(0,actor,Vector2(data.originX,data.originY))
+        end
+        return self._T.client~=nil and isvalid(self._T.client.actor)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CastBattle(string key, boolean automatic, integer targetSlot)
+        -- Original skill timing, MP, projectiles and effects execute on this actor's private cast state.
+        local p=self._T.client local slot=_SkillManager:GetSkillOnKey(key)
+        if p==nil or p.battle~=_CarnivalUI.state.id or not isvalid(p.actor) or slot==nil then return false end
+        if not _SkillManager:SupportsActorSkill(slot.name) then return false end
+        if p.skillState.skillOnCooldown or p.actor:GetComponent("PlayerAttack"):IsActorControlLocked() then return false end
+        p.automatic=automatic p.targetSlot=targetSlot p.sent=false
+        _SkillManager:UseSkillForActor(key,p.actor,p.skillState,true)
+        p.automatic=false
+        return p.sent==true
+    end
+
+
+    @ExecSpace("Server")
+    method void SetAutoRange(string id, number range)
+        -- Range is a movement preference only; original skill hitboxes decide every hit.
+        local match=_CarnivalManager._T.users[senderUserId]
+        if match==nil or match.id~=id or match.state~="active" or range~=range then return end
+        local p=match.members[senderUserId]
+        if p~=nil then p.actor.autoRange=math.max(0.65,math.min(7,range)) end
+    end
+
+
+    @ExecSpace("Client")
+    method void LockSkills(number duration)
+        -- Final-attack recovery belongs to the replica's cast state, never the outside quickslots.
+        local p=self._T.client
+        if p==nil then return end
+        p.skillState.actionLockUntil=math.max(p.skillState.actionLockUntil or 0,_UtilLogic.ElapsedSeconds+duration)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void AcceptLanding(number x, number y)
+        -- Explicit movement skills reset prediction; ordinary walking never triggers a delayed idle warp.
+        local p=self._T.client if p==nil then return end
+        local a=p.battle~=nil and _CarnivalView._T.prediction or p.prediction
+        if a~=nil then
+            if a.physics~=nil then _CarnivalPhysics:Warp(a,x,y) end
+            a.x=x a.y=y a.viewX=x a.viewY=y a.offsetX=0 a.offsetY=0
+            a.authorityAfter=_UtilLogic.ElapsedSeconds+0.6
+        end
+        p.prediction.x=x p.prediction.y=y p.prediction.viewX=x p.prediction.viewY=y
+        local display=_CarnivalView._T.localDisplay
+        if display~=nil then display.x=x display.y=y end
+        p.landing={x=x,y=y,untilTime=_UtilLogic.ElapsedSeconds+0.6}
+    end
+    @ExecSpace("ClientOnly")
+    method void CastLobbySummon(table definition)
+        -- Use the same validated summon implementation in the waiting room, with private cooldowns.
+        local p=self._T.client if p==nil or p.battle~=nil then return end
+        local now=_UtilLogic.ElapsedSeconds
+        if now<(p.skillState.summonUntil or 0) then return end
+        if not self:TryConsumeMp(definition.cost) then return end
+        p.skillState.summonUntil=now+definition.cooldown
+        p.summonSequence=(p.summonSequence or 0)+1
+        p.summonPending=p.summonPending or {} p.summonPending[p.summonSequence]=definition.cost
+        self:RequestLobbySummon(p.generation,definition.name,p.summonSequence)
+    end
+
+    @ExecSpace("Server")
+    method void RequestLobbySummon(integer generation, string name, integer sequence)
+        -- Resolve skill investment from the saved owner; reject duplicates before spawning anything.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.battle~=nil or p.generation~=generation or not isvalid(p.actor) then return end
+        if sequence<=(p.summonSequence or 0) then return end
+        p.summonSequence=sequence p.lastInput=_UtilLogic.ElapsedSeconds
+        local participant={uid=p.uid,player=p.source,actor=p.a,level=_RegionTierLogic:GetServerLevelOf(p.source)}
+        _CarnivalBattle:RefreshStats(participant)
+        local d=_CarnivalSkills:ServerDefinition(participant,{name=name})
+        local accepted=false
+        if d~=nil and d.kind=="summon" and _UtilLogic.ElapsedSeconds>=(p.summonAt or 0) then
+            p.summonAt=_UtilLogic.ElapsedSeconds+d.cooldown
+            accepted=_CarnivalSkills:Apply(p.a,{platforms=_CarnivalTerrain:Data(0).platforms,monsters={}},d,1,0,_UtilLogic.ServerElapsedSeconds)
+        end
+        self:ReceiveLobbySummon(generation,sequence,accepted,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveLobbySummon(integer generation, integer sequence, boolean accepted)
+        -- Refund a rejected preview cast exactly once.
+        local p=self._T.client if p==nil or p.generation~=generation then return end
+        local cost=(p.summonPending or {})[sequence] if cost==nil then return end
+        p.summonPending[sequence]=nil
+        if not accepted then self:RestoreMp(cost) p.skillState.summonUntil=0 end
+    end
+    @ExecSpace("ServerOnly")
+    method table PhysicsFor(Entity actor)
+        -- Original summon AI queries the bounds and spawn belonging to its private carnival room.
+        if not isvalid(actor) then return nil end
+        local pa=actor:GetComponent("PlayerAttack")
+        if not isvalid(pa) or not pa._T.carnivalPreview then return nil end
+        local p=(self._T.cases or {})[pa._T.carnivalOwnerUid]
+        return p~=nil and p.actor==actor and p.a.physics or nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method number HealActor(Entity actor, number amount)
+        -- Store native recovery on the same HP state used by battle damage and snapshots.
+        local pa=isvalid(actor) and actor:GetComponent("PlayerAttack") or nil
+        if not isvalid(pa) or not pa._T.carnivalPreview then return 0 end
+        local p=(self._T.cases or {})[pa._T.carnivalOwnerUid or ""]
+        if p==nil or p.actor~=actor or (p.battle~=nil and p.match.state~="active") or p.a.hp<=0 then return 0 end
+        amount=amount*(1+0.1*((p.a.upgrades or {}).recovery or 0))
+        local before=actor.PlayerComponent.Hp
+        p.a.hp=before
+        p.a.hp=math.min(p.a.maxHp,before+math.max(0,math.floor(amount)))
+        actor.PlayerComponent.Hp=math.floor(p.a.hp)
+        local healed=p.a.hp-before
+        if Environment:IsMakerPlay() then log("[VRF] Carnival native healing amount="..tostring(healed).." hp="..tostring(p.a.hp)) end
+        return healed
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method integer GetMaxMp()
+        return _MpManager:GetMaxMp()
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer GetCurrentMp()
+        local p=self._T.client
+        if p==nil then return 0 end
+        return math.max(0,math.min(self:GetMaxMp(),math.floor(p.mp or self:GetMaxMp())))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean TryConsumeMp(integer cost)
+        local p=self._T.client
+        if p==nil then return false end
+        local need=math.max(0,math.floor(cost))
+        if need<=0 then return true end
+        if self:GetCurrentMp()-(p.skillState.teleportReservedMp or 0)<need then return false end
+        p.mp=math.max(0,math.min(p.mp or self:GetMaxMp(),self:GetMaxMp())-need)
+        p.mpBlockedUntil=_UtilLogic.ElapsedSeconds+_MpManager.regenDelaySeconds
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestoreMp(number amount)
+        local p=self._T.client
+        if p==nil then return end
+        p.mp=math.min(self:GetMaxMp(),math.max(0,p.mp or 0)+math.max(0,amount))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FillMp()
+        local p=self._T.client
+        if p==nil then return end
+        p.mp=self:GetMaxMp()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CreateTrainingRoom(table p, table terrain)
+        -- Reuse the real dummy model and native skill hitboxes, without registering a PVP match.
+        local a=p.a local origin=a.physics.origin
+        local room={origin=origin,map=p.actor.CurrentMap,platforms=terrain.platforms,monsters={}}
+        local participant={uid=p.uid,name="나",player=p.source,actor=a,team=1,level=_RegionTierLogic:GetServerLevelOf(p.source),dead=false}
+        local r={id="lobby:"..p.uid..":"..tostring(p.generation),training=true,state="active",at=_UtilLogic.ServerElapsedSeconds,clock=0,rooms={room},teams={{participant}},members={[p.uid]=participant},cp={0},kills={0}}
+        p.training=r p.participant=participant a.nativeId=p.actor.Id
+        _CarnivalBattle:RefreshStats(participant)
+        p.actor:GetComponent("PlayerAttack")._T.carnivalRoom=r.id..":1"
+        for slot=1,2 do
+        local homeX=1.6+(slot-1)*0.9
+        local dummy=_SpawnService:SpawnByModelId("trainingdummy","CarnivalMob_TrainingDummy"..tostring(slot),Vector3(origin.x+homeX,origin.y,0),room.map)
+        if not isvalid(dummy) then log_error("[Carnival] training dummy spawn failed") return end
+        dummy.RigidbodyComponent.Enable=false dummy.MovementComponent.Enable=false
+        local mon=dummy:GetComponent("Monster")
+        mon.CarnivalRoom=r.id..":1" mon.MaxHp=100000 mon.Hp=100000
+        mon.NeverDie=false mon.Stationary=true mon.RespawnOn=false mon.SpawnFadeStarted=-1
+        dummy.StateComponent:DisconnectHitEvent()
+        dummy.HitComponent.CollisionGroup=CollisionGroups.HitBox
+        local m={slot=slot,id="training-dummy"..tostring(slot),training=true,sprite=tostring(dummy.SpriteRendererComponent.SpriteRUID),entity=dummy,x=homeX,homeX=homeX,y=0,face=-1,hp=100000,maxHp=100000,level=participant.level,dead=false,due=0,hit=0,hitSeq=0,life=0,platform=terrain.platforms[1]}
+        table.insert(room.monsters,m)
+        self._T.monsters=self._T.monsters or {}
+        self._T.monsters[dummy.Id]={match=r,team=1,monster=m}
+        p.actor:AddComponent("TriggerComponent")
+        local actorTrigger=p.actor.TriggerComponent
+        actorTrigger.IsPassive=true actorTrigger.CollisionGroup=CollisionGroups.TriggerBox
+        actorTrigger.BoxSize=Vector2(0.45,0.7) actorTrigger.ColliderOffset=Vector2(0,0.35)
+        dummy:AddComponent("TriggerComponent")
+        local trigger=dummy.TriggerComponent
+        trigger.IsPassive=false trigger.CollisionGroup=CollisionGroups.TriggerBox
+        trigger.BoxSize=Vector2(0.8,1) trigger.ColliderOffset=Vector2(0,0.5)
+        m.contactHandler=dummy:ConnectEvent(TriggerStayEvent,function(event)
+            local now=_UtilLogic.ServerElapsedSeconds
+            if event.TriggerBodyEntity~=p.actor or r.state~="active" or m.dead or p.actor.PlayerComponent.Hp<=0 or now<(p.contactAt or 0) then return end
+            p.contactAt=now+1.5
+            -- PlayerComponent also handles HitEvent even when disabled; apply this fixed damage once.
+            local before=p.actor.PlayerComponent.Hp
+            local hit=p.actor:GetComponent("PlayerHit")
+            if isvalid(hit) and (hit:BlocksSkillContact()) then return end
+            local damage=isvalid(hit) and hit:ApplyDamageReduction(30) or 30
+            a.hp=math.max(0,before-damage) a.recovery=nil
+            p.actor.PlayerComponent.Hp=math.floor(a.hp)
+            if isvalid(hit) then hit:SchedulePowerGuardRecovery(p.actor,damage) end
+            if a.hp<=0 then participant.dead=true p.reviveAt=now+3 p.actor.StateComponent:ChangeState("DEAD") end
+            log("[VRF] Carnival lobby contact base=30 damage="..tostring(damage).." hp="..tostring(before).."->"..tostring(a.hp).." sourceHp="..tostring(p.source.PlayerComponent.Hp))
+        end)
+        log("[VRF] Carnival lobby dummy created slot="..tostring(slot).." x="..tostring(homeX).." hp=100000 contact=30")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StepTraining(table p, number delta)
+        local r=p.training if r==nil or r.state~="active" then return end
+        local now=_UtilLogic.ServerElapsedSeconds local a=p.a local pc=p.actor.PlayerComponent
+        r.clock=now-r.at a.hp=math.max(0,pc.Hp)
+        local pos=p.actor.TransformComponent.WorldPosition
+        a.x=pos.x-a.physics.origin.x a.y=pos.y-a.physics.origin.y
+        a.face=p.actor.PlayerControllerComponent.LookDirectionX a.ground=(not p.actor.RigidbodyComponent.KinematicMove and p.actor.RigidbodyComponent:IsOnGround())
+        if a.ground then a.airJumpUsed=false end
+        a.input.seq=p.sequence
+        if a.hp<=0 and p.reviveAt==nil then p.reviveAt=now+3 p.participant.dead=true p.actor.StateComponent:ChangeState("DEAD") end
+        if p.reviveAt~=nil and now>=p.reviveAt then
+            a.hp=a.maxHp pc.Hp=math.floor(a.hp) p.participant.dead=false p.reviveAt=nil
+            p.actor.StateComponent:ChangeState("IDLE") p.actor:GetComponent("PlayerAttack"):ReleaseDeadLock()
+            local spawn=a.physics.spawn _CarnivalPhysics:Warp(a,spawn.x,spawn.y)
+            p.reviveSeq=(p.reviveSeq or 0)+1
+            log("[VRF] Carnival lobby revived independent=true")
+        end
+        if now>=(p.statsAt or 0) then p.statsAt=now+0.5 _CarnivalBattle:RefreshStats(p.participant) end
+        _CarnivalSkills:Advance(a,r.rooms[1],now,delta,r,p.participant)
+        if a.hp>0 then
+            local multiplier=a.recovery~=nil and a.recovery.kind=="hp" and now>=a.recovery.ready and 5 or 1
+            p.hpRegen=(p.hpRegen or 0)+a.maxHp*(a.regen or 0)/100*delta*multiplier
+            local heal=math.floor(p.hpRegen) p.hpRegen=p.hpRegen-heal
+            a.hp=math.min(a.maxHp,a.hp+heal) pc.Hp=math.floor(a.hp)
+        end
+        for _,m in ipairs(r.rooms[1].monsters) do
+            if m.dead and r.clock>=m.due then
+                m.dead=false m.hp=m.maxHp m.life=m.life+1 m.hit=0
+                m.x=m.homeX m.y=0 m.nativeX=nil
+                if isvalid(m.entity) then m.entity:GetComponent("Monster"):ConsumeReservedDamage(m.maxHp) end
+                log("[VRF] Carnival lobby dummy reset hp=100000")
+            end
+        end
+        self:SyncMonsters(r,1,r.rooms[1])
+        if now>=(p.sceneAt or 0) then
+            p.sceneAt=now+0.1
+            self:ReceiveLobbyScene(p.generation,_CarnivalBattle:Snapshot(r,1),p.reviveSeq or 0,p.uid)
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveLobbyScene(integer generation, table scene, integer reviveSequence)
+        local p=self._T.client
+        if p==nil or p.battle~=nil or p.generation~=generation then return end
+        p.lobbyScene=scene
+        if reviveSequence>(p.reviveSeq or 0) then
+            p.reviveSeq=reviveSequence self:FillMp()
+            local a=scene.actors[1] if a~=nil then self:AcceptLanding(a.x,a.y) end
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestLobbySkill(integer generation, string name, number dx, number dy, integer sequence)
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.battle~=nil or p.generation~=generation or p.training==nil or not isvalid(p.actor) then return end
+        if sequence<=(p.lobbySkillSequence or 0) then return end
+        p.lobbySkillSequence=sequence p.lastInput=_UtilLogic.ElapsedSeconds
+        local now=_UtilLogic.ServerElapsedSeconds
+        local d=_CarnivalSkills:ServerDefinition(p.participant,{name=name})
+        p.skillCooldowns=p.skillCooldowns or {}
+        local accepted=false
+        if d~=nil and p.a.hp>0 and not p.actor:GetComponent("PlayerAttack"):IsActorControlLocked() and now>=(p.skillCooldowns[name] or 0) and now>=(p.a.skillLock or 0) and (not d.airBlock or p.a.ground) then
+            accepted=_CarnivalSkills:Apply(p.a,p.training.rooms[1],d,dx<0 and -1 or 1,math.max(-1,math.min(1,dy)),now)
+            if accepted then p.skillCooldowns[name]=now+d.cooldown p.actor.PlayerComponent.Hp=math.floor(p.a.hp) end
+        end
+        self:ReceiveLobbySkill(generation,sequence,accepted,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveLobbySkill(integer generation, integer sequence, boolean accepted)
+        local p=self._T.client
+        if p==nil or p.battle~=nil or p.generation~=generation then return end
+        _CarnivalSkills:Receipt(sequence,accepted)
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void StartSprint()
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) or not _SkillManager:IsSkillInCurrentJob("러시") or not _SkillManager:IsSkillUsableByInvestment("러시") then return end
+        local axis=p.axis or 0
+        if p.automatic then axis=p.actor.PlayerControllerComponent.LookDirectionX end
+        if axis==0 or _SkillManager._T.dragonRideMounted then return end
+        local state=p.skillState local now=_UtilLogic.ElapsedSeconds
+        if state.sprintActive or now<(state.dashCooldownUntil or 0) then return end
+        if not self:TryConsumeMp(_SkillManager:GetRushMpCost()) then return end
+        state.dashCooldownUntil=now+_SkillManager:GetRushCooldownForLevel(_SkillManager:GetHeroSkillLevelByName("러시"))
+        state.sprintActive=true state.sprintAxis=axis
+        self:SendSkill("RequestActorSprint",{true})
+        local function pose()
+            if self._T.client~=p or not state.sprintActive or not isvalid(p.actor) then return end
+            local body=p.actor.AvatarRendererComponent:GetBodyEntity()
+            if isvalid(body) then body:SendEvent(ActionStateChangedEvent("swingT3","swingT3",1,SpriteAnimClipPlayType.Loop,0,1)) end
+        end
+        pose()
+        state.sprintTimer=_TimerService:SetTimerRepeat(pose,0.08)
+        state.sprintEndTimer=_TimerService:SetTimerOnce(function() if self._T.client==p then self:EndSprint() end end,0.4)
+        log("[VRF] Carnival sprint started multiplier=2 duration=0.4 privateMp="..tostring(self:GetCurrentMp()))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EndSprint()
+        local p=self._T.client if p==nil or not p.skillState.sprintActive then return end
+        local state=p.skillState state.sprintActive=false
+        if state.sprintTimer~=nil then _TimerService:ClearTimer(state.sprintTimer) state.sprintTimer=nil end
+        if state.sprintEndTimer~=nil then _TimerService:ClearTimer(state.sprintEndTimer) state.sprintEndTimer=nil end
+        p.serverLocomotion=true p.lastAction=nil
+        if p.prediction~=nil then p.prediction.sprintMultiplier=1 end
+        self:SendSkill("RequestActorSprint",{false})
+        log("[VRF] Carnival sprint ended")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TryRecovery(string kind)
+        -- Use the same resting, warmup and cooldown rules with this actor's own state.
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) or p.recoveryPending then return end
+        if kind~="hp" and kind~="mp" then return end
+        local a=_CarnivalSkills:Actor()
+        if a==nil or a.dead or not _BeginnerRecovery:IsResting(p.actor) then return end
+        if p.actor:GetComponent("PlayerAttack"):IsActorControlLocked() then return end
+        if a.recovery~=nil and a.recovery.kind==kind then return end
+        if ((p.recoveryCooldowns or {})[kind] or 0)>_UtilLogic.ServerElapsedSeconds then return end
+        p.recoveryPending=true p.sent=true
+        p.skillState.actionLockUntil=_UtilLogic.ElapsedSeconds+0.3
+        self:RequestActorRecovery(p.generation,kind)
+    end
+
+    @ExecSpace("Server")
+    method void RequestActorRecovery(integer generation, string kind)
+        -- Authenticate ownership; health and recovery never mutate the outside player.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) then return end
+        if kind=="" then p.a.recovery=nil return end
+        if kind~="hp" and kind~="mp" then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        p.recoveryCooldowns=p.recoveryCooldowns or {}
+        local accepted=_BeginnerRecovery:IsResting(p.actor) and not p.actor:GetComponent("PlayerAttack"):IsActorControlLocked()
+            and (p.recoveryCooldowns[kind] or 0)<=now and (p.battle==nil or p.match.state=="active")
+        if accepted then
+            p.actor.MovementComponent:Stop()
+            p.actor.RigidbodyComponent:SetForce(Vector2.zero)
+            p.actor.RigidbodyComponent:SetForceReserve(Vector2.zero)
+            local pos=p.actor.TransformComponent.WorldPosition
+            p.a.recovery={kind=kind,ready=now+0.5,settleUntil=now+0.3,x=pos.x-p.a.physics.origin.x,y=pos.y-p.a.physics.origin.y}
+            p.a.skillLock=now+0.3 p.recoveryCooldowns[kind]=now+3
+            log("[VRF] Carnival recovery started kind="..kind.." warmup=0.5 multiplier=5 cooldown=3")
+        end
+        self:ReceiveActorRecovery(generation,kind,accepted,accepted and now+3 or 0,senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveActorRecovery(integer generation, string kind, boolean accepted, number cooldown)
+        -- A rejected request must not leave a pending input lock or consume a cooldown.
+        local p=self._T.client if p==nil or p.generation~=generation then return end
+        p.recoveryPending=false
+        if not accepted then p.skillState.actionLockUntil=0 return end
+        p.recoveryCooldowns=p.recoveryCooldowns or {} p.recoveryCooldowns[kind]=cooldown
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsActorRecovering(Entity actor)
+        -- Native breathing animation uses this to keep recovery's pose beyond three seconds.
+        local p=self._T.client
+        return p~=nil and p.actor==actor and p.recoveryVisual~=nil and p.recoveryVisual.channel~=nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CancelActorRecovery()
+        -- Cancel input only in this window; the outside recovery can continue independently.
+        local p=self._T.client if p==nil then return end
+        local a=_CarnivalSkills:Actor()
+        if a~=nil and a.recovery~=nil then p.cancelledRecovery=a.recovery.ready end
+        if p.recoveryVisual~=nil or p.recoveryPending or (a~=nil and a.recovery~=nil) then
+            self:RequestActorRecovery(p.generation,"")
+            _BeginnerRecovery:RemoveActorVisuals(p.recoveryVisual) p.recoveryVisual=nil p.recoveryPending=false
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateRecoveryVisuals(table p)
+        -- Snapshots acknowledge damage, movement, death and skill cancellation for both room types.
+        local a=_CarnivalSkills:Actor()
+        local recovery=a~=nil and not a.dead and a.recovery or nil
+        if recovery~=nil and recovery.ready==p.cancelledRecovery then recovery=nil end
+        if p.recoveryVisual~=nil and (recovery==nil or p.recoveryVisual.ready~=recovery.ready) then
+            _BeginnerRecovery:RemoveActorVisuals(p.recoveryVisual) p.recoveryVisual=nil
+        end
+        if recovery~=nil and p.recoveryVisual==nil and isvalid(p.actor) and _CarnivalActorPresentation:BindingFor(p.actor)~=nil then
+            p.recoveryVisual=_BeginnerRecovery:CreateActorVisuals(p.actor,recovery.kind)
+            p.recoveryVisual.ready=recovery.ready
+        end
+        if p.recoveryVisual~=nil then _BeginnerRecovery:TickSoundForState(p.recoveryVisual) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void MoveRushMonster(Entity actor, Entity target, number x, number y)
+        -- Carnival monsters use room-owned transforms; their disabled rigidbody cannot apply a push.
+        local record=isvalid(target) and (self._T.monsters or {})[target.Id] or nil
+        local pa=isvalid(actor) and actor:GetComponent("PlayerAttack") or nil
+        if record==nil or not isvalid(pa) or pa._T.carnivalRoom~=record.match.id..":"..tostring(record.team) then return end
+        local m=record.monster local room=record.match.rooms[record.team]
+        if m.dead then return end
+        m.x=math.max(m.platform.l+0.15,math.min(m.platform.r-0.15,x-room.origin.x))
+        m.y=y-room.origin.y m.nativeX=room.origin.x+m.x
+        target.TransformComponent.WorldPosition=Vector3(m.nativeX,room.origin.y+m.y,0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StartRushMotion(Entity actor, number stopX, number stopY, number duration)
+        -- Send the original rush trajectory to the display's prediction body as one skill movement.
+        local pa=actor:GetComponent("PlayerAttack") local p=(self._T.cases or {})[pa._T.carnivalOwnerUid]
+        if p==nil or p.actor~=actor then return end
+        local pos=actor.TransformComponent.WorldPosition local origin=p.a.physics.origin
+        self:ReceiveRushMotion(p.generation,pos.x-origin.x,pos.y-origin.y,stopX-origin.x,stopY-origin.y,duration,p.uid)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveRushMotion(integer generation, number x, number y, number stopX, number stopY, number duration)
+        -- Manual input prediction must follow explicit skill displacement, even below its correction threshold.
+        local p=self._T.client if p==nil or p.generation~=generation then return end
+        p.rushMotion={x=x,y=y,stopX=stopX,stopY=stopY,at=_UtilLogic.ElapsedSeconds,duration=duration}
+        self:AcceptLanding(x,y)
+        log("[VRF] Carnival rush trajectory distance="..tostring(math.abs(stopX-x)).." duration="..tostring(duration))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean UpdateRushMotion()
+        -- Keep the exact original speed and stop position without later snapping back to pre-cast prediction.
+        local p=self._T.client local r=p~=nil and p.rushMotion or nil
+        if r==nil then return false end
+        if not isvalid(p.actor) or p.actor.PlayerComponent.Hp<=0 then p.rushMotion=nil return false end
+        local elapsed=math.max(0,_UtilLogic.ElapsedSeconds-r.at)
+        local distance=math.abs(r.stopX-r.x)
+        local mix=distance<0.001 and 1 or math.min(1,elapsed*2.33/math.max(0.01,r.duration)/distance)
+        self:AcceptLanding(r.x+(r.stopX-r.x)*mix,r.y+(r.stopY-r.y)*mix)
+        if elapsed>=r.duration then
+            p.rushMotion=nil
+            log("[VRF] Carnival rush display landed x="..tostring(r.stopX))
+        end
+        return true
+    end
+
+    @ExecSpace("Client")
+    method void NotifyDefence(string actorId, string kind)
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) or p.actor.Id~=actorId then return end
+        local state=p.skillState
+        if kind=="guard" then
+            state.guardCooldownUntil=math.min(state.guardCooldownUntil or 0,(state.guardUseAt or _UtilLogic.ElapsedSeconds)+5)
+        elseif kind=="parry" then state.parryCooldownUntil=0 end
+        log("[VRF] Carnival defence success="..kind)
+    end
+    @ExecSpace("ClientOnly")
+    method void ApplySkillJump(Vector2 force, boolean reset)
+        local p=self._T.client
+        if p==nil or not isvalid(p.actor) or p.prediction.physics==nil then return end
+        local body=p.prediction.physics.body
+        if not isvalid(body) then return end
+        if reset then body.RigidbodyComponent:PositionReset() end
+        body.RigidbodyComponent:SetForce(force)
+        p.prediction.authorityAfter=_UtilLogic.ElapsedSeconds+0.5
+        self:RequestSkillJump(p.generation,force,reset)
+    end
+
+    @ExecSpace("Server")
+    method void RequestSkillJump(integer generation, Vector2 force, boolean reset)
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) or p.actor.PlayerComponent.Hp<=0 then return end
+        if force.x~=force.x or force.y~=force.y or math.abs(force.x)>12 or force.y<=0 or force.y>12 then return end
+        if _UtilLogic.ElapsedSeconds<(p.jumpForceAt or 0) then return end
+        p.jumpForceAt=_UtilLogic.ElapsedSeconds+0.2
+        if reset then p.actor.RigidbodyComponent:PositionReset() end
+        p.actor.RigidbodyComponent:SetForce(force)
+    end
+    @ExecSpace("ServerOnly")
+    method void WarpSkillActor(Entity actor, number x, number y)
+        local pa=isvalid(actor) and actor:GetComponent("PlayerAttack") or nil
+        if not isvalid(pa) or not pa._T.carnivalPreview then return end
+        local p=(self._T.cases or {})[pa._T.carnivalOwnerUid]
+        if p==nil or p.actor~=actor then return end
+        local origin=p.a.physics.origin
+        _CarnivalPhysics:Warp(p.a,x-origin.x,y-origin.y)
+        self:ReceiveSkillLanding(p.generation,x-origin.x,y-origin.y,p.uid)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveSkillLanding(integer generation, number x, number y)
+        local p=self._T.client
+        if p==nil or p.generation~=generation then return end
+        self:AcceptLanding(x,y)
+    end
+    @ExecSpace("ClientOnly")
+    method void SetRidePrediction(boolean mounted)
+        local p=self._T.client if p==nil then return end
+        local predicted=p.battle~=nil and _CarnivalView._T.prediction or p.prediction
+        if predicted~=nil and predicted.physics~=nil then
+            predicted.physics.body.RigidbodyComponent.KinematicMove=mounted
+            predicted.physics.body.RigidbodyComponent:PositionReset()
+            local offset=mounted and 0.8 or -0.6
+            local generation=p.generation
+            _TimerService:SetTimerOnce(function()
+                if self._T.client~=p or p.generation~=generation or p.skillState.dragonRideMounted~=mounted then return end
+                _CarnivalPhysics:Warp(predicted,predicted.x,predicted.y+offset)
+            end,mounted and 0.5 or 0.05)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateRideInput()
+        local p=self._T.client if p==nil or not p.skillState.dragonRideMounted then return end
+        local vertical=0
+        if _SkillManager:IsActorKeyPressed(true,KeyboardKey.UpArrow) then vertical=vertical+1 end
+        if _SkillManager:IsActorKeyPressed(true,KeyboardKey.DownArrow) then vertical=vertical-1 end
+        local predicted=p.battle~=nil and _CarnivalView._T.prediction or p.prediction
+        if predicted~=nil then predicted.flightY=vertical end
+        if _UtilLogic.ElapsedSeconds>=(p.flightAt or 0) then
+            p.flightAt=_UtilLogic.ElapsedSeconds+0.1
+            self:RequestFlightInput(p.generation,vertical)
+        end
+    end
+
+    @ExecSpace("Server")
+    method void RequestFlightInput(integer generation, number vertical)
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) or not p.actor.RigidbodyComponent.KinematicMove then return end
+        if vertical~=-1 and vertical~=0 and vertical~=1 then return end
+        p.a.flightY=vertical
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsLocalActor(Entity actor)
+        -- Replicas retain authenticated ownership without impersonating a PlayerComponent user.
+        if actor==_UserService.LocalPlayer then return true end
+        local p=self._T.client
+        return p~=nil and isvalid(actor) and p.actor==actor
+    end
+
+    method string OwnerUserId(Entity actor)
+        -- Resolve the real owner for server validation and targeted client callbacks.
+        if not isvalid(actor) then return "" end
+        local pa=actor:GetComponent("PlayerAttack")
+        if isvalid(pa) and pa._T.carnivalOwnerUid~=nil then return pa._T.carnivalOwnerUid end
+        return isvalid(actor.PlayerComponent) and actor.PlayerComponent.UserId or ""
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method Vector3 PresentationPosition(Entity actor)
+        -- Summons follow the same predicted position displayed in the carnival.
+        local p=self._T.client
+        if p~=nil and p.actor==actor and p.prediction~=nil then
+            local predicted=p.battle~=nil and _CarnivalView._T.prediction or p.prediction
+            if predicted~=nil then return Vector3(p.origin.x+(predicted.viewX or predicted.x),p.origin.y+(predicted.viewY or predicted.y),actor.TransformComponent.WorldPosition.z) end
+        end
+        return actor.TransformComponent.WorldPosition
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method number PresentationFacing(Entity actor)
+        -- Follow the displayed local actor, including a held skill's facing.
+        local p=self._T.client
+        if p~=nil and p.actor==actor and isvalid(p.avatar) then
+            return p.avatar.AvatarGUIRendererComponent.FlipX and 1 or -1
+        end
+        local controller=actor.PlayerControllerComponent
+        return isvalid(controller) and controller.LookDirectionX or 1
+    end
+
+
+    @ExecSpace("Server")
+    method void RequestCancelActorBuff(integer generation, string kind)
+        -- The caller can cancel only buffs on its own active replica.
+        local p=(self._T.cases or {})[senderUserId]
+        if p==nil or p.generation~=generation or not isvalid(p.actor) then return end
+        if p.battle~=nil and p.match.state~="active" then return end
+        _SkillManager:CancelBuffForActor(p.actor,kind)
+    end
+
+
+    @ExecSpace("ServerOnly")
+    method void SyncActorHp(Entity actor)
+        local pa=isvalid(actor) and actor:GetComponent("PlayerAttack") or nil
+        if not isvalid(pa) or not pa._T.carnivalPreview then return end
+        local p=(self._T.cases or {})[pa._T.carnivalOwnerUid or ""]
+        if p~=nil and p.actor==actor then p.a.hp=math.max(0,math.min(p.a.maxHp,actor.PlayerComponent.Hp)) end
+    end
+
+    @ExecSpace("Multicast")
+    method void RaiseSkillForeground(Entity entity)
+        if not self:IsClient() then return end
+        -- Client-only scenery may add foreground layers absent from the server hierarchy.
+        _TimerService:SetTimerOnce(function()
+            if isvalid(entity) then _CarnivalActorPresentation:RaiseSkillEntity(entity) end
+        end,0.05)
+    end
+end

@@ -28,7 +28,8 @@ script HeroSummon extends Component
 	property number Lifetime = 300               -- 서버 전용 수명(초)
 	-- (요청 2026-08-11) 소환수 파티 UI(SummonPartyUI)가 클라에서 HP를 읽어야 해서 @Sync로 승격.
 	-- 대입은 전부 서버라 단방향 동기화 규칙에 안전하다.
-	@Sync property number HeroMaxHp = 100        -- 최대 HP(일반 용사 소환은 주인 최대 HP의 2/3, 기사 소환은 1/2)
+	@Sync property number HeroMaxHp = 100        -- 최대 HP(비숍 소환은 기존 2/3 HP의 절반, 기사 소환은 1/2)
+	@Sync property boolean ResurrectionPending = false
 	@Sync property number HeroHp = 100           -- 현재 HP
 	@Sync property number HeroLevel = 1          -- 용사 레벨(주인 레벨의 N% - 용사 소환 투자 레벨이 정한다: 1레벨 50% → 마스터 30에서 65%)
 	-- 용사 레벨에 맞는 전투력. 소환 시점에 클라(SkillManager)가 레벨 곡선으로 환산해 서버로 넘긴다.
@@ -51,7 +52,9 @@ script HeroSummon extends Component
 	@ExecSpace("ServerOnly")
 	method void InitServer()
 		-- 첫 서버 틱에서 1회 실행되는 지연 초기화(외형/네임태그/수명/버프 예약).
-		self._T.dmgMult = 1.0
+		self._T.originalSummonLevel = self.HeroLevel
+        self._T.originalSummonPower = self.BaseCombatPower
+        self._T.dmgMult = 1.0
 		self._T.atkCdMult = 1.0
 		local now = _UtilLogic.ElapsedSeconds
 		self._T.nextAttackAt = now + 1.0
@@ -75,15 +78,15 @@ script HeroSummon extends Component
 		-- 이후 ScheduleBuff는 기존 우선순위대로 헤이스트를 유지하므로 두 버프가 함께 동작한다.
 		if self:IsThiefLine() and self.HeroLevel >= 70 then
 			self:CastBuff("shadowpartner")
-			log("[HeroSummon] 70레벨 이상 도적 - 소환 즉시 쉐도우 파트너 사용")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 70레벨 이상 도적 - 소환 즉시 쉐도우 파트너 사용") end
 		end
 		self:ScheduleBuff(true)
 		self:SpawnHpBar()
 		-- 몬스터 공격 피격(HitEvent) 수신 - 런타임 AddComponent라 정적 @EventSender 대신 명시 연결.
 		self._T.hitEventHandler = self.Entity:ConnectEvent(HitEvent, self.OnHeroHit)
 		self:PlaySummonFx()
-		log("[HeroSummon] 소환 완료 line=" .. self.HeroLine .. " level=" .. tostring(math.floor(self.HeroLevel))
-			.. " 직업=" .. self:GetJobName() .. " 전투력=" .. tostring(math.floor(self:GetCombatPower())))
+		if Environment:IsMakerPlay() then log("[HeroSummon] 소환 완료 line=" .. self.HeroLine .. " level=" .. tostring(math.floor(self.HeroLevel))
+			.. " 직업=" .. self:GetJobName() .. " 전투력=" .. tostring(math.floor(self:GetCombatPower()))) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -144,7 +147,7 @@ script HeroSummon extends Component
 		cm:SetEquip(MapleAvatarItemCategory.Cape, capes[_UtilLogic:RandomIntegerRange(1, #capes)])
 		cm:SetEquip(MapleAvatarItemCategory.Longcoat, armors[_UtilLogic:RandomIntegerRange(1, #armors)])
 		cm:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, weapons[_UtilLogic:RandomIntegerRange(1, #weapons)])
-		log("[HeroSummon] 기사 랜덤 외형 적용 완료")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 기사 랜덤 외형 적용 완료") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -180,8 +183,8 @@ script HeroSummon extends Component
 			end
 		end
 		self:ApplyRandomCosmetics(job)
-		log("[HeroSummonCostume] line=" .. self.HeroLine .. " level=" .. tostring(self.HeroLevel)
-			.. " stars=" .. tostring(stars) .. " cosmetics=" .. tostring(#self._T.cosmeticCostume))
+		if Environment:IsMakerPlay() then log("[HeroSummonCostume] line=" .. self.HeroLine .. " level=" .. tostring(self.HeroLevel)
+			.. " stars=" .. tostring(stars) .. " cosmetics=" .. tostring(#self._T.cosmeticCostume)) end
 	end
 
 	method integer GetAppearanceStars()
@@ -311,10 +314,10 @@ script HeroSummon extends Component
 		_TimerService:SetTimerOnce(function()
 			if self._T.blessToken == tok then
 				self._T.blessAtkBonus = 0
-				log("[HeroSummon] 블레스 만료 - 전투력 원복")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 블레스 만료 - 전투력 원복") end
 			end
 		end, duration)
-		log("[HeroSummon] 블레스 수령 - 전투력 +" .. tostring(atkBonus) .. " (" .. tostring(duration) .. "초)")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 블레스 수령 - 전투력 +" .. tostring(atkBonus) .. " (" .. tostring(duration) .. "초)") end
 	end
 
 	---@type PlayerAttack
@@ -371,6 +374,12 @@ script HeroSummon extends Component
 		local mapB = self.Entity.CurrentMap
 		if isvalid(mapB) and isvalid(mapB.MapComponent) then
 			local bMin, bMax = mapB.MapComponent:GetBound()
+            local privatePhysics=_CarnivalReplica:PhysicsFor(self.OwnerEntity)
+            if privatePhysics~=nil then
+                local bounds=privatePhysics.bounds local origin=privatePhysics.origin
+                bMin=Vector2(origin.x+bounds.minX,origin.y+bounds.minY)
+                bMax=Vector2(origin.x+bounds.maxX,origin.y+bounds.maxY)
+            end
 			if bMin ~= nil and bMax ~= nil and bMax.x > bMin.x + 2.0 then
 				-- 경계 밖 0.2유닛까지는 허용(GetBound가 실플레이 영역과 미세하게 다른 맵 오탐 방지).
 				local clampedX = myPos.x
@@ -380,7 +389,7 @@ script HeroSummon extends Component
 					rb:SetWorldPosition(Vector2(clampedX, myPos.y + 0.1))
 					rb:PositionReset()
 					self._T.rushingUntil = 0
-					log("[HeroSummon] 맵 경계 밖 - 안쪽으로 복귀")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 맵 경계 밖 - 안쪽으로 복귀") end
 					myPos = tr.WorldPosition
 				end
 				-- (신고 2026-08-08 3차 "지형 없는 맵 아래로 떨어지면 안 돌아온다") 맵 세로 경계 아래로
@@ -398,7 +407,7 @@ script HeroSummon extends Component
 					self._T.airborneSince = nil
 					self._T.target = nil
 					self:PlayTeleportFx()
-					log("[HeroSummon] 맵 아래 이탈 - 주인 곁으로 복귀 (y=" .. string.format("%.1f", myPos.y) .. ")")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 맵 아래 이탈 - 주인 곁으로 복귀 (y=" .. string.format("%.1f", myPos.y) .. ")") end
 					return
 				end
 			end
@@ -429,7 +438,7 @@ script HeroSummon extends Component
 				self._T.fellBelowAt = nil
 				self._T.target = nil
 				self:PlayTeleportFx()
-				log("[HeroSummon] 장기 낙하 감지(발판 없음) - 주인 곁으로 복귀")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 장기 낙하 감지(발판 없음) - 주인 곁으로 복귀") end
 				return
 			end
 		end
@@ -452,7 +461,7 @@ script HeroSummon extends Component
 			rb:PositionReset()
 			self._T.target = nil
 			self:PlayTeleportFx()
-			log("[HeroSummon] 주인과 멀어져 순간이동")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 주인과 멀어져 순간이동") end
 			return
 		end
 		-- (신고 2026-08-08 "소환수가 아래로 떨어지면 리스폰 없이 아래에 머문다") 수직 낙하 복귀 신설.
@@ -483,7 +492,7 @@ script HeroSummon extends Component
 				rb:PositionReset()
 				self._T.target = nil
 				self:PlayTeleportFx()
-				log("[HeroSummon] 아래층 낙하 복귀 - 주인 곁으로 순간이동 (ody=" .. string.format("%.1f", ody) .. ")")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 아래층 낙하 복귀 - 주인 곁으로 순간이동 (ody=" .. string.format("%.1f", ody) .. ")") end
 				return
 			end
 		elseif self._T.fellBelowAt ~= nil then
@@ -561,7 +570,7 @@ script HeroSummon extends Component
 						elseif above ~= nil and self.HeroLine == "darkknight" and isvalid(self._T.rideDragonEnt) then
 							self._T.unreachableSince = nil
 							self._T.target = above
-							log("[HeroSummon] 위층 적 발견 - 드래곤 탑승 비행으로 접근")
+							if Environment:IsMakerPlay() then log("[HeroSummon] 위층 적 발견 - 드래곤 탑승 비행으로 접근") end
 						elseif above ~= nil and self:StartRopeClimb(above) then
 							-- (요청 2026-08-11 "로프를 못 탄다") 전용 상향 수단이 없는 직업(팔라딘/나이트로드/
 							-- 섀도어/1차 등)은 로프가 정식 경로다 - 하강 재배치보다 먼저 시도한다.
@@ -569,7 +578,7 @@ script HeroSummon extends Component
 						else
 							-- (신고 2026-08-08 "맨 아래까지 안 떨어진다") 창 4초, 아랫점프 간격 0.4초.
 							self._T.droppingUntil = now + 4.0
-							log("[HeroSummon] 공격 가능한 대상 없음 - 하강 후 스폰 지점 재배치 시작")
+							if Environment:IsMakerPlay() then log("[HeroSummon] 공격 가능한 대상 없음 - 하강 후 스폰 지점 재배치 시작") end
 						end
 					end
 				else
@@ -650,7 +659,7 @@ script HeroSummon extends Component
 				self._T.dropStallSince = nil
 				self._T.unreachableSince = nil
 				self._T.lastTargetAt = now
-				log("[HeroSummon] 하강 중 사냥감 발견 - 이 층에서 전투")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 하강 중 사냥감 발견 - 이 층에서 전투") end
 			else
 				-- (신고 2026-08-08 2차 "아래점프를 하지 않는다") 맨 아래층 발판 등 아랫점프가 안 먹는
 				-- 지형에서는 DownJump가 조용히 무시돼 4초 내내 서 있었다 - 1.2초간 y가 안 내려가면
@@ -662,7 +671,7 @@ script HeroSummon extends Component
 					self._T.dropLastY = nil
 					self._T.dropStallSince = nil
 					self._T.droppingUntil = now
-					log("[HeroSummon] 하강 정체(아랫점프 불가 발판) - 즉시 스폰 재배치")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 하강 정체(아랫점프 불가 발판) - 즉시 스폰 재배치") end
 					return
 				end
 				if rb:IsOnGround() and (self._T.nextDropJumpAt or 0) <= now then
@@ -690,6 +699,7 @@ script HeroSummon extends Component
 				-- 실패하면 **SpawnLocationComponent를 가진 아무 엔티티**(= 플레이어가 죽거나 처음
 				-- 입장할 때 나오는 실제 스폰 지점)로 폴백한다.
 				local spawnE = mapS:GetChildByName("SpawnLocation", true)
+                if _CarnivalReplica:PhysicsFor(self.OwnerEntity)~=nil then spawnE=self.OwnerEntity end
 				if not isvalid(spawnE) then
 					local slList = mapS:GetChildComponentsByTypeName("MOD.Core.SpawnLocationComponent", true)
 					if slList ~= nil and #slList > 0 and isvalid(slList[1]) then
@@ -713,7 +723,7 @@ script HeroSummon extends Component
 						local mvJ = self.Entity.MovementComponent
 						if isvalid(mvJ) then mvJ:Jump() end
 					end, 0.15)
-					log("[HeroSummon] 스폰 지점 재배치 완료 (" .. string.format("%.1f, %.1f", spw.x, spw.y) .. ")")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 스폰 지점 재배치 완료 (" .. string.format("%.1f, %.1f", spw.x, spw.y) .. ")") end
 				else
 					log_warning("[HeroSummon] SpawnLocation을 찾지 못해 재배치 생략(이 맵에 없음)")
 				end
@@ -870,7 +880,7 @@ script HeroSummon extends Component
 				dcomp:BeginMountWarp()
 				mv:Stop()
 				self._T.moving = false
-				log("[HeroSummon] 드래곤 탑승 워프 시작 dist=" .. string.format("%.1f", self._T.flyStartDist))
+				if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤 탑승 워프 시작 dist=" .. string.format("%.1f", self._T.flyStartDist)) end
 				self:UpdateLoco(rb)
 				return
 			end
@@ -1033,7 +1043,7 @@ script HeroSummon extends Component
 			end
 			self._T.ropeCache = out
 			self._T.ropeCacheMap = map
-			log("[HeroSummon] 로프 인덱스 구성: " .. tostring(#out) .. "줄")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 로프 인덱스 구성: " .. tostring(#out) .. "줄") end
 		end
 		local best = nil
 		local bestD = 10.0
@@ -1064,7 +1074,7 @@ script HeroSummon extends Component
 			mv:Stop()
 		end
 		self._T.moving = false
-		log("[HeroSummon] 로프 등반 종료 - " .. reason)
+		if Environment:IsMakerPlay() then log("[HeroSummon] 로프 등반 종료 - " .. reason) end
 	end
 
 	-- 위층 대상(above)을 향한 로프 등반 시작. 쓸 로프가 있으면 상태를 걸고 true.
@@ -1084,8 +1094,8 @@ script HeroSummon extends Component
 		self._T.ropeClimb = { x = rope.x, topY = topY,
 			deadline = _UtilLogic.ElapsedSeconds + 4.0 + walkDist / 2.0 }
 		self._T.target = above   -- 올라가서 바로 이 대상과 싸운다
-		log("[HeroSummon] 로프 등반 시작 x=" .. string.format("%.1f", rope.x)
-			.. " → y=" .. string.format("%.1f", topY) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 로프 등반 시작 x=" .. string.format("%.1f", rope.x)
+			.. " → y=" .. string.format("%.1f", topY) .. " (" .. self:GetJobName() .. ")") end
 		return true
 	end
 
@@ -1168,7 +1178,7 @@ script HeroSummon extends Component
 		if rise > 0.3 and rise <= 1.15 then
 			self._T.nextLedgeJumpAt = now + 1.0
 			mv:Jump()
-			log("[HeroSummon] 전방 턱 감지 - 선제 점프 (높이 " .. string.format("%.2f", rise) .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 전방 턱 감지 - 선제 점프 (높이 " .. string.format("%.2f", rise) .. ")") end
 		end
 	end
 
@@ -1241,7 +1251,7 @@ script HeroSummon extends Component
 					self._T.rushRestoreSpeed = nil
 				end
 			end, pullTime + 0.02)
-			log("[HeroSummon] 체인샷 접근 dist=" .. string.format("%.1f", pullDist) .. " (" .. self:GetJobName() .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 체인샷 접근 dist=" .. string.format("%.1f", pullDist) .. " (" .. self:GetJobName() .. ")") end
 			return
 		end
 		if adx > stopDist then
@@ -1266,7 +1276,7 @@ script HeroSummon extends Component
 					-- (신고 2026-08-11 3차 "언덕 앞에서 벽에 부딪힌 채 걷는다") 첫 점프를 1초 정체가 아니라
 					-- **0.5초 정체(stuck 1)부터** 시도한다 - 낮은 턱은 대부분 첫 점프로 바로 넘는다.
 					mv:Jump()
-					log("[HeroSummon] 벽 감지 - 점프로 넘기 시도 (" .. tostring(self._T.wallStuck) .. "/3)")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 벽 감지 - 점프로 넘기 시도 (" .. tostring(self._T.wallStuck) .. "/3)") end
 				elseif (self._T.wallStuck or 0) >= 4 then
 					-- (신고 2026-08-08 "벽에서 계속 제자리걸음") 포기해도 다음 스캔이 같은 대상을 도로
 					-- 골라 무한 반복됐다 - 포기한 대상을 5초간 블랙리스트해 다른 대상/배회로 전환시킨다.
@@ -1274,7 +1284,7 @@ script HeroSummon extends Component
 					self._T.avoidTarget = target
 					self._T.avoidUntil = now + 5.0
 					self._T.target = nil
-					log("[HeroSummon] 벽 통과 실패 - 대상 포기(5초 회피)")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 벽 통과 실패 - 대상 포기(5초 회피)") end
 					return
 				end
 			end
@@ -1428,7 +1438,7 @@ script HeroSummon extends Component
 				paFx:PlayRidingMountEffectAt(self.Entity, wp.x, wp.y)
 			end
 		end
-		log("[HeroSummon] 드래곤 하차(" .. reason .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤 하차(" .. reason .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1458,10 +1468,13 @@ script HeroSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void SpawnHpBar()
+        -- Carnival draws one party-style HP bar in its own viewport.
+        local ownerAttack=isvalid(self.OwnerEntity) and self.OwnerEntity:GetComponent("PlayerAttack") or nil
+        if isvalid(ownerAttack) and ownerAttack._T.carnivalPreview then return end
 		-- 머리 위 HP바: 스나이핑 게이지와 같은 snipinggaugetext 모델(Bg/Fill/Pct)을 용사 자식으로
 		-- 스폰해 재사용한다. Pct 텍스트는 대입하지 않아 빈 문자열(수치 숫자 미표시 - 요청 사항).
 		-- Color/Transform이 @Sync라 서버 대입만으로 모든 클라이언트에 표시된다.
-		local bar = _SpawnService:SpawnByModelId("snipinggaugetext", "HeroHpBar", Vector3(0, 1.05, 0), self.Entity)
+		local bar = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"snipinggaugetext", "HeroHpBar", Vector3(0, 1.05, 0), self.Entity)
 		if not isvalid(bar) then
 			log_warning("[HeroSummon] HP바 스폰 실패")
 			return
@@ -1481,7 +1494,7 @@ script HeroSummon extends Component
 		end
 		self._T.hpBar = bar
 		self:UpdateHpBar()
-		log("[HeroSummon] HP바 표시 " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)))
+		if Environment:IsMakerPlay() then log("[HeroSummon] HP바 표시 " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp))) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1555,9 +1568,9 @@ script HeroSummon extends Component
 			self._T.hitImmuneUntil = now + 2.0
 			self._T.guardCutUntil = now + 10.0
 			if not _AutoHuntPowerSave.active then
-			_DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+			_CarnivalDamageSkin:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
 			end
-			log("[HeroSummon] 가드 성공! (2초 무적 + 10초 피해 30% 감소)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 가드 성공! (2초 무적 + 10초 피해 30% 감소)") end
 			return
 		end
 		-- (팔라딘 아이언 월) 소환수도 받는 피해 감소를 실제로 적용한다
@@ -1573,7 +1586,7 @@ script HeroSummon extends Component
 		self:UpdateHpBar()
 		self:FlashHpBar()
 		self:ShowReceivedDamage(dmg)
-		log("[HeroSummon] 피격 -" .. tostring(event.TotalDamage) .. " → HP " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)))
+		if Environment:IsMakerPlay() then log("[HeroSummon] 피격 -" .. tostring(event.TotalDamage) .. " → HP " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp))) end
 		if self.HeroHp <= 0 then
 			self:UnsummonByDeath()
 		end
@@ -1585,7 +1598,7 @@ script HeroSummon extends Component
 		local skin = "3271c3e79bf04ecba9a107d55495970d"
 		if isvalid(self.OwnerEntity) then local pa = self.OwnerEntity:GetComponent("script.PlayerAttack") if isvalid(pa) then skin = pa:GetHitDamageSkinId() end end
 		if not _AutoHuntPowerSave.active then
-		_DamageSkinService:Play(self.Entity, skin, 0, { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, false, Vector2(0, 0.55), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		_CarnivalDamageSkin:Play(self.Entity, skin, 0, { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, false, Vector2(0, 0.55), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
 		end
 	end
 
@@ -1594,7 +1607,7 @@ script HeroSummon extends Component
 	method void ApplyIronWall(number duration, integer reducePct)
 		self._T.ironWallUntil = _UtilLogic.ElapsedSeconds + duration
 		self._T.ironWallPct = reducePct
-		log("[HeroSummon] 아이언 월 적용 " .. tostring(duration) .. "초 -" .. tostring(reducePct) .. "%")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 아이언 월 적용 " .. tostring(duration) .. "초 -" .. tostring(reducePct) .. "%") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1604,7 +1617,7 @@ script HeroSummon extends Component
 		-- 사망 상태 동안은 아무 행동도 하지 않는다(dying 가드 - ServerTick/DealHit/CastBuff 전부 차단).
 		if self._T.dying then return end
 		self._T.dying = true
-		log("[HeroSummon] HP 0 - 사망 상태 진입(20초 후 소멸)")
+		if Environment:IsMakerPlay() then log("[HeroSummon] HP 0 - 사망 상태 진입(20초 후 소멸)") end
 		local mv = self.Entity.MovementComponent
 		if isvalid(mv) then mv:Stop() end
 		-- (피드백) 플레이어 사망과 동일한 움직임: 엔진의 플레이어 Dead 해석(Core="dead"+Parts="stand1",
@@ -1631,7 +1644,7 @@ script HeroSummon extends Component
 		self._T.deathTimerId = _TimerService:SetTimerOnce(function()
 			self._T.deathTimerId = nil
 			if isvalid(self.Entity) then
-				log("[HeroSummon] 사망 상태 종료 - 소환 해제")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 사망 상태 종료 - 소환 해제") end
 				self:PlayUnsummonFx()
 				self.Entity:Destroy(0.2)
 			end
@@ -1650,7 +1663,7 @@ script HeroSummon extends Component
 		self._T.lifetimeTimerId = _TimerService:SetTimerOnce(function()
 			self._T.lifetimeTimerId = nil
 			if isvalid(self.Entity) then
-				log("[HeroSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 소환 종료(수명 " .. tostring(self.Lifetime) .. "초)") end
 				self.Entity:Destroy()
 			end
 		end, self.Lifetime)
@@ -1658,7 +1671,12 @@ script HeroSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PrepareResurrect()
-		-- 리저렉션 시전 확정: 사망 소멸 타이머를 멈춰 부활 연출 도중 파괴되지 않게 한다.
+		-- Protect the corpse during the revive animation and expose this state to auto-hunt.
+        self.ResurrectionPending=true
+        if self._T.lifetimeTimerId then
+            _TimerService:ClearTimer(self._T.lifetimeTimerId)
+            self._T.lifetimeTimerId=nil
+        end
 		if self._T.deathTimerId then
 			_TimerService:ClearTimer(self._T.deathTimerId)
 			self._T.deathTimerId = nil
@@ -1670,6 +1688,16 @@ script HeroSummon extends Component
 		-- 리저렉션(4차): 죽어 쓰러져 있던 용사를 그 자리에서 HP 가득 찬 상태로 부활시킨다.
 		if not self._T.dying then return end
 		self:PrepareResurrect()
+        self.ResurrectionPending=false
+        local base=self._T.originalSummonLevel or self.HeroLevel
+        self._T.originalSummonLevel=base
+        self._T.originalSummonPower=self._T.originalSummonPower or self.BaseCombatPower
+        self.HeroLevel=math.max(1,math.floor(base*1.1+0.00001))
+        self.BaseCombatPower=self._T.originalSummonPower*(self.HeroLevel/math.max(1,base))^2
+        local tag=self.Entity.NameTagComponent
+        if isvalid(tag) then tag.Name=string.gsub(tag.Name,"lv%d+$","lv"..tostring(self.HeroLevel)) end
+        self:ApplyCostume()
+        if Environment:IsMakerPlay() then log("[VRF] Resurrection base="..tostring(base).." revived="..tostring(self.HeroLevel)) end
 		self._T.dying = false
 		self.HeroHp = self.HeroMaxHp
 		self:UpdateHpBar()
@@ -1688,11 +1716,13 @@ script HeroSummon extends Component
 		if remaining > 0 and isvalid(self.OwnerEntity) and isvalid(self.OwnerEntity.PlayerComponent) then
 			self:NotifyResurrected(remaining, self.OwnerEntity.PlayerComponent.UserId)
 		end
-		log("[HeroSummon] 리저렉션 부활 - HP " .. tostring(math.floor(self.HeroMaxHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. " 지속시간 초기화 " .. tostring(math.floor(remaining)) .. "초")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 리저렉션 부활 - HP " .. tostring(math.floor(self.HeroMaxHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. " 지속시간 초기화 " .. tostring(math.floor(remaining)) .. "초") end
 	end
 
 	@ExecSpace("Client")
 	method void NotifyResurrected(number remaining)
+        -- Only the real owning character updates the world buff bar.
+        if self.OwnerEntity~=_UserService.LocalPlayer then return end
 		-- 주인 클라이언트: 우측 상단 소환 버프바를 남은 시간으로 다시 띄운다.
 		-- (비숍 개편 2026-08-08) 계통마다 아이콘이 달라 HeroLine으로 갈라준다(@Sync라 클라도 안다).
 		if self:IsArcherLine() then
@@ -1711,11 +1741,13 @@ script HeroSummon extends Component
 		if not self:IsClient() then return end
 		if not isvalid(self.Entity) then return end
 		local pos = self.Entity.TransformComponent.WorldPosition
-		_EffectService:PlayEffect("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(pos.x, pos.y + 0.3, 0), 0, Vector3(0.7, 0.7, 1), false, nil)
+		_CarnivalActorPresentation:PlayEffect(self.Entity,"21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(pos.x, pos.y + 0.3, 0), 0, Vector3(0.7, 0.7, 1), false, nil)
 	end
 
 	@ExecSpace("Client")
 	method void NotifyUnsummoned()
+        -- A replica summon must not clear the outside player’s buff UI.
+        if self.OwnerEntity~=_UserService.LocalPlayer then return end
 		-- 주인 클라이언트: 우측 상단 소환 버프바를 즉시 내린다(계통별 아이콘).
 		if self:IsArcherLine() then
 			_ArcherSummonBuffUI:HideBuff()
@@ -1749,7 +1781,7 @@ script HeroSummon extends Component
 		self.HolyShell = self.HolyShell - 1
 		self._T.holyShellInvulnUntil = now + 1.5
 		self:PlayHolyShellFx(self.HolyShell)
-		log("[HolyShell] 용사 소환수 방어! 남은 쉴드 " .. tostring(self.HolyShell))
+		if Environment:IsMakerPlay() then log("[HolyShell] 용사 소환수 방어! 남은 쉴드 " .. tostring(self.HolyShell)) end
 		return true
 	end
 
@@ -1760,15 +1792,15 @@ script HeroSummon extends Component
 		-- (플레이어 쪽 PlayerHit.PlayHolyShellBlockEffects와 같은 규격).
 		if not self:IsClient() then return end
 		if not isvalid(self.Entity) then return end
-		local serial = _EffectService:PlayEffectAttached("ec0acf34d59043f695f43c55222a7b0e", self.Entity, Vector3(0, -0.1, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Alpha"] = 0.5 })
+		local serial = _CarnivalActorPresentation:PlayEffectAttached("ec0acf34d59043f695f43c55222a7b0e", self.Entity, Vector3(0, -0.1, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8, ["Alpha"] = 0.5 })
 		_TimerService:SetTimerOnce(function()
-			_EffectService:RemoveEffect(serial)
+			_CarnivalActorPresentation:RemoveEffect(serial)
 		end, 1.2)
 		if not _AutoHuntPowerSave.active then
-		_DamageSkinService:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
+		_CarnivalDamageSkin:PlayTextDamage(self.Entity, "02c22d93421b4038b3c413b3e40b57ec", DamageSkinTextType.Guard, DamageSkinTweenType.Default)
 		end
 		if not _AutoHuntPowerSave.active then
-		_DamageSkinService:Play(
+		_CarnivalDamageSkin:Play(
 			self.Entity, "d58b67cf0f3a4eaf9fe1ad87c0ffac8a", 0,
 			{ remain }, DamageSkinTweenType.Default, false,
 			Vector2(0, 0.35), Vector2(1, 1), 1.0, 1.0, LitMode.Default
@@ -2032,7 +2064,7 @@ script HeroSummon extends Component
 				end
 			end, windup + (idx - 1) * gap)
 		end
-		log("[HeroSummon] " .. variant .. " x" .. tostring(arrows) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] " .. variant .. " x" .. tostring(arrows) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	-- 활 스킬별 적중 이펙트 RUID. 본체 스킬이 쓰는 것과 같은 클립을 골라 쓴다
@@ -2050,7 +2082,7 @@ script HeroSummon extends Component
 		if not isvalid(map) then return end
 		self._T.arrowSeq = (self._T.arrowSeq or 0) + 1
 		local myPos = self.Entity.TransformComponent.WorldPosition
-		local proj = _SpawnService:SpawnByModelId("ironarrowprojectile",
+		local proj = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"ironarrowprojectile",
 			"heroArrow_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.arrowSeq),
 			Vector3(myPos.x + dir * 0.25, myPos.y + 0.35, 0), map)
 		if not isvalid(proj) then return end
@@ -2076,7 +2108,7 @@ script HeroSummon extends Component
 			local pa = self:GetOwnerAttack()
 			if not isvalid(pa) then return end
 			pa:FireSummonProjectileShot(self.Entity, kind, tt, self:GetCombatPower(), 2.0 * dm, 2.5 * dm, 1, 1, 1)
-			log("[HeroSummon] " .. kind .. " (" .. self:GetJobName() .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] " .. kind .. " (" .. self:GetJobName() .. ")") end
 		end, 0.3)
 	end
 
@@ -2103,7 +2135,7 @@ script HeroSummon extends Component
 					multMin * dm, multMax * dm, idx, stars, self._T.starSkin or 1)
 			end, 0.25 + (idx - 1) * 0.1)
 		end
-		log("[HeroSummon] " .. variant .. " x" .. tostring(stars) .. " 표창=" .. tostring(self._T.starSkin) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] " .. variant .. " x" .. tostring(stars) .. " 표창=" .. tostring(self._T.starSkin) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2146,7 +2178,7 @@ script HeroSummon extends Component
 		if not isvalid(map) then return nil end
 		self._T.starSeq = (self._T.starSeq or 0) + 1
 		local myPos = self.Entity.TransformComponent.WorldPosition
-		local proj = _SpawnService:SpawnByModelId("luckysevenprojectile",
+		local proj = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"luckysevenprojectile",
 			"heroStar_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.starSeq),
 			Vector3(myPos.x + dir * 0.25, myPos.y + 0.35, 0), map)
 		if not isvalid(proj) then return nil end
@@ -2184,7 +2216,7 @@ script HeroSummon extends Component
 			if not isvalid(pa) then return end
 			pa:FireSummonProjectileShot(self.Entity, "avenger", tt, self:GetCombatPower(),
 				1.0 * dm, 2.0 * dm, 1, 1, 1)
-			log("[HeroSummon] 어벤져 (" .. self:GetJobName() .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 어벤져 (" .. self:GetJobName() .. ")") end
 		end, 0.6)
 	end
 
@@ -2214,7 +2246,7 @@ script HeroSummon extends Component
 				end, 0.25 + (ti - 1) * 0.07)
 			end
 		end
-		log("[HeroSummon] 표창 분산 targets=" .. tostring(thrown) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 표창 분산 targets=" .. tostring(thrown) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	-- 섬광(히어로 2차): 본체 섬광의 소환수판 - 대상 곁으로 번쩍 이동해 베고, 본체와 같은
@@ -2270,7 +2302,7 @@ script HeroSummon extends Component
 			end, math.max(0.05, slideTime * 0.6))
 		end
 		self:ThrowFlashSword(Vector2(myPos.x, myPos.y + 0.3), Vector2(tp.x, tp.y + 0.3))
-		log("[HeroSummon] 섬광(검 투척→돌진) reach=" .. string.format("%.1f", reach) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 섬광(검 투척→돌진) reach=" .. string.format("%.1f", reach) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	-- 섬광 검 투척(공용): 본체 섬광 1단계와 같은 회전 검 투척 연출. 검 아트는 소환수 장착 무기
@@ -2286,7 +2318,7 @@ script HeroSummon extends Component
 		local ndx = dxs / reach
 		local ndy = dys / reach
 		self._T.flashSeq = (self._T.flashSeq or 0) + 1
-		local sword = _SpawnService:SpawnByModelId("spearburstfadingeffect", "SummonFlashSword" .. tostring(self._T.flashSeq), Vector3(from.x, from.y, 0), map)
+		local sword = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"spearburstfadingeffect", "SummonFlashSword" .. tostring(self._T.flashSeq), Vector3(from.x, from.y, 0), map)
 		if isvalid(sword) then
 			local spr = sword.SpriteRendererComponent
 			if isvalid(spr) then
@@ -2333,7 +2365,7 @@ script HeroSummon extends Component
 		if not isvalid(mapE) then return end
 		self._T.chainVisSeq = (self._T.chainVisSeq or 0) + 1
 		local myP = self.Entity.TransformComponent.WorldPosition
-		local chain = _SpawnService:SpawnByModelId("chainshotchain",
+		local chain = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"chainshotchain",
 			"herochain_" .. tostring(self.Entity.Name) .. "_" .. tostring(self._T.chainVisSeq),
 			Vector3(myP.x, myP.y + 0.35, 0), mapE)
 		if not isvalid(chain) then
@@ -2392,7 +2424,7 @@ script HeroSummon extends Component
 			self:PlayTeleportFx()
 			if isvalid(ttU) then self._T.target = ttU end
 		end, 0.25)
-		log("[HeroSummon] 체인샷 상승(위층) (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 체인샷 상승(위층) (" .. self:GetJobName() .. ")") end
 	end
 
 	-- 섬광 도약(히어로): 위층에만 적이 있을 때 그 곁으로 올라가 벤다 - 본체 섬광과 같은
@@ -2432,7 +2464,7 @@ script HeroSummon extends Component
 			end, 0.15)
 		end
 		self:ThrowFlashSword(Vector2(myPos.x, myPos.y + 0.3), Vector2(tp.x, tp.y + 0.3))
-		log("[HeroSummon] 섬광 도약(위층, 검 투척) (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 섬광 도약(위층, 검 투척) (" .. self:GetJobName() .. ")") end
 	end
 
 	-- 돌진(전사 4차): 본체 AttackRush와 같은 로직의 소환수판.
@@ -2470,7 +2502,7 @@ script HeroSummon extends Component
 		-- ① 전방의 적만(본체 FindRushTargets - 뒤쪽 적은 밀 수 없다). 없으면 제자리 시전.
 		local targets = paR:FindRushTargets(Vector2(myPos.x, myPos.y), dir, 6, RUSH_DIST + PUSH_FRONT)
 		if targets == nil or #targets == 0 then
-			log("[HeroSummon] 돌진 제자리 시전(전방에 적 없음) (" .. self:GetJobName() .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 돌진 제자리 시전(전방에 적 없음) (" .. self:GetJobName() .. ")") end
 			return
 		end
 		-- ② 발판 끝 정지선(본체와 같은 체인워크).
@@ -2537,7 +2569,7 @@ script HeroSummon extends Component
 				timerId = nil
 			end
 		end, 1 / 60)
-		log("[HeroSummon] 돌진(본체 로직) targets=" .. tostring(#targets) .. " stopX=" .. string.format("%.2f", stopX) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 돌진(본체 로직) targets=" .. tostring(#targets) .. " stopX=" .. string.format("%.2f", stopX) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	-- 브랜디쉬(히어로 4차): 본체와 같은 구성 - 1타 1줄 + 마무리 2줄(총 3줄), 두손검 스윙.
@@ -2580,7 +2612,7 @@ script HeroSummon extends Component
 				end
 			end, 0.55 + (li - 2) * 0.1)
 		end
-		log("[HeroSummon] 브랜디쉬 (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 브랜디쉬 (" .. self:GetJobName() .. ")") end
 	end
 
 	-- ══════ 섀도어 소환수 전투 ═══════════════════════════════════════════
@@ -2666,7 +2698,7 @@ script HeroSummon extends Component
 				end, 0.2 + (idx - 1) * step + (tIdx - 1) * hopStep)
 			end
 		end
-		log("[HeroSummon] " .. variant .. " targets=" .. tostring(#targets) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] " .. variant .. " targets=" .. tostring(#targets) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2754,7 +2786,7 @@ script HeroSummon extends Component
 			self:DealHit(tt, 1.0 * heroMult, 2.0 * heroMult)
 			self:PlayFxAttachedAt("dad03b3a528348bf98295b01edd621a4", tt, dir, 0)
 		end, 0.35)
-		log("[HeroSummon] 파워스트라이크 (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 파워스트라이크 (" .. self:GetJobName() .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2779,7 +2811,7 @@ script HeroSummon extends Component
 				end, (i - 1) * 0.1)
 			end
 		end, 0.35)
-		log("[HeroSummon] 슬래쉬블래스트 (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 슬래쉬블래스트 (" .. self:GetJobName() .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2922,11 +2954,11 @@ script HeroSummon extends Component
 					end
 				end
 				if hi == 3 then
-					log("[HeroSummon] 스피어버스터 3타 완료 targets=" .. tostring(hitCount))
+					if Environment:IsMakerPlay() then log("[HeroSummon] 스피어버스터 3타 완료 targets=" .. tostring(hitCount)) end
 				end
 			end, at)
 		end
-		log("[HeroSummon] 스피어버스터 시전(선딜 1초/후딜 1.5초, 원본 타임라인) (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 스피어버스터 시전(선딜 1초/후딜 1.5초, 원본 타임라인) (" .. self:GetJobName() .. ")") end
 	end
 
 	method integer GetElemAmpLv()
@@ -2983,7 +3015,7 @@ script HeroSummon extends Component
 			self._T.elemFieldUntil = now + fieldBuffDuration
 			self:PlayMotion("swingO2", 0.7)
 			pa:PlayElementalFieldCastFx(self.Entity)
-			log("[HeroSummon] 속성필드 버프 시전(" .. tostring(fieldBuffDuration) .. "초) (" .. self:GetJobName() .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 속성필드 버프 시전(" .. tostring(fieldBuffDuration) .. "초) (" .. self:GetJobName() .. ")") end
 			return
 		end
 		-- (요청) 속성 사슬 순서 고정: 불(2) → 얼음(1) → 전기(3) → 성(4, 복귀). (주인의 자동사냥도
@@ -3003,7 +3035,7 @@ script HeroSummon extends Component
 			mode = seq[self._T.divineIdx]
 			self._T.divineMode = mode
 			self._T.nextDivineChangeAt = now + 5.0
-			log("[HeroSummon] 속성 변환 mode=" .. tostring(mode) .. " / 다음 변환 5초 후")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 속성 변환 mode=" .. tostring(mode) .. " / 다음 변환 5초 후") end
 		end
 		local motion = self:NextSwingMotion()
 		self:PlayMotion(motion, 1.0)
@@ -3128,7 +3160,7 @@ script HeroSummon extends Component
 					fusionTriggered = true
 					pa2:SpawnChargeBlowCurseZoneForWithAmp(self.Entity, myCp, myAmp)
 					pa2:ConsumeAllElemFieldsAt(myPos, curseField)
-					log("[HeroSummon] 허공 연계: 화상 저주 (필드 " .. tostring(curseField) .. " + 속성 " .. tostring(myMode) .. ")")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 허공 연계: 화상 저주 (필드 " .. tostring(curseField) .. " + 속성 " .. tostring(myMode) .. ")") end
 				end
 				local shockField = 0
 				if myMode == 3 and pa2:IsPosInElemField(myPos, 1) then shockField = 1
@@ -3138,7 +3170,7 @@ script HeroSummon extends Component
 					pa2:PlayChargeBlowShockHitEffect(self.Entity)
 					pa2:SpawnChargeBlowShockZoneForWithAmp(self.Entity, myCp, myAmp)
 					pa2:ConsumeAllElemFieldsAt(myPos, shockField)
-					log("[HeroSummon] 허공 연계: 감전 장판 (필드 " .. tostring(shockField) .. " + 속성 " .. tostring(myMode) .. ")")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 허공 연계: 감전 장판 (필드 " .. tostring(shockField) .. " + 속성 " .. tostring(myMode) .. ")") end
 				end
 			end
 			-- (요청) 속성필드: 시전한 속성(1~3)의 필드를 남긴다. 다음 사슬 스텝이 이 필드를 소모하므로
@@ -3147,10 +3179,10 @@ script HeroSummon extends Component
 			if myField and myMode >= 1 and myMode <= 3 and not fusionTriggered then
 				pa2:SpawnElemFieldAtPosForSummon(fieldPos, myMode, self:GetElemFieldZoneDuration(), self.Entity)
 			elseif fusionTriggered then
-				log("[HeroSummon] 속성 연계 성립 - 현재 공격의 속성필드 재료도 소모")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 속성 연계 성립 - 현재 공격의 속성필드 재료도 소모") end
 			end
 		end, 0.45)
-		log("[HeroSummon] 차지 블로우 mode=" .. tostring(mode) .. " (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 차지 블로우 mode=" .. tostring(mode) .. " (" .. self:GetJobName() .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3172,7 +3204,7 @@ script HeroSummon extends Component
 		-- 짧게 뒤 다시 확인하고, 쿨다운·모션·이펙트·소모는 시작하지 않는다.
 		if kind == "coma" and (self._T.heroOrbCount or 0) <= 0 then
 			self._T.nextSpecialAt = now + 1.0
-			log("[HeroSummon] 패닉/코마 보류 - 콤보 구슬 없음")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 패닉/코마 보류 - 콤보 구슬 없음") end
 			return
 		end
 		self._T.nextSpecialAt = now + 15.0 + _UtilLogic:RandomDouble() * 15.0
@@ -3195,9 +3227,9 @@ script HeroSummon extends Component
 				local panicTarget = self:FindKnightPanicTarget(pa, dir)
 				if isvalid(panicTarget) then
 					self:CastKnightPanic(panicTarget, dir, now)
-					log("[HeroSummon] 특수기 전환 coma→panic targets=" .. tostring(comaTargets ~= nil and #comaTargets or 0))
+					if Environment:IsMakerPlay() then log("[HeroSummon] 특수기 전환 coma→panic targets=" .. tostring(comaTargets ~= nil and #comaTargets or 0)) end
 				else
-					log("[HeroSummon] 패닉 보류 - 패닉 사거리 대상 없음")
+					if Environment:IsMakerPlay() then log("[HeroSummon] 패닉 보류 - 패닉 사거리 대상 없음") end
 				end
 				return
 			end
@@ -3223,9 +3255,9 @@ script HeroSummon extends Component
 					pa2:PlayComaHitEffect(t, 5)
 				end
 			end
-			log("[HeroSummon] coma 발동 targets=" .. tostring(#targets))
+			if Environment:IsMakerPlay() then log("[HeroSummon] coma 발동 targets=" .. tostring(#targets)) end
 		end, 0.5)
-		log("[HeroSummon] 특수기 coma (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 특수기 coma (" .. self:GetJobName() .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3263,7 +3295,7 @@ script HeroSummon extends Component
 		local orbCount = math.min(self._T.heroOrbCount or 0, 10)
 		if orbCount <= 0 then
 			self._T.nextSpecialAt = now + 1.0
-			log("[HeroSummon] 패닉 취소 - 콤보 구슬 없음")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 패닉 취소 - 콤보 구슬 없음") end
 			return
 		end
 		self._T.attackLockUntil = now + 1.0
@@ -3279,7 +3311,7 @@ script HeroSummon extends Component
 			local panicMult = (not self.KnightVariant) and 0.5 or 1.0
 			self:DealHit(target, 6.15 * 1.3 * panicMult * orbCount, 8.20 * 1.3 * panicMult * orbCount)
 			pa2:PlayPanicEffects(self.Entity, dir, { target }, orbCount, "")
-			log("[HeroSummon] 기사 panic 적중 orbCount=" .. tostring(orbCount))
+			if Environment:IsMakerPlay() then log("[HeroSummon] 기사 panic 적중 orbCount=" .. tostring(orbCount)) end
 		end, 0.45)
 	end
 
@@ -3292,13 +3324,13 @@ script HeroSummon extends Component
 		local roarCost = math.floor(self.HeroMaxHp * 0.30)
 		if self.HeroHp < self.HeroMaxHp * 0.5 then
 			self._T.nextSpecialAt = now + 15.0
-			log("[HeroSummon] 드래곤로어 취소 - HP 50% 미만 (" .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. ")")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤로어 취소 - HP 50% 미만 (" .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)) .. ")") end
 			return
 		end
 		self.HeroHp = self.HeroHp - roarCost
 		self:UpdateHpBar()
 		self:FlashHpBar()
-		log("[HeroSummon] 드래곤로어 HP 소모 " .. tostring(roarCost) .. " → " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp)))
+		if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤로어 HP 소모 " .. tostring(roarCost) .. " → " .. tostring(math.floor(self.HeroHp)) .. "/" .. tostring(math.floor(self.HeroMaxHp))) end
 		-- 드래곤로어(용기사 이상): (피드백) 원본 규격으로 재작업.
 		--   사용 전 1초 제자리 → 시전(alert 모션 + 원본 시전 이펙트/사운드/화면흔들림 + 2초 자기 스턴 표시)
 		--   → 1.5초 뒤 폭발(전방위 최대 20명, 전투력 1000%~1300% + 원본 히트 이펙트) → 사용 후 3초 제자리.
@@ -3330,9 +3362,9 @@ script HeroSummon extends Component
 					pa:PlayDragonRoarHitEffect(t)
 				end
 			end
-			log("[HeroSummon] 드래곤로어 폭발 targets=" .. tostring(#targets))
+			if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤로어 폭발 targets=" .. tostring(#targets)) end
 		end, 2.5)
-		log("[HeroSummon] 드래곤로어 시전(선딜 1초/후딜 3초) (" .. self:GetJobName() .. ")")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤로어 시전(선딜 1초/후딜 3초) (" .. self:GetJobName() .. ")") end
 	end
 
 	-- ── 버프(서버) ───────────────────────────────────────────────
@@ -3424,7 +3456,7 @@ script HeroSummon extends Component
 			_TimerService:SetTimerOnce(function()
 				if self._T.buffToken == tok then self._T.dmgMult = 1.0 end
 			end, 30.0)
-			log("[HeroSummon] 버프: 분노(30초, 데미지 1.3배)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 분노(30초, 데미지 1.3배)") end
 		elseif kind == "comboattack" then
 			-- 콤보어택(30초): 데미지 1.2배 + 시전 마법진/사운드 + (피드백) 플레이어와 같은
 			-- 궤도를 도는 콤보 구슬 연출. 버프 중 스킬을 쓸 때마다 +1(최대 5), 코마가 전부 소모한다.
@@ -3439,13 +3471,13 @@ script HeroSummon extends Component
 					self:ClearHeroOrbs()
 				end
 			end, 30.0)
-			log("[HeroSummon] 버프: 콤보 어택(30초, 데미지 1.2배 + 콤보 구슬)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 콤보 어택(30초, 데미지 1.2배 + 콤보 구슬)") end
 		elseif kind == "powerguard" then
 			-- 파워가드(30초): 시각 효과(좌우 합쳐짐 + 본체 실드) 재현. 몬스터가 용사를 공격하지
 			-- 않으므로 반사 효과는 표현만 한다.
 			self:CastPowerGuardFx(pa, dir)
 			pa:PlayBuffSound("a83d56a314fd449cad236fd7d9b2fa63")
-			log("[HeroSummon] 버프: 파워가드(30초)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 파워가드(30초)") end
 		elseif kind == "booster" then
 			-- 부스터(1분, 본인의 부스터와 별개): 공격 쿨타임 0.9배.
 			self._T.atkCdMult = 0.9
@@ -3454,7 +3486,7 @@ script HeroSummon extends Component
 			_TimerService:SetTimerOnce(function()
 				if self._T.buffToken == tok then self._T.atkCdMult = 1.0 end
 			end, 60.0)
-			log("[HeroSummon] 버프: 부스터(60초, 공격 쿨타임 0.9배)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 부스터(60초, 공격 쿨타임 0.9배)") end
 		elseif kind == "knight" then
 			-- 나이트 공속 버프(1분): 공속 +2단계 = 쿨타임 0.81배(0.9^2).
 			self._T.atkCdMult = 0.81
@@ -3463,24 +3495,24 @@ script HeroSummon extends Component
 			_TimerService:SetTimerOnce(function()
 				if self._T.buffToken == tok then self._T.atkCdMult = 1.0 end
 			end, 60.0)
-			log("[HeroSummon] 버프: 공격속도 +20%(60초, 쿨타임 0.81배)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 공격속도 +20%(60초, 쿨타임 0.81배)") end
 		elseif kind == "guard" then
 			-- 가드(팔라딘): 본체와 같은 규격 - 1.2초 패링 창을 열고, 그 안에 맞으면 피해를 통째로
 			-- 막고(가드 표시) 2초 무적 + 10초간 받는 피해 30% 감소를 얻는다. 자체 쿨 30초.
 			local nowG = _UtilLogic.ElapsedSeconds
 			self._T.guardReadyAt = nowG + 30.0
 			self._T.guardWindowUntil = nowG + 1.2
-			log("[HeroSummon] 버프: 가드(1.2초 패링 창)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 가드(1.2초 패링 창)") end
 		elseif kind == "dragonride" then
 			-- 드래곤 라이딩(다크나이트 3차+): 드래곤이 살아 있으면 재소환하지 않는다(중복 방지).
 			local nowD = _UtilLogic.ElapsedSeconds
 			if (self._T.summonDragonUntil or 0) > nowD then
-				log("[HeroSummon] 드래곤 라이딩 - 이미 소환 중(건너뜀)")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 드래곤 라이딩 - 이미 소환 중(건너뜀)") end
 			else
 				local DRAGON_DUR = 150.0
 				self._T.summonDragonUntil = nowD + DRAGON_DUR
 				self._T.rideDragonEnt = pa:SpawnSummonRideDragon(self.Entity, self:GetCombatPower(), DRAGON_DUR)
-				log("[HeroSummon] 버프: 드래곤 라이딩(" .. tostring(DRAGON_DUR) .. "초)")
+				if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 드래곤 라이딩(" .. tostring(DRAGON_DUR) .. "초)") end
 			end
 		elseif kind == "shadowpartner" then
 			-- (요청 2026-08-08) 쉐도우 파트너(도적 3차, 60초): 본체와 같은 성격 - **타수 2배**다.
@@ -3492,7 +3524,7 @@ script HeroSummon extends Component
 			_TimerService:SetTimerOnce(function()
 				if self._T.buffToken == tok then self._T.dmgMult = 1.0 end
 			end, 60.0)
-			log("[HeroSummon] 버프: 쉐도우 파트너(60초, 데미지 2배)")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 쉐도우 파트너(60초, 데미지 2배)") end
 		elseif kind == "haste" then
 			-- (요청 2026-08-08) 헤이스트(도적류, 60초): 자신의 이동/공격/점프가 빨라지고,
 			-- **곁의 파티원(다른 소환수 + 주인)에게 버프가 없으면 함께 걸어준다**.
@@ -3508,7 +3540,7 @@ script HeroSummon extends Component
 			-- 자기 헤이스트 창 기록 - GetBuffKind가 "꺼져 있으면 헤이스트 최우선" 판단에 쓴다.
 			self._T.selfHasteUntil = now + 60.0
 			self:SpreadHasteToParty()
-			log("[HeroSummon] 버프: 헤이스트(60초) - 파티원에게도 전파")
+			if Environment:IsMakerPlay() then log("[HeroSummon] 버프: 헤이스트(60초) - 파티원에게도 전파") end
 		end
 	end
 
@@ -3542,7 +3574,7 @@ script HeroSummon extends Component
 				if pa:GrantHasteFromSummon(60.0) then spread = spread + 1 end
 			end
 		end
-		log("[HeroSummon] 헤이스트 전파 - " .. tostring(spread) .. "명")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 헤이스트 전파 - " .. tostring(spread) .. "명") end
 	end
 
 	-- 다른 소환수에게서 헤이스트를 받는다. 이미 받고 있으면 false(중복 시전 방지).
@@ -3577,7 +3609,7 @@ script HeroSummon extends Component
 				if self._T.baseJumpForce ~= nil then mv2.JumpForce = self._T.baseJumpForce end
 			end
 		end, duration)
-		log("[HeroSummon] 헤이스트 받음(" .. tostring(duration) .. "초, 이동속도/점프 +20%)")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 헤이스트 받음(" .. tostring(duration) .. "초, 이동속도/점프 +20%)") end
 		return true
 	end
 
@@ -3594,7 +3626,7 @@ script HeroSummon extends Component
 		local idx = count + 1
 		self._T.heroOrbCount = idx
 		if idx == 1 then
-			local center = _SpawnService:SpawnByModelId("spearburstfadingeffect", "HeroOrbCenter", Vector3(0, 0.35, 0), self.Entity)
+			local center = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"spearburstfadingeffect", "HeroOrbCenter", Vector3(0, 0.35, 0), self.Entity)
 			if isvalid(center) then
 				center:AddComponent("script.ComboOrb")
 				---@type ComboOrb
@@ -3606,7 +3638,7 @@ script HeroSummon extends Component
 				self._T.heroOrbCenter = center
 			end
 		end
-		local fx = _SpawnService:SpawnByModelId("spearburstfadingeffect", "HeroOrb" .. idx, Vector3(0, 0.35, 0), self.Entity)
+		local fx = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"spearburstfadingeffect", "HeroOrb" .. idx, Vector3(0, 0.35, 0), self.Entity)
 		if isvalid(fx) then
 			fx:AddComponent("script.ComboOrb")
 			---@type ComboOrb
@@ -3618,7 +3650,7 @@ script HeroSummon extends Component
 			self._T.heroOrbEntities = self._T.heroOrbEntities or {}
 			table.insert(self._T.heroOrbEntities, fx)
 		end
-		log("[HeroSummon] 콤보 구슬 +1 → " .. tostring(idx) .. "/5")
+		if Environment:IsMakerPlay() then log("[HeroSummon] 콤보 구슬 +1 → " .. tostring(idx) .. "/5") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3707,9 +3739,9 @@ script HeroSummon extends Component
 		if not self:IsClient() then return end
 		if not isvalid(anchor) then return end
 		local options = { ["FlipX"] = dirX > 0, ["OrderInLayer"] = 6 }
-		local serial = _EffectService:PlayEffectAttached(clipRuid, anchor, Vector3(0, offsetY, 0), 0, Vector3(1, 1, 1), false, options)
+		local serial = _CarnivalActorPresentation:PlayEffectAttached(clipRuid, anchor, Vector3(0, offsetY, 0), 0, Vector3(1, 1, 1), false, options)
 		_TimerService:SetTimerOnce(function()
-			_EffectService:RemoveEffect(serial)
+			_CarnivalActorPresentation:RemoveEffect(serial)
 		end, 2.0)
 	end
 
@@ -3723,10 +3755,10 @@ script HeroSummon extends Component
 			"eed46092f65940a7a8e77a1bd8e2aa75",
 		}
 		local ruid = hits[math.floor(_UtilLogic:RandomDouble() * #hits) + 1]
-		local serial = _EffectService:PlayEffectAttached(ruid, target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = dirX > 0 })
+		local serial = _CarnivalActorPresentation:PlayEffectAttached(ruid, target, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["FlipX"] = dirX > 0 })
 		_GameAudio:PlaySound("0f213b255ab34a0e8ed258c89f3b62fe", 1.0)
 		_TimerService:SetTimerOnce(function()
-			_EffectService:RemoveEffect(serial)
+			_CarnivalActorPresentation:RemoveEffect(serial)
 		end, 1.5)
 	end
 
@@ -3735,7 +3767,7 @@ script HeroSummon extends Component
 		-- 콤보어택 시전 마법진 버스트 + 사용음(다크드래곤과 동일한 RUID)을 용사 위치에서 재생.
 		if not self:IsClient() then return end
 		if not isvalid(self.Entity) then return end
-		_EffectService:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
+		_CarnivalActorPresentation:PlayEffectAttached("19e3ba3ab994431b81a3d4ee7a1b86e0", self.Entity, Vector3(0, 0, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
 		_GameAudio:PlaySound("4b254b65adbe4df4885acbe2e2fa3671", 1.0)
 	end
 
@@ -3744,7 +3776,7 @@ script HeroSummon extends Component
 		-- 범용 사운드 재생.
 		if not self:IsClient() then return end
 		if soundRuid == nil or soundRuid == "" then return end
-		log("[HeroSummon] (클라) 사운드 재생 " .. soundRuid)
+		if Environment:IsMakerPlay() then log("[HeroSummon] (클라) 사운드 재생 " .. soundRuid) end
 		_GameAudio:PlaySound(soundRuid, 1.0)
 	end
 
@@ -3753,10 +3785,10 @@ script HeroSummon extends Component
 		-- 소환 시 1회: 영웅의 메아리(효과+사운드)를 용사 위치에서 재생.
 		if not self:IsClient() then return end
 		if not isvalid(self.Entity) then return end
-		local serial = _EffectService:PlayEffectAttached("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
+		local serial = _CarnivalActorPresentation:PlayEffectAttached("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 8 })
 		_GameAudio:PlaySound("358e9f9bdc8c45e893c5a1f839bea8cf", 1.0)
 		_TimerService:SetTimerOnce(function()
-			_EffectService:RemoveEffect(serial)
+			_CarnivalActorPresentation:RemoveEffect(serial)
 		end, 2.5)
 	end
 
@@ -3765,9 +3797,9 @@ script HeroSummon extends Component
 		-- 주인 곁으로 순간이동할 때 1회 재생.
 		if not self:IsClient() then return end
 		if not isvalid(self.Entity) then return end
-		local serial = _EffectService:PlayEffectAttached("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(0.7, 0.7, 1), false, { ["OrderInLayer"] = 8 })
+		local serial = _CarnivalActorPresentation:PlayEffectAttached("21d3191f10984059bf84b16fe406698e", self.Entity, Vector3(0, 0.3, 0), 0, Vector3(0.7, 0.7, 1), false, { ["OrderInLayer"] = 8 })
 		_TimerService:SetTimerOnce(function()
-			_EffectService:RemoveEffect(serial)
+			_CarnivalActorPresentation:RemoveEffect(serial)
 		end, 2.0)
 	end
 
@@ -3804,6 +3836,7 @@ script HeroSummon extends Component
 		if not isvalid(ar) then return end
 		local body = ar:GetBodyEntity()
 		if not isvalid(body) then return end
+        if self._T.pendingAvatarMotion~=nil then self:OnSyncProperty("MotionCmd",self._T.pendingAvatarMotion) end
 		local now = _UtilLogic.ElapsedSeconds
 		if (self._T.motionLockUntil or 0) > now then return end
 		local want = self.LocoState
@@ -3832,7 +3865,8 @@ script HeroSummon extends Component
 			ev.PartsActionName = "stand1"
 			ev.PlayType = SpriteAnimClipPlayType.ZigzagLoop
 		end
-		body:SendEvent(ev)
+		self._T.avatarAction={ev.CoreActionName,ev.PartsActionName,ev.PlayRate,ev.PlayType,ev.StartFrameIndex,ev.EndFrameIndex}
+        body:SendEvent(ev)
 		self._T.lastLoco = want
 	end
 
@@ -3843,15 +3877,17 @@ script HeroSummon extends Component
 		--   "seq|모션명|0.001|프레임번호"  → 그 프레임 하나에 정지(포즈 - 스피어버스터 조합 모션용.
 		--   구간 길이 0이면 엔진이 무시하므로 End=Start+1, PlayRate 0.001로 사실상 정지시킨다)
 		if name ~= "MotionCmd" then return end
+        self._T.pendingAvatarMotion=value
 		local s = tostring(value or "")
-		if s == "" then return end
+		if s == "" then self._T.pendingAvatarMotion=nil return end
 		local parts = {}
 		for p in string.gmatch(s, "[^|]+") do
 			table.insert(parts, p)
 		end
 		local motion = parts[2]
-		if motion == nil or motion == "" then return end
+		if motion == nil or motion == "" then self._T.pendingAvatarMotion=nil return end
 		if motion == "revive" then
+            self._T.pendingAvatarMotion=nil
 			-- 리저렉션 부활: 사망 스핀을 즉시 멈추고 아바타 루트를 원위치(원래 높이)/원회전으로 되돌린 뒤
 			-- 잠금을 풀어 이동 클립(stand/walk)을 즉시 재개한다. 스핀 중지 플래그를 먼저 꺼서
 			-- 같은 프레임의 ClientTick이 궤도 오프셋을 다시 쓰지 못하게 한다.
@@ -3882,7 +3918,9 @@ script HeroSummon extends Component
 			self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 21.0
 			self._T.lastLoco = nil
 			local ev2 = ActionStateChangedEvent("dead", "stand1", 0.001, SpriteAnimClipPlayType.Onetime, 0, 1)
-			dbody:SendEvent(ev2)
+			self._T.pendingAvatarMotion=nil
+        self._T.avatarAction={ev2.CoreActionName,ev2.PartsActionName,ev2.PlayRate,ev2.PlayType,ev2.StartFrameIndex,ev2.EndFrameIndex}
+        dbody:SendEvent(ev2)
 			-- (피드백) body만 돌리면 얼굴(눈)이 안 따라온다 - 얼굴은 별개 엔티티(GetFaceEntity)라서.
 			-- body/얼굴/파츠 전체를 묶는 아바타 루트 엔티티를 돌린다(네임태그/HP바는 이 바깥이라 제자리).
 			local spinRoot = dar:GetAvatarRootEntity()
@@ -3913,7 +3951,9 @@ script HeroSummon extends Component
 			ev.PlayType = SpriteAnimClipPlayType.Onetime
 			self._T.motionLockUntil = _UtilLogic.ElapsedSeconds + 0.7 / math.max(rate, 0.001)
 		end
-		body:SendEvent(ev)
+		self._T.pendingAvatarMotion=nil
+        self._T.avatarAction={ev.CoreActionName,ev.PartsActionName,ev.PlayRate,ev.PlayType,ev.StartFrameIndex,ev.EndFrameIndex}
+        body:SendEvent(ev)
 		self._T.lastLoco = nil   -- 모션이 끝나면 이동 클립을 다시 적용하게 강제
 	end
 

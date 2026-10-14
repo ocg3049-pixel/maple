@@ -1,9 +1,185 @@
 @Logic
 script TestCommandManager extends Logic
 
-	@ExecSpace("ClientOnly")
-	method void OnBeginPlay()
-		-- Retired: keep the registered entry, without input hooks or test commands.
-		log("[TestCommand] retired: command UI and handlers removed")
-	end
+    @Sync
+    property string huntBenchmarkUser = ""
+
+    method boolean IsHuntBenchmarkActor(Entity actor)
+        -- Resource/SP overrides are scoped to one explicitly enabled Maker actor.
+        return Environment:IsMakerPlay() and self.huntBenchmarkUser ~= ""
+            and isvalid(actor) and isvalid(actor.PlayerComponent)
+            and actor.PlayerComponent.UserId == self.huntBenchmarkUser
+    end
+
+    @ExecSpace("Server")
+    method void SetHuntBenchmarkMode(boolean enabled)
+        -- Never enable test resources in a published world or for another player.
+        if not Environment:IsMakerPlay() then return end
+        local actor = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(actor) then return end
+        if enabled then
+            if self.huntBenchmarkUser ~= "" and self.huntBenchmarkUser ~= senderUserId then return end
+            self.huntBenchmarkUser = senderUserId
+            actor.PlayerComponent.Hp = actor.PlayerComponent.MaxHp
+        elseif self.huntBenchmarkUser == senderUserId then
+            self.huntBenchmarkUser = ""
+        end
+        log("[VRF][HuntBenchmark] unlimited resources=" .. tostring(enabled))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self:ResetSession()
+        if Environment:IsMakerPlay() then log("[VRF][TestCommand] ready maker=" .. tostring(Environment:IsMakerPlay())) end
+    end
+
+    method table JobNames()
+        return {"히어로", "팔라딘", "다크나이트", "비숍", "아크메이지(썬,콜)", "아크메이지(불,독)", "신궁", "보우마스터", "나이트로드", "섀도어"}
+    end
+
+    method integer ResolveJob(string name)
+        name = string.gsub(name or "", "%s+", "")
+        for index, jobName in ipairs(self:JobNames()) do
+            if name == jobName then return index end
+        end
+        local aliases = { ["썬콜"]=5, ["썬콜법사"]=5, ["아크메이지(썬콜)"]=5,
+            ["불독"]=6, ["불독법사"]=6, ["아크메이지(불독)"]=6,
+            ["닼나"]=3, ["보마"]=8, ["나로"]=9, ["쉐도어"]=10 }
+        return aliases[name] or 0
+    end
+
+    method table ParseCommand(string text)
+        local command, argument = string.match(text or "", "^%s*(/%S+)%s*(.-)%s*$")
+        if command ~= "/레벨" and command ~= "/전직" then return {handled=false} end
+        if command == "/레벨" then
+            local level = tonumber(argument)
+            if not string.match(argument, "^%d+$") or level == nil or level < 1 or level > 200 then
+                return {handled=true, error="사용법: /레벨 1~200 (정수). 예: /레벨 100"}
+            end
+            return {handled=true, kind="level", value=math.floor(level)}
+        end
+        local job = self:ResolveJob(argument)
+        if job == 0 then
+            return {handled=true, error="사용법: /전직 직업명 — 히어로, 팔라딘, 다크나이트, 비숍, 썬콜, 불독, 신궁, 보우마스터, 나이트로드, 섀도어"}
+        end
+        return {handled=true, kind="job", value=job}
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean HandleCommand(string uid, string text)
+        local result = self:ParseCommand(text)
+        if not result.handled then return false end
+        if not Environment:IsMakerPlay() then
+            _MapleHUDManager:ReceiveChat("테스트", "메이커 플레이에서만 사용하는 명령어입니다.", "map", "", false, uid)
+            return true
+        end
+        if result.error ~= nil then
+            _MapleHUDManager:ReceiveChat("테스트", result.error, "map", "", false, uid)
+            return true
+        end
+        local player = _UserService:GetUserEntityByUserId(uid)
+        local sv = _CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        if not isvalid(player) or sv == nil or sv.activeId == nil or sv.activeId == "" then
+            _MapleHUDManager:ReceiveChat("테스트", "캐릭터로 입장한 뒤 사용해주세요.", "map", "", false, uid)
+            return true
+        end
+        -- Keep the approved Maker override on the server too. It is session-only
+        -- and never replaces the character's saved level.
+        if result.kind == "level" then sv.testLevel = result.value end
+        self:ApplyCommand(result.kind, result.value, uid)
+        if Environment:IsMakerPlay() then log("[VRF][TestCommand] accepted " .. result.kind .. "=" .. tostring(result.value)) end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetSession()
+        self._T.level = 0
+        self._T.job = 0
+        self._T.snapshot = nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer GetLevelOverride()
+        return self._T.level or 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer GetJobOverride()
+        return self._T.job or 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method number GetCombatPowerOverride()
+        local level = self:GetLevelOverride()
+        if level <= 0 then return 0 end
+        return _CharInfoManager:ScaleFinalCombatPower(_CharInfoManager:GetEquipCPForLevel(level))
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method string PreserveTestBuild(string current)
+        -- Only the temporary build is frozen. Rewards, items and receipts stay live.
+        local baseline=self._T.snapshot
+        if baseline==nil then return current end
+        local protected={CP=true,LV=true,SP=true,H=true,RS=true,MOBILE=true,PH=true,SPREADAUTO=true}
+        local lines={}
+        for line in string.gmatch(current,"[^\r\n]+") do
+            if not protected[string.match(line,"^([^\t]+)")] then table.insert(lines,line) end
+        end
+        for line in string.gmatch(baseline,"[^\r\n]+") do
+            if protected[string.match(line,"^([^\t]+)")] then table.insert(lines,line) end
+        end
+        return table.concat(lines,"\n")
+    end
+
+    @ExecSpace("Client")
+    method void ApplyCommand(string kind, integer value)
+        if not Environment:IsMakerPlay() or not _LoginFlow:IsInGame() then return end
+        local cl = _CharacterPersistence._T.cl
+        if cl == nil or not cl.entered then return end
+        if kind == "level" then
+            if value < 1 or value > 200 then return end
+        elseif kind == "job" then
+            if value < 1 or value > 10 then return end
+        else return end
+        -- Keep the pre-test client snapshot: temporary SP, hotkey and level changes
+        -- must not overwrite the character's normal equipment-based build.
+        if self._T.snapshot == nil then
+            self._T.snapshot = _CharacterPersistence:BuildSaveString()
+            _MapleHUDManager:ReceiveChat("테스트", "임시 테스트 모드: 재입장하면 원래 상태로 돌아갑니다. 임시 레벨·직업·스킬 분배만 복구하며 아이템·보상은 정상 저장됩니다.", "map", "", false)
+        end
+        if kind == "level" then
+            self._T.level = value
+        else
+            -- Keep the current level when changing the job's main-stat formula.
+            if self:GetLevelOverride() == 0 then self._T.level = _CharInfoManager:GetDisplayLevel() end
+            self._T.job = value
+            _SkillManager:EndHurricane()
+            _SkillManager:EndRapidFire()
+            _SkillManager:CancelPiercing()
+            _SkillManager:CancelSniping()
+            _SkillManager:CleanupJobExclusiveBuffs(value)
+            _SkillManager:RebuildVisibleSkills(value)
+            _SkillManager:RefundAllSkillPoints()
+            _SkillManager:RefreshBoosterIcon()
+        end
+        _SkillManager._T.pendingLevelDrop = nil
+        _SkillManager._T.pendingLevelDropTicks = 0
+        _SkillManager._T.watchedLevel = self:GetLevelOverride()
+        _SkillManager:ReconcileSkillPointsToLevel()
+        _SkillManager:RefreshSkillWindowForLevelChange()
+        _SkillManager:UpdateSkillBookTitle()
+        _SkillManager:SyncSkillEffectsToServer()
+        _UIMyInfoManager:UpdateBars()
+        _CharInfoManager:RefreshCharInfo()
+        local player = _UserService.LocalPlayer
+        if isvalid(player) then
+            local attack = player:GetComponent("script.PlayerAttack")
+            if isvalid(attack) then attack:SyncCombatLevel(self:GetLevelOverride()) end
+        end
+        local jobName = self:JobNames()[_UIMyInfoManager:GetSelectedCharacterJobIdx()] or ""
+        local message = "레벨 " .. tostring(_CharInfoManager:GetDisplayLevel()) .. " / 전투력 " .. tostring(_CharInfoManager:CalcCombatPower()) .. " / 직업 " .. jobName
+        _MapleHUDManager:ReceiveChat("테스트", message, "map", "", false)
+        if Environment:IsMakerPlay() then log("[VRF][TestCommand] applied " .. message) end
+    end
 end

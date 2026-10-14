@@ -22,7 +22,8 @@ script BahamutSummon extends Component
 	-- 맵 자식이라 클라가 부모로 주인을 알 수 없다 → 주인을 @Sync로 내려준다.
 	-- (AddComponent 직후 대입이라 클라 첫 프레임엔 nil일 수 있다 - 아래에서 nil 가드)
 	@Sync property Entity OwnerEntity = nil
-	property number Lifetime = 600               -- 서버 전용 수명(초). 10분.
+	@Sync property number Lifetime = 600               -- 서버 전용 수명(초). 10분.
+	@Sync property number ExpiresAt = 0
 	@Sync property string AtkState = ""          -- "" | "atk"
 	@Sync property integer AtkSeq = 0            -- 공격 시작마다 +1. 클라가 모션 재시작 시점을 잡는 기준.
 	@Sync property number FacingX = -1           -- 시트 원본이 왼쪽을 보므로 -1=왼쪽(원본), +1=오른쪽(Flip)
@@ -34,24 +35,33 @@ script BahamutSummon extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
-		-- 서버: 수명 타이머 + 0.5초 간격 전투 판단 루프.
-		_TimerService:SetTimerOnce(function()
-			if not isvalid(self.Entity) then return end
-			self.Dying = true
-			_TimerService:SetTimerOnce(function()
-				if isvalid(self.Entity) then self.Entity:Destroy() end
-			end, 1.1)
-		end, self.Lifetime)
+        -- AddComponent runs before the caller assigns Lifetime; initialize on the next tick.
+        self._T.initTimerId=_TimerService:SetTimerOnce(function()
+            self._T.initTimerId=nil
+            if not isvalid(self.Entity) then return end
+            self.ExpiresAt=_UtilLogic.ServerElapsedSeconds+self.Lifetime
+            self._T.lifeTimerId=_TimerService:SetTimerOnce(function()
+                self._T.lifeTimerId=nil
+                if not isvalid(self.Entity) then return end
+                self.Dying=true
+                _TimerService:SetTimerOnce(function()
+                    if isvalid(self.Entity) then self.Entity:Destroy() end
+                end,1.1)
+            end,self.Lifetime)
+            if Environment:IsMakerPlay() then log("[VRF] Bahamut lifetime initialized="..tostring(self.Lifetime)) end
+        end,0.05)
 		self._T.combatTimerId = _TimerService:SetTimerRepeat(function()
 			if not isvalid(self.Entity) then return end
 			self:CombatTick()
 		end, 0.5)
-		log("[Bahamut] 소환 - 수명 " .. tostring(self.Lifetime) .. "초")
+		if Environment:IsMakerPlay() then log("[Bahamut] 소환 - 수명 " .. tostring(self.Lifetime) .. "초") end
 	end
 
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
-		-- 전투 루프 타이머 정리.
+        -- Release lifetime and combat timers when replaced, dismissed or stopped.
+        if self._T.initTimerId then _TimerService:ClearTimer(self._T.initTimerId) end
+        if self._T.lifeTimerId then _TimerService:ClearTimer(self._T.lifeTimerId) end
 		if self._T.combatTimerId ~= nil then
 			_TimerService:ClearTimer(self._T.combatTimerId)
 			self._T.combatTimerId = nil
@@ -60,6 +70,7 @@ script BahamutSummon extends Component
 
 	@ExecSpace("Server")
 	method void ReportBahamutPos(number x, number y)
+        if senderUserId~=_CarnivalReplica:OwnerUserId(self.OwnerEntity) then return end
 		-- 소유 클라가 계산한 실제 바하뮤트 월드좌표. 0.15초마다 갱신(프리져/피닉스와 동일한 보고 방식).
 		-- 이 엔티티는 이동을 클라가 계산하므로(HP가 없어 피격 판정이 없다) 서버 Transform은 스폰 당시
 		-- 로컬 좌표 그대로다 → 적 탐색 기준점으로 쓰려면 반드시 클라가 알려줘야 한다.
@@ -144,7 +155,7 @@ script BahamutSummon extends Component
 		-- 타격 순간에도 기준점은 바하뮤트 자신(탐색과 동일).
 		local targets = pa:FindMonstersInRadius(self:GetSearchCenter(), 6.5, 6)
 		if #targets == 0 then
-			log("[Bahamut] 브레스 - 타격 시점에 대상 없음")
+			if Environment:IsMakerPlay() then log("[Bahamut] 브레스 - 타격 시점에 대상 없음") end
 			return
 		end
 		local hitCount = 0
@@ -155,7 +166,7 @@ script BahamutSummon extends Component
 				hitCount = hitCount + 1
 			end
 		end
-		log("[Bahamut] 브레스 타격 " .. tostring(hitCount) .. "마리(최대 6)")
+		if Environment:IsMakerPlay() then log("[Bahamut] 브레스 타격 " .. tostring(hitCount) .. "마리(최대 6)") end
 	end
 
 	@ExecSpace("Multicast")
@@ -164,11 +175,11 @@ script BahamutSummon extends Component
 		-- 타격음은 6마리를 동시에 때려도 한 번만(첫 대상에서만) 낸다.
 		if not self:IsClient() then return end
 		if not isvalid(target) then return end
-		local serial = _EffectService:PlayEffectAttached("598a38c6f7d747b9aedf97c18dad6dc7", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
+		local serial = _CarnivalActorPresentation:PlayOwnedEffectAttached(self.OwnerEntity,"598a38c6f7d747b9aedf97c18dad6dc7", target, Vector3(0, 0.3, 0), 0, Vector3(1, 1, 1), false, { ["OrderInLayer"] = 7 })
 		if withSound then
 			_GameAudio:PlaySound("154f797432104a0b9de86cdb7c9e7a6a", 1.0)
 		end
-		_TimerService:SetTimerOnce(function() _EffectService:RemoveEffect(serial) end, 1.2)
+		_TimerService:SetTimerOnce(function() _CarnivalActorPresentation:RemoveEffect(serial) end, 1.2)
 	end
 
 	method table GetSummonedFrames()
@@ -265,11 +276,15 @@ script BahamutSummon extends Component
 		-- 아직 동기화가 안 왔거나(스폰 직후 몇 프레임) 주인이 사라졌으면 제자리에 머문다.
 		local owner = self.OwnerEntity
 		if not isvalid(owner) or not isvalid(owner.TransformComponent) then return end
-		local pw = owner.TransformComponent.WorldPosition
+        if owner==_UserService.LocalPlayer and not self._T.buffTracked and self.ExpiresAt>0 then
+            _BahamutBuffUI:TrackSummon(self.Entity,self.Lifetime,self.ExpiresAt)
+            self._T.buffTracked=true
+        end
+		local pw = _CarnivalReplica:PresentationPosition(owner)
 
 		local look = 1
 		local ctrl = owner.PlayerControllerComponent
-		if isvalid(ctrl) then look = (ctrl.LookDirectionX >= 0) and 1 or -1 end
+		if isvalid(ctrl) then look = _CarnivalReplica:PresentationFacing(owner) end
 
 		-- 정위치(홈) = 주인 뒤쪽 1.1 / 위 0.75 + 완만한 부양.
 		-- ⚠ 여기서 정한 값에 프레임 오프셋(+0.7~0.9)이 더 얹혀서 화면상 높이가 된다.
@@ -334,7 +349,7 @@ script BahamutSummon extends Component
 		self._T.posY = ny
 
 		-- 소유 클라만 실제 월드좌표를 서버에 보고한다(서버의 적 탐색 기준점).
-		if _UserService.LocalPlayer == owner then
+		if _CarnivalReplica:IsLocalActor(owner) then
 			self._T.reportTimer = (self._T.reportTimer or 0) + delta
 			if self._T.reportTimer >= 0.15 then
 				self._T.reportTimer = 0
@@ -409,8 +424,13 @@ script BahamutSummon extends Component
 		tr.Position = Vector3(nx + offX, ny + offY, 0)
 		tr.Scale = Vector3(scale, scale, 1)
 		if sr.SpriteRUID ~= frame[1] then sr.SpriteRUID = frame[1] end
-		if sr.SortingLayer ~= "MapLayer0" then sr.SortingLayer = "MapLayer0" end
-		if sr.OrderInLayer ~= 3 then sr.OrderInLayer = 3 end
+        -- Preserve foreground sorting on every animation update (the old reset hid it behind terrain).
+        if self._T.foregroundMap~=self.Entity.CurrentMap then
+            sr.SortingLayer=_CarnivalActorPresentation:SkillForegroundLayer(self.Entity)
+            self._T.foregroundMap=self.Entity.CurrentMap
+            if Environment:IsMakerPlay() then log("[VRF] Bahamut foreground="..sr.SortingLayer) end
+        end
+        if sr.OrderInLayer~=20003 then sr.OrderInLayer=20003 end
 
 		-- 페이드인 0.4초. 소멸 중에는 끝으로 갈수록 흐려진다.
 		if self._T.fadeStart == nil then self._T.fadeStart = _UtilLogic.ElapsedSeconds end
@@ -420,6 +440,7 @@ script BahamutSummon extends Component
 			if d > 0.45 then alpha = math.max(0.0, 1.0 - (d - 0.45) / 0.5) end
 		end
 		sr.Color = Color(1, 1, 1, alpha)
+        _CarnivalActorPresentation:RefreshEntity(self.Entity)
 	end
 
 end

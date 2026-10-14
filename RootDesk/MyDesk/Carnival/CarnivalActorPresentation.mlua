@@ -1,0 +1,594 @@
+@Logic
+script CarnivalActorPresentation extends Logic
+    @ExecSpace("ClientOnly")
+    method void Bind(Entity actor, Entity view, number pixelsPerUnit, Vector2 origin)
+        -- Register a real world actor's UI surface; unregistered actors retain native rendering.
+        self._T.views=self._T.views or {}
+        self._T.views[actor.Id]={actor=actor,view=view,ppu=pixelsPerUnit,origin=origin}
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Unbind(Entity actor)
+        -- Remove the actor's attached effects before releasing its window.
+        if actor==nil then return end
+        if self._T.avatarAlpha then self._T.avatarAlpha[actor.Id]=nil end
+        if self._T.views then self._T.views[actor.Id]=nil end
+        local entities={}
+        for id,record in pairs(self._T.entities or {}) do if record.actor==actor then table.insert(entities,id) end end
+        for _,id in ipairs(entities) do self:RemoveEntity(id) end
+        local remove={}
+        for serial,effect in pairs(self._T.effects or {}) do
+            if effect.actor==actor then table.insert(remove,serial) end
+        end
+        for _,serial in ipairs(remove) do self:RemoveEffect(serial) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer PlayEffectAttached(string ruid, Entity actor, Vector3 offset, number rotation, Vector3 scale, boolean loop, table options)
+        -- Forward the original skill's resource, frame range, rate, color and transform without a second skill definition.
+        local binding=self:BindingFor(actor)
+        if binding==nil or not isvalid(binding.view) then
+            return _EffectService:PlayEffectAttached(ruid,actor,offset,rotation,scale,loop,self:ForegroundOptions(actor,options))
+        end
+        options=options or {}
+        local template=_CarnivalUI:UI("Lobby/Scene/EffectTemplate")
+        if not isvalid(template) then return 0 end
+        self._T.serial=(self._T.serial or 0)-1
+        local serial=self._T.serial
+        local node=_SpawnService:SpawnByEntity(template,"NativeSkillEffect"..tostring(-serial),Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
+        if not isvalid(node) then return 0 end
+        node.Enable=false
+        local effect={node=node,actor=binding.actor,anchor=actor,offset=offset,rotation=rotation,scale=scale,options=options,frames={},ruid=ruid,worldPosition=options.carnivalWorldPosition}
+        self._T.effects=self._T.effects or {}
+        self._T.effects[serial]=effect
+        local sprite=node.SpriteGUIRendererComponent
+        sprite.Type=ImageType.Simple
+        sprite.PreserveSprite=PreserveSpriteType.NativeSize
+        sprite.RaycastTarget=false
+        sprite.ImageRUID=DataRef(ruid)
+        sprite.StartFrameIndex=options.StartFrameIndex or 0
+        sprite.EndFrameIndex=options.EndFrameIndex or 2147483647
+        sprite.PlayRate=options.PlayRate or 1
+        sprite.AnimClipPlayType=loop and SpriteAnimClipPlayType.Loop or SpriteAnimClipPlayType.Onetime
+        sprite.FlipX=options.FlipX==true
+        sprite.FlipY=options.FlipY==true
+        local color=options.Color or Color.white
+        sprite.Color=Color(color.r,color.g,color.b,color.a*(options.Alpha or 1))
+        if options.MaterialID~=nil then sprite.MaterialId=options.MaterialID end
+        self:UpdateEffectTransform(effect,binding)
+        effect.frameEvent=node:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,function(e)
+            effect.frames[e.FrameIndex]=true
+            effect.total=e.TotalFrameCount
+            effect.last=e.FrameIndex
+        end)
+        effect.endEvent=node:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function()
+            if loop then return end
+            local count=0
+            for _,seen in pairs(effect.frames) do if seen then count=count+1 end end
+            log("[VRF] Carnival original effect completed ruid="..ruid.." frames="..tostring(count).."/"..tostring(effect.total).." last="..tostring(effect.last))
+            self:RemoveEffect(serial)
+        end)
+        node.Enable=true
+        log("[VRF] Carnival original effect routed ruid="..ruid.." rate="..tostring(sprite.PlayRate).." ppu="..tostring(binding.ppu))
+        return serial
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RemoveEffect(integer serial)
+        -- Negative IDs belong to this UI adapter; native EffectService IDs pass through unchanged.
+        if serial>=0 then _EffectService:RemoveEffect(serial) return end
+        local effect=(self._T.effects or {})[serial]
+        if effect==nil then return end
+        self._T.effects[serial]=nil
+        if isvalid(effect.node) then
+            effect.node:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,effect.frameEvent)
+            effect.node:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,effect.endEvent)
+            _EntityService:Destroy(effect.node)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Release all renderer subscriptions and temporary UI entities on stop.
+        local remove={}
+        for serial,_ in pairs(self._T.effects or {}) do table.insert(remove,serial) end
+        for _,serial in ipairs(remove) do self:RemoveEffect(serial) end
+        local entities={} for id,_ in pairs(self._T.entities or {}) do table.insert(entities,id) end
+        for _,id in ipairs(entities) do self:RemoveEntity(id) end
+        self._T.views={} self._T.effects={} self._T.entities={} self._T.owners={}
+    end
+
+    @ExecSpace("ClientOnly")
+    method integer PlayEffect(Entity owner, string ruid, Entity context, Vector3 position, number rotation, Vector3 scale, boolean loop, table options)
+        -- Converts the original world-space effect to the actor window without altering the clip.
+        local binding=self:BindingFor(owner)
+        if binding==nil or not isvalid(binding.view) then
+            return _EffectService:PlayEffect(ruid,context,position,rotation,scale,loop,self:ForegroundOptions(owner,options))
+        end
+        local effectOptions={}
+        for key,value in pairs(options or {}) do effectOptions[key]=value end
+        effectOptions.carnivalWorldPosition=position
+        local actorPos=owner.TransformComponent.WorldPosition
+        local serial=self:PlayEffectAttached(ruid,owner,position-actorPos,rotation,scale,loop,effectOptions)
+        local effect=(self._T.effects or {})[serial]
+        if effect~=nil then
+            effect.worldPosition=position
+            self:UpdateEffectTransform(effect,binding)
+        end
+        return serial
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TrackEntity(Entity actor, Entity entity)
+        -- Watches the native entity rather than simulating a second projectile.
+        if not isvalid(actor) or not isvalid(entity) or actor==entity then return end
+        -- Avatar internals already render through AvatarGUIRenderer; never project them a second time.
+        local avatar=actor.AvatarRendererComponent
+        local avatarRoot=isvalid(avatar) and avatar:GetAvatarRootEntity() or nil
+        local cursor=entity
+        while isvalid(cursor) and cursor~=actor do
+            if cursor==avatarRoot or cursor.Name=="HealerHpBar" or cursor.Name=="HeroHpBar" then return end
+            local parent=cursor.Parent
+            if isvalid(parent) and isvalid(parent.AvatarRendererComponent) and cursor==parent.AvatarRendererComponent:GetAvatarRootEntity() then return end
+            cursor=cursor.Parent
+        end
+        self._T.entities=self._T.entities or {}
+        if self._T.entities[entity.Id]~=nil then return end
+        local record={actor=actor,entity=entity,frameChanges=0}
+        self._T.entities[entity.Id]=record
+        self._T.owners=self._T.owners or {}
+        self._T.owners[entity.Id]=actor
+        if Environment:IsMakerPlay() then log("[VRF] Carnival native entity tracked name="..entity.Name) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RemoveEntity(string entityId)
+        if self._T.avatarAlpha then self._T.avatarAlpha[entityId]=nil end
+        -- Releases only the UI proxy; the original entity keeps its normal game lifetime.
+        local record=(self._T.entities or {})[entityId]
+        if record==nil then return end
+        self._T.entities[entityId]=nil
+        if isvalid(record.avatarSource) and record.avatarEvent~=nil then record.avatarSource:DisconnectEvent(ActionStateChangedEvent,record.avatarEvent) end
+        if isvalid(record.frameSource) and record.frameEvent~=nil then record.frameSource:DisconnectEvent(SpriteAnimPlayerChangeFrameEvent,record.frameEvent) end
+        if self._T.owners~=nil then
+            self._T.owners[entityId]=nil
+            if record.visualId~=nil then self._T.owners[record.visualId]=nil end
+        end
+        local effects={}
+        for serial,effect in pairs(self._T.effects or {}) do if effect.anchor==record.entity or effect.anchor==record.frameSource then table.insert(effects,serial) end end
+        for _,serial in ipairs(effects) do self:RemoveEffect(serial) end
+        if isvalid(record.node) then _EntityService:Destroy(record.node) end
+        if isvalid(record.health) then _EntityService:Destroy(record.health) end
+        if Environment:IsMakerPlay() and record.projected then
+            log("[VRF] Carnival native entity released frames="..tostring(record.frameChanges).." ruid="..tostring(record.ruid))
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawEntity(table record, table binding)
+        -- Copies transform, appearance and animation frame from the running native renderer.
+        local entity=record.entity
+        if isvalid(entity.TextRendererComponent) then self:DrawTextEntity(record,binding) return end
+        if isvalid(entity.AvatarRendererComponent) then self:DrawAvatarEntity(record,binding) return end
+        local network=(_NetworkMotionVisual._T.entries or {})[entity.Id]
+        local visual=network~=nil and isvalid(network.visual) and network.visual or entity
+        if record.frameSource~=visual then
+            if isvalid(record.frameSource) and record.frameEvent~=nil then record.frameSource:DisconnectEvent(SpriteAnimPlayerChangeFrameEvent,record.frameEvent) end
+            record.frameSource=visual record.visualId=visual.Id record.frame=nil
+            self._T.owners[visual.Id]=record.actor
+            record.frameEvent=visual:ConnectEvent(SpriteAnimPlayerChangeFrameEvent,function(event)
+                record.frame=event.FrameIndex record.frameChanges=record.frameChanges+1
+            end)
+            local shuriken=entity:GetComponent("LuckySevenProjectile")
+            if isvalid(shuriken) then shuriken:RefreshCarnivalFlyVisual() end
+        end
+        local source=visual.SpriteRendererComponent
+        if not isvalid(source) or source.SpriteRUID==nil or source.SpriteRUID=="" then
+            if isvalid(record.node) then record.node.Enable=false end
+            return
+        end
+        if not isvalid(record.node) then
+            local template=_CarnivalUI:UI("Lobby/Scene/EffectTemplate")
+            if not isvalid(template) then return end
+            record.node=_SpawnService:SpawnByEntity(template,"NativeEntity_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
+            if not isvalid(record.node) then return end
+            record.node.Enable=false
+            record.node.SpriteGUIRendererComponent.Type=ImageType.Simple
+            record.node.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
+            record.node.SpriteGUIRendererComponent.RaycastTarget=false
+            record.node.SpriteGUIRendererComponent.AnimClipPlayType=SpriteAnimClipPlayType.Loop
+        end
+        local node=record.node local sprite=node.SpriteGUIRendererComponent
+        -- Publish only after costume, image and transform are initialized.
+        if record.ruid~=source.SpriteRUID then
+            record.ruid=source.SpriteRUID record.frame=nil
+            sprite.ImageRUID=DataRef(source.SpriteRUID)
+        end
+        if source.DrawMode~=SpriteDrawMode.Simple then
+            sprite.Type=source.DrawMode==SpriteDrawMode.Sliced and ImageType.Sliced or ImageType.Tiled
+            sprite.PreserveSprite=PreserveSpriteType.None
+            node.UITransformComponent.RectSize=source.TiledSize*100
+        else
+            sprite.Type=ImageType.Simple sprite.PreserveSprite=PreserveSpriteType.NativeSize
+        end
+        sprite.FlipX=source.FlipX sprite.FlipY=source.FlipY
+        sprite.Color=source.Color sprite.PlayRate=source.PlayRate
+        sprite.MaterialId=source.MaterialID
+        local first=source.StartFrameIndex
+        local last=source.EndFrameIndex
+        if sprite.StartFrameIndex~=first or sprite.EndFrameIndex~=last then
+            sprite.EndFrameIndex=2147483647
+            sprite.StartFrameIndex=first sprite.EndFrameIndex=last
+        end
+        node.UITransformComponent.anchoredPosition=self:ProjectAnchor(binding,entity,visual.TransformComponent.WorldPosition)
+        node.UITransformComponent.UIRotation=Vector3(0,0,visual.TransformComponent.WorldZRotation)
+        local sx=1 local sy=1 local cursor=visual
+        while isvalid(cursor) and cursor~=entity.CurrentMap do
+            local transform=cursor.TransformComponent
+            if isvalid(transform) then sx=sx*transform.Scale.x sy=sy*transform.Scale.y end
+            cursor=cursor.Parent
+        end
+        node.UITransformComponent.UIScale=Vector3(sx*binding.ppu/100,sy*binding.ppu/100,1)
+        node.Enable=visual.EnabledInHierarchy and visual.VisibleInHierarchy and source.Enable
+        if not record.projected then
+            record.projected=true
+            if Environment:IsMakerPlay() then log("[VRF] Carnival native entity projected name="..entity.Name.." ruid="..tostring(record.ruid)) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawFrame(number delta)
+        -- Run after the window camera and actor views have been updated for this frame.
+        -- Native hit flashes are often child sprites spawned directly by projectile components.
+        for id,binding in pairs(self._T.views or {}) do
+            if not isvalid(binding.actor) then
+                self._T.views[id]=nil
+                local stale={}
+                for serial,effect in pairs(self._T.effects or {}) do if effect.actor==binding.actor then table.insert(stale,serial) end end
+                for _,serial in ipairs(stale) do self:RemoveEffect(serial) end
+            else
+                for _,child in pairs(binding.actor.Children) do
+                    self:TrackEntity(binding.actor,child)
+                end
+            end
+        end
+        local remove={}
+        for id,record in pairs(self._T.entities or {}) do
+            local binding=isvalid(record.actor) and (self._T.views or {})[record.actor.Id] or nil
+            if not isvalid(record.entity) or binding==nil or not isvalid(binding.view) then table.insert(remove,id)
+            else
+                for _,child in pairs(record.entity.Children) do self:TrackEntity(record.actor,child) end
+                self:DrawEntity(record,binding)
+            end
+        end
+        for _,id in ipairs(remove) do self:RemoveEntity(id) end
+        for _,effect in pairs(self._T.effects or {}) do
+            if isvalid(effect.actor) and isvalid(effect.node) then
+                local binding=(self._T.views or {})[effect.actor.Id]
+                if binding~=nil then
+                    self:UpdateEffectTransform(effect,binding)
+                end
+            end
+        end
+        self:SortScene()
+        _CarnivalDamageSkin:DrawFrame()
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method table BindingFor(Entity anchor)
+        -- Resolves actor and projectile anchors without changing player ownership.
+        if not isvalid(anchor) then return nil end
+        local views=self._T.views or {}
+        if views[anchor.Id]~=nil then return views[anchor.Id] end
+        local owner=(self._T.owners or {})[anchor.Id]
+        if isvalid(owner) then return views[owner.Id] end
+        local parent=anchor.Parent
+        if isvalid(parent) and parent~=anchor.CurrentMap then return self:BindingFor(parent) end
+        local p=_CarnivalReplica._T.client
+        local monster=anchor:GetComponent("Monster")
+        if p~=nil and isvalid(p.actor) and isvalid(monster) and monster.CarnivalRoom~="" and monster.CarnivalRoom==p.actor.PlayerAttack._T.carnivalRoom then return views[p.actor.Id] end
+        return nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawAvatarEntity(table record, table binding)
+        -- Project the summoned entity's own costume and action events, never the local player's outfit.
+        local entity=record.entity local ar=entity.AvatarRendererComponent
+        self:DrawSummonHealth(record,binding)
+        if not isvalid(record.node) then
+            local template=_CarnivalUI:UI("Lobby/Scene/Actor1/Body")
+            record.node=_SpawnService:SpawnByEntity(template,"NativeAvatar_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
+            if not isvalid(record.node) then return end
+            record.node.Enable=false
+            record.node.AvatarGUIRendererComponent.PreserveAvatar=PreserveSpriteType.NativeSize
+            record.node.AvatarGUIRendererComponent.RaycastTarget=false
+            record.node.AvatarGUIRendererComponent.FlipX=false
+        end
+        local node=record.node local gui=node.AvatarGUIRendererComponent
+        -- Publish only after costume, image and transform are initialized.
+        local costume=entity.CostumeManagerComponent local copy=node.CostumeManagerComponent
+        if isvalid(costume) and isvalid(copy) and _UtilLogic.ElapsedSeconds>=(record.costumeAt or 0) then
+            record.costumeAt=_UtilLogic.ElapsedSeconds+0.2
+            copy.UseCustomEquipOnly=costume.UseCustomEquipOnly copy.DefaultEquipUserId=costume.DefaultEquipUserId
+            for _,key in ipairs(_CarnivalBattle:EquipKeys()) do if copy[key]~=costume[key] then copy[key]=costume[key] end end
+        end
+        local body=ar:GetBodyEntity() local target=gui:GetBodyEntity()
+        if isvalid(body) and isvalid(target) and (record.avatarSource~=body or record.avatarTarget~=target) then
+            if isvalid(record.avatarSource) and record.avatarEvent~=nil then record.avatarSource:DisconnectEvent(ActionStateChangedEvent,record.avatarEvent) end
+            record.avatarSource=body record.avatarTarget=target
+            record.avatarEvent=body:ConnectEvent(ActionStateChangedEvent,function(e)
+                if not isvalid(node) then return end
+                local receiver=node.AvatarGUIRendererComponent:GetBodyEntity()
+                if isvalid(receiver) then
+                    receiver:SendEvent(ActionStateChangedEvent(e.CoreActionName,e.PartsActionName,e.PlayRate,e.PlayType,e.StartFrameIndex,e.EndFrameIndex))
+                    record.frameChanges=record.frameChanges+1
+                end
+            end)
+            local summon=entity:GetComponent("HealerSummon") or entity:GetComponent("HeroSummon")
+            local action=isvalid(summon) and summon._T.avatarAction or nil
+            if action~=nil then target:SendEvent(ActionStateChangedEvent(action[1],action[2],action[3],action[4],action[5],action[6]))
+            else target:SendEvent(ActionStateChangedEvent("stand1","stand1",1,SpriteAnimClipPlayType.Loop)) end
+        end
+        node.UITransformComponent.anchoredPosition=self:ProjectAnchor(binding,entity,entity.TransformComponent.WorldPosition)
+        local scale=self:WorldScale(entity)
+        node.UITransformComponent.UIScale=Vector3(scale.x*binding.ppu/100,scale.y*binding.ppu/100,1)
+        node.UITransformComponent.UIRotation=Vector3(0,0,entity.TransformComponent.WorldZRotation)
+        self:CopyAvatarAlpha(entity,gui)
+        gui.PlayRate=ar.PlayRate gui.MaterialId=ar.MaterialId
+        node.Enable=entity.EnabledInHierarchy and entity.VisibleInHierarchy
+        if not record.projected then
+            record.projected=true
+            if Environment:IsMakerPlay() then log("[VRF] Carnival original summon avatar="..entity.Name.." ownCostume=true") end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector2 ProjectWorld(table binding, Vector3 position)
+        -- A flying projectile belongs to the room, independently of its caster's prediction.
+        local origin=binding.origin
+        return _CarnivalView:Project(position.x-origin.x,position.y-origin.y)
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector2 ProjectAnchor(table binding, Entity anchor, Vector3 position)
+        -- Only effects parented to an actor inherit that actor's predicted screen position.
+        local cursor=anchor
+        while isvalid(cursor) and cursor~=binding.actor.CurrentMap do
+            if cursor==binding.actor then
+                local offset=position-binding.actor.TransformComponent.WorldPosition
+                local base=_CarnivalReplica:PresentationPosition(binding.actor)
+                return self:ProjectWorld(binding,base)+Vector2(offset.x*binding.ppu,offset.y*binding.ppu)
+            end
+            cursor=cursor.Parent
+        end
+        return self:ProjectWorld(binding,position)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Hidden windows still release expired effects and destroyed projectiles.
+        if not _CarnivalUI.opened or _CarnivalUI.minimized then self:DrawFrame(delta) end
+    end
+
+    method void SetAvatarAlpha(any renderer, number alpha)
+        if not isvalid(renderer) then return end
+        renderer:SetAlpha(alpha,nil)
+        if not self:IsClient() then return end
+        self._T.avatarAlpha=self._T.avatarAlpha or {}
+        self._T.avatarAlpha[renderer.Entity.Id]=alpha
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CopyAvatarAlpha(Entity actor, any gui)
+        local alpha=(self._T.avatarAlpha or {})[actor.Id]
+        if alpha==nil then alpha=1 end
+        local color=gui.Color
+        if color.a~=alpha then gui.Color=Color(color.r,color.g,color.b,alpha) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawTextEntity(table record, table binding)
+        -- Charge percentages and native text children retain their world font and position.
+        local entity=record.entity local source=entity.TextRendererComponent
+        if not isvalid(record.node) then
+            local template=_CarnivalUI:UI("Lobby/Scene/Actor1/Name")
+            record.node=_SpawnService:SpawnByEntity(template,"NativeText_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
+            if not isvalid(record.node) then return end
+        end
+        local node=record.node local target=node.TextGUIRendererComponent
+        target.Text=source.Text target.FontColor=source.FontColor target.FontSize=source.FontSize
+        local scale=entity.TransformComponent.Scale
+        node.UITransformComponent.RectSize=source.RectSize*100
+        node.UITransformComponent.anchoredPosition=self:ProjectAnchor(binding,entity,entity.TransformComponent.WorldPosition)+source.RectOffset*binding.ppu
+        node.UITransformComponent.UIScale=Vector3(scale.x*binding.ppu/100,scale.y*binding.ppu/100,1)
+        node.Enable=entity.EnabledInHierarchy and entity.VisibleInHierarchy and source.Enable
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSummonHealth(table record, table binding)
+        -- Reuse the real summon-party health gauge above each summoned avatar.
+        local entity=record.entity local hp=0 local maximum=0
+        local hero=entity:GetComponent("HeroSummon") local healer=entity:GetComponent("HealerSummon")
+        if isvalid(hero) then hp=hero.HeroHp maximum=hero.HeroMaxHp
+        elseif isvalid(healer) then hp=healer.HealerHp maximum=healer.HealerMaxHp else return end
+        if not isvalid(record.health) then
+            local template=_EntityService:GetEntityByPath("/ui/SummonPartyUI/Board/Row1/HpBg")
+            if not isvalid(template) then return end
+            record.health=_SpawnService:SpawnByEntity(template,"SummonHP_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),true)
+            if not isvalid(record.health) then return end
+            record.health.UITransformComponent.RectSize=Vector2(55,6)
+        end
+        record.health.UITransformComponent.anchoredPosition=self:ProjectAnchor(binding,entity,entity.TransformComponent.WorldPosition+Vector3(0,1.05,0))
+        local fill=record.health:GetChildByName("HpFill")
+        if not isvalid(fill) then return end
+        fill.SpriteGUIRendererComponent.FillAmount=maximum>0 and math.max(0,math.min(1,hp/maximum)) or 0
+        record.health.Enable=entity.EnabledInHierarchy and hp>0
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void PreloadSkillResources()
+        -- Warm the shared source skill assets once, before the first carnival cast.
+        if self._T.resourcesRequested then return end
+        self._T.resourcesRequested=true
+        local resources={"ea55ff6b7e1748a6aeda07c6e78c665c","3271c3e79bf04ecba9a107d55495970d","b0fba4de0af64fe18d288b6d791329ea","55f7cfa3c85d4d9a95c4e9b18b8d564d","cb4d15eb5d56431f98ed45d3cb9e72a5","3cf9b68a0ab04210a1188bcaf941c229","db19194fc2804ac887c0d5add5cf28cd","0ae88fa494e743158da6ddb81c0c55f2","a0279b03a97840c8ac1cab9971590dfe","d2c4352cea214fd6bdef86812683683d","458e72f0720a4584a9a7fc3642b6e601","879c81c8fc274aea87dc673de48ab5d1","44c1d14578e24c639e480f54b156a8a2","41e13add2ba746d9bbe624a31205a848","880e540095704e30af6a554d51b8a3b3","eed46092f65940a7a8e77a1bd8e2aa75","0f213b255ab34a0e8ed258c89f3b62fe","e46fe5e970f84e3f8f75ea914b2e3bf7","6aa85073bc87433fbbca0f04a00732d6","80a1909b6de14954851a49cfd371d791","98d2124f4c2740758a7ed92fb5aa3af1","447033cc51594e20a25d15bfe2995d2e","64e8406faa78478dbaccde3db7f074d1","04b47e478b824131bcf2b02a93a75702","d0515d7c8aef446d98e553a7f7c02696","c36e70d7b1d84845bf4067d069ba5e1a","e0178f48602742c0bd8b295fdc27261c","f6b84a0152ef492e9233f621c81a4920","522793cef4ff4b79bdf73b9eda9386f8","28a559c14e6e497db84d4b70f4419ac6","cd6a3d7ca3514862ade106e46dd0dfd3","8de6e8d4e04b4d488662e73456d7639f","1c9e86b289c249de8772fcbe1b9b1ae2","256ed90a49b54a17a4be2280e49009ce","919aec05616b464aba949064c65499b4","435ac3806a924dc9b4239cb8c1c86243","3f97672a96fa4dcdb9e274ea39673b09","7c0f3e19de034c12815247cb272f6301","4938bb94bfb1455bbb483d805ee14d49","c61a0eb09c35487ca1d45b74389afc0d","4876d4a6544c45e0af9989877ab39e5b","4cce0f1075a843858a72f1c3934179df","433bf9eb0b884b57bf2e379b75f0c9a8","99acf5028d394e898cfcc780893578b3","50a36c1b7d44453fbcbb8c518fd525ea","e34c657a37934280a2828c935ad90714","8b3d8c43db4b4aabb93c194dc13062a2","d39424cc827e4bbc9c62269a44ea97be","22eed4ca45d241558dfd1cd41f802220","8ed34627d76d4500907a123ec4817242","c446252cdb9c4d9e936755e1b9138ac1","20006015b5484621bade91e2afd63a6e","5df7aba02f834818a92b07340736b0ef","ee783abac9c646aeb0a67da38471a50c","dbba0b7f570c4a669604f326382bd738","250ef83c342c4296bcde108e8bd80ecf","ae0f4f68c5b44305bdf85e5524987c34","507d9c37ad214dd09a7123716eece5d3","0916e5711ae04feb9265fc8db4dbc405","ee8f14cd11c943e89c370352303eb8f5","79e0485dea9a4bea85e09f70461cb9bb","475a253a7a0942918fa279f611577fa4","f5d2a9d46cea47b7837c21d8c7647c73","b4f5d7c8f21240d6b1cc2d2b8500b09b","5bce29112dbf4393a30e59e852f94c52","0b0d53c99e514b21b1f3b94bf91c4410","6e766ce2b33845c49e7a7a35ad0ea567","0325c34e91a3425ca8d847bbdafe4c2b","f9172c536716419e9096774d27594efe","615a87a6bcac4e7185778acf54787594","d817abc05b1249f8a23c34e020616a7a","a0eaef90d00246eebb97f24853cdec16","2a3be62afb9448e3a11ab6a49ec1aa3f","f9c5606515d84a2ca5615ee3ef42efe0","a1574059f19a4cc2837d8f2c47532665","93012b7ce08240e79659e3d886591c72","5d818f4df3714acfb97f4816027f928d","9979fce5082d47dd87c002c0bbd8ba87","16b87869ef1e4b40955eebbb63b2e41c","3031de3aad7d4736a6bd37b63dc72c84","2fb4759ebfe5485bbb4eed246de191dd","fc48f9ad06294b5dad48b846418363cd","9e67fec6094445bfac073ca3769d4ccb","7628999206e04ef8b3ed093d5827f9de","ff3182dea66642348e77436ff63a36d0","6e565b598ba44799a507f0481c4e46ce","aaad6f339ec84f3585edcd1e96d21369","2a30d12e3196479f9e7b8ad7d7b0a2c7","790c99921d95489abee6f427f6a8b58a","ef846906c4b54786b3017245a1fcb084","4fd0804986e543688e875a59b446f744","82c64a31f984418ba0a16592a556bbb4","a1d1c7ecda334e7bb664e7bfff99f816","3b6e2f19df8e486dbad3cd6abf5d836d","ade08cff629644f8817990e780523a66","1f642456eb344ff980d13626861e4716","5ba8a9e73caa44ab83fe4aef6d836410","1de1c87ae2ed443184844dc0ea1e831e","6169b9874ef64af3899f14fc2a8420fd","fd8d94ac1de548958b8467a4131659cb","256171c083234b5db66fac1cab2d20d5","b0bd80f44c1543438ddf8c2c31a0a7ce","288e10be2948421ebd107829c10f07ba","6beb8d728a7d4cca92eb7f4d2d9c45f9","01a549ce77c14d7582799adeaab1ed2f","d3205fdd08e34b68bc01292a997531ed","dad03b3a528348bf98295b01edd621a4","ca4f802052184c0ba47f6971fde80bd0","8de01c7022964b1b9d6cf96070073446","96edfa618f6a4fe4a4620a5c56eb93b6","2a0d72e836fb4862aae83087035f3d2a","598d2d1859e84eaab18ae460a0a1e0a4","5f0c2e9b04ee4a3a9d493a863b8a1379","4c1eb6001e9c47eda239cc58443b79cd","b34e818d784f4a3891c2d50e48ca559d","f8fadbcc8e2e4157bda9282f0ac54d95","0d4f67d975384f97b3c8a1b83122900d","90cb093d97774c759803786c0d7c59a7","c62705ad771740cab233cc36c0633d8f","2bc1fccd0c144316b0e843fe3f8a8713","6a4dcc8933f348c892310bfd66341cc1","59027dc875d149249fbd6f8656fd3a69","fa97dbede9ef4b628e1ffafe9c0f841b","314b600360fd4841a61aca060a2bd301","da39548361ea4b3b888e9c54a1899174","84e3eea5a34845e5a3545d0a89dff400","3a8cf5d7d10f47f79f7bc9bdad81a746","7b1fbc817b9a478e9f5c384dfc1a7176","bb8d0c3c8b9940dfa5e4678bc642fa8d","c67a743ca1934626ad2f7744062ec14f","69042e2218c6446db879e9be6db7ef3b","9139599c677b405490757c9ae77bbd93","d34afae34a3c4a3abe2bacbad32edc43","151d9a3a646e4099882a988b4d0a5aba","49aeecc1218f4a40a0ffbc7e6277451c","c7b9c30f7bc14979af7eef57e86d0023","1eb118d660d440659ca819c6e19a37c8","4da33ae59d2746cd9d4ded4809f0d504","bbfb9ff38749410b8c4fb04bbe518e55","4248fdf44677473ebd33434b7434dc4e","d508da81ddb447928ea3aca807b6aa17","2cdc5bd1aee34c4c8d7458f4673f418a","fcdd9956f4784311a2655dcfb121994e","45d4dfdffe0b4281b95781967a03bd11","79b47a455b5944b5a79bf9e4259647b7","0a9e7d58c1cf4116bb2baa56c1bbff3a","b1dcbc8511314d458f57f5bad122ee3e","c6c35c45c07f45a294119279dc310c5f","00ff7680a5174ed795595a940fcade2f","ae477b7187524ecfb23ce79aea4c1574","6e63529a524e4626a1036d7851758178","b45a268669e946f0afa8f917d100c6c8","c1e0f9d495354586bbeb6e31809a22d5","f4acad30463f431d9be8a1c0540ea525","ba7adc4c48a343ec8b23b33a2110c360","3c2a7fc354a848e69a61b73bce57fd95","e6b5c3d0076c47fcb2dfd46ccd855998","e9084f7b6c7f4bb28b32fe5ee0aa3475","d21d62a474464af49955fbb05564d94a","32b7809b396e4ec1a4dc32d68ed4befc","075e01d0741c4dd1a066669adfced6bc","693d8428b7754d1c87458e7c6ae0e809","117e9e94c6984f438af8faf6d74d52ee","a96d3c814ac0425481332c9ff87e2ba0","245de9ba93a446ec85fab3ba817fc5a5","6648e74d13164cde9df9f5278d547002","cfee3131ed4546a2920de5e240f6a054","e5a3e22eb0b14b56afe18b28f15c7151","d24b9dd8082b4b23a5085d0125461846","c197b42c5d9f4affbd49354555f9e4e5","e2b6a3e05fe0430e8b8beb44aca514bc","961ac75e651048e5a62f209c40355199","ae3393a5eb7c48cea2cc4bc216334a49","6f972ab4e14841398281f3fc2a8f376e","01cd44c5de6d45cfbf47938e26243452","a2ade2fb109b490cb95814c0622b4f4f","dcac510901fe451282ad7b93abc3032d","6df269a10323437c8acf7c7937fff4c1","37667e283b994c4a94880227dbe4d387","5b622d47e7e4412b8217bcfcef140946","0dd3dfd6b97c4a689deac7f3fde133dc","2cdfa53899d2462cb051e958a70b4747","2ea4ea3b4d4a492e981d3536b14d7da6","a1a425ae3c1c49afa068ee212676c5dc","26a8af1751324d2c9f14b1719a28d3c8","38052d3003a941759a340ae28611d4dd","e81f0ba3f2b545d7895b98b1cf9be879","d58b67cf0f3a4eaf9fe1ad87c0ffac8a","410e6a09f8ec471f87bd8d55c34cc48d","64795afda95e4b7dbdbdfe731e7d405a","19e3ba3ab994431b81a3d4ee7a1b86e0","4b254b65adbe4df4885acbe2e2fa3671","6db426f91ed54b83beddb7837d96fb4c","8ef08d990aeb452bad114479f6bc76fd","6c7c28167b9049419435cc53001cef0c","594f34c4103145a28951780047e71e42","eefe86c8b370407aa16c9fe34f12c98d","dfb6702ddc994b8b8b24acf3c695020b","18b94fa75cc54db0a806f522564ba449","1c603235dffd468f8b28b36aa8cb3df2","4711c880fffd4da694871cf1fe331e7d","8abd73b1954e42f5af565af4426ae582","eaede9190e7f48e5a78123777220ebbf","6360c35bf2ad47b0b68235182c063f80","45c5effa123f463296b9c861fe017215","5f5348ebeb2345f0869d1682828a848d","9cfc22d7db1842608b648d9d7b5d216e","73ca2da2e4174b88b79b2f53aec7d231","59220240d7004a439c16329b829a6900","e150a53e0a61454b9fde4e53380cd9ab","3e7aef83235b4e8ebd28ba9462d9b8c0","1be23b85b0b44b84bc6e88a2caf986de","8cbbf339d9de40b09d933cc9d4e8b803","9c267e7da01c4c34992cfbfd02132a5f","4561e55a44f74a3086d4e88a4c2c8f01","aab1604317524fc78ab79e23416d6947","d01b135e62a74129b1515c8e0250a2f5","4b8e5b7b21f74a26a54cf3a17d91930c","8f260fa8eb49460691544a8806e80342","e6eefdb13ca4452ba51437f1bca9d165","7b5b0596abbd4f44afaa332f11943ebf","6c60534394bf4fba8a2553528f3f9ec3","8d638b1a7d5a4fac9de02f4c875ab956","7805bdc3c28b471fb90fc27b51801d1b","1e5b27a588564f44ab0ffc30040c1308","895a0c9854634b88af00e658e2fb5327","2672e793d7274cb5b8e4daa716671832","3f6088e8a7134c5aaa65b4f5ac12e374","15cbdb9c56db4e87a379ba631e06a3d1","df55af646a634f62a9a167a1380a147e","17b87afe9f03458cbaf63c0194d699ae","b798d9bdc19e4bfab33ccc906f4ccd2a","a83d56a314fd449cad236fd7d9b2fa63","42514aa334774d0bb0fade61945e5970","9d4e8b3b2eab441a8aa42ef883531704","b7b99713c5ba4a55948ee31c7e213820","c94fc0ca497c4ee2b2496bae4ded3259","d5f5ceb4d0a04e25b3b978755d7a2f85","3d84f51e0bc84c99b90e1e299338401f","ea23c07eb82742709a0cad07d9614954","c112602d64c84307b0438420d8d8a394","85ed511773ff4ba1be37b92190c0cd50","6cf8c9dcbdf94d539a8d6afe1ef57281","c4d8035c4ded408aadc62ebbf6eb54a3","267c7840593c419098060eb07e2b4dbb","c2a6680d91c84a98a42151cc5b47299a","451ad9c3daf242c2bcc0ca704c171231","1b63db8e85e543738c3172c669651a62","a02b80f5599f481f9818166f4e3abe9d","36faa085b70f4dceb681b13c5e507aec","b0eac942e50d42e58cf37ba082fb7a6e","efad481e5db5447bbcff52debe1c15e3","e6828bdf4c8147739b60285a680558a4","526568bad72b4dd4a516415c26d1110c","d54c705fb1dc4a0ca06efa00d4148d0d","3f38641f56ab4c988966952ed951f723","1c44ed375d9d477bb12dc29fdbbe2880","bbc5c210f9ef4fb6b83fccf2a9e41d4b","3fa020cfd70f495c89c39fd3a3dd480a","fbf3efdbb65a471296d3b6932faaaccb","b36a872cc61f401fa248d9483c7baa48","587f1c0fdc254cabad1701395814498c","1b78e68cd9c14ddfb8b5b1dd5ef51f30","e868faf607ce4698a538053515026e2d","5b4258569fd447ba952faf18383a7e49","d790809da58249a9bffe6fec4c684587","8ddd66f6b9844b23aa789859bcac064b","03128f23618849e98d401d05b944bd28","693e8550871b4a0db0e6970f08e26add","3fe5f0b67992400d93c244a88f42731c","98bd3c9123204bbb8fd94cc1bd799749","fe52cf2e9f9e4f059cfb4fb3856aecf9","e9c90ecd65224980b56903dba89ef856","af39b536300f43d3a657fc82d63abfe3","36df58eba56c466da4d0b22a2442769f","92142c6ac4d34d2daf944c08fc58b271","868dd9f7b7904886b83d249b0348e6e6","aedc319200784424abd34fc871c48b5a","abbbf1be03174056a77bd2c2d4a214ff","4dc3a9e1c46e4aa48806c6e623ef5f08","2da9534322854e3f83622796501b695c","b77fe52bc6014e45b9f6f1e29ec947b0","4536cf19140e49279692778a71a38c89","b01e705abf4b41daaa38cbac7a3330be","cc403b7a60e242a486134b84c2fc932f","f7f5e895ff734b0188c6d8e66305db75","8e28ee0c44434d33be3479f7d0d0d5f1","782d83ba1201452d859cc40173feeca6","11303e38b196458389a057243514f3c6","2be62bf4ab7c4ee481e86935e57952c6","d1ad7e3f41ba40f8b7d449782d7edb4a","b5dba0c50ea54fdcac03c6606a8f68c1","16c392994ef44c04840c856ff93ca65e","3f2ba57ceb724b3aba1c9205292fe6c1","8c47758b2cc143469be1bf9148fbb345","981b537715ca420e85bad99c0b09886a","c873a59b360746d5afb7b6a6f801b940","434275d7979f4339bddb232d3e90f9ad","933e9d7f0dca40a19c2cc58f2298a9b1","745690c5baf34bd48bd8fa2e1e8543f8","99bc646420bd4d8e86f7ea89e3bbf02a","d1915346d12b47feab9fef9427312172","e3fdc90505e44322a9cf1609eb1640bf","1af5a3dc8713417480b08537cf882079","1c5ceb5b21af4e9c9a73bb371d8609e8","5b52635496af427882cfdfd1962b8143","033d6254dc1340ff8757482266bc7770","5a0c60a200644c7ca5af8aa120d1adf8","d2f9e539b9d04662be1bb3933673f2cf","10c49d0b8ac34f2382ef97c48c7ba522","867e8f5003e34eb781dc8a7d762850a8","97c816f3cf0c47efb45f2ecbd1c2f2a6","ae32c0d6ffe04774ba24ef9c251f37d3","eb7aefeee82b4e48b281bcd584344e38","0544be7da91a4aa38b2d5fd59f7aad7e","3697356e16ba486cb9069c432d976235","d3c16c82974b4933b03eeba3c2ec644c","88b7df45f13e43f5acdb374b9d5286a8","f12bdb312e404be5a58e7fb157ee9b8f","6fcc6e7183704cff9ec8a356ff477c64","a49bed1bd7f04571b78a6507bcc5f2b2","88175dd62ea3411faffee0446b5716f6","5e9e7bdbc0624cd8b9aac4698f3ade58","b68ea6ee3e0445a0898f02da53070dab","8bac5a8b9fe04382a50afac0bc65a994","04ab10c58c174b27b11be0beaf30f1b9","23a03201d15f46dc8b7d34d9af562c04","14d58140ffe94bb383d8ce4fb7fef2d5","b3199ee4a4ec48fc84a6aab4a824cd74","b1585d55ff8f4bb2af9e23d0fc4abe72","a52d7487325540fea53e92d14b4e023f","eb7f504670a14802a48cc94f4eb66848","1700015d7c2442b78e9ba7e415805a69","e371ffa7dfe44d8e909c059160ffb1ec","dd4fd90408414f7590ec076b5e40d944","3ff878ceda484e6f9c2b06754d077ab8","ffb987bd624f45ecaf212a8b8f0a9ca3","286bebe1f08144309fa1d52e178e0269","8bd9be973f944c48adc964df04699894","3fbc8d8a4e734b19987763bf76eb2a35","9a5909ba934d4f81a665b2b60b15fc80","a815dd5b52de469dbbe97051f246c9b1","8777aa4a32ac426ea227415b11a1772d","5cfe320f978549a991f812837932f2f3","040d3a6e368f43f2ba85c5b78c229682","fe17d206f30f49f2adb50d8f73c6b40e","419e26654a5e470fa386a8a4e92e9eb3","38f9aa42ec39406987a9fd92ba2c14ad","154a7b585c474b07ae77d96a465756e6","ff046ea8281f4ed48430594340ddf6af","49621e22bbab410d87318e2f8cd57899","3edd6d189b9b4bf1ac48162339848e36","5468cadd2f60428e925bc368968e1a1e","7dd03981265b4d9a8c638bf0b18649cc","6337b66c57a947e7b2cda8bbf8697094","01c803531e2c4e5aa3c3ef66f14711b8","d9d44fb072ec4ccfacad6fe43959c7c9","0806f2b09d904519bb5c4b136109268d","50249344d7ed4203ac6f00a46c31fc9c","43e522b840ce4529aed13a8911f906b4","25791d83eda1436a9de855d4c5441e51","1889792ff11046859a0a08f171f4feff","12299cffd6244ffa81e117d65205f4f1","53e7e89799844616b82d85d81decc54f","b52555b494544c46a99cbb238802f939","735ad75ae1f64d88a9444cf9832f4abc","96b261657b0c4aa792bd6f3e7d6c6681","267aa4a9324f460b80bc04600aa4d0e0","c50b1e30210d4019a97da3e76c33079f","d0bbfb140e164860b8b30281613a42c3","5db175946e27401f8203d7a01e632631","a428e9f4129141e7a6dd1f48ffda4147","1c0dd97b95b440b3ad512646db0ee079","6da13ae8587b4931b9c3ecd556e052ec","90ff4f1089ed4adba09908e19ee5290a","31e46cc996124cef90b00cb3df7511d3","1337ffe04c53468b87d591dfc6e73ad6","243dc71d00f14282b669b0ccb2e5e406","21061252ec4545ecb9007fab4ef73839","697e026b5c314a798f8d9709f53750ee","80c99d8c2d1c4af083f45ac41eed6427","9b741d8f0f494a1c92cc9138b6483835","e1445a2788914e0da35aac0afd84c984","d597c4be7305402abd0db552555db844","59c9de29813a4b518f3047fddd32bfe0","fe8f028da11146429831e28f0418247a","6d680c10e49c415196b877779cc53498","1b733750b199436ea9fac6e043f170a6","738ef9ba228044d792a5216ee47b7854","7c9c706857f8427eab8ad561277b0484","fed37c0c37ed427e9aa93f946bb65062","4eb79d452f7f464ebe8cbe5abc267426","bca99c25fd7d4eff9dfbc97826c0ac46","7562004f471a4e909c2eee2747a71df7","ea7be11eff3a4814aa58b99bf3cfe2d5","c04324310b7d43219ec0d0fa400c4a5b","f3d1726f78be40beae0b32960858f132","17e6f8af37eb4be09b95304e7854c3db","bf1fda424a06413d9617789715d0470e","1e06841cc18a47c9975303520f3429d6","7d5ef2c392a34251990a9dc8b51deb12","4d01ad5c78c14a8fb954fb76713048c4","f589e80ef37e4e2fbbe99b97915b329e","9c4e6931f24c4aaa92363594c6c181e1","6b3b8eab7b5e4cc28c73684fe9794b91","f0b14236ed864b63bc2a04c62722fe48","fdfd7c732ac64deaa1513b497c33fc9c","8cebe7a19ebd4a58a48989e4e1f2d1a3","ce02b0dd95744002b6f3d9671268257f","da302311a55b4795b3e54ab7d2dbe17f","02c11b4b3caf47c693a5eb960eec1138","92e6e9e493ac4b89956df9f209d04b21","3061ea19cdb34f40a503645097b2a891","5abf2cb1687340c8bed551d2ea178dc2","921860f9bee942ccb572a21439b6f6e0","13eb62c1a0094965adbb19e3dbb5d4f0","848cc0f7534642c9b5716c2c4f8bd30a","d8275b5454a84af580d7dc865ae7ada0","d9e3726f83b648cbb235ff2ec77f2904","ffd0471aa2654f0f83d52f9437a69451","cdd3bb9a395644a7bf44b52751cf695a","b3b8ccb8e5a247c28402d470aadc379c","c96717e1d97042f589ea2da562525ad4","ffdc4a624af340e093d6ebee921349f1","801d3ae9a54e4b6d965ac2ba5565cfde","9af8818422a04d12877fb9e1c30573a8","c43f61a98b8f41fd8a7d5f8769034db8","f1a8e518ae624dbcbe9c007af3429c2d","028a2e518e6c4713ad7300684d4a39d2","2d66c100851845ec902a98ede7c88b78","eb49560ca2a84e0585e0e83cd61c9dc6","b403326e82304598873d37bbf57c6b93","450dda0f413945faa44fb2135082ef05","73aa5e24acfd4b66b91829f779099365","e67191d8816d478a880550c3a58d9f8f","3f29477d4edb4ae5a2def02d69bcd587","bd1609c01d4b40a5b13bf8455c9a22f7","f9e8423d4d514dcfa88f42fe5867d8a3","4ece98754816484dace1322e13042151","249df88b783c492a8d82e862780719fd","cb01592c6d3746a2a3ca161044896c15","fc4f1fba7c57461380a634feda24aa5c","9963f5ab73474e2786259878ef66f3f6","26cbc52d8d444032b20fea7af775fd3b","34097d531f564cce9ed75b6a531e8f60","76ee3683807148dda4bc742ad5279633","0b76f710f9df4baebf5c92d0281ce92b","452571b69b534d91a993de876f3c7887","7c9082f93eed42b5a083e84df4f77178","61abc73fd8984644a2c51bda25070d22","85058c44ca0c484c95ff82f97102b972","0c07d7883fd1441ab6da765b28d300d7","da91c7308b5d4fee87ceffc55a05e797","bdcd828ae2b84712913b4d1caf4faa0f","6016fff40eb44ea0bea95b0b62fb4c38","30f71881e7f8462baa8976be22c8aee9","323555cae27c4a4db948180520efdb33","5665b3baf98b4b5dabda5f9af099b4c9","d1d9997a4506427cba18e9685582e675","9f2f620898fa4e1e9b1020c213b8b2e1","ed0ad6f305714bf19f43d1f55095cd08","8ab05c4bdaa043358eba21022d1ddc3e","e977e818949d4a56a91ad56d71210134","9499ffd7e97c46dbb21091beb77ca1f9","ca43ce46201c4aa3880c81d1a23d88a3","8b286400e84d4f53b90f62a54c845586","4a55a4e2d77641dcb9e71e32c3ada08f","08f5ab15eb36402081cd3f531b339774","2ae146528c6a496ba2070bc16f0b04ed","b140c7d348b24e09bdeb4b0e5cb8d99f","0dbbd23199e04a199e4505b8d9ed87fe","28cc63a0d29a468c9f9842e5ef7dc0ac","e78cee3d2fe148c6a917d072977ccb1d","dfcf285ec5734d66a5ea7766505e5040","237aff6426064721a4bc57105d22abb8","879f3d2f1b274b9ebbf44936d83d4666","1707e8b8e77c4cef828f4e75b3768865","5a2282507e6b40ed88dfe51b85fca32c","b4543f8051f24a85bf9d800c91f94721","f9a6521d810d401bba7a17dab78e9cfd","83543636229040b5b1ed680018e07831","1a9c37ef154d4f92bfe0ef7766723745","c84903652c754652a1848bf2678baba4","2b55af109b1146ec9d1755d1cde9206f","be80b8c517f24ecaa7ddec2ceabcd3e6","d0660ef4ef3f4658abdb98a2f233881e","ef1e2aeb9b8b4c5b8caa036a67b7666e","a62292659ac24cbba754bfa031515632","fc09ab8e29854412a3bb72b9eca4cbad","10936dedf57547f891246b6ba50a5946","5814e0d06e42448b978b5c5574fdfa08","0f89ed20b90c4f75bb42629cc2b0edbb","b9ba4f1bcd014882b1c605ccd240412c","7cc0e79e626d489aa1ac679766445167","895d634bcad24368b8bb346e32e73072","3de124ab53274bf7823c7ffb158e66a0","69bc456198774052b016ed347c5ed0a1","005e888efcdd49aabc87550d2a0adc1c","b8fe685987c5427fbef10b33fe5e83ef","77358577ab1b444a8d07cb0837de99b6","61bc8b0689b34e18a54ead6240151f09","dc18a1917b064773a8f6c1c53ad09991","bde5b9e6e2c2462ab596f0f287b06c62","ed57488f3abb468798b5cb8921464341","0279ebbf02fc42ee8d47b720ab35aef3","5929523d735c4e848c3ab4f8b465bc8c","9aa52c525f7c4eaeb71c096cfd405db3","ba5335861bac490bb376c6279d8afdbe","c7438da1d66e49c4bbbd2fb9379377d6","5e48242e94c6463c8601119e8f263b3c","4423619c1a49476697b459e49bddb575","c47d84d453d0493c904046cc1d4ba9f2","5be2bfc98ac5406485fd89dac2278ad4","f74015c5accf42e79889e343489f3ed6","79037c68813a4d48bf85a27bb1c34b5a","0b6df3e081d0484fb9a4aa174f9784a8","eb55ee8b8efe4345aa9c0d480df70939","2a51218fa53441b79ac41db6028a8110","38f9664abbec45a4b11b05ecc9ebfa02","4f091580df214c7dbb846ce850f7f491","c834c492754444f3b25046a222863743","2d79c1fb547846b4ae6ca7435b88d996","cd440aa30a954f54b41e45172b849ffb","abe88a701a094181b44c8aa9746a1cd7","e01294d012d247c1a5bc07949484778b","176fcaa19ead485393cd3fd2c2f715d4","23798d6930964aff953735b22f28a7c7","146af997ea3c4d77b99eaa477ae6057f","954896b2b40a4d8085586ea0ec2f0e19","0477b2c75e4b4fbcaf795e03bd8da11a","28d565bf11b242f8b55b05c1fe252b69","3cc6e9d3ad6b41fbbe2a6ab17b364b94","316118f8a80a4ce992e7f5a9a84ce721","150b5255237f4e6c8a873cb4ae80e9c8","54d78693959b4babb1fe2fd6e2ff1ee3","99f282382a0147f295f776297fa1095e","e87245990ba54cc899304722089dead0","e567c85e9d2e4f67bef25e99f1badb49","6c010db6b6244a38af4d3c877565a309","41093edab78c4c56b5119d55a880a064","7c6d247ed19c4424a9068ea8200b47da","a10deaf907694d82aa2b7d68f82f5fbf","dd96705b1c6a48999a721ddb70e5e9d6","de4cb0667240476ebd7163e4b694e53c","fef55524a6a94235b060e78341f67510","a1dfebbea2c24f6d85ed054dd9deaaa5","bbb8c45c0d21491a97deb363a9d95e0c","ef25d1fcb69c4d3dbed9978403753114","270e31778ea6475e807e27bc835765d8","c5990dd1744347aea53516a51cb086df","ce339ca7e6a44ee3815d5f77edefebac","8da209f377f249f292e1d0c50c928683","c7051cc242c54208a7c22df2b4bcc28e","5b1685eba9af484cbcde8015ca7398f6","d757a7ca9e3b417fb2d0d5b725baa12c","3e2d1d048bb74bec8b9bd8966cde41ad","7d52e3968f954e2dabc8f5a050adcd40","9229298b79a64868b7cee06dc198edec","38361a0c587544dc8b6074920475db82","38922d3cb17f44bcaddf7d6269e5d6d2","852883a5b27442e88ac5a23f5a218a58","3c2ee6e636924e179cca843f819f9b30","521bf9f60cb94a7fb9890ba2e0ede109","fcac442d953049d980da4b8d7bd766d8","84c06a061ae74a10a96fd55947769868","60930fee4e624d7f898debb4d0a92a3a","2b33049e548c43d7bbdd5f00dfd441de","51c423c9d2d841e993ae26fcfa986be4","5154d64ae24843a3bc29a878f13768ad","45087e25ef5949f68af9fe40c5b3c0a9","53a8a9f33fdb42819715399936e1a7fa","83efc24157d04c67b152d6782ce82b6b","a2b497a1013f44e7b29ef8de081720f1","de98060353f946dea96cf5b66692cd0a","0af4c1308c1e4724948d1463ddfc4027","f13097785b904ae8aaf1005d3763f94f","ccad5380cdc3462e8bfedb5ca58b2562","901a02d3026e41f692077e628eea38a9","c4902ddd53ad4f38a65b2b777960dbde","d9522927411a4f8f9dc7e083ee891f7f","c3dabaa7cf6543aaae6e12a8f7450755","e329cbdd2402405f8a4ffa09dd73369f","35e3a144e09c4f0db5ea3ddf9f8e6a21","e01b24a0d0b14a919cce57e5a8e54c4c","598fa2d4779049b9be5d9c4e62194d0c","5e115329cbbf43b481c144ae34190357","4700271227d84b589e384262c3ace071","560dc982d20745b391af3911ed148700","ba976729a84a4003939e1d14c12b581d","917b8bff6c5044f4a1bea90b7606609c","639c7632196842e08b5a1a31a5f296f8","65aaec279c494c81a3c2890187ddd125","5c28a75c1c6f481d985aa19135f414e1","ab086b62bedd46c0867f75d69e1ee877","3ac2ef3f31e94349aacb24834f4b8741","df8272beff36488b9c3de4a55b033673","296c907c19484b6abefe13be5cc9f98a","3d4b3e01c65344f390c3215587080acc","595604d41ee246fdbd6f12b4da73f7e5","32bce4194d894420abc2e9bdd64aeb3a","448e8e3d60854881b523a323ebfedadc","c7c34f4dd865419a9f9e46ca0de65335","dad03677cdcf4954a6e9640f30d2e841","0963776e5b2c4cc5b8cefd340232ec43","eda2d88ee15548dbaef0d35ff9097e54","c7698d96072a44fdbdf1228fa5164870","f3289d15cc7844a38bbe6ec343353a92","f3fa95742daa4c77b56c161c9df475d6","b6237eea51ec44fb824868d844b8601c","bf4035aa5e3e4baaa4dc7de2dd77b33a","844308c7cfbc4f65bf7908d73705fd72","0dba960a4c8345ac83b4b473d818e044","1ae2ce71ba284b9ca34c931213edecb5","da1c1c482f114293930993049ac7b764","1488e238bb474c9087cd563a892d5dcb","6c06fe8ab27b469eb61f466ea7f7e182","1c29e2f0793a48eb8aa40f697b93963d","8736f22509854a2a873a12da0bdea57a","087ddd3b2038432d8477a9ce1d2a4977","1e8698fd912644f28458031b25a62827","06184b0d6c0446c6944827222843b399","07531c9679d44f7992d7c66871b5f551","d068d34b66d34aa28a170dfa5b55e13f","edfb3dd0204f49e1a5dfac95520439b8","fc164d4b226e4a22bab992992cdfdd4c","4a729e5b7b0f4759ba197dcbb1d25a8b","6d345fda6041465680c0238ff8a1f12d","923441a3738d45acbf57a54160cef756","9691429ecec748e792173dd277901ee0","6dd0db759f9a4f6680f298105676d203","f69a8c62757a40c6bb0d5a8e6e903aab","fda4b4350ef14f07b2de294974efe1aa","c6f54657879448b496daecc8a15c2918","64b8f9ee7c4f43ef98f77296c4ef145b","1526c51ba3ea4a2795f1be1522d42b5d","009f23ef00f54cb98723740af3d848db","6eb5b37dad16420baf8df8c29734f9f2","a30e038d7a9a4260abc1d645cf3aef75","3a436ae129ae4aab8ca9533d8864afc7","5044fe5629044efd8da504d153fae348","9cd912e261bd4b72bd3113d7c8cbc6ed","c9af85359e644b568c8ba555f642e367","c4442692903d48f6aa3583ee83cfc521","732c8aeac0624d21bdcfc89bc6244105","17d4148acb0b4d67a1f3680778e9444b","9e7588ff39d8486c912331b84020d583","61f1012f9c6b403f90570c994088b26f","f00e153032174ac496c58ac96ff14643","a1c176033b9d4ecb9b4e774e954f5826","fa0f0b8a618c4cabb1bd5d2a67cdde72","6940317f79e641cba0379e42badeae1f","ddb7f000fabe4ef4a73038965a146583","7a7f27ef00d742ac8c0fb9060c37c60e","f27543a0eb8e425c9e0725401b38ece7","103919eff81f444e800c51b6737ecb9c","113ef93caa1741d58a9deb555db0f582","77da6025562145ff9b3bb5458371c6ba","71f48142db364828b39e953dc63dcf50","db8e4beca5bb4b9282433e5830449d42","db260e0665cc44ce8f4261af3670c57a","4bd903c41887458f9ccf1aa20aa46181","7984d07ac9d34320be87cf0744e37925","e1d7aa4dedcc43cea11cfd879f216e3c","1f6dc4a446df4eaaa0fec17b455758b3","7ae16a28558045e2903af41106d7ba47","97f1637cc68143cd979124499adcd75f","ee451f0e79a944b7b5546636a674005a","3d2d26d6025a451cb2ee86f81c3f5c67","7a06895b1964498a867682c9688492fb","f10a72f238fd4e629b8c5c0f5b177e0a","f0aa22db64814b95937dd9e10a106b74","6af9eb7233fe4d2aa4151981c5a212dc","6a13c3d0dc334cf7991f6751ee1eecfd","9ddeb5688a21456c8268748a0da5264c","4ff70cf57b1742d7aa9c0be30ea87881","dae60053f27744168340f70ae309dbc7","47286e5fd6eb4a989792415aacf07f73","2eb15c8e49f8492f948c5292cd31171f","d906d21dc9bd4c8cb66861d423044a65","de5f1d1c7ed644b9a31a31d5c078ed31","7709d0a8994d47528542989badf1c85d","0500714fee8645bb9a4894535ea723b1","befa4d153d36410ba30ba5ec09c88611","236a5855f26a4cbeb405a2e6446bef4e","9bceda8956f74866b6fd65655c85f8d0","623d68d21e784ac9949fd7941ab53f67","3b377b037832404e9f2246b7f4bfa283","ef28fe5cc5de4cc7b79c6e358cef614c","f0035d3b88da4c9a91689b9db9c6bf7a","1c434f7cecf94e1cb16b68ee0079b01d","d07011d88da0400e8018379396e564b9","f0f6d14dc2ab41e48289b9b08838c2e5","3c075a252a75471aa2afb46284a92b18","841bc14615dd48a49e247f7b3bd75ed8","039d09d0013640b182a7588ac2d34553","ad63f4c64f304b6c876fb68511addb87","bc1ba61e96e5474d92525cd20990aace","048e10628f134eca9bc0e9a46ce5e2cf","18312d09b99c45eebe6d5cfba1fdbddc","8cbe41f131c244c58ff6d1669bc6b8ef","8c99c7df2b73470cafd310c6fcb797b2","14c3bcf57c854f3291a02efde5becdc5","6a31da72eabb4efcac6ebb5dc09ce15a","5d7f5dfe794a4cdfabbafcc58601e625","fd820c75aaf9447093ec0191f3911bed","02c22d93421b4038b3c413b3e40b57ec","a570afd728ae461caed63151ad72a181","46f1109c5f144e92a04c75a50089f37b","1a98368791d74f02a96d3d98e53d86d4","df96a642056140d4af05eee6f9f77862","3434358e79084e51910ca3489046cb45","1e2645994d6e47f6a2cb356e9d3f0f62","898b5bfa0c5644cf8dc81b4c8603a9d0","f5a0e04558144bd583bf7a2b7e7c72fc","166b0965cf0e4827867a7581de618779","8e8656117ba5498aa4f8308cd53c59d9","3c837a89f39e4e038b0a3a378de9a377","d5cf4af358ad4b968b0098482b8e4f01","5acc3586c88744a4a317017949deaeac","bda2f30b3f2e4f7797923dfa6d67a2ad","80ef1189a2bb4c62b6d38e9acf49646e","434499f4207643e6b15b1bc486038ab9","efdb69589210447da328503a7919ae41","3d3c65d7fd3b4ca5a0b9f04b5f2e7491","d815226fbe56432fb67affffdbd33836","6c739f06d7bb408fa42af225520f38fe","3fb4de466df94a91a4b2fda7b0d54d9c","2a1611d4ed69422a97077992d1506f73","ebc45e7393ed4d738534fbfcfcf71b45","fde245aeb0eb49baa3b0bd64fbc05f7a","fdfe96a01f704ede9882f5e324c70118","a83eaccf55764d269aec652f27fe1944","b499aa0ce95647ceb592198e0ce0d97c","1361b140f2e848128ed69676647e27cf","4c5c48d9597048a38f85d0f6cb32c575","43aa8b75f719400ab4c077832442e260","715c8da82db44087b06a507b37ea7bba","0d221895ece44d45aacfbbf6fe6d76bc","3afe42b0abe2406b90bc58dc6c8e278d","e541f867148947a8bde68bb0f73eefa0","36187759ab2f4bc293aeb035e4ea8d73","d0b40c5dac994b99922c685beeee95ca","ce399c29d5a942509b3d83adeb22e8db","2007790a351748f8840abaa5b9bf2b75","12d7f2b75f9f4f8fb07c516adb75b8cc","561ba62c72dc4ba3b949d596691956c5","5fd7615083bf4db0900cbdf1cf044ed0","f5d7ad8c9c1e4394bb76849b05892414","dda45105026c44bc9da9e6c0ef927a4e","71b45cb575334b6c8f9600550a6fab07","e2a70c91988042c2ad15899b52930de1","f9edfcdbc017459a8b2e2e5dc2059855","5338dab178324afbab75f2ecc1432e62","b06a76b23efa4c4da71ce5a8f2d2a738","5dbdffc5c4354e80ab70ce89a99c2e9f","746e837c321d4ad49ff7b2d45bebbe3b","49067e2f9b48468f83670946feb36d00","c3ccd28a1538424ba8de3dbf7296cefc","aa73d034ee744829a5adb80bba8ff653","6dfb1820aa224e1eba8c972e87b0f337","2b7c26a68f7c4c5da65d1e2d41964e70","01ee429bfdec415db565efac779f5b41","84277879bbd84fb0abde04d2a990b3ab","0ea4289706f64e88911df8d93578c5f0","0e9c5b4660994c1b94c3a95e5c0e1b11","2069596aa0644c6382ad0bcffcd5f78b","dcf8643257e74642a414667460a76333","eb7863f9c6ea452e9a595b37555a89fe","8ae07b10339a4de4b2e4e3146ae6697f","710c5700232d496385735f158fd06ac6","9863cc13ee6f4de0b51d2888ac1370de","f03324b1068e4c1caf4d753262fc096f","9ff78a10c21047a7a9821d71255e53fc","31dad2a61a904c4aa397eecd99d6b10f","1137e890f2e444bebfe4c51be7893f89","e08387d34c1c43d6a895207f3608472b","c5e8473026df4b0491f3ceb2af224af5","a5d0745555fd4b678976f2e0b9d94a38","2a26381dc6284ed18ae2592ca8df3e0c","c7b20fac0f7c49f2b30f10c15d842826","720f9da349f54d3baddc573ff1423478","35936e07e6c442a08b91230fa9b3b607","ec345522135e4a76b02a2ddb54b8f751","11c90f0a51e94c2d8617ed53ca439917","4573e4cfa46c4ede819dc765c064ce86","19e7ddb3a2724e9999ffaf370a28626b","235a25c4ced7448d94cc005868b81967","7506ad835fe645d9a64491f23f8c82aa","373b5608ad5c46e2b78fbcc00de47a63","764864ef173142e9bb9acaa40ff2ddb8","35d91ec3215f4244b2da439722599a97","e52cf4e8a5394c59ac937cf0d36f5aad","1b87e09089a549d788f9686cdaa6eadf","cd2a4c9906cf42c685767b96765c9a5f","d2538070f23b42658eed6dd7afc5d4cf","dac139320f7b4c4ca63835716b6daab4","d855eba453c84bb087cc9464b3c19928","ec46e5657b864d19b740159b465d23d1","43a18ef761724c75b8e79049200a8dd9","82622cad8b1b4cef8c58aa36d07d949a","f5ade829a1f14203b22b0c665f405a1b","46005f728f244674ad763cc061ffc26e","65314ea68ace41368e6883772510840c","a09d9772cc4c4cecb4138862b36d089e","922fa176488740c0b4c74fdd30d45f33","b57982104fc24997900fcdd693be1f77","f0f7c7dd4d72494d91f145d07dc170e3","86500681cfad4e8488cf4ba9376fe801","1b59436ee8a34893be13d1ed75104cb1","2d932a6e7989426a9856fb5fc2d0e59f","0314573ebc8d43f49e50047bdf28133a","22c654ad535a48d99be4af99857f1f90","af21747f71154e3392d2669160dceb81","598a38c6f7d747b9aedf97c18dad6dc7","154f797432104a0b9de86cdb7c9e7a6a","73ad3604b79c42ce9409fbaf30de4453","f522d0a7e19448319894d0f5d9902417","74be5f4344bf45979ae87dcd8cc6d6a2","61a7319b0288406f80303fb0e6ae4e0b","e71643acb2be4ab58a6b0e53af7be3d3","0996e99f07f44d5fa346dcd4a0b3d933","d6fe03bd5cf64ed39fe5342c08492e32","18f214270f2a4eaea398a07f897a929d","4cba4639956a4ee4b5ca960da3fb49d0","661a54c863124a58ae7397a04eb1ff2e","a2b242bd9d0f4941b3eece0e4b61c6c2","a2d3896a75c94b6f8c7bf71c10982178","56b30c245ba74e95b6cff98bf0589bf4","41aa9e797db14f9ab4a073fed466b691","87af8e06638d4602988e83c091642da2","517932a2dcac4e7489c8477bddd1c544","7cfc11cc5fda435bb54685a4074dcb51","0f60840e17be428a9fab9f40c174bfab","afacf4bb28d345c6819738f045744e0f","a2968603f51747c4adbb075fd5d5753e","e75dbda1d9b647c79b2f667557bff5a4","299e84a1637b4974a14901b9e215888f","1d6de88b112046bb9f94c086b58b2e67","0be0d6e181bb4043bfabac7a14dc5f2f","2acd876157e847329cb5c5d2a00ab628","7a52e8e08b5745c8bb25203691cb2f39","cf817d0c1786476bb2ee0d3492abf09c","afb0276b6ab74a4ebbcebaa3bce2ba4b","7dc0f0a054af4d60a3cb633b9f2ef1d2","3dd5253453f8487d8099d72a94d189e2","efe2df8f2bb84ef5a46697cb933bed5f","1dba81a7faf2406ca6ba5b0011c0074a","ddb4d23bac92475cb866f83245fff47c","49b5687d7cca4d5bb615e3288e412f21","dd4ed7fb74be44c688801d9f7d4ab3bd","f1689a5814974874836eb3824f3ed576","1afa60a09a3d48d9bf02cdb64e622990","f93a056cb91c44198b77253c86e2cd5f","878a9bbf70014003ab8c8d20e551b101","f07120bbac0444cf822dd9dcda1a95ae","94aac94c92074c7e9b77021369162b5c","af5d7c460c314959b7062d9501d1aa90","0018d872ea76464fa1c981d65753afe8","00199c1161e843f8b1f3d3b92b039b8b","fa3ba1e407a7476e938e60d6362b5a66","002edb95ebe24b40856d19b9fc8ffe39","003566cae02441718a5c0ed26b356f6f","3cf4cb29ae344577b9eed37e531688a4","6e462a4ae44b4a518ea68fde456ea5c3","ec0acf34d59043f695f43c55222a7b0e","eaed7d6a19f0483aa51dc5ff151f7acf","7f743e56d7cd43c7a3baf9f7061abd3d","302b1c7f241b400b8544f3b7378eacce","550d34dd449242c9b3df7daebac8f259","8bfddf0644494979ba02ef5a59b5a336","53f3500a48814dd0b97b2825d781583c","ce9db043ed324af5865e8fa21ce41dc1","92f82ee141f24246b462856f3ecd1493","3a6509634ee24b789f5446afb10fe357","fbc82c9f2524497c81aea0a647043ab9","7d78d41b9d6b4da986eccee3ba18700f","f4aba8c33f204125a231595006d84b4a","74c3a6b4f33e481ebdd241d1cd92370e","993820c3b6ea4ec682af47300d366b1c","d41f649cd95341a29a1bdf24b629b6c1","e158d66435e84caeaa029e61b7303fac","311af551050744debb1c5acf7b8e268d","05bf354c21e74f7681deac6f206f2704","07002b4e493048e9a5f857b02e3ba51c","55b24d5e74074e638770aa5266190028","85497bc859ae45a29a0aea551ce8345b","bce3238cb89c454bbd9798eb92286ba5","cbd3663877364d2cafeae1dffb1e553c","f713b8efdada4fd2ab5235331d510a7d","f72d242125aa40f09bce04b9881b1423","05969cc0bb60409ebb4c1b4ef059eb0a","1760108d7e904933a91168b568f91a9d","087d665af45a4c7994fe652eb0ad16a1","df7c1492de864fea852ce8f4aa45de58","2fdbfcd7056d45fb80009e1f79d3f404","86a6af2b709245e7a6da1ec30ce67ff3","115a328173d840c2ab3757c6816eae78","e2d1a0a592ec485c8af9cf82e8bdf9ca","8d3c203a44b4486aae2b19133ca794ab","04fec532f4f74ffb9741ebafe2526201","af61463a604f437bb9e5c782992622fb","15a76a6ee450459a97fe44e3ad9283d0","9212c14c063e4d4ca27dc1cb1dfc5edf","48c2f4049db54b3b88b9144320d3d41a"}
+        self._T.resourcesTotal=#resources self._T.resourcesLoaded=0
+        local loadBatch
+        loadBatch=function(first)
+            if first>#resources then
+                if Environment:IsMakerPlay() then log("[VRF] Carnival skill preload="..tostring(self._T.resourcesLoaded).."/"..tostring(self._T.resourcesTotal)) end
+                return
+            end
+            local batch={}
+            for i=first,math.min(first+31,#resources) do table.insert(batch,resources[i]) end
+            _ResourceService:PreloadAsync(batch,function(results)
+                for _,status in pairs(results) do
+                    if status==PreloadResultStatus.Success then self._T.resourcesLoaded=self._T.resourcesLoaded+1 end
+                end
+                _TimerService:SetTimerOnce(function() loadBatch(first+32) end,0.01)
+            end)
+        end
+        loadBatch(1)
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method integer PlayOwnedEffectAttached(Entity owner, string ruid, Entity anchor, Vector3 offset, number rotation, Vector3 scale, boolean loop, table options)
+        -- Establish the source actor before a summon attaches a hit effect to a monster.
+        local binding=self:BindingFor(owner)
+        if binding~=nil and isvalid(anchor) and self:BindingFor(anchor)==nil then
+            self._T.owners=self._T.owners or {}
+            self._T.owners[anchor.Id]=binding.actor
+        end
+        return self:PlayEffectAttached(ruid,anchor,offset,rotation,scale,loop,options)
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method Vector3 WorldScale(Entity entity)
+        -- Preserve parent mirrors and scaling when flattening into the scene UI.
+        local scale=Vector3(1,1,1)
+        local cursor=entity
+        while isvalid(cursor) and cursor~=entity.CurrentMap do
+            local tr=cursor.TransformComponent
+            if isvalid(tr) then scale=Vector3(scale.x*tr.Scale.x,scale.y*tr.Scale.y,scale.z*tr.Scale.z) end
+            cursor=cursor.Parent
+        end
+        return scale
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateEffectTransform(table effect, table binding)
+        -- Attached effects use local coordinates, whereas world effects remain fixed.
+        local tr=effect.node.UITransformComponent
+        local scale=effect.scale
+        local rotation=effect.rotation
+        if effect.worldPosition~=nil then
+            tr.anchoredPosition=self:ProjectWorld(binding,effect.worldPosition)
+        elseif isvalid(effect.anchor) then
+            local anchor=effect.anchor.TransformComponent
+            tr.anchoredPosition=self:ProjectAnchor(binding,effect.anchor,anchor:ToWorldPoint(effect.offset))
+            local parentScale=self:WorldScale(effect.anchor)
+            scale=Vector3(scale.x*parentScale.x,scale.y*parentScale.y,scale.z*parentScale.z)
+            rotation=rotation+anchor.WorldZRotation
+        end
+        tr.UIRotation=Vector3(0,0,rotation)
+        tr.UIScale=Vector3(scale.x*binding.ppu/100,scale.y*binding.ppu/100,scale.z)
+        if effect.options.SyncFlip==true and isvalid(effect.anchor) then
+            local source=effect.anchor.SpriteRendererComponent
+            local controller=effect.anchor.PlayerControllerComponent
+            local sprite=effect.node.SpriteGUIRendererComponent
+            if isvalid(source) then sprite.FlipX=source.FlipX sprite.FlipY=source.FlipY
+            elseif isvalid(controller) then sprite.FlipX=_CarnivalReplica:PresentationFacing(effect.anchor)>0 end
+        end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void SortScene()
+        -- Keep the world renderer order inside this window, without global UI overrides.
+        local scene=_CarnivalUI:UI("Lobby/Scene")
+        if not isvalid(scene) then return end
+        local list={} local seen={}
+        local function add(node, order, depth)
+            if not isvalid(node) or node.Parent~=scene or seen[node.Id] then return end
+            seen[node.Id]=true
+            table.insert(list,{node=node,order=order,depth=depth or 0})
+        end
+        for _,binding in pairs(self._T.views or {}) do
+            local entity=binding.actor
+            if isvalid(entity) then
+                local renderer=entity.AvatarRendererComponent or entity.SpriteRendererComponent
+                if isvalid(renderer) then add(binding.view,renderer.OrderInLayer,entity.TransformComponent.WorldPosition.z) end
+            end
+        end
+        for _,record in pairs(self._T.entities or {}) do
+            if isvalid(record.entity) then
+                local source=record.entity
+                local renderer=source.AvatarRendererComponent or source.SpriteRendererComponent
+                if isvalid(renderer) then add(record.node,renderer.OrderInLayer,source.TransformComponent.WorldPosition.z)
+                elseif isvalid(source.TextRendererComponent) then add(record.node,1000,0) end
+                add(record.health,1001,0)
+            end
+        end
+        for _,effect in pairs(self._T.effects or {}) do
+            add(effect.node,effect.options.OrderInLayer or 4,0)
+        end
+        table.sort(list,function(a,b)
+            if a.order~=b.order then return a.order<b.order end
+            if a.depth~=b.depth then return a.depth>b.depth end
+            return a.node.Id<b.node.Id
+        end)
+        local signature=""
+        for _,item in ipairs(list) do signature=signature..item.node.Id..":"..tostring(item.order)..";" end
+        if self._T.sortSignature==signature then return end
+        self._T.sortSignature=signature
+        local first=#scene.Children:ToTable()-#list
+        for i,item in ipairs(list) do _UILogic:SetSiblingIndex(item.node.UITransformComponent,first+i-1) end
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void RefreshEntity(Entity entity)
+        -- Present after the source movement tick, avoiding a frame of extra interpolation delay.
+        if not isvalid(entity) then return end
+        local record=(self._T.entities or {})[entity.Id]
+        if record==nil or not isvalid(record.actor) then return end
+        local binding=(self._T.views or {})[record.actor.Id]
+        if binding~=nil and isvalid(binding.view) then self:DrawEntity(record,binding) end
+    end
+
+    method string SkillForegroundLayer(Entity entity)
+        if not isvalid(entity) or not isvalid(entity.CurrentMap) then return "MapLayer0" end
+        local map=entity.CurrentMap
+        self._T.foregroundLayers=self._T.foregroundLayers or {}
+        local cached=self._T.foregroundLayers[map.Id]
+        if cached~=nil then return cached end
+        local name,order="MapLayer0",-2147483648
+        for _,layer in ipairs(map:GetChildComponentsByTypeName("MOD.Core.MapLayerComponent",true)) do
+            if layer.LayerSortOrder>order then name=layer.MapLayerName order=layer.LayerSortOrder end
+        end
+        self._T.foregroundLayers[map.Id]=name
+        return name
+    end
+
+    method table ForegroundOptions(Entity entity, table options)
+        local result={}
+        for key,value in pairs(options or {}) do result[key]=value end
+        result.SortingLayer=self:SkillForegroundLayer(entity)
+        result.OrderInLayer=20000+math.max(-1000,math.min(1000,result.OrderInLayer or 0))
+        return result
+    end
+
+    method void RaiseSkillEntity(Entity entity)
+        if not isvalid(entity) then return end
+        local layer=self:SkillForegroundLayer(entity)
+        local renderers=entity:GetChildComponentsByTypeName("MOD.Core.SpriteRendererComponent",true)
+        if isvalid(entity.SpriteRendererComponent) then table.insert(renderers,entity.SpriteRendererComponent) end
+        for _,sprite in ipairs(renderers) do
+            sprite.SortingLayer=layer
+            if sprite.OrderInLayer<19000 then sprite.OrderInLayer=20000+math.max(-1000,math.min(1000,sprite.OrderInLayer)) end
+        end
+    end
+end

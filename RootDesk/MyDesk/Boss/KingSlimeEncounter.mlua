@@ -1,0 +1,403 @@
+@Component
+script KingSlimeEncounter extends Component
+    property string OwnerId = ""
+    property integer LiquidPercent = 5
+    @Sync property boolean CombatActive = false
+    @Sync property number HitAt = -10
+    @Sync property number JumpStarted = -1
+    @Sync property number SlamStarted = -1
+    @Sync property number LandStarted = -1
+    @Sync property Vector3 JumpOrigin = Vector3.zero
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- The encounter owns every temporary liquid and summon, separately from weekly loot.
+        self._T.liquids={} self._T.summons={} self._T.serial=0 self._T.damageUnits=0 self._T.pending=0 self._T.healUnits=0 self._T.pattern=0 self._T.patternStep=0
+        self.Entity.Monster.Stationary=true
+        self.Entity.RigidbodyComponent.WalkSpeed=0.65
+        self.Entity.MovementComponent.InputSpeed=1
+        self:Mode("chase",4,"297ad7bed08046e8a4a0bb47fed0f7d1")
+        if Environment:IsMakerPlay() then log("[KingSlime] initialized hp="..tostring(self.Entity.Monster.MaxHp)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Decorate()
+        -- The arena owns the three temporary footholds for its entire visible lifetime.
+        local map=self.Entity.CurrentMap
+        local traversal=map:GetComponent("script.ManoArenaTraversal")
+        if not isvalid(traversal) then traversal=map:AddComponent("ManoArenaTraversal") end
+        traversal:SetupKing(self.OwnerId)
+        if Environment:IsMakerPlay() then log("[KingSlime] arena ready ground="..tostring(self:FloorY(0,4))) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Active()
+        -- A stale spawn or delayed hit cannot heal, summon, or drop into a completed run.
+        local r=(_BossStageManager._T.runs or {})[self.OwnerId]
+        return not self._T.cleaned and self.CombatActive and not self.Entity.Monster.IsDead and self.Entity.Monster.Hp>0 and r~=nil and r.boss==self.Entity and r.state=="active"
+    end
+
+    method number JumpHeight(number elapsed)
+        -- Both render and hitbox paths use an ease-out rise and an accelerating fall.
+        local t=math.max(0,math.min(0.9,elapsed))
+        if t<=0.52 then local u=t/0.52 return 2.1*(1-(1-u)*(1-u)) end
+        local u=(t-0.52)/0.38 return 2.1*(1-u*u)
+    end
+
+    @ExecSpace("ServerOnly")
+    method number FloorY(number x, number fromY)
+        -- Raycast below the temporary platforms: bosses, summons and liquids share the main floor.
+        local f=self.Entity.CurrentMap.FootholdComponent:Raycast(Vector2(x,math.min(fromY,0.2)),Vector2(0,-1),30)
+        if f==nil then return 0 end
+        local a,b=f.StartPoint,f.EndPoint
+        if math.abs(b.x-a.x)<0.001 then return math.max(a.y,b.y) end
+        return a.y+(b.y-a.y)*math.max(0,math.min(1,(x-a.x)/(b.x-a.x)))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Mode(string mode, number duration, string clip)
+        -- Pattern A: one script owns movement and the complete animation clip.
+        self._T.mode=mode self._T.age=0 self._T.duration=duration
+        self.Entity.MovementComponent:Stop()
+        local sr=self.Entity.SpriteRendererComponent
+        sr.SpriteRUID=clip sr.PlayRate=1 sr.StartFrameIndex=0 sr.EndFrameIndex=2147483647
+        if Environment:IsMakerPlay() then log("[KingSlime] mode="..mode.." duration="..tostring(duration)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnDamage(integer damage)
+        -- Integer units preserve partial-percent hits and emit every crossed threshold once.
+        if not self:Active() or damage<=0 then return end
+        local maxHp=self.Entity.Monster.MaxHp
+        self._T.damageUnits=self._T.damageUnits+damage*100
+        local count=math.floor(self._T.damageUnits/(maxHp*self.LiquidPercent))
+        self._T.damageUnits=self._T.damageUnits-count*maxHp*self.LiquidPercent
+        self._T.pending=self._T.pending+count
+        if count>0 then if Environment:IsMakerPlay() then log("[KingSlime] damage liquid count="..tostring(count).." pending="..tostring(self._T.pending)) end end
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity SpawnLiquid(Vector3 origin, boolean scatter)
+        -- Death drops return to the same X; boss damage drops fly to random reachable floor positions.
+        if not self:Active() then return nil end
+        self._T.serial=self._T.serial+1
+        local x=scatter and (-6.5+_UtilLogic:RandomDouble()*13) or math.max(-6.5,math.min(6.5,origin.x))
+        local destination=Vector3(x,self:FloorY(x,math.max(4,origin.y))+0.23,0)
+        local e=_SpawnService:SpawnByModelId("kingslimeliquid","KingLiquid"..tostring(self._T.serial),origin,self.Entity.CurrentMap)
+        if not isvalid(e) then return nil end
+        if not self:Active() then e:Destroy() return nil end
+        table.insert(self._T.liquids,e)
+        local liquid=e:AddComponent("KingSlimeLiquid")
+        liquid:Configure(self.Entity,origin,destination,scatter and (0.7+_UtilLogic:RandomDouble()*0.65) or (0.65+_UtilLogic:RandomDouble()*0.25))
+        return e
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HealLiquid()
+        -- Called only by a liquid which has claimed its arrival; healing never creates new damage drops.
+        if not self:Active() then return end
+        local m=self.Entity.Monster
+        self._T.healUnits=self._T.healUnits+m.MaxHp*self.LiquidPercent
+        local amount=math.floor(self._T.healUnits/100)
+        self._T.healUnits=self._T.healUnits-amount*100
+        amount=math.min(amount,math.max(0,m.MaxHp-m.Hp))
+        if amount>0 then m.Hp=m.Hp+amount self:HealVisual(amount,self.OwnerId) self:Cue("absorb",self.OwnerId) end
+        if Environment:IsMakerPlay() then log("[KingSlime] absorbed liquid heal="..tostring(amount).." hp="..tostring(m.Hp)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity NearestLiquid()
+        -- Seek only unclaimed ground liquids; transformation and pickup own their own destination.
+        local best=nil local distance=math.huge local p=self.Entity.TransformComponent.WorldPosition
+        for i=#self._T.liquids,1,-1 do
+            local e=self._T.liquids[i]
+            if not isvalid(e) then table.remove(self._T.liquids,i)
+            else
+                local l=e:GetComponent("script.KingSlimeLiquid")
+                if isvalid(l) and l.Phase=="ground" then
+                    local d=math.abs(e.TransformComponent.WorldPosition.x-p.x)
+                    if d<distance then best=e distance=d end
+                end
+            end
+        end
+        return best
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CollectLiquids()
+        -- Snapshot the current drops: each liquid atomically reserves one morph/absorption sequence.
+        local count=0
+        for _,e in ipairs(self._T.liquids) do
+            if isvalid(e) then
+                local l=e:GetComponent("script.KingSlimeLiquid")
+                if isvalid(l) and l:Collect() then count=count+1 end
+            end
+        end
+        if Environment:IsMakerPlay() then log("[KingSlime] collect reserved="..tostring(count)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SummonWave()
+        -- Share Mano's flank pursuit and death animation, with King-specific HP and liquid drops.
+        local count=_UtilLogic:RandomIntegerRange(6,9)
+        for i=#self._T.summons,1,-1 do if not isvalid(self._T.summons[i]) then table.remove(self._T.summons,i) end end
+        for i=1,count do
+            if not self:Active() then return end
+            local p=self.Entity.TransformComponent.WorldPosition
+            local x=math.max(-6.5,math.min(6.5,p.x+(i-(count+1)/2)*0.4))
+            self._T.serial=self._T.serial+1
+            local e=_SpawnService:SpawnByModelId("kingslimesummon","KingSlimeSummon"..tostring(self._T.serial),Vector3(x,self:FloorY(x,4)+0.1,0),self.Entity.CurrentMap)
+            if not isvalid(e) then continue end
+            if not self:Active() then e:Destroy() return end
+            table.insert(self._T.summons,e)
+            e.MonsterAttack.BossOwner=self.OwnerId
+            local ai=e:AddComponent("ManoSnail") ai.OwnerId=self.OwnerId ai:ConfigureSlime(self.Entity)
+        end
+        if Environment:IsMakerPlay() then log("[KingSlime] summoned count="..tostring(count).." hp=300") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method integer NextPattern()
+        -- Two slams between utility skills halve their share of the six-action cycle.
+        self._T.patternStep=(self._T.patternStep or 0)%6+1
+        local sequence={1,1,2,1,1,3}
+        return sequence[self._T.patternStep]
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginPattern(integer pattern)
+        -- Windups make jump, summon, and collection recognizable before their effects resolve.
+        if not self:Active() then return end
+        self._T.pattern=pattern
+        if pattern==1 then
+            self.SlamStarted=_UtilLogic.ServerElapsedSeconds self.LandStarted=-1
+            self:Mode("jumpTell",0.42,"763ee1a40786483f9671435c1a8e8537")
+            _BossStageManager:WarningText("킹슬라임이 뛰어오릅니다! 착지 순간 점프로 피하세요.",self.OwnerId)
+            self:Cue("jump",self.OwnerId)
+        else
+            self:Mode(pattern==2 and "summon" or "collect",1.1,"bf6150842fff4f4aa0f3e8e97b574e59")
+            self.SlamStarted=-1
+            self:Cue(pattern==2 and "summon" or "collect",self.OwnerId)
+            if pattern==3 then _BossStageManager:WarningText("액체 수집! 물컹물컹한 액체를 먼저 밟아 회복을 막으세요.",self.OwnerId) end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginJump()
+        -- Preserve the grounded origin so repeated jumps never accumulate vertical drift.
+        local rb=self.Entity.RigidbodyComponent local p=self.Entity.TransformComponent.WorldPosition
+        self:Mode("jump",0.9,"e4ae46df71794213b2a5432906ed1f85")
+        self.JumpOrigin=Vector3(p.x,self:FloorY(p.x,p.y+0.2),p.z)
+        self.JumpStarted=_UtilLogic.ServerElapsedSeconds
+        rb.MoveVelocity=Vector2.zero rb:SetForce(Vector2.zero) rb:SetForceReserve(Vector2.zero)
+        rb.KinematicMove=true rb.KinematicMoveAcceleration=Vector2.one
+        rb:SetWorldPosition(Vector2(self.JumpOrigin.x,self.JumpOrigin.y)) rb:PositionReset()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickJump(number delta, boolean damage)
+        -- Physical placement and the client display sample the same timestamp and arc.
+        local t=math.min(0.9,_UtilLogic.ServerElapsedSeconds-self.JumpStarted)
+        local p=self.Entity.TransformComponent.WorldPosition
+        local velocity=(self.JumpOrigin.y+self:JumpHeight(t)-p.y)/math.max(0.001,delta)
+        self.Entity.MovementComponent.InputSpeed=math.abs(velocity)
+        self.Entity.MovementComponent:MoveToDirection(Vector2(0,velocity>=0 and 1 or -1),0)
+        if t<0.9 then return end
+        self.LandStarted=self.JumpStarted+0.9
+        self:FinishJump()
+        self:Mode("recover",0.45,"6401ef4c5ccb4269a5c97831fa8fd329")
+        self:Cue("impact",self.OwnerId)
+        self:Effect("e777797b543446548a1fdb855ac66f30",self.JumpOrigin,"",true,self.OwnerId)
+        if damage and self:Active() then
+            self.Entity.MonsterAttack:AttackFast(BoxShape(Vector2(0,self.JumpOrigin.y+0.6),Vector2(15,1.3),0),"boss.king.slam",CollisionGroups.HitBox)
+            if Environment:IsMakerPlay() then log("[KingSlime] jump impact damage=50%") end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void FinishJump()
+        -- Clear all motion before restoring the foothold body at the captured floor.
+        self.Entity.MovementComponent:Stop()
+        local rb=self.Entity.RigidbodyComponent
+        rb.MoveVelocity=Vector2.zero rb:SetForce(Vector2.zero) rb:SetForceReserve(Vector2.zero)
+        rb.KinematicMove=false rb:SetWorldPosition(Vector2(self.JumpOrigin.x,self.JumpOrigin.y)) rb:PositionReset()
+        self.Entity.MovementComponent.InputSpeed=1 self.JumpStarted=-1
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(Entity player, number delta)
+        -- Drain large multi-line damage batches gradually, retaining every five-percent receipt.
+        if not self:Active() then return end
+        for i=1,math.min(4,self._T.pending) do
+            self._T.pending=self._T.pending-1
+            self:SpawnLiquid(self.Entity.TransformComponent.WorldPosition+Vector3(0,0.85,0),true)
+            if not self:Active() then return end
+        end
+        local t=self._T t.age=t.age+delta
+        if t.mode=="jump" then self:TickJump(delta,true) return end
+        if t.mode=="chase" or t.mode=="seek" then
+            local target=t.mode=="seek" and self:NearestLiquid() or player
+            local dir=0 local p=self.Entity.TransformComponent.WorldPosition
+            if isvalid(target) then
+                local dx=target.TransformComponent.WorldPosition.x-p.x
+                if math.abs(dx)>0.65 then dir=dx>=0 and 1 or -1 end
+            end
+            if (p.x>=6.5 and dir>0) or (p.x<=-6.5 and dir<0) then dir=0 end
+            if dir~=0 then self.Entity.TransformComponent.Scale=Vector3(-dir,1,1) end
+            self.Entity.MovementComponent:MoveToDirection(Vector2(dir,0),0)
+        end
+        if t.age<t.duration then return end
+        if t.mode=="chase" or t.mode=="seek" or t.mode=="idle" then self:BeginPattern(self:NextPattern())
+        elseif t.mode=="jumpTell" then self:BeginJump()
+        elseif t.mode=="summon" or t.mode=="collect" then
+            local action=t.mode self:Mode("recover",0.9,"6401ef4c5ccb4269a5c97831fa8fd329")
+            if action=="summon" then self:SummonWave() else self:CollectLiquids() end
+        elseif t.mode=="recover" then
+            local choice=_UtilLogic:RandomIntegerRange(1,3)
+            if choice==3 and not isvalid(self:NearestLiquid()) then choice=1 end
+            self:Mode(choice==1 and "chase" or choice==2 and "idle" or "seek",choice==2 and (1+_UtilLogic:RandomDouble()*2) or (3+_UtilLogic:RandomDouble()*2),choice==2 and "6401ef4c5ccb4269a5c97831fa8fd329" or "297ad7bed08046e8a4a0bb47fed0f7d1")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickAfterDefeat(Entity player, number delta)
+        -- Finish an airborne motion without damage and preserve the arena until the player leaves.
+        if self._T.cleaned then return end
+        if self.JumpStarted>=0 then self:TickJump(delta,false)
+        elseif self._T.mode~="defeatIdle" then self.SlamStarted=-1 self:Mode("defeatIdle",0,"6401ef4c5ccb4269a5c97831fa8fd329") end
+    end
+
+    @ExecSpace("Client")
+    method void Effect(string ruid, Vector3 position, string sound, boolean impact)
+        -- One-shot cues are scoped to the encounter map and the authoritative impact packet.
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then return end
+        if impact then _NetworkMotionVisual:SnapImpact(self.Entity,position) if isvalid(p.CameraComponent) then p.CameraComponent:ShakeCamera(0.22,0.3) end end
+        if ruid~="" then _EffectService:PlayEffect(ruid,self.Entity,position,0,Vector3.one,false,{SortingLayer="MapLayer0",OrderInLayer=6}) end
+        if sound~="" then _GameAudio:PlayBossSound(sound,0.8) end
+    end
+
+    @ExecSpace("Client")
+    method void HealVisual(integer amount)
+        -- Actual HP gained uses the game's green recovery skin, plus three random nearby bursts.
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then return end
+        _DamageSkinService:Play(self.Entity,"d58b67cf0f3a4eaf9fe1ad87c0ffac8a",0,{amount},DamageSkinTweenType.Default,false,Vector2(0,0.6),Vector2.one,1,1,LitMode.Default)
+        self._T.puffs=self._T.puffs or {}
+        for i=1,3 do table.insert(self._T.puffs,{at=_UtilLogic.ElapsedSeconds+_UtilLogic:RandomDouble(),x=(_UtilLogic:RandomDouble()-0.5)*2,y=0.25+_UtilLogic:RandomDouble()*1.2}) end
+        if Environment:IsMakerPlay() then log("[KingSlime] heal skin amount="..tostring(amount).." bursts=3") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- A short queue avoids leaving timers attached to a destroyed boss.
+        self:UpdateAudio(delta)
+        local q=self._T.puffs or {}
+        for i=#q,1,-1 do
+            local v=q[i]
+            if _UtilLogic.ElapsedSeconds>=v.at then
+                if not self.Entity.Monster.IsDead then self:Effect("08ae116f052540318d4174cca7dcfca6",_NetworkMotionVisual:Position(self.Entity)+Vector3(v.x,v.y,0),"",false) end
+                table.remove(q,i)
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cleanup()
+        -- Victory, disconnect, retry, and map departure all share idempotent disposal.
+        if self._T.cleaned then return end
+        self._T.cleaned=true self.CombatActive=false self._T.pending=0
+        if self.JumpStarted>=0 then self:FinishJump() end
+        self.Entity.MovementComponent:Stop()
+        for _,e in ipairs(self._T.liquids or {}) do if isvalid(e) then e:Destroy() end end
+        for _,e in ipairs(self._T.summons or {}) do if isvalid(e) then e:Destroy() end end
+        self._T.liquids={} self._T.summons={}
+        if Environment:IsMakerPlay() then log("[KingSlime] encounter cleaned") end
+    end
+
+    method void OnEndPlay()
+        -- Client queues and server entities cannot survive the encounter owner.
+        if self:IsServer() then self:Cleanup() else
+            self._T.puffs={}
+            for _,v in pairs(self._T.audio or {}) do if isvalid(v.entity) then v.entity:Destroy() end end
+            self._T.audio=nil
+        end
+    end
+    @ExecSpace("ClientOnly")
+    method boolean ApplySlamPose(SpriteRendererComponent renderer)
+        -- Sample one attack sequence against the same clock as the jump; never restart it at impact.
+        if self.SlamStarted<0 or self.Entity.Monster.IsDead then return false end
+        local now=_UtilLogic.ServerElapsedSeconds
+        local frame=0
+        if self.JumpStarted>=0 then
+            local t=now-self.JumpStarted
+            frame=t<0.15 and 3 or t<0.52 and 4 or t<0.9 and 5 or t<1.04 and 6 or 7
+        elseif self.LandStarted>=self.SlamStarted then
+            local t=now-self.LandStarted
+            if t>=0.28 then return false end
+            frame=t<0.14 and 6 or 7
+        else
+            local t=now-self.SlamStarted
+            frame=t<0.14 and 0 or t<0.28 and 1 or 2
+        end
+        if renderer.SpriteRUID~="763ee1a40786483f9671435c1a8e8537" then renderer.SpriteRUID="763ee1a40786483f9671435c1a8e8537" end
+        if renderer.StartFrameIndex~=frame then renderer.StartFrameIndex=frame end
+        if renderer.EndFrameIndex~=frame then renderer.EndFrameIndex=frame end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PrepareAudio()
+        -- Preload native sound components before the first windup; source lifetime follows this boss.
+        if self._T.audio~=nil then return end
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then return end
+        self._T.audio={}
+        local cues={jump={"94b721bcc6d2404cbb1c0b1e13878eeb",1},impact={"6444bd2181fe43c487d52677f2ab1040",0.8},summon={"e35d980959fe4cd3b8302331cfa742c3",1},collect={"e35d980959fe4cd3b8302331cfa742c3",0.85},absorb={"6444bd2181fe43c487d52677f2ab1040",1.2}}
+        for key,info in pairs(cues) do
+            local e=_SpawnService:SpawnByModelId("kingslimepatternsound","KingCue_"..key,self.Entity.TransformComponent.WorldPosition,self.Entity.CurrentMap)
+            if isvalid(e) then
+                local sound=e.SoundComponent
+                sound.AudioClipRUID=info[1] sound.Pitch=info[2]
+                self._T.audio[key]={entity=e,pending=0}
+            end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void Cue(string key)
+        -- Queue only while loading; muted cues never play later after unmuting.
+        self:PrepareAudio()
+        local v=(self._T.audio or {})[key]
+        local p=_UserService.LocalPlayer
+        if v==nil or not isvalid(v.entity) or not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then return end
+        if _GameAudio.muted or _GameAudio.sfxVolume<=0 then return end
+        if key=="absorb" and _UtilLogic.ElapsedSeconds<(self._T.absorbSoundAt or 0) then return end
+        if key=="absorb" then self._T.absorbSoundAt=_UtilLogic.ElapsedSeconds+0.12 end
+        v.pending=0.5
+        self:UpdateAudio(0)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateAudio(number delta)
+        -- Respect live volume/mute changes and avoid silent first-use playback before audio is ready.
+        self:PrepareAudio()
+        local p=_UserService.LocalPlayer
+        local allowed=isvalid(p) and p.CurrentMap==self.Entity.CurrentMap and not _GameAudio.muted
+        for key,v in pairs(self._T.audio or {}) do
+            if not isvalid(v.entity) then continue end
+            local sound=v.entity.SoundComponent
+            local volume=allowed and _GameAudio:GetBossSfxVolume(1.4) or 0
+            if sound.Volume~=volume then sound.Volume=volume end
+            if v.pending>0 then
+                v.pending=v.pending-delta
+                if volume<=0 then v.pending=0
+                elseif sound:IsAudioClipLoaded() then
+                    v.pending=0 sound:Stop() sound:Play()
+                    if Environment:IsMakerPlay() then log("[KingSlime] sound cue="..key.." loaded=true playing="..tostring(sound:IsPlaying()).." volume="..tostring(volume)) end
+                end
+            end
+        end
+    end
+
+end

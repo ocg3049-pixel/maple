@@ -7,10 +7,12 @@ script BuffBarManager extends Logic
 
 	method void OnBeginPlay()
 		if not self:IsClient() then return end
+        _EntityService:GetEntityByPath("/ui/DefaultGroup/BuffBar").Enable=true
 		-- 등록된 버프 목록 - 새 버프 UI를 추가할 때 이 표에 한 줄만 추가하면 된다.
 		-- cancel = (요청) 아이콘 우클릭 시 그 버프/스킬을 즉시 중단하는 처리. 클라 표시(HideBuff)와
 		-- 클라 전용 스탯 정리(CharInfoManager)는 여기서, 서버 상태는 SkillManager.RequestCancelBuff로 정리한다.
 		self._T.buffList = {
+            {path="/ui/DefaultGroup/BuffBar/BossBattleIcon",getRemaining=function() return _BossStageManager:BattleBuffActive(_UserService.LocalPlayer) and 1000000 or 0 end,cancel=function() _BossStageManager:CancelBattleBuff() end},
             {path="/ui/DefaultGroup/BuffBar/RecoveryPotion_hp", getRemaining=function() return _RecoveryPotionManager.hpRemaining end, cancel=function() _RecoveryPotionManager:RequestCancel("hp") end},
             {path="/ui/DefaultGroup/BuffBar/RecoveryPotion_mp", getRemaining=function() return _RecoveryPotionManager.mpRemaining end, cancel=function() _RecoveryPotionManager:RequestCancel("mp") end},
 			{ path = "/ui/DefaultGroup/BuffBar/AttackSpeedPotionIcon", getRemaining = function() return _CharInfoManager.attackSpeedPotionRemaining end,
@@ -33,11 +35,11 @@ script BuffBarManager extends Logic
 			-- 리스토네이션(요청 2026-08-12): 5초짜리 지속 회복 - 우클릭 취소는 **표시만** 내린다.
 			-- 서버 회복 예약(PlayerAttack의 restorationToken)까지 끊을 만한 길이가 아니라 패링과 같은 처리다.
 			{ path = "/ui/DefaultGroup/BuffBar/RestorationIcon", getRemaining = function() return _RestorationBuffUI:GetRemaining() end,
-				cancel = function() _RestorationBuffUI:HideBuff() end },
+				cancel = function() _SkillManager:RequestCancelBuff("restoration"); _RestorationBuffUI:HideBuff() end },
 			{ path = "/ui/DefaultGroup/BuffBar/ElemFieldIcon",   getRemaining = function() return _ElemFieldBuffUI:GetRemaining() end,
 				cancel = function() _SkillManager:RequestCancelBuff("elemfield"); _ElemFieldBuffUI:HideBuff() end },
 			{ path = "/ui/DefaultGroup/BuffBar/ParryIcon",       getRemaining = function() return _ParryBuffUI:GetRemaining() end,
-				cancel = function() _ParryBuffUI:HideBuff() end },
+				cancel = function() _SkillManager:RequestCancelBuff("parry"); _ParryBuffUI:HideBuff() end },
 			{ path = "/ui/DefaultGroup/BuffBar/RageIcon",        getRemaining = function() return _RageBuffUI:GetRemaining() end,
 				cancel = function() _CharInfoManager:CancelAttackBuff("rage"); _RageBuffUI:HideBuff() end },
 			{ path = "/ui/DefaultGroup/BuffBar/MeditationIcon",  getRemaining = function() return _MeditationBuffUI:GetRemaining() end,
@@ -123,7 +125,16 @@ script BuffBarManager extends Logic
 			{ path = "/ui/DefaultGroup/BuffBar/ThiefSummonIcon", getRemaining = function() return _ThiefSummonBuffUI:GetRemaining() end,
 				cancel = function() _SkillManager:RequestCancelBuff("thiefsummon"); _ThiefSummonBuffUI:HideBuff() end },
 		}
-		self._T.timerId = _TimerService:SetTimerRepeat(self.Reorder, 0.1)
+		self._T.buffTouchLinks={}
+        for _,entry in ipairs(self._T.buffList) do
+            local entity=_EntityService:GetEntityByPath(entry.path)
+            if isvalid(entity) then
+                local path=entry.path
+                local callbackId=entity:ConnectEvent(UITouchDownEvent,function(event) self:CancelBuff(path,event.TouchPoint) end)
+                table.insert(self._T.buffTouchLinks,{entity=entity,callbackId=callbackId})
+            end
+        end
+        self._T.timerId = _TimerService:SetTimerRepeat(self.Reorder, 0.1)
 		-- (요청) 버프 아이콘 우클릭 취소. PC 우클릭은 ScreenTouchEvent(TouchId=2는 모바일 두 손가락)가
 		-- 아니라 KeyDownEvent(KeyboardKey.Mouse1)로만 온다(프로젝트 공통 규칙).
 		self._T.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
@@ -147,9 +158,25 @@ script BuffBarManager extends Logic
             if b.getRemaining()>0 then
                 local ent=_EntityService:GetEntityByPath(b.path)
                 if _UICursorManager:Hit(ent,Vector2(cx+960,cy+540)) then
-                    self._T.cancelUntil=now+0.2 b.cancel()
-                    log("[BuffBar] cancelled "..b.path) return
+                    self:CancelBuff(b.path,Vector2(cx+960,cy+540)) return
                 end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CancelBuff(string path, Vector2 point)
+        local now=_UtilLogic.ElapsedSeconds
+        if now<(self._T.cancelUntil or 0) or _MobileUIManager._T.layoutEditing then return end
+        if _UIClickArbiter:GetTopmostWindowAt(point)~="" then return end
+        for _,entry in ipairs(self._T.buffList or {}) do
+            if entry.path==path and entry.getRemaining()>0 then
+                if entry.cancel==nil then return end
+                self._T.cancelUntil=now+0.2
+                entry.cancel()
+                self:Reorder()
+                if Environment:IsMakerPlay() then log("[BuffBar] cancelled "..path) end
+                return
             end
         end
     end
@@ -160,7 +187,7 @@ script BuffBarManager extends Logic
         for _,b in ipairs(self._T.buffList or {}) do
             if b.getRemaining()>0 then
                 local ent=_EntityService:GetEntityByPath(b.path)
-                if _UICursorManager:Hit(ent,Vector2(cx+960,cy+540)) then return tostring(ent.SpriteGUIRendererComponent.ImageRUID or "") end
+                if _UICursorManager:Hit(ent,Vector2(cx+960,cy+540)) then return tostring(ent:GetChildByName("Icon").SpriteGUIRendererComponent.ImageRUID.DataId or "") end
             end
         end
         return ""
@@ -182,9 +209,10 @@ script BuffBarManager extends Logic
         if self._T.layoutSignature==signature then return end
         self._T.layoutSignature=signature
 
+        -- Leave room below the boss HP, timer and top menu, including enlarged mobile icons.
 		local slotWidth = _MobileUIManager:IsMobile() and 88 or 60
         local bar=_EntityService:GetEntityByPath("/ui/DefaultGroup/BuffBar")
-        if isvalid(bar) then bar.UITransformComponent.AlignmentOption=AlignmentType.TopCenter bar.UITransformComponent.Pivot=Vector2(0.5,1) bar.UITransformComponent.anchoredPosition=Vector2(0,-20) end
+        if isvalid(bar) then bar.UITransformComponent.AlignmentOption=AlignmentType.TopCenter bar.UITransformComponent.Pivot=Vector2(0.5,1) bar.UITransformComponent.anchoredPosition=Vector2(0,_MobileUIManager:IsMobile() and -350 or -258) end
 		for i, b in ipairs(active) do
 			local ent = _EntityService:GetEntityByPath(b.path)
 			if isvalid(ent) then
@@ -198,6 +226,10 @@ script BuffBarManager extends Logic
 	end
 
 	method void OnEndPlay()
+        for _,link in ipairs(self._T.buffTouchLinks or {}) do
+            if isvalid(link.entity) then link.entity:DisconnectEvent(UITouchDownEvent,link.callbackId) end
+        end
+        self._T.buffTouchLinks={}
 		if self._T.timerId then
 			_TimerService:ClearTimer(self._T.timerId)
 		end

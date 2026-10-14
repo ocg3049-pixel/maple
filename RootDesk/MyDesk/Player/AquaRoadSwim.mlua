@@ -1,0 +1,266 @@
+@Component
+script AquaRoadSwim extends Component
+
+    property number GravityScale = 0.22
+    property number FallSpeedScale = 0.60
+    property number StrokeForce = 3.0
+    property number RiseSpeedMultiplier = 2.0
+    property number DiveSpeedMultiplier = 2.0
+    property number StrokeInterval = 0.16
+    property number HorizontalAccelerationScale = 20.0
+    property number HorizontalDecelerationScale = 40.0
+    property string BubbleRUID = "b13fb48c0d8c4c39b654c1940dfcbf4f"
+
+    method boolean IsWaterMap(string mapName)
+        -- Public Maple map swim flags; indoors and islands remain dry. Channel copies share the flag.
+        local name = string.gsub(mapName, "__channel_%d+$", "")
+        if self._T.waterMaps == nil then
+            self._T.waterMaps = {
+                ["230000000"]=true, ["230010000"]=true, ["230010100"]=true,
+                ["230010200"]=true, ["230010300"]=true, ["230010400"]=true,
+                ["230020000"]=true, ["230020100"]=true, ["230020200"]=true,
+                ["230020300"]=true, ["230030000"]=true, ["230030100"]=true,
+                ["230030200"]=true, ["230040000"]=true, ["230040100"]=true,
+                ["230040200"]=true, ["230040300"]=true, ["230040400"]=true
+            }
+        end
+        return self._T.waterMaps[name] == true or name=="seruf_arena" or string.sub(name,1,17)=="boss_stage_seruf_" or name=="regional_boss_27" or string.sub(name,1,18)=="boss_stage_pianus_"
+    end
+
+    method boolean IsSubmerged()
+        -- Derive environment from the actual map rather than a client request or remembered destination.
+        local map = self.Entity.CurrentMap
+        return isvalid(map) and isvalid(map.MapComponent) and map.MapComponent.TileMapMode == TileMapMode.MapleTile and self:IsWaterMap(map.Name)
+    end
+
+    method void OnBeginPlay()
+        -- One component per player; no map timers or global movement state survives on a different player.
+        self._T.mapName = ""
+        self._T.strokeCooldown = 0
+        if self:IsClient() and self.Entity == _UserService.LocalPlayer then
+            local controller = self.Entity.PlayerControllerComponent
+            controller:AddCondition("Jump", function()
+                if not isvalid(self) or not self.Enable or not self:IsSubmerged() then return true end
+                return not self:TrySwimInput(false)
+            end)
+            controller:AddCondition("DownJump", function()
+                if not isvalid(self) or not self.Enable or not self:IsSubmerged() then return true end
+                return not self:TrySwimInput(true)
+            end)
+        end
+        self:RefreshEnvironment()
+        if Environment:IsMakerPlay() then log("[VRF][AquaSwim] ready side=" .. (self:IsServer() and "server" or "client")) end
+    end
+
+    method void RefreshEnvironment()
+        -- Server owns animation mappings; only the owning client changes player physics.
+        local map = self.Entity.CurrentMap
+        local name = isvalid(map) and map.Name or ""
+        if name == self._T.mapName then return end
+        self._T.mapName = name
+        local water = self:IsSubmerged()
+        if self:IsServer() then
+            self:ApplyAnimation(water)
+        elseif self.Entity == _UserService.LocalPlayer then
+            self:ApplyPhysics(water)
+            self._T.strokeCooldown = 0
+            self._T.riseStartGrace = 0
+            self._T.fastFall = false
+            self._T.ceilingBlocked = false
+            if Environment:IsMakerPlay() then log("[VRF][AquaSwim] map=" .. name .. " water=" .. tostring(water) .. " gravity=" .. tostring(self.Entity.RigidbodyComponent.Gravity)) end
+        end
+        if self:IsClient() then self:ClearBubbles() end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ApplyAnimation(boolean water)
+        -- Remap airborne poses only: ground movement, attacks, hit, ladders and death keep their own clips.
+        local animation = self.Entity.AvatarStateAnimationComponent
+        if not isvalid(animation) then return end
+        if water and self._T.savedActions == nil then
+            self._T.savedActions = {}
+            for _,key in ipairs({"JUMP", "FALL"}) do
+                local old = animation.StateToAvatarBodyActionSheet[key]
+                self._T.savedActions[key] = {exists=old~=nil, name=old~=nil and old.AvatarBodyActionStateName or "fall", rate=old~=nil and old.PlayRate or 1}
+                animation.StateToAvatarBodyActionSheet[key] = AvatarBodyActionElement("fly", 1)
+            end
+        elseif not water and self._T.savedActions ~= nil then
+            for key,old in pairs(self._T.savedActions) do
+                if old.exists then animation.StateToAvatarBodyActionSheet[key] = AvatarBodyActionElement(old.name, old.rate)
+                else animation:RemoveActionSheet(key) end
+            end
+            self._T.savedActions = nil
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyPhysics(boolean water)
+        -- Keep buff-owned InputSpeed/JumpForce intact and restore the exact previous body values on exit.
+        local rb = self.Entity.RigidbodyComponent
+        if not isvalid(rb) then return end
+        if water and self._T.savedPhysics == nil then
+            self._T.savedPhysics = {gravity=rb.Gravity, fall=rb.FallSpeedMaxY, acceleration=rb.AirAccelerationX, drag=rb.AirDecelerationX}
+            rb.Gravity = self._T.savedPhysics.gravity * self.GravityScale
+            rb.FallSpeedMaxY = self._T.savedPhysics.fall * self.FallSpeedScale
+            -- Native air steering is very weak from rest; match ordinary walking responsiveness underwater.
+            rb.AirAccelerationX = self._T.savedPhysics.acceleration * self.HorizontalAccelerationScale
+            rb.AirDecelerationX = self._T.savedPhysics.drag * self.HorizontalDecelerationScale
+        elseif not water and self._T.savedPhysics ~= nil then
+            local saved = self._T.savedPhysics
+            rb.Gravity = saved.gravity
+            rb.FallSpeedMaxY = saved.fall
+            rb.AirAccelerationX = saved.acceleration
+            rb.AirDecelerationX = saved.drag
+            self._T.savedPhysics = nil
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanStroke()
+        -- Respect the same login, modal, chat, death and skill locks as the normal controls.
+        if self.Entity ~= _UserService.LocalPlayer or not self.Enable or not self:IsSubmerged() then return false end
+        if not _LoginFlow:IsInGame() or _MapleHUDManager:IsChatTyping() then return false end
+        if _GameSystemMenu:BlocksGameplayInput() or _UIItemDiscardManager:BlocksInput() or _SkillManager:BlocksAmountInput() then return false end
+        if _KeySettingManager:IsWindowOpen() or _KeySettingManager:IsCapturingKey() then return false end
+        if _SkillManager._T.actionLock == true or _AutoHuntPowerSave.active then return false end
+        local pc = self.Entity.PlayerControllerComponent
+        local player = self.Entity.PlayerComponent
+        if not isvalid(pc) or pc.IsUpdateBlocked or not isvalid(player) or player.Hp <= 0 or player:IsDead() then return false end
+        if _MobileUIManager:IsMobile() then return _MobileUIManager:CanAct() end
+        return pc.Enable or (_AutoHuntManager:IsActive() and (self._T.autoInputUntil or 0)>_UtilLogic.ElapsedSeconds)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TryAutoSwim(boolean descend)
+        -- Reuse normal swimming physics and locks while auto hunting owns the disabled input controller.
+        if not _AutoHuntManager:IsActive() or not self:IsSubmerged() then return end
+        self._T.autoInputUntil=_UtilLogic.ElapsedSeconds+0.25
+        self._T.autoDiveUntil=descend and self._T.autoInputUntil or 0
+        self:TrySwimInput(descend)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean TrySwimInput(boolean descend)
+        -- Return true when the water controller consumes the input, including cooldown/blocked input.
+        if not self:IsSubmerged() then return false end
+        self:RefreshEnvironment()
+        if not self:CanStroke() or (self._T.strokeCooldown or 0) > 0 then return true end
+        local state = self.Entity.StateComponent.CurrentStateName
+        if state == "ATTACK" or state == "ATTACK_WAIT" or state == "HIT" or state == "DEAD" or state == "SIT" then return true end
+        local rb = self.Entity.RigidbodyComponent
+        if state == "CLIMB" or state == "LADDER" then return false end
+        self:LimitSerufCeiling()
+        if not descend and self._T.ceilingBlocked then return true end
+        if descend and rb:IsOnGround() then
+            rb:DownJump()
+        else
+            -- Double upward speed and quadruple upward gravity to retain the original stroke height.
+            local force = descend and -self.StrokeForce * 0.65 or self.StrokeForce * self.RiseSpeedMultiplier
+            self._T.riseStartGrace = descend and 0 or 0.06
+            if not descend and self._T.savedPhysics ~= nil then
+                rb.Gravity = self._T.savedPhysics.gravity * self.GravityScale * self.RiseSpeedMultiplier * self.RiseSpeedMultiplier
+            end
+            rb:SetForce(Vector2(0, force))
+            self._T.lastStrokeForce = force
+            self.Entity.StateComponent:ChangeState(descend and "FALL" or "JUMP")
+        end
+        self._T.strokeCooldown = self.StrokeInterval
+        self._T.strokeCount = (self._T.strokeCount or 0) + 1
+        if self._T.strokeCount <= 3 then if Environment:IsMakerPlay() then log("[VRF][AquaSwim] stroke=" .. tostring(self._T.strokeCount) .. " descend=" .. tostring(descend)) end end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LimitSerufCeiling()
+        local map=self.Entity.CurrentMap
+        if not isvalid(map) then return end
+        local pianus=map.Name=="regional_boss_27" or string.sub(map.Name,1,18)=="boss_stage_pianus_"
+        if not pianus and map.Name~="seruf_arena" and string.sub(map.Name,1,17)~="boss_stage_seruf_" then return end
+        local ceiling=pianus and (_RegionalBossCatalog:Stage(27).camera[4]-0.8) or 5.40
+        local position=self.Entity.TransformComponent.WorldPosition
+        local rb=self.Entity.RigidbodyComponent
+        if position.y<ceiling-0.24 then self._T.ceilingBlocked=false end
+        if position.y<ceiling or self._T.ceilingBlocked then return end
+        -- The owning client resolves the top edge once. Repeated server teleports discard lateral movement.
+        self._T.ceilingBlocked=true self._T.riseStartGrace=0
+        if position.y>ceiling+0.06 then rb:SetWorldPosition(Vector2(position.x,ceiling)) end
+        rb:SetForce(Vector2(0,-0.3))
+        self._T.strokeCooldown=self.StrokeInterval
+        if Environment:IsMakerPlay() then log("[VRF][AquaSwim] ceiling released x="..tostring(position.x).." horizontalInput="..tostring(rb.MoveVelocity.x)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateDive(boolean downHeld)
+        -- Down alone accelerates an airborne swimmer; release, landing and input locks restore normal fall.
+        local saved = self._T.savedPhysics
+        if saved == nil then return end
+        local rb = self.Entity.RigidbodyComponent
+        local state = self.Entity.StateComponent.CurrentStateName
+        local locked = state == "ATTACK" or state == "ATTACK_WAIT" or state == "HIT" or state == "DEAD" or state == "SIT" or state == "CLIMB" or state == "LADDER"
+        local airborne = not rb:IsOnGround()
+        local fast = downHeld and self:CanStroke() and airborne and not locked
+        local rising = airborne and (rb.RealMoveVelocity.y > 0 or (self._T.riseStartGrace or 0) > 0)
+        local gravityMultiplier = rising and self.RiseSpeedMultiplier * self.RiseSpeedMultiplier or 1
+        local multiplier = fast and self.DiveSpeedMultiplier or 1
+        -- Gravity also affects the native fall limit; multiplying both would make diving four times faster.
+        if fast and not self._T.fastFall and rising then
+            rb:SetForce(Vector2(0, 0))
+            self._T.riseStartGrace = 0
+        end
+        rb.Gravity = saved.gravity * self.GravityScale * (fast and 1 or gravityMultiplier)
+        rb.FallSpeedMaxY = saved.fall * self.FallSpeedScale * multiplier
+        if self._T.fastFall ~= fast then
+            self._T.fastFall = fast
+            if Environment:IsMakerPlay() then log("[VRF][AquaDive] active=" .. tostring(fast) .. " fall=" .. tostring(rb.FallSpeedMaxY)) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClearBubbles()
+        -- Explicitly remove the looping effect on map change, death, or component teardown.
+        if (self._T.bubbleSerial or 0) > 0 then _EffectService:RemoveEffect(self._T.bubbleSerial) end
+        self._T.bubbleSerial = 0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateBubbles()
+        -- Every client renders bubbles for visible swimmers, using the original Maple Bubbling clip.
+        local localPlayer = _UserService.LocalPlayer
+        local player = self.Entity.PlayerComponent
+        local visible = isvalid(localPlayer) and self.Entity.CurrentMap == localPlayer.CurrentMap and self:IsSubmerged() and isvalid(player) and player.Hp > 0 and not player:IsDead()
+        if not visible then self:ClearBubbles() return end
+        if (self._T.bubbleSerial or 0) > 0 then return end
+        self._T.bubbleSerial = _EffectService:PlayEffectAttached(self.BubbleRUID, self.Entity, Vector3(0, 0.5, 0), 0, Vector3.one, true, {PlayRate=0.6, Alpha=0.65, SortingLayer="MapLayer0", OrderInLayer=5})
+        if self._T.bubbleSerial > 0 and not self._T.bubbleLogged then
+            self._T.bubbleLogged = true
+            if Environment:IsMakerPlay() then log("[VRF][AquaSwim] bubbling started serial=" .. tostring(self._T.bubbleSerial)) end
+        end
+    end
+
+    method void OnUpdate(number delta)
+        -- Map identity checks are cheap; no timers accumulate after repeated map/channel transitions.
+        self:RefreshEnvironment()
+        if self:IsServer() then return end
+        self:UpdateBubbles()
+        if self.Entity ~= _UserService.LocalPlayer then return end
+        self._T.strokeCooldown = math.max(0, (self._T.strokeCooldown or 0) - delta)
+        if not self:IsSubmerged() then return end
+        local mobile = _MobileUIManager:IsMobile()
+        local jumpHeld = mobile and _MobileUIManager:IsJumpHeld() or (not mobile and _KeySettingManager:IsFuncKeyPressed("jump"))
+        local downHeld = mobile and (_MobileUIManager._T.stickY or 0)<0 or (not mobile and _InputService:IsKeyPressed(KeyboardKey.DownArrow))
+        if _AutoHuntManager:IsActive() and (self._T.autoDiveUntil or 0)>_UtilLogic.ElapsedSeconds then downHeld=true end
+        self._T.riseStartGrace = math.max(0, (self._T.riseStartGrace or 0) - delta)
+        self:LimitSerufCeiling()
+        self:UpdateDive(downHeld)
+        if jumpHeld then self:TrySwimInput(downHeld) end
+    end
+
+    method void OnEndPlay()
+        -- Restore borrowed values; input conditions become pass-through when the component is invalid.
+        if self:IsServer() then self:ApplyAnimation(false)
+        else
+            if self.Entity == _UserService.LocalPlayer then self:ApplyPhysics(false) end
+            self:ClearBubbles()
+        end
+    end
+end

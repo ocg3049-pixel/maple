@@ -36,7 +36,7 @@ script RewardCenter extends Logic
         end)
         self._T.key=_InputService:ConnectEvent(KeyDownEvent,self.OnKey)
         self:UI("").Enable=false
-        log("[RewardCenter] HUD, hotkey and claim-all ready")
+        if Environment:IsMakerPlay() then log("[RewardCenter] HUD, hotkey and claim-all ready") end
     end
 
     @ExecSpace("ClientOnly")
@@ -49,14 +49,14 @@ script RewardCenter extends Logic
 
     @ExecSpace("ClientOnly")
     method boolean Pending()
-        -- Unconfirmed delivery must be retried before other inventory operations.
+        -- Serialize reward receipts only; ordinary input does not consult this flag.
         return _ManoTitle._T.pending==true or _EventRewards._T.pending~=nil or _OfflineRestRewards._T.retryAction~=nil or _OfflineRestRewards._T.busy==true or (_OfflineRestRewards._T.view or {}).claim~=nil
     end
 
     @ExecSpace("ClientOnly")
     method boolean BlocksInput()
         -- A short close guard prevents Escape from also opening the game menu.
-        return self.opened or self._T.running==true or _UtilLogic.ElapsedSeconds<(self._T.closedUntil or 0)
+        return self.opened or _UtilLogic.ElapsedSeconds<(self._T.closedUntil or 0)
     end
 
     @ExecSpace("ClientOnly")
@@ -87,13 +87,13 @@ script RewardCenter extends Logic
         _EventRewards:RequestStatus(_EventRewards._T.id)
         _OfflineRestRewards:RequestStatus(_OfflineRestRewards._T.id)
         self:Draw() _UIAudio:Play("MenuUp")
-        log("[RewardCenter] opened")
+        if Environment:IsMakerPlay() then log("[RewardCenter] opened") end
     end
 
     @ExecSpace("ClientOnly")
     method void Close()
-        -- Never let a provisional inventory grant be spent before its receipt is saved.
-        if self._T.running or self:Pending() then _UIToast:ShowMessage("보상 저장 확인이 필요합니다. 보상 받기로 재시도해주세요.") return end
+        -- Closing the window leaves the serialized receipt queue running in the background.
+        if _EventRewards._T.pending~=nil and not _EventRewards._T.busy then _EventRewards:SendPending() end
         self.opened=false self:UI("").Enable=false self._T.closedUntil=_UtilLogic.ElapsedSeconds+0.2
     end
 
@@ -139,7 +139,7 @@ script RewardCenter extends Logic
             title=(_BossStageManager:Stage(bundle.stage or 1).name or "보스").." 주간 처치 보상"
         end
         local add=function(label,item) table.insert(rows,{title=title,reward=label,item=item,task=task}) end
-        if kind=="title" then title="보스 최초 처치 칭호" add("마노 정복자 ★"..tostring(_ManoTitle.kills).." · 올스탯 +"..tostring(_ManoTitle.kills),_ManoTitle:Item(_ManoTitle.kills)) return rows end
+        if kind=="title" then title="보스 최초 처치 칭호" add(_BossStageManager:Stage(_ManoTitle.kills).name.." 정복자 ★"..tostring(_ManoTitle.kills).." · 주스탯 +"..tostring(_ManoTitle.kills*4).." · 공/마 +"..tostring(_ManoTitle.kills*3),_ManoTitle:Item(_ManoTitle.kills)) return rows end
         if task.retry then add("이전 수령의 저장 확인 · 추가 차감 없이 재시도",nil) return rows end
         if kind=="weekly" then add("휴식 시간 20시간",nil)
         elseif kind=="rest" then
@@ -171,9 +171,26 @@ script RewardCenter extends Logic
             _EventRewards:RequestStatus(_EventRewards._T.id) _OfflineRestRewards:RequestStatus(_OfflineRestRewards._T.id)
             self._T.message="보상 정보를 확인 중입니다. 잠시 후 다시 눌러주세요." self:Draw() return
         end
-        self._T.queue=self:Tasks() self._T.index=1 self._T.skipped=0 self._T.received={}
+        local queue={} local events={}
+        for _,task in ipairs(self:Tasks()) do
+            if task.kind=="title" or task.kind=="rest" or task.kind=="weekly" or task.retry then table.insert(queue,task)
+            else table.insert(events,task) end
+        end
+        -- Rest inventory is delivered on this click, before weekly/title storage acknowledgements.
+        for i,task in ipairs(queue) do
+            if task.kind=="rest" then table.remove(queue,i) table.insert(queue,1,task) break end
+        end
+        if #events>0 then
+            table.insert(queue,queue[1] and queue[1].kind=="rest" and 2 or 1,{kind="batch",key=0,tasks=events})
+        end
+        self._T.queue=queue self._T.index=1 self._T.skipped=0 self._T.received={}
         self._T.running=#self._T.queue>0 self._T.waiting=nil self._T.message=""
-        self:Draw()
+        if self._T.running then
+            self:Close()
+            self._T.closedUntil=0
+            if Environment:IsMakerPlay() then log("[VRF][RewardClaim] claim-all dispatched inputBlocked="..tostring(self:BlocksInput())) end
+            self:RunNext()
+        else self:Draw() end
     end
 
     @ExecSpace("ClientOnly")
@@ -186,8 +203,11 @@ script RewardCenter extends Logic
             if task.kind==row.task.kind and task.key==row.task.key then
                 self._T.queue={task} self._T.index=1 self._T.skipped=0 self._T.received={}
                 self._T.running=true self._T.waiting=nil self._T.message=""
-                self:Draw()
-                log("[RewardCenter] single bundle selected "..task.kind..":"..tostring(task.key))
+                self:Close()
+                self._T.closedUntil=0
+                if Environment:IsMakerPlay() then log("[VRF][RewardClaim] single dispatched inputBlocked="..tostring(self:BlocksInput())) end
+                self:RunNext()
+                if Environment:IsMakerPlay() then log("[RewardCenter] single bundle selected "..task.kind..":"..tostring(task.key)) end
                 return
             end
         end
@@ -215,11 +235,19 @@ script RewardCenter extends Logic
         -- A full inventory skips that bundle and keeps it available for a later claim.
         if not self._T.running or self._T.waiting~=nil then return end
         local cl=_CharacterPersistence._T.cl
-        if cl==nil or not cl.entered or cl.flushing then return end
+        if cl==nil or not cl.entered then return end
+        if cl.flushing then
+            self._T.flushWaitSince=self._T.flushWaitSince or _UtilLogic.ElapsedSeconds
+            if _UtilLogic.ElapsedSeconds-self._T.flushWaitSince>15 then
+                self._T.running=false self._T.message="저장 응답이 늦어지고 있습니다. 창을 닫고 잠시 후 다시 받아주세요." self:Draw()
+            end
+            return
+        end
+        self._T.flushWaitSince=nil
         local task=self._T.queue[self._T.index]
         if task==nil then
             self._T.running=false self._T.message=(self._T.skipped or 0)>0 and "공간이 부족한 보상은 보관했습니다. 인벤토리를 비우고 다시 받아주세요." or "보상 수령 완료! 남은 보상을 확인하세요."
-            self._T.page=1 self:Draw() log("[RewardCenter] batch complete skipped="..tostring(self._T.skipped)) return
+            self._T.page=1 self:Draw() if Environment:IsMakerPlay() then log("[RewardCenter] batch complete skipped="..tostring(self._T.skipped)) end return
         end
         local kind=task.kind
         self._T.waiting=(kind=="weekly" or kind=="rest" or kind=="title") and kind or "event"
@@ -231,6 +259,7 @@ script RewardCenter extends Logic
             _OfflineRestRewards._T.fromCenter=true _OfflineRestRewards:Claim()
             started=_OfflineRestRewards._T.busy==true
             if not started then _OfflineRestRewards._T.fromCenter=false end
+        elseif kind=="batch" then started=_EventRewards:ClaimBatchFromCenter(task.tasks or {})
         else started=_EventRewards:ClaimFromCenter(kind,task.key) end
         if not started then self._T.waiting=nil self._T.skipped=self._T.skipped+1 self._T.index=self._T.index+1 end
         self:Draw()
@@ -244,9 +273,10 @@ script RewardCenter extends Logic
             self._T.index=self._T.index+1
         else
             self._T.running=false self._T.message="저장 확인이 필요합니다. 다시 받기를 눌러주세요. 미수령 보상은 보관됩니다."
+            _MobileUIManager:ShowNotice(self._T.message)
         end
         self._T.waiting=nil self:Draw()
-        log("[RewardCenter] acknowledged "..family.." ok="..tostring(ok))
+        if Environment:IsMakerPlay() then log("[RewardCenter] acknowledged "..family.." ok="..tostring(ok)) end
     end
 
     @ExecSpace("ClientOnly")
@@ -290,7 +320,7 @@ script RewardCenter extends Logic
         self:UI("Prev").ButtonComponent.Enable=self._T.page>1 self:UI("Next").ButtonComponent.Enable=self._T.page<pages
         self:UI("Claim").ButtonComponent.Enable=not self._T.running and #tasks>0
         self:UI("Claim").TextGUIRendererComponent.Text=self._T.running and "받는 중…" or self:Pending() and "저장 확인 · 다시 받기" or "모두 받기 ("..tostring(#tasks)..")"
-        self:UI("Status").TextGUIRendererComponent.Text=self._T.running and "보상을 받고 있습니다. 잠시만 기다려주세요." or self._T.message~="" and self._T.message or (_MobileUIManager:IsMobile() and "항목 터치: 해당 보상 묶음 받기 · 상자는 아이템 → 소비 탭" or "항목 클릭: 해당 보상 묶음 받기 · 상자/주머니는 소비 탭 · 공간 부족 시 보관")
+        self:UI("Status").TextGUIRendererComponent.Text=self._T.running and "보상을 저장 중입니다. 창을 닫고 이동·전투를 계속할 수 있습니다." or self._T.message~="" and self._T.message or (_MobileUIManager:IsMobile() and "항목 터치: 해당 보상 묶음 받기 · 상자는 아이템 → 소비 탭" or "항목 클릭: 해당 보상 묶음 받기 · 상자/주머니는 소비 탭 · 공간 부족 시 보관")
     end
 
     @ExecSpace("ClientOnly")
@@ -316,9 +346,9 @@ script RewardCenter extends Logic
             local button=_EntityService:GetEntityByPath(path)
             if isvalid(button) then
                 local glow=button:GetChildByName("Glow")
-                if isvalid(glow) then glow.Enable=available glow.SpriteGUIRendererComponent:SetAlpha(0.35+0.45*(0.5+0.5*math.sin(now*5))) end
+                if isvalid(glow) then glow.Enable=available glow.CanvasGroupComponent.GroupAlpha=0.65+0.35*(0.5+0.5*math.sin(now*5)) end
                 local label=button:GetChildByName("Label")
-                if isvalid(label) then label.TextGUIRendererComponent.Text=available and "보상 !" or "보상" end
+                if isvalid(label) then label.TextGUIRendererComponent.Text=available and "보상 !" or "보상" label.TextGUIRendererComponent.FontColor=Color.white end
             end
         end
         if self.opened then self:Draw() end

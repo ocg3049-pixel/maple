@@ -51,7 +51,7 @@ script StarforceMini extends Logic
         table.insert(self.links, {e=title, listener=down, event=UITouchDownEvent})
         table.insert(self.links, {e=title, listener=up, event=UITouchUpEvent})
         self:UI("MiniPanel").Enable = false
-        log("[StarforceMini] ready")
+        if Environment:IsMakerPlay() then log("[StarforceMini] ready") end
     end
 
     @ExecSpace("ClientOnly")
@@ -82,15 +82,20 @@ script StarforceMini extends Logic
         end
         local goalText = input.Text
         self.minimized = true
+        _MobileUIManager:SyncEquipmentPicker()
+        if not self._T.minimizeUsed then
+            self._T.minimizeUsed = true
+            _CharacterPersistence:MarkDirty("enhance_minimize_learned")
+        end
         tr.RectSize = Vector2(340, 210)
-        tr.anchoredPosition = self._T.miniPosition or Vector2(-760, 140)
+        tr.anchoredPosition = self._T.miniPosition or Vector2(0, 360)
         self:UI("MiniPanel").Enable = true
         self:UI("MiniPanel/Goal").TextGUIRendererInputComponent.Text = goalText
         _UILogic:SetSiblingIndex(self:UI("MiniPanel").UITransformComponent, 1000000)
         _UIEquipInventoryManager:BringWindowToFront(self.windowPath)
         self:Refresh()
         self:PlaceEffects()
-        log("[StarforceMini] minimized running=" .. tostring(_AutoStarforce.running))
+        if Environment:IsMakerPlay() then log("[StarforceMini] minimized running=" .. tostring(_AutoStarforce.running)) end
     end
 
     @ExecSpace("ClientOnly")
@@ -98,12 +103,19 @@ script StarforceMini extends Logic
         -- Restoring does not start, stop or resolve any enhancement attempt.
         if not self.minimized then return end
         self:CommitGoal()
+        if _UIEquipInventoryManager._T.dragWindowPath == self.windowPath then _UIEquipInventoryManager:StopWindowDrag() end
+        local drag = _MobileUIManager._T.windowDrag
+        if drag ~= nil and drag.entity == self:UI("") then _MobileUIManager._T.windowDrag = nil end
         self.minimized = false
         local w = self:UI("")
         if isvalid(w) then
+            -- Keep old geometry hidden until the engine has committed the resized rectangle.
+            self._T.restoreAlpha = self._T.restoreAlpha or w.CanvasGroupComponent.GroupAlpha
+            w.CanvasGroupComponent.GroupAlpha = 0
             local tr = w.UITransformComponent
             self._T.miniPosition = Vector2(tr.anchoredPosition.x, tr.anchoredPosition.y)
             tr.RectSize = self._T.fullSize or Vector2(800, 900)
+            if _MobileUIManager:IsMobile() then _MobileUIManager:FitWindow(self.windowPath) end
             tr.anchoredPosition = self._T.fullPosition or Vector2(-170, 0)
         end
         for _, saved in ipairs(self._T.groups or {}) do
@@ -117,8 +129,18 @@ script StarforceMini extends Logic
         self._T.groups = {}
         local panel = self:UI("MiniPanel")
         if isvalid(panel) then panel.Enable = false end
+        _MobileUIManager:SyncEquipmentPicker()
         self:PlaceEffects()
-        log("[StarforceMini] restored running=" .. tostring(_AutoStarforce.running))
+        self._T.restoreGeneration = (self._T.restoreGeneration or 0) + 1
+        local generation = self._T.restoreGeneration
+        _TimerService:SetTimerOnce(function()
+            if self._T.restoreGeneration ~= generation then return end
+            if isvalid(w) then w.CanvasGroupComponent.GroupAlpha = self._T.restoreAlpha or 1 end
+            self._T.restoreAlpha = nil
+            self:PlaceEffects()
+            if Environment:IsMakerPlay() then log("[VRF] Enhancement restored at committed position") end
+        end, 0.03)
+        if Environment:IsMakerPlay() then log("[StarforceMini] restored running=" .. tostring(_AutoStarforce.running)) end
     end
 
     @ExecSpace("ClientOnly")
@@ -144,7 +166,7 @@ script StarforceMini extends Logic
         if not isvalid(center) then return end
         local tr = center.UITransformComponent
         local overlay = _EntityService:GetEntityByPath("/ui/StarforceEffects")
-        if isvalid(overlay) then overlay.CanvasGroupComponent.GroupAlpha = (not self.minimized and _MobileUIManager:IsEnhancementBehindWindow()) and 0 or 1 end
+        if isvalid(overlay) then overlay.CanvasGroupComponent.GroupAlpha = (self._T.restoreAlpha ~= nil or (not self.minimized and _MobileUIManager:IsEnhancementBehindWindow())) and 0 or 1 end
         local effects = _EntityService:GetEntityByPath(_StarforcePresentation.effectPath)
         local window = self:UI("")
         if isvalid(effects) and isvalid(window) then
@@ -195,7 +217,7 @@ script StarforceMini extends Logic
         self:UI("MiniPanel/Stars").TextGUIRendererComponent.Text = ruid ~= "" and tostring(level) .. "성" or "장비 없음"
         self:UI("MiniPanel/Run").TextGUIRendererComponent.Text = _AutoStarforce.running and "중지" or "자동강화"
         self:UI("MiniPanel/Mute").TextGUIRendererComponent.Text = p.soundMuted and "무음" or "소리"
-        self:UI("MiniPanel/Mute").SpriteGUIRendererComponent.Color = p.soundMuted and Color(0.65,0.36,0.3,1) or Color(0.3,0.38,0.42,1)
+        _UITheme:Button(self:UI("MiniPanel/Mute"), p.soundMuted and Color(.24,.26,.28,1) or Color(.13,.14,.15,1))
         local goal = self:UI("MiniPanel/Goal")
         goal.CanvasGroupComponent.Interactable = not _AutoStarforce.running
         if _AutoStarforce.running then goal.TextGUIRendererInputComponent.Text = tostring(_AutoStarforce.goalStars) end
@@ -211,10 +233,10 @@ script StarforceMini extends Logic
         local button = self:UI("Minimize")
         if isvalid(button) then
             button.Enable = not self.minimized and _EnhancementManager.currentTab == 1
-            local guide=not self._T.ever30 and _LevelCosmeticRewards.highest<30 and _LoginFlow.phase=="ingame"
+            local guide=not self._T.minimizeUsed and _LoginFlow.phase=="ingame"
             button.TextGUIRendererComponent.Text=guide and "축소 ▼" or "−"
-            button.SpriteGUIRendererComponent.Color=guide and Color(1,0.72+0.18*math.sin(_UtilLogic.ElapsedSeconds*5),0.28,1) or Color(1,1,1,0)
-            button.TextGUIRendererComponent.FontColor=guide and Color(0.16,0.10,0.03,1) or Color(1,1,1,1)
+            button.SpriteGUIRendererComponent.Color=guide and Color(.055,.055,.055,1) or Color(1,1,1,0)
+            button.TextGUIRendererComponent.FontColor=guide and Color(1,1,1,1) or Color(1,1,1,1)
         end
         self:PlaceEffects()
         if not self.minimized then return end

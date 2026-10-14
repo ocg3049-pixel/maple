@@ -1,0 +1,503 @@
+@Logic
+script CarnivalUI extends Logic
+    property boolean opened = false
+    property boolean focused = false
+    property boolean minimized = false
+    property integer mode = 1
+    property integer page = 1
+    property table registered = {}
+    property table profile = {}
+    property table state = {}
+    property string queue = ""
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- All Carnival UI entities are local to this client.
+        if path == "Entry" then return _EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnPvp") end
+        return _EntityService:GetEntityByPath("/ui/CarnivalUI/"..path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Text(string path, string value)
+        -- Update text only when its content changes.
+        local e=self:UI(path)
+        if path=="Entry" and isvalid(e) then e=e:GetChildByName("Label") value="PvP" end
+        if isvalid(e) and e.TextGUIRendererComponent.Text~=value then e.TextGUIRendererComponent.Text=value end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Show(string path, boolean visible)
+        -- A stable visible element must not be disabled and enabled by snapshot refreshes.
+        local e=self:UI(path) if isvalid(e) and e.Enable~=visible then e.Enable=visible end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any action)
+        -- Reuse the game's existing click sound and retain subscriptions for cleanup.
+        local e=self:UI(path)
+        if not isvalid(e) then log_warning("[CarnivalUI] missing "..path) return end
+        table.insert(self._T.events,{e=e,h=e:ConnectEvent(ButtonClickEvent,function() if _UIClickArbiter:AcceptClickAt(path=="Entry" and "/ui/DefaultGroup/MapleHUD/BtnPvp" or ("/ui/CarnivalUI/"..string.match(path,"^[^/]+")),_InputService:GetCursorPosition()) then _UIAudio:Play("Tab") action() end end)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.events={} self.state={} self.queue="" self.opened=false self.profile={} self.registered={}
+        self._T.character=nil self._T.viewCharacter=nil self.focused=false self.minimized=false
+        for _,name in ipairs({"Lobby","Summons","Result","Notice","Entry","ConfirmLeave","Upgrades"}) do self:Show(name,false) end
+        self:Bind("Entry",function() _GameSystemMenu:Close() self:Open() end)
+        self:Bind("Lobby/Close",function() self:Close() end)
+        self:Bind("Lobby/Minimize",function() self:Minimize() end)
+        self:Bind("Lobby/Carnival",function() self:Notice("창 안을 클릭하면 방향키와 설정한 점프·공격 키로 조작합니다.") end)
+        self:Bind("Lobby/One",function() self.mode=1 self:Draw() end)
+        self:Bind("Lobby/Two",function() self.mode=2 self:Draw() end)
+        self:Bind("Lobby/Match",function() _CarnivalManager:RequestQueue(self.mode) end)
+        self:Bind("Lobby/Cancel",function() _CarnivalManager:RequestCancel() end)
+        self:Bind("Lobby/Records",function() self:Close() if not _InformationBook:IsOpen() then _InformationBook:Toggle() end _InformationBook:SelectTab(8) end)
+        self:Bind("Lobby/Controls/Auto",function() _CarnivalView:ToggleAuto() end)
+        self:Bind("Lobby/Controls/Summon",function() self:SelectSummonSlot(self._T.selectedSummonSlot or 1,true) end)
+        self:Bind("Lobby/Controls/Leave",function() self:Show("ConfirmLeave",true) _CarnivalView:Neutral() end)
+        -- Movement touches are captured by CarnivalView with their individual TouchIds.
+        self:Bind("ConfirmLeave/Yes",function() self:Show("ConfirmLeave",false) _CarnivalManager:RequestLeave() end)
+        self:Bind("ConfirmLeave/No",function() self:Show("ConfirmLeave",false) end)
+        self:Bind("Summons/Close",function() self:Show("Summons",false) end)
+        self:Bind("Summons/Prev",function() self.page=math.max(1,self.page-1) self:DrawSummons() end)
+        self:Bind("Summons/Next",function() self.page=math.min(math.max(1,math.ceil(#self.registered/6)),self.page+1) self:DrawSummons() end)
+        for i=1,6 do local slot=i self:Bind("Summons/Row"..tostring(i),function()
+            local id=self.registered[(self.page-1)*6+slot]
+            if id~=nil then self:RegisterSummon(id) end
+        end) end
+        self._T.summonSlots={}
+        self:Bind("Lobby/SummonSlots/Settings",function() self._T.editSummons=not self._T.editSummons self:DrawSummonSlots() end)
+        for i=1,4 do local index=i self:Bind("Lobby/SummonSlots/Slot"..tostring(i),function() self:SelectSummonSlot(index,false) end) end
+        self:Bind("Lobby/Controls/Shop",function() self:Show("Upgrades",true) self:DrawUpgrades() _CarnivalView:Neutral() end)
+        self:Bind("Upgrades/Close",function() self:Show("Upgrades",false) end)
+        for _,kind in ipairs({"heal","clear","recovery","power"}) do local choice=kind self:Bind("Upgrades/"..choice,function() _CarnivalManager:RequestUpgrade(self.state.id or "",choice) end) end
+        self:Bind("Result/Close",function() self:Show("Result",false) _CarnivalManager:RequestLeave() end)
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,function(e)
+            if _LoginFlow:IsInGame() and not _MapleHUDManager:IsChatTyping() and not _KeySettingManager:IsCapturingKey()
+                and not _KeySettingManager:IsWindowOpen() and not _SkillManager:BlocksAmountInput()
+                and not _MapleIslandTutorial:IsTyping() and _KeySettingManager:GetFuncForKeyEnum(e.key)=="pvp" then
+                if self.opened then self:Close() elseif not _GameSystemMenu:BlocksInput() then self:Open() end
+                return
+            end
+            if e.key==KeyboardKey.Escape and self.focused and not _MapleHUDManager:IsChatTyping() then
+                if self:UI("Summons").Enable then self:Show("Summons",false)
+                elseif self:UI("Upgrades").Enable then self:Show("Upgrades",false)
+                elseif self:UI("ConfirmLeave").Enable then self:Show("ConfirmLeave",false)
+                elseif self.opened then self:Close() end
+            end
+        end)
+        self._T.pointer=_InputService:ConnectEvent(ScreenTouchEvent,function(e) self:PointerDown(e.TouchPoint) end)
+        self._T.blur=_ApplicationService:ConnectEvent(ApplicationFocusOutEvent,function() self:SetFocus(false) end)
+        log("[VRF] Carnival focus-routing UI boot")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open()
+        if not _LoginFlow:IsInGame() then return end
+        self.opened=true self.minimized=false self:Show("Lobby",true)
+        self:SetFocus(true) self:Draw()
+        if self.state.state=="result" then self:Show("Result",true) end
+        _CarnivalManager:RequestStatus()
+        _CarnivalView._T.copyAt=0
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        self:Minimize()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        local battle=self.state.id~=nil and self.state.id~=""
+        self:Text("Lobby/One",self.mode==1 and "[ 1 : 1 ]" or "1 : 1")
+        self:Text("Lobby/Two",self.mode==2 and "[ 2 : 2 ]" or "2 : 2")
+        local rating=self.profile.rating
+        self:Text("Lobby/Rating",rating and (_CarnivalRules:Tier(rating).."  ·  "..tostring(rating).." 승점") or "승점 불러오는 중")
+        for _,name in ipairs({"Carnival","One","Two","Rating","Records","Queue"}) do self:Show("Lobby/"..name,not battle) end
+        self:Show("Lobby/Match",not battle and self.queue=="") self:Show("Lobby/Cancel",not battle and self.queue~="")
+        self:Show("Lobby/MatchStatus",battle)
+        for _,name in ipairs({"Attack","Auto","Summon","Shop","Leave"}) do self:Show("Lobby/Controls/"..name,battle) end
+        self:Text("Lobby/Title",battle and "몬스터 카니발 · 전투" or "몬스터 카니발 · 대기실")
+        self:Text("Lobby/Controls/Auto",_CarnivalView.autoOn and "자동전투 켜짐" or "자동전투 꺼짐")
+        self:Text("Entry",battle and "카니발" or (self.queue~="" and "매칭 중" or "PvP"))
+        local mobile=_MobileUIManager:IsMobile()
+        local buttons=mobile and {"Auto","Summon","Shop","Leave","Jump","Attack"} or {"Auto","Summon","Shop","Leave"}
+        for index,name in ipairs(buttons) do
+            local node=self:UI("Lobby/Controls/"..name)
+            if isvalid(node) then
+                node.UITransformComponent.RectSize=Vector2(mobile and 92 or 136,mobile and 88 or 56)
+                node.UITransformComponent.anchoredPosition=Vector2((index-(#buttons+1)/2)*(mobile and 96 or 144),0)
+                node.TextGUIRendererComponent.FontSize=mobile and 16 or 18
+            end
+        end
+        for _,name in ipairs({"Jump","Attack"}) do self:Show("Lobby/Controls/"..name,mobile) end
+        self:Show("Lobby/Controls/Left",false) self:Show("Lobby/Controls/Right",false)
+        self:Show("Lobby/Controls/KeyboardHint",false)
+        self:Show("Lobby/SummonSlots",battle)
+        self:Show("Lobby/Controls",battle)
+        self:Show("Lobby/Opponent",battle)
+        self:DrawSummonSlots()
+        self:Show("Lobby/Touch",mobile)
+        _UITheme:Button(self:UI("Lobby/One"),self.mode==1 and Color(.26,.32,.12,1) or Color(.12,.13,.14,1))
+        _UITheme:Button(self:UI("Lobby/Two"),self.mode==2 and Color(.26,.32,.12,1) or Color(.12,.13,.14,1))
+        self:DrawFocus()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void QueueState(string mode, integer elapsed)
+        -- A visible elapsed counter explains the deliberate balance wait.
+        self.queue=mode
+        local names={duel="1:1",solo2="2:2 개인",party2="2:2 파티"}
+        local text=mode=="" and "레벨과 승점이 비슷한 상대를 찾습니다." or ((names[mode] or mode).." 매칭 중  ·  "..tostring(elapsed).."초")
+        self:Text("Lobby/Queue",text) self:Text("Entry",mode=="" and "PvP" or "매칭 "..tostring(elapsed).."초")
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReceiveProfile(string id, table data, table registered)
+        -- Keep statistics and the collection tied to the selected character.
+        local cl=_CharacterPersistence._T.cl
+        local selected=cl and cl.chars and cl.chars[cl.enteredIndex]
+        if selected~=nil and selected.id~=id then return end
+        if self._T.character~=id then self.registered={} self.page=1 self._T.summonSlots={} self._T.editSummons=false end
+        self._T.character=id self.profile=data
+        if #registered>0 or self.state.id==nil or self.state.id=="" then self.registered=registered end
+        self:Draw() self:DrawSummons()
+        if _InformationBook:IsOpen() and _InformationBook.tab==8 then _InformationBook:Render() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void MatchState(table state)
+        local changed=self.state.id~=state.id self.state=state
+        if state.state=="outside" then
+            _CarnivalView:ClearOpponent()
+            self:Show("Summons",false) self:Show("ConfirmLeave",false) self:Show("Upgrades",false)
+            _CarnivalView:Neutral() self:Draw() return
+        end
+        if changed then
+            self.queue="" _CarnivalView:ResetMatch()
+            if not self.minimized then self.opened=true self:Show("Lobby",true) end
+            self:Show("Summons",false)
+            _KeySettingManager:ApplyPlayerActionKeys()
+            log("[VRF] Carnival scene expanding inside existing window")
+        end
+        self:Text("Lobby/MatchStatus","아군 "..tostring(state.alive or 0).." : 상대 "..tostring(state.enemyAlive or 0).."  ·  소환 "..tostring(state.cp or 0).."점  ·  내 맵 몬스터 "..tostring(state.monsterCount or 0).." / 150"..(state.dead and "  ·  분신 사망" or ""))
+        self:Draw() self:DrawSummons() self:DrawUpgrades()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSummons()
+        -- Six reusable rows page the player's registered monsters, with authoritative prices.
+        if not isvalid(self:UI("Summons")) then return end
+        self.page=math.max(1,math.min(self.page,math.max(1,math.ceil(#self.registered/6))))
+        self:Text("Summons/Points",tostring(self._T.selectedSummonSlot or 1).."번 슬롯에 등록할 몬스터를 선택하세요.")
+        self:Text("Summons/Page",tostring(self.page).." / "..tostring(math.max(1,math.ceil(#self.registered/6))))
+        self:Show("Summons/Empty",#self.registered==0)
+        for i=1,6 do
+            local path="Summons/Row"..tostring(i)
+            local id=self.registered[(self.page-1)*6+i] local row=id and _MonsterCodexCatalog:Get(id) or nil
+            self:Show(path,row~=nil)
+            if row~=nil then
+                self:Text(path.."/Name",row.name.."  Lv."..tostring(row.level))
+                self:Text(path.."/Cost",tostring(_CarnivalRules:Cost(row.level)).."점 · 등록")
+                local icon=self:UI(path.."/Icon").SpriteGUIRendererComponent
+                local ruid="thumbnail://"..row.sprite
+                if icon.ImageRUID.DataId~=ruid then icon.ImageRUID=DataRef(ruid) end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Notice(string message)
+        -- Short feedback is available whether the lobby is open or the player is fighting.
+        self:Text("Notice/Text",message) self:Show("Notice",true) self._T.noticeUntil=_UtilLogic.ElapsedSeconds+5
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Result(boolean won, integer delta, integer rating)
+        -- Server sends this only after atomic rating settlement succeeds.
+        self.state.state="result" _CarnivalView:Neutral() self:Show("Summons",false) self:Show("Upgrades",false) self:Show("Result",self.opened)
+        self:Text("Result/Title",won and "VICTORY" or "DEFEAT")
+        self:Text("Result/Rating",(delta>=0 and "+" or "")..tostring(delta).." 승점\n".._CarnivalRules:Tier(rating).."  ·  "..tostring(rating).."점")
+    end
+
+    @ExecSpace("ClientOnly")
+    method table InformationLines()
+        -- The information book shares exactly the same persistent profile as the lobby.
+        local p=self.profile
+        if p.rating==nil then return {"PvP 정보를 불러오는 중입니다."} end
+        local wins=(p.wins1 or 0)+(p.wins2 or 0) local losses=(p.losses1 or 0)+(p.losses2 or 0)
+        local lines={"몬스터 카니발 · PvP 기록", "티어: ".._CarnivalRules:Tier(p.rating),"승점: "..tostring(p.rating),"1:1  "..tostring(p.wins1 or 0).."승 / "..tostring(p.losses1 or 0).."패","2:2  "..tostring(p.wins2 or 0).."승 / "..tostring(p.losses2 or 0).."패","승률: "..string.format("%.1f",wins/math.max(1,wins+losses)*100).."%","","최근 경기"}
+        for _,h in ipairs(p.history or {}) do table.insert(lines,(h.won and "승리" or "패배").." · "..(h.mode=="duel" and "1:1" or "2:2").." · "..(h.delta>=0 and "+" or "")..tostring(h.delta)) end
+        table.insert(lines,"") table.insert(lines,"소환 점수는 경기마다 초기화됩니다.")
+        table.insert(lines,"소환 몬스터는 일반 사냥터와 같은 "..tostring(_MonsterZoneRespawn.RespawnInterval).."초 주기로 부활합니다.")
+        table.insert(lines,"본캐 자동사냥과 별도로 분신이 전투합니다.")
+        return lines
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateAvatar(number delta)
+        _CarnivalView:Frame(delta)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        _CarnivalView:InputTick()
+        local inGame=_LoginFlow:IsInGame()
+        self:Show("Entry",inGame and not _MobileUIManager:IsMobile())
+        if not inGame then
+            if self.opened then self:Close() end
+            self:Show("Summons",false) self:Show("Result",false) self:Show("ConfirmLeave",false)
+            self.state={} self.profile={} self.registered={} self.queue="" self._T.character=nil self._T.viewCharacter=nil
+            return
+        end
+        local cl=_CharacterPersistence._T.cl local selected=cl and cl.chars and cl.chars[cl.enteredIndex]
+        if selected~=nil and self._T.viewCharacter~=selected.id then
+            self._T.viewCharacter=selected.id self.profile={} self.registered={} self.page=1
+            self:Draw() _CarnivalManager:RequestStatus()
+        end
+        local mobile=_MobileUIManager:IsMobile()
+        if self._T.mobileLayout~=mobile then
+            self._T.mobileLayout=mobile _CarnivalView:Neutral() self:Draw()
+        end
+        if self.opened then _CarnivalView:Frame(delta) self:DrawBuffs() end
+        if self._T.noticeUntil~=nil and _UtilLogic.ElapsedSeconds>=self._T.noticeUntil then self:Show("Notice",false) self._T.noticeUntil=nil end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string WindowAt(Vector2 point)
+        for _,name in ipairs({"ConfirmLeave","Result","Upgrades","Summons","Lobby","Entry"}) do
+            if _UIClickArbiter:ContainsScreenPoint(self:UI(name),point) then return name=="Entry" and "/ui/DefaultGroup/MapleHUD/BtnPvp" or ("/ui/CarnivalUI/"..name) end
+        end
+        return ""
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for _,record in pairs(self._T.buffNodes or {}) do
+            if isvalid(record.node) then record.node:DisconnectEvent(UITouchDownEvent,record.callbackId) record.node:Destroy() end
+        end
+        self._T.buffNodes={}
+        -- No event subscription survives a new play session.
+        for _,v in ipairs(self._T.events or {}) do if isvalid(v.e) then v.e:DisconnectEvent(ButtonClickEvent,v.h) end end
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+        if self._T.pointer then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.pointer) end
+        if self._T.blur then _ApplicationService:DisconnectEvent(ApplicationFocusOutEvent,self._T.blur) end
+        self._T.events={} self._T.key=nil self.opened=false self.focused=false
+        _CarnivalView._T.blocked={}
+        _KeySettingManager:ApplyPlayerActionKeys()
+    end
+    @ExecSpace("ClientOnly")
+    method void Minimize()
+        self:SetFocus(false)
+        self.opened=false self.minimized=true
+        for _,name in ipairs({"Lobby","Summons","Upgrades","ConfirmLeave","Result"}) do self:Show(name,false) end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetFocus(boolean active)
+        active=active and self.opened and _LoginFlow:IsInGame()
+        if active and _MapleHUDManager:IsChatTyping() then
+            local input=_MapleHUDManager._T.chatInput
+            local draft=isvalid(input) and input.TextGUIRendererInputComponent.Text or ""
+            _MapleHUDManager:FinishChatInput()
+            if isvalid(input) then input.TextGUIRendererInputComponent.Text=draft end
+        end
+        if self.focused==active then return end
+        _CarnivalView:BlockHeldKeys()
+        _CarnivalView:Neutral()
+        self.focused=active
+        -- Discard manual touch/held input without toggling the world's auto hunt.
+        _MobileUIManager:ReleaseControls()
+        if active then
+            for key,held in pairs(_SkillManager._T.heldSkillKeys or {}) do
+                if held then _SkillManager:ReleaseSkillKey(key) end
+            end
+            _SkillManager._T.jumpKeyHeld=false
+            local p=_UserService.LocalPlayer
+            if isvalid(p) and not _AutoHuntManager.autoOn then
+                p.MovementComponent:Stop()
+                if p.StateComponent.CurrentStateName=="MOVE" then p.StateComponent:ChangeState("IDLE") end
+                _SkillManager:EndSprint()
+            end
+        end
+        _KeySettingManager:ApplyPlayerActionKeys()
+        self:DrawFocus()
+        log("[VRF] Carnival input target="..(active and "carnival" or "world"))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PointerDown(Vector2 point)
+        if not self.opened then return end
+        local window=self:WindowAt(point)
+        self:SetFocus(window~="" and window~="/ui/DefaultGroup/MapleHUD/BtnPvp")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawFocus()
+        self:Text("Lobby/Focus",self.focused and "카니발 조작 중 · 창 밖을 누르면 본캐 조작" or "본캐 조작 중 · 이 창을 누르면 카니발 조작")
+        self:Text("Lobby/Help","← → 이동 · ".._KeySettingManager:GetKeyForFunc("jump").." 점프 · ".._KeySettingManager:GetKeyForFunc("attack").." 공격\n↓ 숙이기 · ↓ + 점프 아래로 이동")
+        self:Text("Entry",self.minimized and "카니발 복원" or (self.state.id~=nil and self.state.id~="" and "카니발" or "PvP"))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectSummonSlot(integer index, boolean forceEdit)
+        -- Empty slots and edit mode open the registration book; normal taps summon.
+        if index<1 or index>4 then return end
+        self._T.summonSlots=self._T.summonSlots or {}
+        local id=self._T.summonSlots[index]
+        if forceEdit or self._T.editSummons or id==nil then
+            self._T.selectedSummonSlot=index
+            self:Show("Upgrades",false) self:Show("Summons",true) self:DrawSummons()
+            _CarnivalView:Neutral()
+        elseif self.state.state=="active" then _CarnivalManager:RequestSummon(self.state.id,id) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RegisterSummon(string id)
+        -- Only the character's registered codex entries can be assigned.
+        local allowed=false
+        for _,entry in ipairs(self.registered) do if entry==id then allowed=true break end end
+        if not allowed then return end
+        self._T.summonSlots=self._T.summonSlots or {}
+        self._T.summonSlots[self._T.selectedSummonSlot or 1]=id
+        self._T.editSummons=false
+        self:Show("Summons",false) self:DrawSummonSlots()
+        _UIAudio:Play("Tab")
+        log("[VRF] Carnival summon registered slot="..tostring(self._T.selectedSummonSlot or 1).." id="..id)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawSummonSlots()
+        -- Mirror the quickslot interaction with a monster image and its authoritative price.
+        for i=1,4 do
+            local path="Lobby/SummonSlots/Slot"..tostring(i)
+            local id=(self._T.summonSlots or {})[i]
+            local row=id~=nil and _MonsterCodexCatalog:Get(id) or nil
+            local icon=self:UI(path.."/Icon")
+            if isvalid(icon) then
+                icon.Enable=row~=nil
+                if row~=nil and icon.SpriteGUIRendererComponent.ImageRUID.DataId~="thumbnail://"..row.sprite then icon.SpriteGUIRendererComponent.ImageRUID=DataRef("thumbnail://"..row.sprite) end
+            end
+            self:Text(path.."/Cost",row~=nil and (tostring(_CarnivalRules:Cost(row.level)).."점") or "등록")
+        end
+        self:Text("Lobby/SummonSlots/Settings","")
+        self:Show("Lobby/SummonSlots/EditHint",self._T.editSummons==true)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawUpgrades()
+        -- Show current-match upgrades and the cost of the next purchase.
+        local upgrades=self.state.upgrades or {}
+        self:Text("Upgrades/Points","사용 가능 "..tostring(self.state.cp or 0).."점")
+        self:Text("Upgrades/heal","HP 즉시 회복 30% · 30점")
+        self:Text("Upgrades/clear","내 진영 몬스터 전체 제거 · 200점")
+        self:Text("Upgrades/recovery","HP 회복량 +10% (현재 +"..tostring((upgrades.recovery or 0)*10).."%) · "..tostring(_CarnivalRules:UpgradeCost("recovery",upgrades)).."점")
+        self:Text("Upgrades/power","전투력 +5% (현재 +"..tostring((upgrades.power or 0)*5).."%) · "..tostring(_CarnivalRules:UpgradeCost("power",upgrades)).."점")
+    end
+
+
+    @ExecSpace("ClientOnly")
+    method void StartBuff(string uiName, number duration, string skillName)
+        -- Use the original icon template and the original skill's exact duration.
+        local p=_CarnivalReplica._T.client
+        if p==nil or duration<=0 then return end
+        local catalog={HasteBuffUI={icon="HasteIcon",kind="haste"},BoosterBuffUI={icon="BoosterIcon",kind=""},MagicBoosterBuffUI={icon="MagicBoosterIcon",kind=""},ComboBuffUI={icon="ComboAttackIcon",kind="combo"},ShadowPartnerBuffUI={icon="ShadowPartnerIcon",kind="shadowpartner"},GuardBuffUI={icon="GuardIcon",kind="guardshield"},IronWallBuffUI={icon="IronWallIcon",kind="ironwall"},RestorationBuffUI={icon="RestorationIcon",kind="restoration"},ElemFieldBuffUI={icon="ElemFieldIcon",kind="elemfield"},ParryBuffUI={icon="ParryIcon",kind="parry"},RageBuffUI={icon="RageIcon",kind=""},MeditationBuffUI={icon="MeditationIcon",kind=""},BlessBuffUI={icon="BlessIcon",kind=""},PowerGuardBuffUI={icon="PowerGuardIcon",kind="powerguard"},DragonRidingBuffUI={icon="DragonRidingIcon",kind="dragonride"},HeroSummonBuffUI={icon="HeroSummonIcon",kind="herosummon"},KnightSummonBuffUI={icon="KnightSummonIcon",kind="knightsummon"},DragonBloodBuffUI={icon="DragonBloodIcon",kind="dragonblood"},SixDragonsBuffUI={icon="SixDragonsIcon",kind="sixdragons"},HealerSummonBuffUI={icon="HealerSummonIcon",kind="healersummon"},DarkDragonBuffUI={icon="DarkDragonIcon",kind="darkdragon"},FireZoneBuffUI={icon="FireZoneIcon",kind="firezone"},GlacierBuffUI={icon="GlacierIcon",kind="glacier"},BattoBuffUI={icon="BattojutsuIcon",kind="battojutsu"},DarkSightBuffUI={icon="DarkSightIcon",kind="darksight"},AwakeningBuffUI={icon="AwakeningIcon",kind="awakening"},AmhaengBuffUI={icon="AmhaengIcon",kind="amhaeng"},ShadowCloneBuffUI={icon="ShadowCloneIcon",kind="shadowclone"},SmokeScreenBuffUI={icon="SmokeScreenIcon",kind="smokescreen"},SharpEyesBuffUI={icon="SharpEyesIcon",kind="sharpeyes"},StarSpreadBuffUI={icon="StarSpreadIcon",kind="starspread"},BahamutBuffUI={icon="BahamutIcon",kind="bahamut"},IfritBuffUI={icon="IfritIcon",kind="ifrit"},ElquinesBuffUI={icon="ElquinesIcon",kind="elquines"},FreezerBuffUI={icon="FreezerIcon",kind="freezer"},PhoenixBuffUI={icon="PhoenixIcon",kind="phoenix"},ArcherSummonBuffUI={icon="ArcherSummonIcon",kind="archersummon"},ThiefSummonBuffUI={icon="ThiefSummonIcon",kind="thiefsummon"},Amhaeng2BuffUI={icon="Amhaeng2Icon",kind="amhaeng2"}}
+        local def=catalog[uiName]
+        if def==nil then return end
+        p.buffs=p.buffs or {}
+        p.buffs[uiName]={icon=def.icon,kind=def.kind,name=skillName,duration=duration,expires=_UtilLogic.ElapsedSeconds+duration}
+        log("[VRF] Carnival buff started name="..skillName.." seconds="..tostring(duration))
+    end
+
+    @ExecSpace("ClientOnly")
+    method number BuffRemaining(string skillName)
+        -- Auto combat consults the replica's buffs, independent of the field character.
+        local p=_CarnivalReplica._T.client local remaining=0
+        for _,buff in pairs(p~=nil and p.buffs or {}) do
+            if buff.name==skillName then remaining=math.max(remaining,buff.expires-_UtilLogic.ElapsedSeconds) end
+        end
+        return math.max(0,remaining)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CancelCarnivalBuff(string key)
+        -- Cancel the displayed actor buff and clear its local toggles, keeping cooldowns.
+        local p=_CarnivalReplica._T.client
+        local buff=p~=nil and (p.buffs or {})[key] or nil
+        if buff==nil then return end
+        p.buffs[key]=nil
+        local cast=p.skillState
+        if buff.kind=="awakening" then _SkillManager:OnAwakeningEndedForActor(p.actor,cast,true)
+        elseif buff.kind=="darksight" then _SkillManager:CancelDarkSightEarlyForActor(p.actor,cast,true)
+        elseif buff.kind=="amhaeng" then _SkillManager:OnAmhaengEndedForActor(p.actor,cast,true)
+        elseif buff.kind=="amhaeng2" then _SkillManager:OnAmhaeng2EndedForActor(p.actor,cast,true)
+        elseif buff.kind=="sharpeyes" then
+            cast.sharpEyesToken=(cast.sharpEyesToken or 0)+1
+            _CharInfoManager:CancelSharpEyes()
+            _SkillManager:SyncSharpEyesStatsForActor(p.actor,cast,true)
+        end
+        local fields={dragonride="dragonRideActiveUntil",darkdragon="darkDragonActiveUntil",darksight="darkSightActiveUntil",awakening="awakeningActiveUntil"}
+        if fields[buff.kind]~=nil then cast[fields[buff.kind]]=0 end
+        if buff.kind=="starspread" then cast.starSpreadEnabled=false _CarnivalReplica:SendSkill("RequestSetStarSpread",{false})
+        elseif buff.kind~="" then _CarnivalReplica:RequestCancelActorBuff(p.generation,buff.kind) end
+        if key=="BoosterBuffUI" then _CharInfoManager:CancelBooster()
+        elseif key=="MagicBoosterBuffUI" then _CharInfoManager:CancelMagicBooster()
+        elseif key=="RageBuffUI" then _CharInfoManager:CancelAttackBuff("rage")
+        elseif key=="MeditationBuffUI" then _CharInfoManager:CancelAttackBuff("meditation")
+        elseif key=="BlessBuffUI" then _CharInfoManager:CancelBless()
+        elseif key=="PowerGuardBuffUI" then _CharInfoManager:CancelAttackBuff("powerguard")
+        elseif key=="DragonBloodBuffUI" then _CharInfoManager:CancelAttackBuff("dragonblood")
+        elseif key=="BattoBuffUI" then _CharInfoManager:CancelBattoAtkSpeed() end
+        p.autoBuffRetry=p.autoBuffRetry or {} p.autoBuffRetry[buff.name]=_UtilLogic.ElapsedSeconds+3
+        log("[VRF] Carnival buff cancelled name="..buff.name)
+        self:DrawBuffs()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawBuffs()
+        -- Same template, countdown, radial shade and last-five-second fade as field buffs.
+        self._T.buffNodes=self._T.buffNodes or {}
+        local p=_CarnivalReplica._T.client local now=_UtilLogic.ElapsedSeconds
+        for key,record in pairs(self._T.buffNodes) do
+            local buff=p~=nil and (p.buffs or {})[key] or nil
+            if isvalid(record.node) and (buff==nil or buff.expires<=now) and record.node.Enable then record.node.Enable=false end
+        end
+        local active={}
+        for key,buff in pairs(p~=nil and p.buffs or {}) do
+            if buff.expires>now then table.insert(active,{key=key,buff=buff}) end
+        end
+        table.sort(active,function(a,b) if a.buff.expires==b.buff.expires then return a.key<b.key end return a.buff.expires>b.buff.expires end)
+        for index,item in ipairs(active) do
+            local key=item.key local buff=item.buff local record=self._T.buffNodes[key]
+            if record==nil then
+                local template=_EntityService:GetEntityByPath("/ui/DefaultGroup/BuffBar/"..buff.icon)
+                if not isvalid(template) then continue end
+                local node=_SpawnService:SpawnByEntity(template,"CarnivalBuff_"..key,Vector3.zero,self:UI("Lobby/Buffs"),true)
+                if not isvalid(node) then continue end
+                record={node=node}
+                record.callbackId=node:ConnectEvent(UITouchDownEvent,function(e)
+                    if _UIClickArbiter:IsTopmostAt("/ui/CarnivalUI/Lobby",e.TouchPoint) then self:CancelCarnivalBuff(key) end
+                end)
+                self._T.buffNodes[key]=record
+            end
+            local node=record.node local remain=buff.expires-now
+            local tr=node.UITransformComponent
+            tr.AlignmentOption=AlignmentType.Center tr.AnchorsMin=Vector2(0.5,0.5) tr.AnchorsMax=Vector2(0.5,0.5)
+            tr.Pivot=Vector2(0.5,0.5) tr.UIScale=Vector3.one
+            tr.anchoredPosition=Vector2(((index-1)%4-1.5)*58,-math.floor((index-1)/4)*58)
+            local overlay=node:GetChildByName("GrayOverlay") local label=node:GetChildByName("Text")
+            if isvalid(overlay) then overlay.SpriteGUIRendererComponent.FillAmount=math.max(0,math.min(1,buff.permanent and 0 or 1-remain/buff.duration)) end
+            if isvalid(label) then
+                local text=label.TextGUIRendererComponent or label.TextComponent
+                text.Text=(buff.permanent or remain<5) and "" or tostring(remain<60 and math.ceil(remain) or math.floor(remain/60))
+                text.FontColor=Color.black
+            end
+            if isvalid(node.CanvasGroupComponent) then node.CanvasGroupComponent.GroupAlpha=math.min(1,remain/5) end
+            if not node.Enable then node.Enable=true end
+        end
+    end
+
+end

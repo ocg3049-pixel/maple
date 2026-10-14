@@ -1,0 +1,392 @@
+@Logic
+script CarnivalBattle extends Logic
+    method table Platforms(integer layout)
+        -- Both teams share the footholds exported from the selected original Carnival map.
+        return _CarnivalTerrain:Data(layout).platforms
+    end
+
+    method table NewActor(string uid, string name)
+        return {uid=uid,name=name,x=-5,y=0,vx=0,vy=0,face=1,ground=true,hp=1,maxHp=1,attackAt=0,hitAt=0,action="stand1",auto=true,input={axis=0,attack=false,at=-99,seq=0},power=1,crit=0,critMult=1.25,interval=0.65,speed=3.2,regen=0}
+    end
+
+    method void Move(table actor, table platforms, number axis, boolean jump, boolean down, number delta)
+        -- The native body owns motion; table coordinates are only the window projection.
+        if actor.physics~=nil then _CarnivalPhysics:Step(actor,axis,jump,down,delta) return end
+        if jump and actor.ground then actor.vy=11.2 actor.ground=false end
+        if down and actor.ground and actor.y>0.1 then actor.y=actor.y-0.12 actor.ground=false actor.vy=-1 end
+        local oldY=actor.y
+        actor.vx=axis*(actor.speed or 3.2)
+        actor.x=math.max(-7.7,math.min(7.7,actor.x+actor.vx*delta))
+        if axis~=0 then actor.face=axis>0 and 1 or -1 end
+        actor.vy=actor.vy-22*delta actor.y=actor.y+actor.vy*delta actor.ground=false
+        if actor.vy<=0 then
+            local floor=-100
+            for _,f in ipairs(platforms) do
+                if actor.x>=f.l and actor.x<=f.r and oldY>=f.y-0.01 and actor.y<=f.y and f.y>floor then floor=f.y end
+            end
+            if floor>-100 then actor.y=floor actor.vy=0 actor.ground=true end
+        end
+        if actor.y<0 then actor.y=0 actor.vy=0 actor.ground=true end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void RefreshStats(table p)
+        -- Read the same server-side combat and regeneration sources used by ordinary hunting.
+        if not isvalid(p.player) then return end
+        local a=p.actor local pc=p.player.PlayerComponent
+        local pa=p.player:GetComponent("script.PlayerAttack") local hit=p.player:GetComponent("script.PlayerHit")
+        local old=a.maxHp
+        a.maxHp=math.max(1,pc.MaxHp)
+        if a.hp>0 then a.hp=math.min(a.maxHp,a.hp+math.max(0,a.maxHp-old)) end
+        if isvalid(pa) then
+            a.power=math.max(1,pa:GetServerCombatPower())*(1+0.05*((a.upgrades or {}).power or 0))
+            a.crit=math.max(0,math.min(100,pa:GetServerCritRatePercent()))
+            a.critMult=math.max(1,pa:GetCriticalDamageRate())
+            a.interval=math.max(0.12,math.min(2,0.65*(pa._T.lastAtkMultiplier or 1)))
+        end
+        local movement=p.player.MovementComponent
+        a.speed=isvalid(movement) and math.max(1,math.min(8,3.2*movement.InputSpeed)) or 3.2
+        if isvalid(hit) then
+            a.regen=math.max(0,hit.HpRegenPercentPerSecond)
+            if not _RecoveryPotionManager:IsBossRestricted(p.player) then a.regen=a.regen+hit.HpPotionRegenPercentPerSecond end
+            a.regen=a.regen+hit.BeginnerHpRegenPercentPerSecond*(_BossStageManager:BattleBuffMultiplier("hpRecovery",p.player)-1)
+        end
+        a.regen=a.regen*(1+0.1*((a.upgrades or {}).recovery or 0))
+        a.worldRecovery=(isvalid(hit) and hit._T.recovery~=nil and hit._T.recovery.kind=="hp" and _UtilLogic.ServerElapsedSeconds>=hit._T.recovery.ready) and 5 or 1
+        p.liveLevel=math.max(1,_RegionTierLogic:GetServerLevelOf(p.player))
+        local costume=p.player.CostumeManagerComponent
+        if isvalid(costume) then
+            local equip={}
+            for _,key in ipairs(self:EquipKeys()) do table.insert(equip,tostring(costume[key] or "")) end
+            a.equip=equip a.custom=costume.UseCustomEquipOnly
+            a.owner=costume.DefaultEquipUserId~="" and costume.DefaultEquipUserId or p.uid
+        end
+    end
+
+    method table EquipKeys()
+        return {"CustomBodyEquip","CustomCapEquip","CustomCapeEquip","CustomCoatEquip","CustomEarAccessoryEquip","CustomEarEquip","CustomEyeAccessoryEquip","CustomFaceAccessoryEquip","CustomFaceEquip","CustomGloveEquip","CustomHairEquip","CustomLongcoatEquip","CustomOneHandedWeaponEquip","CustomPantsEquip","CustomShoesEquip","CustomSubWeaponEquip","CustomTwoHandedWeaponEquip"}
+    end
+
+    @ExecSpace("ServerOnly")
+    method table AddMonster(table room, table row)
+        -- Reuse dead instance slots without turning their replacements into new spawners.
+        if row==nil or self:LivingCount(room)>_CarnivalRules.MonsterLimit then return nil end
+        local n=#room.monsters+1 local life=1
+        for index,old in ipairs(room.monsters) do
+            if old.dead and _UtilLogic.ServerElapsedSeconds>=(old.deathAt or 0)+1.1 then
+                n=index life=(old.life or 0)+1
+                if isvalid(old.entity) then
+                    if _CarnivalReplica._T.monsters~=nil then _CarnivalReplica._T.monsters[old.entity.Id]=nil end
+                    _EntityService:Destroy(old.entity)
+                end
+                break
+            end
+        end
+        local platform=room.platforms[(n-1)%#room.platforms+1]
+        local x=platform.l+(platform.r-platform.l)*(0.22+0.56*((n*7)%11)/10)
+        local profile=_CarnivalCatalog:FieldProfile(row)
+        local maxHp=(profile~=nil and profile.hp~=3000) and profile.hp or _RegionTierLogic:GetMonsterHpForLevel(row.level)
+        local m={slot=n,id=row.id,name=row.name,level=row.level,sprite=row.sprite,x=x,y=platform.y,homeX=x,homeY=platform.y,platform=platform,hp=maxHp,maxHp=maxHp,face=n%2==0 and 1 or -1,dead=false,due=0,life=life,attackAt=0,hit=0,hitSeq=0}
+        m.profile=profile m.bornAt=_UtilLogic.ServerElapsedSeconds m.motion="stand"
+        room.monsters[n]=m
+        return m
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Kill(table r, integer team, table monster)
+        -- Keep carnival state and execution isolated from the outside character.
+        if r.state~="active" or monster.dead then return end
+        monster.deathAt=_UtilLogic.ServerElapsedSeconds monster.motion="die"
+        if r.training then
+            monster.dead=true monster.hp=0 monster.due=r.clock+3
+            log("[VRF] Carnival lobby dummy defeated rewards=0")
+            return
+        end
+        monster.dead=true monster.hp=0 monster.due=_MonsterZoneRespawn:NextRespawnAt(_UtilLogic.ServerElapsedSeconds)-r.at
+        r.cp[team]=r.cp[team]+_CarnivalRules:KillPoints(monster.level) r.kills[team]=r.kills[team]+1
+        -- Native hitboxes report damage here; ordinary monster drops and rewards are bypassed.
+        log("[VRF] Carnival window kill team="..tostring(team).." slot="..tostring(monster.slot).." respawnWait="..tostring(monster.due-r.clock).." fieldInterval="..tostring(_MonsterZoneRespawn.RespawnInterval))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(table r, number delta)
+        -- Resolve manual input, valid auto targets and combat on the authoritative room.
+        if r.state~="active" then return end
+        r.clock=math.max(0,_UtilLogic.ServerElapsedSeconds-r.at)
+        for _,room in ipairs(r.rooms) do self:SpawnWave(room,_UtilLogic.ServerElapsedSeconds) end
+        _CarnivalManager:CheckOutcome(r)
+        if r.state~="active" then return end
+        for team,room in ipairs(r.rooms) do
+            for _,p in ipairs(r.teams[team]) do if not p.dead then _CarnivalReplica:EnsureBattle(p,r,room) end end
+            _CarnivalReplica:SyncMonsters(r,team,room)
+            for _,p in ipairs(r.teams[team]) do
+                local a=p.actor
+                if not p.dead then
+                    if r.clock>=(a.statsAt or 0) then a.statsAt=r.clock+0.1 self:RefreshStats(p) end
+                    _CarnivalPhysics:Ensure(a,p.player,room.platforms)
+                    a.hp=math.min(a.maxHp,a.hp+a.maxHp*a.regen/100*delta*math.max(a.worldRecovery or 1,(a.recovery~=nil and a.recovery.kind=="hp" and _UtilLogic.ServerElapsedSeconds>=a.recovery.ready) and 5 or 1))
+                    local native=isvalid(a.physics.body) and a.physics.body:GetComponent("PlayerAttack") or nil
+                    local input=a.input local fresh=_UtilLogic.ServerElapsedSeconds-(input.at or -99)<0.4
+                    local axis=fresh and input.axis or 0
+                    local jump=fresh and input.jump or false local down=fresh and input.down or false
+                    local attack=fresh and input.attack or false
+                    local crouch=fresh and input.crouch==true
+                    input.jump=false input.down=false
+                    local nearest=nil local distance=math.huge
+                    for _,m in ipairs(room.monsters) do
+                        if self:LivingTarget(m) then
+                            local d=math.abs(m.x-a.x)+math.abs(m.y-a.y)*2.5
+                            if d<distance then distance=d nearest=m end
+                        end
+                    end
+                    local now=_UtilLogic.ServerElapsedSeconds
+                    if axis~=0 or jump or down or crouch or attack then
+                        a.manualUntil=now+0.3
+                        if now>=(a.skillLock or 0) then a.recovery=nil end
+                    end
+                    a.autoMode=a.auto and now>=(a.manualUntil or 0)
+                    if a.autoMode then
+                        local intent=self:AutoIntent(a,room,now)
+                        axis=intent.axis jump=intent.jump down=intent.down attack=intent.attack nearest=intent.target
+                        a.autoFace=intent.face
+                    end
+                    if a.recovery~=nil then
+                        if nearest~=nil and math.abs(nearest.x-a.x)<=4 and math.abs(nearest.y-a.y)<=2.5 then a.recovery=nil
+                        else axis=0 jump=false down=false attack=false end
+                    end
+                    if crouch and a.ground then axis=0 end
+                    a.nativeLocked=isvalid(native) and native:IsAutoAttackMotionLocked()
+                    a.forcedMotion=isvalid(native) and native._T.isRushing==true
+                    if a.nativeLocked or (a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds then axis=0 jump=false down=false attack=false end
+                    local facing=a.face
+                    self:Move(a,room.platforms,axis,jump,down,delta)
+                    if a.nativeLocked then a.face=facing elseif a.autoMode and a.autoFace~=nil then a.face=a.autoFace end
+                    if isvalid(native) then
+                        a.physics.body.PlayerControllerComponent.Enable=false
+                        a.physics.body.PlayerControllerComponent.LookDirectionX=a.face
+                        if not a.nativeLocked then
+                            a.physics.body.StateComponent:ChangeState(not a.ground and "FALL" or (crouch and "CROUCH" or (axis~=0 and "MOVE" or "IDLE")))
+                        end
+                    end
+                    a.action=not a.ground and "jump" or (crouch and "prone" or (axis~=0 and "walk1" or "stand1"))
+                    if attack and nearest~=nil then a.recovery=nil end
+                    if attack and nearest~=nil and r.clock>=a.attackAt and math.abs(nearest.x-a.x)<=1.65 and math.abs(nearest.y-a.y)<1 then
+                        a.face=nearest.x>=a.x and 1 or -1 a.attackAt=r.clock+a.interval+(a.autoMode and 0.3 or 0) a.swingUntil=r.clock+0.32
+                        if isvalid(native) then
+                            a.physics.body.PlayerControllerComponent.LookDirectionX=a.face
+                            a.physics.body.PlayerControllerComponent:ActionAttack()
+                        end
+                    end
+                    if (a.swingUntil or 0)>r.clock then a.action="swingO1" end
+                    _CarnivalSkills:Advance(a,room,_UtilLogic.ServerElapsedSeconds,delta,r,p)
+                    if (a.skillUntil or 0)>_UtilLogic.ServerElapsedSeconds then a.action=a.skillAction end
+                    if a.recovery~=nil then a.action="alert" end
+                end
+            end
+            for _,m in ipairs(room.monsters) do
+                if not m.dead then
+                    local target=nil local best=100
+                    for _,p in ipairs(r.teams[team]) do
+                        if not p.dead and math.abs(p.actor.y-m.y)<0.9 then
+                            local dx=math.abs(p.actor.x-m.x)
+                            if dx<best then best=dx target=p end
+                        end
+                    end
+                    local dir=m.face
+                    local now=_UtilLogic.ServerElapsedSeconds
+                    if target~=nil and now<(m.aggroUntil or 0) then dir=target.actor.x>=m.x and 1 or -1
+                    else
+                        if now>=(m.patrolAt or 0) then
+                            m.resting=not m.resting
+                            m.patrolAt=now+(m.resting and (0.6+_UtilLogic:RandomDouble()) or (2+_UtilLogic:RandomDouble()*2))
+                            if not m.resting then dir=_UtilLogic:RandomDouble()<0.5 and -1 or 1 end
+                        end
+                        if m.resting then dir=0 end
+                    end
+                    if m.x<=m.platform.l+0.2 then dir=1 elseif m.x>=m.platform.r-0.2 then dir=-1 end
+                    if dir~=0 then m.face=dir end
+                    local stun=isvalid(m.entity) and (_MonsterStatusLedger._T.stun or {})[m.entity.Path] or nil
+                    local stunned=stun~=nil and stun.untilTime>_UtilLogic.ElapsedSeconds
+                    local hitMotion=now<(m.hitUntil or 0)
+                    local spawning=now<(m.bornAt or 0)+1
+                    local moving=best>0.25 and dir~=0 and not stunned and not hitMotion and not spawning
+                    m.motion=hitMotion and "hit" or (moving and "move" or "stand")
+                    if isvalid(m.entity) and m.entity.MovementComponent.Enable then
+                        if moving then m.entity.MovementComponent:MoveToDirection(Vector2(dir,0),0)
+                        else m.entity.MovementComponent:Stop() end
+                    end
+                    if not spawning and not stunned and target~=nil and best<((m.profile~=nil and m.profile.width or 0.8)*0.5+0.3) and r.clock>=m.attackAt and r.clock>=target.actor.hitAt then
+                        m.attackAt=r.clock+1 target.actor.hitAt=r.clock+0.65
+                        local range=_RegionTierLogic:GetMonsterDamageRange(m.level)
+                        local damage=_UtilLogic:RandomIntegerRange(range.min,range.max)
+                        local native=target.actor.physics~=nil and target.actor.physics.body or nil
+                        local hit=isvalid(native) and native:GetComponent("PlayerHit") or nil
+                        if isvalid(hit) then
+                            if hit:BlocksSkillContact() then damage=0
+                            else damage=hit:ApplyDamageReduction(damage) end
+                        end
+                        target.actor.hp=math.max(0,target.actor.hp-damage)
+                        target.actor.recovery=nil
+                        local native=target.actor.physics~=nil and target.actor.physics.body or nil
+                        if isvalid(native) then
+                            native.PlayerComponent.Hp=math.floor(target.actor.hp)
+                            if isvalid(hit) then hit:SchedulePowerGuardRecovery(native,damage) end
+                        end
+                        if target.actor.hp<=0 then target.dead=true target.actor.action="dead" end
+                    end
+                end
+            end
+            _CarnivalReplica:SyncMonsters(r,team,room)
+        end
+    end
+
+    method table Snapshot(table r, integer team)
+        -- Keep carnival state and execution isolated from the outside character.
+        local actors={} local monsters={}
+        for _,p in ipairs(r.teams[team]) do
+            local a=p.actor
+            table.insert(actors,{uid=p.uid,name=p.name,level=p.level,job=p.job or 1,nativeId=a.nativeId,originX=a.physics~=nil and a.physics.origin.x or 0,originY=a.physics~=nil and a.physics.origin.y or 0,x=a.x,y=a.y,face=a.face,hp=math.ceil(a.hp),maxHp=a.maxHp,dead=p.dead,action=a.action,auto=a.auto,autoMode=a.autoMode==true,autoTarget=a.autoTarget,ground=a.ground,airJumpUsed=a.airJumpUsed,skillRate=a.skillRate,inputSeq=a.input.seq,forcedMotion=a.forcedMotion==true,locked=a.nativeLocked==true or (a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds,recovery=a.recovery,visuals=_CarnivalSkills:Visuals(a),owner=a.owner or p.uid,custom=a.custom or false,equip=a.equip})
+        end
+        for _,m in ipairs(r.rooms[team].monsters) do
+            table.insert(monsters,{slot=m.slot,id=m.id,sprite=m.training and m.sprite or nil,training=m.training==true,nativeId=isvalid(m.entity) and m.entity.Id or "",x=m.x,y=m.y,face=m.face,hp=m.hp,maxHp=m.maxHp,dead=m.dead,respawn=math.max(0,m.due-r.clock),hit=m.hit,hitSeq=m.hitSeq,life=m.life,motion=m.motion,bornAt=m.bornAt,deathAt=m.deathAt})
+        end
+        return {actors=actors,monsters=monsters}
+    end
+
+    method boolean LivingTarget(table monster)
+        -- Death/respawn entries stay in the room but must never be selected as active targets.
+        return monster~=nil and monster.dead~=true and (monster.hp or 0)>0
+            and type(monster.x)=="number" and type(monster.y)=="number"
+            and monster.x==monster.x and monster.y==monster.y
+    end
+
+    method table AutoRoute(table a, table room, table target)
+        -- Traverse only footholds reachable with the actor's current native jump multiplier.
+        local platforms=room.platforms
+        local start=nil local goal=nil local best=0.4
+        for i,f in ipairs(platforms) do
+            if a.x>=f.l-0.15 and a.x<=f.r+0.15 and math.abs(a.y-f.y)<best then start=i best=math.abs(a.y-f.y) end
+            if target.platform==f then goal=i end
+        end
+        if goal==nil then
+            for i,f in ipairs(platforms) do if target.x>=f.l and target.x<=f.r and math.abs(target.y-f.y)<0.2 then goal=i break end end
+        end
+        if start==nil or goal==nil then return nil end
+        if start==goal then return {first=platforms[start],next=platforms[start],count=0} end
+        local jumpForce=1
+        if a.physics~=nil and isvalid(a.physics.body) then jumpForce=a.physics.body.MovementComponent.JumpForce end
+        local rise=math.max(0,1.194*jumpForce*jumpForce-0.05)
+        local queue={start} local previous={[start]=0} local head=1
+        while head<=#queue do
+            local i=queue[head] head=head+1 local from=platforms[i]
+            for j,to in ipairs(platforms) do
+                if previous[j]==nil then
+                    local gap=math.max(0,to.l-from.r,from.l-to.r)
+                    local height=to.y-from.y
+                    -- Long drops need overlapping ground; upward links must fit the real jump arc.
+                    local canReach=(height<=rise and height>=-rise and gap<=1.2)
+                        or (height<0 and gap<=0.05)
+                    if canReach then
+                        previous[j]=i table.insert(queue,j)
+                        if j==goal then
+                            local nextIndex=j local count=1
+                            while previous[nextIndex]~=start do nextIndex=previous[nextIndex] count=count+1 end
+                            return {first=platforms[start],next=platforms[nextIndex],count=count}
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    method table AutoIntent(table a, table room, number now)
+        -- Flat-floor hunting keeps its target, never jumps, and uses a stop/resume margin.
+        local target=nil local best=math.huge
+        for _,m in ipairs(room.monsters) do
+            if self:LivingTarget(m) and math.abs(m.y-a.y)<1.5 then
+                if m.slot==a.autoTarget then target=m break end
+                local distance=math.abs(m.x-a.x)
+                if distance<best then target=m best=distance end
+            end
+        end
+        local selected=target~=nil and target.slot or nil
+        if selected~=a.autoTarget then a.autoTarget=selected a.autoHolding=false end
+        local intent={axis=0,jump=false,down=false,attack=false,target=target}
+        if target==nil then a.autoAxis=0 a.autoHolding=false return intent end
+        local dx=target.x-a.x local distance=math.abs(dx)
+        local stop=math.max(0.65,math.min(7,a.autoRange or 1.05))
+        if a.autoHolding and distance>stop+0.45 then a.autoHolding=false
+        elseif not a.autoHolding and distance<=stop then a.autoHolding=true end
+        local native=a.physics~=nil and isvalid(a.physics.body) and a.physics.body:GetComponent("PlayerAttack") or nil
+        if isvalid(native) and native:IsAutoAttackMotionLocked() then return intent end
+        if distance>0.1 then a.face=dx>=0 and 1 or -1 end
+        if not a.autoHolding then intent.axis=dx>=0 and 1 or -1 end
+        -- Short retreat/advance hops stay inside the current foothold and avoid contact clusters.
+        local nearby=0
+        for _,m in ipairs(room.monsters) do
+            if self:LivingTarget(m) and math.abs(m.x-a.x)<2.4 and math.abs(m.y-a.y)<1.5 then nearby=nearby+1 end
+        end
+        local hop=a.autoHop
+        if hop~=nil then
+            if now-hop.at>1.25 or (now-hop.at>0.18 and a.ground) then a.autoHop=nil
+            else intent.axis=math.abs(a.x-hop.x)<1.1 and hop.axis or 0 end
+        elseif a.ground and now>=(a.nextAutoHop or 0) and (nearby>=3 or distance<0.9) then
+            local face=dx>=0 and 1 or -1
+            local direction=-face
+            local platform=target.platform or room.platforms[1]
+            if a.x+direction*1.6<platform.l+0.25 or a.x+direction*1.6>platform.r-0.25 then direction=face end
+            if a.x+direction*1.6>=platform.l+0.25 and a.x+direction*1.6<=platform.r-0.25 then
+                a.autoHop={at=now,x=a.x,axis=direction}
+                a.nextAutoHop=now+2.4 intent.axis=direction intent.jump=true
+            end
+        end
+        intent.face=dx>=0 and 1 or -1
+        intent.attack=distance<=1.65 and math.abs(target.y-a.y)<1
+        a.autoAxis=intent.axis
+        return intent
+    end
+
+
+    method integer LivingCount(table room)
+        -- Count surviving instances, not purchased spawn points or retired slots.
+        local count=0
+        for _,m in ipairs(room.monsters or {}) do if not m.dead and m.hp>0 then count=count+1 end end
+        return count
+    end
+
+    @ExecSpace("ServerOnly")
+    method table AddSpawn(table room, table row)
+        -- A purchased or base spawn point keeps producing even while its previous monsters live.
+        local m=self:AddMonster(room,row)
+        if m==nil then return nil end
+        room.spawners=room.spawners or {}
+        table.insert(room.spawners,{row=row,x=m.homeX,y=m.homeY,platform=m.platform,nextAt=_MonsterZoneRespawn:NextRespawnAt(_UtilLogic.ServerElapsedSeconds)})
+        return m
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SpawnWave(table room, number now)
+        -- Share the field respawn clock; bounded to limit+1 so overflow can settle immediately.
+        for _,source in ipairs(room.spawners or {}) do
+            if now>=source.nextAt then
+                source.nextAt=_MonsterZoneRespawn:NextRespawnAt(now)
+                local m=self:AddMonster(room,source.row)
+                if m~=nil then m.x=source.x m.y=source.y m.homeX=source.x m.homeY=source.y m.platform=source.platform end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ClearRoom(table room)
+        -- Remove living enemies without kill rewards; their purchased spawn points remain.
+        for _,m in ipairs(room.monsters) do
+            m.dead=true m.hp=0 m.deathAt=_UtilLogic.ServerElapsedSeconds m.motion="die"
+            if isvalid(m.entity) then
+                if _CarnivalReplica._T.monsters~=nil then _CarnivalReplica._T.monsters[m.entity.Id]=nil end
+                _EntityService:Destroy(m.entity) m.entity=nil
+            end
+        end
+    end
+
+end

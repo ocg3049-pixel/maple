@@ -5,8 +5,8 @@ script HolyArrowProjectile extends Component
 	-- ⚠ 엔젤레이/아이언에로우(둘 다 6)와 갈라진 값이다 - 홀리 에로우만 빠르다.
 	property number Speed = 10
 
-	-- 속도를 올린 만큼 같은 사거리를 유지하려면 수명은 반대로 줄어들어야 한다(6×1.5 = 10×0.9).
-	property number MaxLifetime = 0.9
+	-- 현재 사거리를 추가로 20% 줄인다: 6.3 × 0.8 = 10 × 0.504 = 5.04유닛.
+	property number MaxLifetime = 0.504
 
 	property number CombatPower = 0
 
@@ -66,14 +66,18 @@ script HolyArrowProjectile extends Component
         local pa = isvalid(owner) and owner:GetComponent("script.PlayerAttack") or nil
         if not self.VisualOnly and isvalid(pa) then
             pa:PlanFlyingDamage(attack,dirX,dirY,self.Speed*self.MaxLifetime,self.MaxHitCount,.6,"skill.holyarrow",self.MaxLifetime+.5)
+            if not pa._T.holyRangeVerified then
+                pa._T.holyRangeVerified=true
+                if Environment:IsMakerPlay() then log("[VRF] HolyArrow range="..tostring(self.Speed*self.MaxLifetime).." cap="..tostring(self.MaxHitCount).." identity=entityId") end
+            end
         end
 
 		self.Fired = true
 	end
 
 	@ExecSpace("ServerOnly")
-	method boolean HasHit(string defenderName)
-		return self._T.hitSet[defenderName] == true
+	method boolean HasHit(string defenderId)
+		return self._T.hitSet[defenderId] == true
 	end
 
 	@ExecSpace("ServerOnly")
@@ -82,8 +86,9 @@ script HolyArrowProjectile extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method void MarkHit(string defenderName)
-		self._T.hitSet[defenderName] = true
+	method void MarkHit(string defenderId)
+		if self._T.hitSet[defenderId] then return end
+		self._T.hitSet[defenderId] = true
 		self._T.hitCount = self._T.hitCount + 1
 	end
 
@@ -101,8 +106,8 @@ script HolyArrowProjectile extends Component
 			return
 		end
 
-		self._T.lifetime = self._T.lifetime + delta
-		if self._T.lifetime >= self.MaxLifetime then
+		local step = math.min(delta, math.max(0, self.MaxLifetime - self._T.lifetime))
+		if step <= 0 then
 			_EntityService:Destroy(self.Entity)
 			return
 		end
@@ -113,7 +118,9 @@ script HolyArrowProjectile extends Component
 			return
 		end
 
-		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * delta, self._T.dirY * self.Speed * delta)
+		local previous = self.Entity.TransformComponent.WorldPosition
+		self._T.lifetime = self._T.lifetime + step
+		self.Entity.TransformComponent:Translate(self._T.dirX * self.Speed * step, self._T.dirY * self.Speed * step)
 
 		-- 쉐도우 파트너의 그림자 몫(시각 전용) 화살은 판정 자체를 하지 않는다.
 		if self.VisualOnly then return end
@@ -121,9 +128,11 @@ script HolyArrowProjectile extends Component
 		---@type HolyArrowProjectileAttack
 		local ac = self.Entity:GetComponent("script.HolyArrowProjectileAttack")
 		if ac ~= nil then
-			local pos = self.Entity.TransformComponent.Position
-			-- 엔젤레이와 동일하게 세로로 긴 상자(가로 0.6 x 세로 1.2) 판정 - 경로보다 조금 위/아래의 적도 맞는다.
-			ac:AttackFast(BoxShape(Vector2(pos.x, pos.y), Vector2(0.6, 1.2), 0), "skill.holyarrow", CollisionGroups.HitBox)
+			local pos = self.Entity.TransformComponent.WorldPosition
+			-- Cover the traveled segment so fast arrows cannot skip enemies between updates.
+			local center = Vector2((previous.x + pos.x) / 2, (previous.y + pos.y) / 2)
+			local angle = math.deg(math.atan(self._T.dirY, self._T.dirX))
+			ac:AttackFast(BoxShape(center, Vector2(self.Speed * step + 0.6, 1.2), angle), "skill.holyarrow", CollisionGroups.HitBox)
 		end
 	end
 

@@ -86,21 +86,14 @@ script CashItemAudit extends Logic
             local key="cashAudit_"..characterId.."_"..eventId.."_"..tostring(index)
             sv.cashAuditPending[key]={tag="cashAudit_"..characterId,value=_HttpService:JSONEncode(record)}
         end
-        log("[CashAudit] queued character="..characterId.." event="..eventId.." changes="..tostring(#changes).." reason="..reason)
+        if Environment:IsMakerPlay() then log("[CashAudit] queued character="..characterId.." event="..eventId.." changes="..tostring(#changes).." reason="..reason) end
         return true
     end
 
     @ExecSpace("ServerOnly")
     method void Flush(table sv, boolean synchronous)
         -- Immutable batch records are retried; failed writes never clear the pending entries.
-        sv.cashAuditPending = sv.cashAuditPending or {}
-        for id, r in pairs(sv.mesoAudit or {}) do
-            local reasons={} for reason,_ in pairs(r.reasons) do table.insert(reasons,reason) end
-            local eventId=_RecoveryManager:NewId()
-            local record={header={version=1,eventId=eventId,characterId=id,characterName=sv.lastName or "",timeUtc=r.lastUtc,firstUtc=r.firstUtc,reason=table.concat(reasons,","),source="server_observed_client_snapshot",mesoBefore=r.before,mesoAfter=r.after,operations=r.count},part=1,parts=1}
-            sv.cashAuditPending["cashAudit_"..id.."_"..eventId.."_1"]={tag="cashAudit_"..id,value=_HttpService:JSONEncode(record)}
-        end
-        sv.mesoAudit={}
+        self:PreparePending(sv)
         if next(sv.cashAuditPending)==nil then return end
         if sv.cashAuditBusy and not synchronous then return end
         local batch={}
@@ -118,7 +111,7 @@ script CashItemAudit extends Logic
             end
             sv.cashAuditBusy=false
             if code~=0 then log_warning("[CashAudit] storage failed ec="..tostring(code).."; pending records retained for retry")
-            else log("[CashAudit] durable batch saved") end
+            else if Environment:IsMakerPlay() then log("[CashAudit] durable batch saved") end end
         end
         sv.cashAuditBusy=true
         if synchronous then
@@ -131,4 +124,17 @@ script CashItemAudit extends Logic
             end
         else sv.storage:BatchSetByInfoAsync(batch,finish) end
     end
+    @ExecSpace("ServerOnly")
+    method void PreparePending(table sv)
+        -- Materialize pending currency audit records without issuing a separate storage request.
+        sv.cashAuditPending = sv.cashAuditPending or {}
+        for id, r in pairs(sv.mesoAudit or {}) do
+            local reasons={} for reason,_ in pairs(r.reasons) do table.insert(reasons,reason) end
+            local eventId=_RecoveryManager:NewId()
+            local record={header={version=1,eventId=eventId,characterId=id,characterName=sv.lastName or "",timeUtc=r.lastUtc,firstUtc=r.firstUtc,reason=table.concat(reasons,","),source="server_observed_client_snapshot",mesoBefore=r.before,mesoAfter=r.after,operations=r.count},part=1,parts=1}
+            sv.cashAuditPending["cashAudit_"..id.."_"..eventId.."_1"]={tag="cashAudit_"..id,value=_HttpService:JSONEncode(record)}
+        end
+        sv.mesoAudit={}
+    end
+
 end

@@ -53,19 +53,21 @@ script BossRewards extends Logic
 
     @ExecSpace("ServerOnly")
     method table Roll(Entity player, integer stage)
-        -- Roll the ordinary level-20 tables 100/50 times, with the killer's hunting modifiers.
+        -- Roll 2,000 ordinary monsters at this boss's recommended level.
         local attack=player:GetComponent("script.PlayerAttack")
         local dropMult=isvalid(attack) and 1+attack:GetDropRateBonusPct()/100 or 1
         local mesoMult=isvalid(attack) and 1+attack:GetMesoRateBonusPct()/100 or 1
         local level=_RegionTierLogic:GetServerLevelOf(player)
-        local rate=level>0 and _RegionTierLogic:GetLevelDropRate(20,level) or 1
+        local rewardLevel=_BossStageManager:Stage(stage).recommended or 20
+        local rate=level>0 and _RegionTierLogic:GetLevelDropRate(rewardLevel,level) or 1
         local bundle={meso=0,items={}}
-        for i=1,100 do
-            local amount=_MonsterDropRules:CalculateMeso(_RegionTierLogic:RollMesoForLevel(20),mesoMult,rate)
+        for i=1,2000 do
+            local amount=_MonsterDropRules:CalculateMeso(_RegionTierLogic:RollMesoForLevel(rewardLevel),mesoMult,rate)
             if _UtilLogic:RandomDouble()<_MonsterDropRules:GetMesoDropChance(rate) then bundle.meso=bundle.meso+amount end
         end
-        for i=1,50 do
-            for _,drop in ipairs(_MonsterDropRules:GetItems()) do
+        local itemTable=_MonsterDropRules:GetItems()
+        for i=1,2000 do
+            for _,drop in ipairs(itemTable) do
                 local chance=_MonsterDropRules:CalculateItemChance(drop.rate,drop.fixedRate==true,dropMult,rate)
                 if _UtilLogic:RandomDouble()<chance then
                     local item=drop.name.."|"..drop.ruid.."|0|0|0|0|1"
@@ -80,7 +82,23 @@ script BossRewards extends Logic
         end
         -- The rare roll is exactly 2%, independent of drop buffs and level difference.
         if stage==1 and _UtilLogic:RandomDouble()<0.02 then table.insert(bundle.items,"무지개색 달팽이 등껍질|3eb056d03f034a29b52bfa917319d71a|0|0|0|0|1") end
+        if Environment:IsMakerPlay() then log("[VRF] BossReward rolls=2000 level="..tostring(rewardLevel).." meso="..tostring(bundle.meso).." items="..tostring(#bundle.items)) end
         return bundle
+    end
+
+    @ExecSpace("ServerOnly")
+    method Vector3 ResolveLootPosition(Entity boss)
+        local thief=boss:GetComponent("script.ThiefEncounter")
+        if isvalid(thief) and thief._T.lastDefeatedPosition~=nil then return thief._T.lastDefeatedPosition end
+        local stumpy=boss:GetComponent("script.StumpyEncounter")
+        if isvalid(stumpy) and stumpy.SlamStarted>=0 then
+            return stumpy.SlamOrigin+Vector3(0,stumpy:JumpHeight(_UtilLogic.ServerElapsedSeconds-stumpy.SlamStarted),0)
+        end
+        local king=boss:GetComponent("script.KingSlimeEncounter")
+        if isvalid(king) and king.JumpStarted>=0 then
+            return king.JumpOrigin+Vector3(0,king:JumpHeight(_UtilLogic.ServerElapsedSeconds-king.JumpStarted),0)
+        end
+        return boss.TransformComponent.WorldPosition
     end
 
     @ExecSpace("ServerOnly")
@@ -100,13 +118,13 @@ script BossRewards extends Logic
         data.weeks[tostring(run.stage)]=week data.bundles[tostring(key)]=bundle
         sv.saves[run.id]=self:Write(sv.saves[run.id] or "",data)
         sv.dirtySaves[run.id]=true
-        local position=isvalid(run.boss) and run.boss.TransformComponent.WorldPosition or player.TransformComponent.WorldPosition
+        local position=run.rewardPosition or (isvalid(run.boss) and self:ResolveLootPosition(run.boss) or player.TransformComponent.WorldPosition)
         local map=player.CurrentMap
         local saved=_CharacterPersistence:WriteCharacterSaves(sv,true)
         self:Receive(run.id,self:Record(data),run.uid)
         if isvalid(map) and isvalid(player) and player.CurrentMap==map then self:SpawnLoot(map,position,bundle,key,run.uid,run.id) end
         self:Notice(saved and "주간 보상이 떨어졌습니다. 미수령 보상은 보상창에 보관됩니다." or "주간 보상을 보관했습니다. 보상창에서 저장 확인 후 받을 수 있습니다.",run.uid)
-        log("[BossRewards] reserved stage="..tostring(run.stage).." week="..tostring(week).." meso="..tostring(bundle.meso).." saved="..tostring(saved))
+        if Environment:IsMakerPlay() then log("[BossRewards] reserved stage="..tostring(run.stage).." week="..tostring(week).." meso="..tostring(bundle.meso).." saved="..tostring(saved)) end
     end
 
     method table LootRows(table bundle)
@@ -135,7 +153,11 @@ script BossRewards extends Logic
         local drops=self:LootRows(bundle)
         local rare=false
         for _,row in ipairs(drops) do if row.kind=="etc" then rare=true break end end
-        local centerX=math.max(-3.2,math.min(3.2,position.x))
+        local centerX=position.x
+        local edge=#map:GetChildComponentsByTypeName("script.ThiefEncounter",true)>0 and 14.6 or 6.8
+        local left=-edge local right=edge
+        local regional=map:GetFirstChildComponentByTypeName("script.RegionalBossEncounter",true)
+        if isvalid(regional) then local d=regional:Data() left=d.left+0.3 right=d.right-0.3 end
         for i,row in ipairs(drops) do
             local entity=_SpawnService:SpawnByModelId(row.kind=="meso" and "droppedmeso" or "droppedshell","BossLoot"..tostring(key).."_"..tostring(i),position,map)
             if isvalid(entity) then
@@ -146,7 +168,7 @@ script BossRewards extends Logic
                 local lane=#drops>1 and (i-1)/(#drops-1) or 0.5
                 local upwardSpeed=6.8+((i-1)%5)*0.45
                 local flightTime=2*upwardSpeed/math.abs(drop.gravity)
-                local landingX=centerX+(lane-0.5)*7.2
+                local landingX=math.max(left,math.min(right,centerX+(lane-0.5)*7.2))
                 drop._T.vx=(landingX-position.x)/flightTime drop._T.vy=upwardSpeed
                 drop.settleDuration=(rare and 3 or 1.1)+((i-1)%6)*0.08
                 entity.SpriteRendererComponent.SpriteRUID=row.ruid
@@ -155,7 +177,7 @@ script BossRewards extends Logic
                 if row.kind=="etc" then drop.GroundOffset=0.35 end
             end
         end
-        log("[BossRewards] loot shower piles="..tostring(#drops).." meso="..tostring(bundle.meso).." potions=0")
+        if Environment:IsMakerPlay() then log("[VRF] BossLoot origin="..tostring(position).." piles="..tostring(#drops).." meso="..tostring(bundle.meso).." potions=0") end
         if rare then self:Flash(uid) end
         if #drops==0 then self:Collect(id,key,uid) end
     end
@@ -165,18 +187,21 @@ script BossRewards extends Logic
         -- Character identity prevents a delayed reply from leaking between slots.
         if id~=self._T.id then return end
         self._T.data=self:Read(record)
+        if _BossStageManager.opened then _BossStageManager:Draw() end
     end
 
     @ExecSpace("ClientOnly")
     method void Restore(string id, string snapshot)
         -- Restore pending bundles even if the player disconnected during the clear animation.
         self._T.id=id self._T.data=self:Read(snapshot) self._T.autoKey=nil
+        if _BossStageManager.opened then _BossStageManager:Draw() end
     end
 
     @ExecSpace("Client")
     method void Collect(string id, integer key)
         -- Multiple ground items can request the same bundle; the receipt allows only one grant.
         if id~=self._T.id or _EventRewards:HasLevel(_EventRewards._T.state or _EventRewards:ReadState(""),key) then return end
+        _GameAudio:PlaySound("c6da79f93bc34e7cb213080a00f09fef",1.0)
         self._T.autoKey=key self._T.autoAt=_UtilLogic.ElapsedSeconds+0.25
     end
 
@@ -203,7 +228,7 @@ script BossRewards extends Logic
         e.SpriteGUIRendererComponent.AnimClipPlayType=SpriteAnimClipPlayType.Onetime
         self._T.flashEnd=e:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function() self:ClearFlash() end)
         self:FitFlash(e) e.Enable=true self._T.flashUntil=_UtilLogic.ElapsedSeconds+8
-        log("[BossRewards] rare flash started once")
+        if Environment:IsMakerPlay() then log("[BossRewards] rare flash started once") end
     end
 
     @ExecSpace("ClientOnly")
@@ -223,7 +248,7 @@ script BossRewards extends Logic
         local e=self._T.flash
         if isvalid(e) then
             if self._T.flashEnd then e:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,self._T.flashEnd) end
-            e:Destroy() log("[BossRewards] rare flash ended")
+            e:Destroy() if Environment:IsMakerPlay() then log("[BossRewards] rare flash ended") end
         end
         self._T.flash=nil self._T.flashEnd=nil
     end
@@ -236,7 +261,7 @@ script BossRewards extends Logic
                 local e=self:UI("Acquired") e.Enable=true
                 e.TextGUIRendererComponent.Text="무지개색 달팽이 등껍질 획득!"
                 self._T.goldUntil=_UtilLogic.ElapsedSeconds+5
-                log("[BossRewards] rainbow shell acquired banner") return
+                if Environment:IsMakerPlay() then log("[BossRewards] rainbow shell acquired banner") end return
             end
         end
     end
@@ -260,7 +285,7 @@ script BossRewards extends Logic
             end
         end
         local key=self._T.autoKey
-        if key and now>=(self._T.autoAt or 0) and _LoginFlow:IsInGame() and not _RewardCenter.opened and (not _GameSystemMenu:BlocksInput() or (_BossStageManager._T.result==true and not _GameSystemMenu.opened)) and _EventRewards._T.ready and not _RewardCenter:Pending() then
+        if key and _BossStageManager._T.battle~=true and now>=(self._T.autoAt or 0) and _LoginFlow:IsInGame() and not _RewardCenter.opened and (not _GameSystemMenu:BlocksInput() or (_BossStageManager._T.result==true and not _GameSystemMenu.opened)) and _EventRewards._T.ready and not _RewardCenter:Pending() then
             self._T.autoKey=nil
             if not _EventRewards:HasLevel(_EventRewards._T.state,key) then
                 if not _EventRewards:ClaimFromCenter("boss",key) then _UIToast:ShowMessage("보스 보상을 보상창에 보관했습니다. 가방 공간을 확인해주세요.") end
@@ -280,7 +305,7 @@ script BossRewards extends Logic
             end
             if centers[ids[1]] and centers[ids[2]] then self._T.auraOffset=centers[ids[1]]-centers[ids[2]]*0.22 end
         end)
-        log("[BossRewards] weekly ledger and rare overlay ready")
+        if Environment:IsMakerPlay() then log("[BossRewards] weekly ledger and rare overlay ready") end
     end
 
     @ExecSpace("ClientOnly")

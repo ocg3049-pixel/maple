@@ -1,0 +1,436 @@
+@Logic
+script AuctionHouse extends Logic
+    property boolean opened = false
+    property string tab = "search"
+    property integer page = 1
+    property string category = "all"
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        return _EntityService:GetEntityByPath("/ui/AuctionHouse/Window"..(path=="" and "" or "/"..path))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Text(string path, string value)
+        local e=self:UI(path) if isvalid(e) then e.TextGUIRendererComponent.Text=value end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Input(string path)
+        local e=self:UI(path) return isvalid(e) and e.TextGUIRendererInputComponent.Text or ""
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        local e=self:UI(path) if not isvalid(e) then return end
+        table.insert(self._T.links,{entity=e,kind=ButtonClickEvent,link=e:ConnectEvent(ButtonClickEvent,callback)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.links={} self._T.state={rev=0} self._T.rows={} self._T.wishes={} self._T.hours=24
+        self:UI("").Enable=false
+        _EntityService:GetEntityByPath("/ui/AuctionHouse/Shield").Enable=false
+        for _,name in ipairs({"search","market","wish","sell","mine","complete"}) do
+            local key=name self:Bind("Tabs/"..key,function() if self._T.pending then return end self.tab=key self.page=1 self._T.selected=nil self:Draw() end)
+        end
+        for _,name in ipairs({"all","equip","consume","decorate"}) do
+            local key=name self:Bind("Filters/"..key,function() self.category=key self.page=1 if key~="equip" then self._T.part="전체" end self:Draw() end)
+        end
+        self._T.grade="전체" self._T.addGrade="전체" self._T.option="선택 안함"
+        self._T.part="전체"
+        self:Bind("Filters/Part",function() self:Dropdown("part",{"전체","무기","모자","상의","한벌옷","하의","신발","망토","장갑","반지","귀고리","펜던트","얼굴장식","눈장식","코디 이용권"}) end)
+        self:Bind("Filters/Grade",function() self:Dropdown("grade",{"전체","레어","에픽","유니크","레전드리"}) end)
+        self:Bind("Filters/AddGrade",function() self:Dropdown("addGrade",{"전체","레어","에픽","유니크","레전드리"}) end)
+        self:Bind("Filters/Option",function() self:Dropdown("option",{"선택 안함","STR","DEX","INT","LUK","공격력","마력","보스 공격","방어율 무시","MaxHP"}) end)
+        for i=1,20 do local index=i self:Bind("Dropdown/Item"..tostring(i),function()
+            local list=self._T.dropdown if not list then return end
+            if list.values[index]==nil then return end
+            if list.key=="part" then self.category="equip" end
+            self._T[list.key]=list.values[index] self:UI("Dropdown").Enable=false self.page=1 self:Draw()
+        end) end
+        self:Bind("Details",function() self:Inspect() end)
+        self:Bind("Inspect/Close",function() self:UI("Inspect").Enable=false end)
+        self:Bind("Close",function() self:Close() end)
+        self:Bind("Refresh",function() self:Refresh() end)
+        self:Bind("Filters/Search",function() self.page=1 self:Draw() self:Refresh() end)
+        self:Bind("Filters/Reset",function() self:ResetFilters() end)
+        self:Bind("Prev",function() self.page=math.max(1,self.page-1) self:Draw() end)
+        self:Bind("Next",function() self.page=math.min(self._T.pages or 1,self.page+1) self:Draw() end)
+        self:Bind("Action",function() self:Action() end)
+        self:Bind("Wish",function() local r=self._T.selected if r then self._T.wishes[r.id]=not self._T.wishes[r.id] _CharacterPersistence:MarkDirty("auction_wish") self:Draw() end end)
+        self:Bind("Sell/Hours",function() self._T.hours=self._T.hours==24 and 48 or 24 self:Draw() end)
+        self:Bind("Sell/Register",function() self:PrepareSell() end)
+        for _,name in ipairs({"Count","Price"}) do
+            local field=self:UI("Sell/"..name)
+            table.insert(self._T.links,{entity=field,kind=TextInputValueChangeEvent,link=field:ConnectEvent(TextInputValueChangeEvent,function() self:UpdateSalePrice() end)})
+        end
+        self:Bind("Confirm/Yes",function() self:Submit() end)
+        self:Bind("Confirm/No",function() self:UI("Confirm").Enable=false self._T.confirm=nil end)
+        for i=1,8 do local index=i self:Bind("List/Row"..tostring(i),function() self:Select(index) end) end
+        for i=1,48 do local index=i local path="Sell/Bag/Slot"..tostring(i)
+            self:Bind(path,function() self:SelectItem(index) end)
+            local e=self:UI(path)
+            table.insert(self._T.links,{entity=e,kind=UITouchBeginDragEvent,link=e:ConnectEvent(UITouchBeginDragEvent,function() self:SelectItem(index) end)})
+        end
+        for i=1,5 do local index=i self:Bind("Suggest/Item"..tostring(i),function()
+            local value=(self._T.suggestions or {})[index] if value then self:UI("Query").TextGUIRendererInputComponent.Text=value self:UI("Suggest").Enable=false self.page=1 self:Draw() end
+        end) end
+        local input=self:UI("Query")
+        table.insert(self._T.links,{entity=input,kind=TextInputValueChangeEvent,link=input:ConnectEvent(TextInputValueChangeEvent,function() self:Suggest() end)})
+        table.insert(self._T.links,{entity=input,kind=TextInputSubmitEvent,link=input:ConnectEvent(TextInputSubmitEvent,function() self:UI("Suggest").Enable=false self.page=1 self:Draw() end)})
+        local restricted=_EntityService:GetEntityByPath("/ui/AuctionHouse/LevelNotice")
+        restricted.Enable=false
+        local ok=restricted:GetChildByName("Panel"):GetChildByName("OK")
+        table.insert(self._T.links,{entity=ok,kind=ButtonClickEvent,link=ok:ConnectEvent(ButtonClickEvent,function() restricted.Enable=false _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2 end)})
+        self._T.key=_InputService:ConnectEvent(KeyDownEvent,function(event)
+            if restricted.Enable and (event.key==KeyboardKey.Escape or event.key==KeyboardKey.Return) then
+                restricted.Enable=false _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2 return
+            end
+            if _LoginFlow:IsInGame() and not _MapleHUDManager:IsChatTyping() and not _KeySettingManager:IsCapturingKey() and not _KeySettingManager:IsWindowOpen() and not _SkillManager:BlocksAmountInput() and not _MapleIslandTutorial:IsTyping() and _KeySettingManager:GetFuncForKeyEnum(event.key)=="auction" then
+                if self.opened then self:Close() elseif not _GameSystemMenu:BlocksInput() then self:Open() end
+                return
+            end
+            if not self.opened then return end
+            if event.key==KeyboardKey.Escape then
+                if self:UI("Inspect").Enable then self:UI("Inspect").Enable=false elseif self:UI("Dropdown").Enable then self:UI("Dropdown").Enable=false elseif self:UI("Confirm").Enable then self:UI("Confirm").Enable=false self._T.confirm=nil else self:Close() end
+            elseif event.key==KeyboardKey.Return and self:UI("Confirm").Enable then self:Submit() end
+        end)
+        local menu=_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/BtnAuction")
+        if isvalid(menu) then table.insert(self._T.links,{entity=menu,kind=ButtonClickEvent,link=menu:ConnectEvent(ButtonClickEvent,function() _GameSystemMenu:Close() self:Open() end)}) end
+        if Environment:IsMakerPlay() then log("[VRF][Auction] client ready") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for _,r in ipairs(self._T.links or {}) do if isvalid(r.entity) then r.entity:DisconnectEvent(r.kind,r.link) end end
+        if self._T.key then _InputService:DisconnectEvent(KeyDownEvent,self._T.key) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string snapshot, string character)
+        self._T.state=_AuctionRules:State(snapshot) self._T.character=character self._T.pending=nil
+        self._T.rows={} self._T.selected=nil self._T.wishes=_AuctionService:Decode(string.match("\n"..snapshot,"\nAUW\t([^\r\n]+)") or "{}") self.opened=false
+        local root=self:UI("") if isvalid(root) then root.Enable=false end
+        local notice=_EntityService:GetEntityByPath("/ui/AuctionHouse/LevelNotice") if isvalid(notice) then notice.Enable=false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Export()
+        return _AuctionRules:Record(self._T.state or {rev=0}).."\nAUW\t".._HttpService:JSONEncode(self._T.wishes or {})
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean BlocksInput()
+        -- Include the level requirement dialog in the common Escape/input arbiter.
+        local notice=_EntityService:GetEntityByPath("/ui/AuctionHouse/LevelNotice")
+        return self.opened or (isvalid(notice) and notice.EnabledInHierarchy)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Open()
+        if _LoginFlow.phase~="ingame" then return end
+        if _CharInfoManager:GetDisplayLevel()<70 then
+            local notice=_EntityService:GetEntityByPath("/ui/AuctionHouse/LevelNotice")
+            notice:GetChildByName("Panel"):GetChildByName("Message").TextGUIRendererComponent.Text="경매장은 70레벨 이상부터 이용할 수 있습니다.\n현재 레벨: "..tostring(_CharInfoManager:GetDisplayLevel()).."\n70레벨을 달성하면 아이템 구매와 판매가 열립니다."
+            notice.Enable=true _MobileUIManager:ReleaseControls()
+            if Environment:IsMakerPlay() then log("[VRF][Oct12] auction level requirement dialog") end
+            return
+        end
+        self.opened=true _EntityService:GetEntityByPath("/ui/AuctionHouse/Shield").Enable=true self:UI("").Enable=true self:UI("Confirm").Enable=false self:UI("Suggest").Enable=false self:UI("Dropdown").Enable=false self:UI("Inspect").Enable=false
+        _MobileUIManager:ReleaseControls() _UIEquipInventoryManager:HideTooltip()
+        self.tab="search" self.page=1 self:Draw() self:Refresh()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Close()
+        if self._T.pending then self:Text("Status","거래 결과를 확인 중입니다. 잠시 기다려주세요.") return end
+        self.opened=false self:UI("").Enable=false
+        _EntityService:GetEntityByPath("/ui/AuctionHouse/Shield").Enable=false _UIEquipInventoryManager:HideTooltip()
+        _GameSystemMenu._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Refresh()
+        if self._T.pending then return end
+        self._T.sequence=(self._T.sequence or 0)+1
+        _CharacterPersistence:FlushToServer()
+        _AuctionService:Query(self._T.character or "",self._T.sequence)
+        self:Text("Status","상품 목록을 불러오고 있습니다...")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Results(string character, integer sequence, string rows, string message)
+        if character~=self._T.character or sequence~=self._T.sequence then return end
+        self._T.rows=_AuctionService:Decode(rows) self:Draw()
+        self:Text("Status",message~="" and message or "판매 수수료 30% · 구매 상품과 판매 대금은 완료 탭에서 수령합니다.")
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Match(string item, number price)
+        if self.category~="all" and _AuctionRules:Category(item)~=self.category then return false end
+        if (self._T.part or "전체")~="전체" and self:EquipmentPart(item)~=self._T.part then return false end
+        local query=string.lower(self:Input("Query"))
+        if query~="" and not string.find(string.lower(_AuctionRules:Field(item,1)),query,1,true) then return false end
+        local min=tonumber(self:Input("Filters/MinPrice")) or 0 local max=tonumber(self:Input("Filters/MaxPrice")) or 1000000000000
+        if price<min or price>max then return false end
+        local stars=tonumber(_AuctionRules:Field(item,4)) or 0
+        if _AuctionRules:Category(item)=="equip" and stars<(tonumber(self:Input("Filters/Stars")) or 0) then return false end
+        if (self._T.grade or "전체")~="전체" and _UIEquipInventoryManager:NormalizeGradeName(_AuctionRules:Field(item,9))~=self._T.grade then return false end
+        if (self._T.addGrade or "전체")~="전체" and _UIEquipInventoryManager:NormalizeGradeName(_AuctionRules:Field(item,13))~=self._T.addGrade then return false end
+        local option=self._T.option or "선택 안함"
+        if option~="선택 안함" then
+            local value=0 local found=false
+            for _,i in ipairs({10,11,12,14,15,16}) do local line=_AuctionRules:Field(item,i)
+                if string.find(string.lower(line),string.lower(option),1,true) then value=value+(tonumber(string.match(line,"(%d+%.?%d*)")) or 0) found=true end
+            end
+            if not found or value<(tonumber(self:Input("Filters/OptionMin")) or 0) then return false end
+        end
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method string EquipmentPart(string item)
+        if _AuctionRules:Category(item)~="equip" then return "" end
+        local inv=_UIEquipInventoryManager local slot=inv:ParseSlotIdx(item)
+        if slot>=10 and slot<=13 then return "반지" end
+        if slot==15 or slot==29 then return "펜던트" end
+        if slot==3 and inv:IsLongcoatItem(item) then return "한벌옷" end
+        return inv:GetEquipTypeFullBySlot(slot)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Dropdown(string key, table values)
+        self._T.dropdown={key=key,values=values} self:UI("Dropdown").Enable=true self:UI("Suggest").Enable=false
+        local columns=#values>10 and 2 or 1
+        local rows=math.ceil(#values/columns)
+        local height=rows*50+12
+        local root=self:UI("Dropdown").UITransformComponent
+        root.RectSize=Vector2(columns*310,height)
+        root.anchoredPosition=Vector2(columns==2 and -425 or -580,210-height/2)
+        for i=1,20 do
+            local e=self:UI("Dropdown/Item"..tostring(i)) e.Enable=values[i]~=nil
+            if values[i] then
+                e.TextGUIRendererComponent.Text=values[i]
+                e.UITransformComponent.anchoredPosition=Vector2(columns==2 and ((i-1)%2==0 and -155 or 155) or 0,height/2-31-math.floor((i-1)/columns)*50)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Inspect()
+        local r=self._T.selected if not r then return end
+        local inv=_UIEquipInventoryManager local item=r.item
+        self:Icon("Inspect/Slot/Icon",item) self:Text("Inspect/Name",_AuctionRules:Field(item,1))
+        local body=inv:GetItemBaseDescription(_AuctionRules:Field(item,1))
+        if _AuctionRules:Category(item)=="equip" then body="스타포스 ".._AuctionRules:Field(item,4).."성\n"..inv:BuildTooltipStatsText(_AuctionRules:Field(item,1),tonumber(_AuctionRules:Field(item,4)) or 0,tonumber(_AuctionRules:Field(item,6)) or 0)..inv:BuildPotentialText(item) end
+        if _AuctionRules:Category(item)=="equip" then body=inv:EquipmentJobDescription(item).."\n"..body end
+        self:Text("Inspect/TradeStatus",_AuctionRules:TradeRestriction(item)~="" and "(교환불가)" or "")
+        self:Text("Inspect/Body",body) self:UI("Inspect").Enable=true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetFilters()
+        self._T.part="전체"
+        self.category="all" self.page=1 self._T.selected=nil self._T.grade="전체" self._T.addGrade="전체" self._T.option="선택 안함"
+        for _,n in ipairs({"Query","Filters/MinPrice","Filters/MaxPrice","Filters/Stars","Filters/OptionMin"}) do self:UI(n).TextGUIRendererInputComponent.Text="" end
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Suggest()
+        local q=string.lower(self:Input("Query")) local out={} local seen={}
+        if q~="" then for _,r in ipairs(self._T.rows or {}) do
+            local name=_AuctionRules:Field(r.item,1)
+            if not seen[name] and string.find(string.lower(name),q,1,true) then table.insert(out,name) seen[name]=true if #out>=5 then break end end
+        end end
+        self._T.suggestions=out self:UI("Suggest").Enable=#out>0
+        for i=1,5 do local e=self:UI("Suggest/Item"..tostring(i)) e.Enable=out[i]~=nil if out[i] then e.TextGUIRendererComponent.Text=out[i] end end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Icon(string path, string item)
+        local e=self:UI(path) e.Enable=item~=""
+        if item~="" then e.SpriteGUIRendererComponent.ImageRUID=_UIEquipInventoryManager:ItemIconRUID(item) e.SpriteGUIRendererComponent.Color=Color.white end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string Money(number value)
+        return _UIEquipInventoryManager:FormatMeso(value)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        if not self.opened then return end
+        local selling=self.tab=="sell" local now=DateTime.UtcNow.Elapsed
+        self:UI("Sell").Enable=selling self:UI("List").Enable=not selling self:UI("Wish").Enable=not selling and self.tab~="mine"
+        self:UI("Action").Enable=not selling self:UI("Details").Enable=not selling
+        self:Text("Filters/Grade","잠재능력  "..(self._T.grade or "전체").."  ∨")
+        self:Text("Filters/AddGrade","에디셔널  "..(self._T.addGrade or "전체").."  ∨")
+        self:Text("Filters/Option",(self._T.option or "선택 안함").."  ∨")
+        self:Text("Filters/Part","장비 부위  "..(self._T.part or "전체").."  ∨")
+        self:Text("Balance","보유 메소   "..self:Money(_UIEquipInventoryManager.meso))
+        for _,n in ipairs({"search","market","wish","sell","mine","complete"}) do self:UI("Tabs/"..n).SpriteGUIRendererComponent.Color=n==self.tab and Color(.10,.70,.79,1) or Color(.27,.29,.32,1) end
+        for _,n in ipairs({"all","equip","consume","decorate"}) do self:UI("Filters/"..n).SpriteGUIRendererComponent.Color=n==self.category and Color(.10,.70,.79,1) or Color(.27,.29,.32,1) end
+        local filtered={}
+        if selling then
+            local inv=_UIEquipInventoryManager
+            for _,tab in ipairs({"equip","consume","decorate"}) do for i=1,128 do
+                local item=inv:GetTabItem(tab,i)
+                if item~="" and _AuctionRules:Rejection(item)=="" and self:Match(item,0) then table.insert(filtered,{item=item,tab=tab,index=i}) end
+            end end
+        else
+            for _,r in ipairs(self._T.rows or {}) do
+                local active=r.status=="active" and r.expires>now
+                local show=self.tab=="search" and active or self.tab=="market" and r.status=="sold" or self.tab=="wish" and self._T.wishes[r.id] or self.tab=="mine" and r.mine and active or self.tab=="complete" and (r.mine or r.bought) and not active
+                if show and (self.tab=="mine" or self:Match(r.item,r.price)) then table.insert(filtered,r) end
+            end
+            table.sort(filtered,function(a,b) if a.price==b.price then return a.id<b.id end return a.price<b.price end)
+        end
+        local size=selling and 48 or 8 self._T.filtered=filtered self._T.pages=math.max(1,math.ceil(#filtered/size)) self.page=math.min(self.page,self._T.pages)
+        self:Text("Page",tostring(self.page).." / "..tostring(self._T.pages).."     "..tostring(#filtered).."개")
+        if selling then
+            for i=1,48 do local r=filtered[(self.page-1)*48+i] local p="Sell/Bag/Slot"..tostring(i)
+                self:Icon(p.."/Icon",r and r.item or "") self:Text(p.."/Count",r and tostring(_AuctionRules:Count(r.item)) or "")
+            end
+            self:Text("Sell/Hours","등록시간   "..tostring(self._T.hours or 24).."시간  (변경)")
+            self:UpdateSalePrice()
+        else
+            for i=1,8 do local r=filtered[(self.page-1)*8+i] local p="List/Row"..tostring(i) self:UI(p).Enable=r~=nil
+                if r then
+                    self:Icon(p.."/Slot/Icon",r.item) self:Text(p.."/Name",_AuctionRules:Field(r.item,1))
+                    self:Text(p.."/Slot/Count",tostring(_AuctionRules:Count(r.item)))
+                    self:Text(p.."/Price",self:Money(r.price)) self:Text(p.."/Unit",self:Money(math.floor(r.price/_AuctionRules:Count(r.item))))
+                    local label="" if r.claimed then label="수령 완료" elseif r.status=="sold" then label=r.mine and "판매 완료" or "구매 완료" elseif r.status=="cancelled" then label="판매 취소" elseif r.expires<=now then label="기간 만료" else label=tostring(math.ceil((r.expires-now)/3600000)).."시간" end
+                    self:Text(p.."/Time",label)
+                    self:UI(p).SpriteGUIRendererComponent.Color=self._T.selected and self._T.selected.id==r.id and Color(.10,.56,.64,.88) or Color(.22,.24,.26,.38)
+                end
+            end
+        end
+        self:Text("Empty",#filtered==0 and (selling and "거래 가능한 아이템이 없습니다." or self.tab=="mine" and "현재 판매 중인 아이템이 없습니다." or "검색 결과가 없습니다.") or "")
+        self:Text("Action",self.tab=="mine" and "판매 취소" or self.tab=="complete" and "수령하기" or "구매하기")
+        self:Text("Wish","찜하기 / 해제")
+        if self._T.selected==nil then self:Text("Details","아이템을 선택하면 상세 능력치를 볼 수 있습니다.") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Select(integer index)
+        self._T.selected=(self._T.filtered or {})[(self.page-1)*8+index]
+        local r=self._T.selected if not r then return end
+        local desc=_UIEquipInventoryManager:GetItemBaseDescription(_AuctionRules:Field(r.item,1))
+        self:Text("Details",_AuctionRules:Field(r.item,1).."  ×"..tostring(_AuctionRules:Count(r.item)).."\n상세 능력치 보기  >")
+        self:Draw()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectItem(integer index)
+        if self._T.pending then return end
+        self._T.sell=(self._T.filtered or {})[(self.page-1)*48+index]
+        local r=self._T.sell if not r then return end
+        self:Icon("Sell/Preview/Icon",r.item) self:Text("Sell/Name",_AuctionRules:Field(r.item,1))
+        self:UI("Sell/Count").TextGUIRendererInputComponent.Text=tostring(_AuctionRules:Count(r.item))
+        self:UI("Sell/Price").TextGUIRendererInputComponent.Text=""
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateSalePrice()
+        local count=tonumber(self:Input("Sell/Count")) or 0
+        local unitPrice=tonumber(self:Input("Sell/Price")) or 0
+        local total=_AuctionRules:SaleTotal(count,unitPrice)
+        if total==0 then
+            self:Text("Sell/Fee","판매 수수료 30% · 등록 보증금 없음\n수량과 개당 가격을 입력하세요.\n판매 총액은 최대 1조 메소입니다.") return
+        end
+        self:Text("Sell/Fee",tostring(count).."개 × "..self:Money(unitPrice).." 메소\n판매 총액  "..self:Money(total).." 메소\n수수료 30%  "..self:Money(total-_AuctionRules:Net(total)).." 메소\n수령액  "..self:Money(_AuctionRules:Net(total)).." 메소")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PrepareSell()
+        if self._T.pending then return end local r=self._T.sell
+        if not r then self:Text("Status","판매할 아이템을 선택해주세요.") return end
+        local current=_UIEquipInventoryManager:GetTabItem(r.tab,r.index)
+        if current~=r.item then self._T.sell=nil self:Draw() self:Text("Status","아이템이 변경되었습니다. 다시 선택해주세요.") return end
+        local count=tonumber(self:Input("Sell/Count")) or 0 local unitPrice=tonumber(self:Input("Sell/Price")) or 0
+        local price=_AuctionRules:SaleTotal(count,unitPrice)
+        if count>_AuctionRules:Count(r.item) or price==0 then self:Text("Status","수량과 개당 가격을 확인해주세요. 판매 총액은 최대 1조 메소입니다.") return end
+        self._T.confirm={kind="sell",tab=r.tab,index=r.index,count=count,unitPrice=unitPrice,price=price,hours=self._T.hours,item=r.item}
+        self:Confirm(_AuctionRules:WithCount(r.item,count),"개당 "..self:Money(unitPrice).." 메소 × "..tostring(count).."개\n판매 총액  "..self:Money(price).." 메소\n수수료 30%  "..self:Money(price-_AuctionRules:Net(price)).." 메소\n판매 후 수령액  "..self:Money(_AuctionRules:Net(price)).." 메소")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Action()
+        if self._T.pending then return end local r=self._T.selected if not r then return end
+        local kind="buy"
+        if self.tab=="market" then self:Text("Status","시세 탭은 완료된 거래를 보여줍니다.") return end
+        if self.tab=="mine" then
+            if not r.mine or r.status~="active" or r.expires<=DateTime.UtcNow.Elapsed then
+                self:Draw() self:Text("Status","판매가 종료된 상품입니다. 완료 탭에서 확인해주세요.") return
+            end
+            kind="cancel"
+        elseif self.tab=="complete" then
+            if r.claimed then return end
+            kind=r.mine and r.status=="active" and r.expires>DateTime.UtcNow.Elapsed and "cancel" or "claim"
+        elseif r.ownAccount then self:Text("Status","본인 계정의 상품은 구매할 수 없습니다.") return end
+        self._T.confirm={kind=kind,listing=r.id,price=r.price,item=r.item,money=r.mine and r.status=="sold"}
+        self:Confirm(r.item,kind=="buy" and "묶음 전체를 "..self:Money(r.price).." 메소에 구매합니다." or (kind=="cancel" and "판매를 취소하고 완료 탭으로 이동합니다." or (r.mine and r.status=="sold" and "수수료 30%를 제외한 "..self:Money(_AuctionRules:Net(r.price)).." 메소를 받습니다." or "아이템을 인벤토리로 받습니다.")))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Confirm(string item, string message)
+        self:Icon("Confirm/Slot/Icon",item) self:Text("Confirm/Name",_AuctionRules:Field(item,1).." ×"..tostring(_AuctionRules:Count(item)))
+        self:Text("Confirm/Message",message) self:UI("Confirm").Enable=true self:UI("Suggest").Enable=false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Submit()
+        local req=self._T.confirm if not req or self._T.pending then return end
+        if _EventRewards._T.pending or _EventRewards._T.busy or _OfflineRestRewards._T.busy then self:Text("Status","진행 중인 보상 수령을 먼저 완료해주세요.") return end
+        local inv=_UIEquipInventoryManager
+        if req.kind=="buy" and inv.meso<req.price then self:Text("Status","메소가 부족합니다.") return end
+        local snapshot=_CharacterPersistence:BuildSaveString()
+        if req.kind=="sell" then
+            if inv:GetTabItem(req.tab,req.index)~=req.item then self:Text("Status","아이템이 변경되었습니다. 다시 선택해주세요.") return end
+            req.reservedTab=req.tab req.reservedIndex=req.index
+        end
+        if req.kind=="claim" and not req.money then
+            local tab=_AuctionRules:InventoryTab(req.item) local index=_AuctionRules:EmptySlot(snapshot,tab)
+            if index==0 then self:Text("Status","인벤토리의 빈 칸이 필요합니다.") return end
+            req.reservedTab=tab req.reservedIndex=index
+        end
+        req.token=_UtilLogic:NewGuid() req.snapshot=snapshot self._T.pending=req self._T.confirm=nil
+        if req.kind=="buy" then inv.meso=inv.meso-req.price end
+        if req.reservedIndex then inv:SetTabItem(req.reservedTab,req.reservedIndex,"경매 수령 대기|2860136c06ab075439721c027de365af|0|0|0|0|1|auction-reserved") end
+        self:UI("Confirm").Enable=false self:Text("Status","거래를 처리하고 있습니다...") self:SendPending()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SendPending()
+        local p=self._T.pending if not p then return end
+        local req={token=p.token,kind=p.kind,listing=p.listing,tab=p.tab,index=p.index,count=p.count,unitPrice=p.unitPrice,price=p.price,hours=p.hours}
+        _AuctionService:Request(self._T.character,p.snapshot,_HttpService:JSONEncode(req))
+        local token=p.token
+        _TimerService:SetTimerOnce(function() if self._T.pending and self._T.pending.token==token then self:SendPending() end end,8)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Receive(string character, string token, string status, string payload)
+        local p=self._T.pending if character~=self._T.character or not p or p.token~=token then return end
+        if status=="retry" then self:Text("Status",payload) return end
+        local inv=_UIEquipInventoryManager
+        if p.reservedIndex then inv:SetTabItem(p.reservedTab,p.reservedIndex,"") end
+        if status=="reject" then
+            if p.kind=="sell" then inv:SetTabItem(p.tab,p.index,p.item) end
+            if p.kind=="buy" then inv.meso=inv.meso+p.price end
+            self:Text("Status",payload)
+        else
+            local state=_AuctionService:Decode(payload) local receipt=state.receipt or {}
+            if receipt.token~=token then return end
+            if p.kind=="sell" then
+                inv:SetTabItem(p.tab,p.index,_AuctionRules:WithCount(p.item,_AuctionRules:Count(p.item)-p.count))
+            end
+            if receipt.item and receipt.item~="" then inv:SetTabItem(p.reservedTab,p.reservedIndex,receipt.item) end
+            inv.meso=inv.meso+(receipt.meso or 0) self._T.state=state self:Text("Status",receipt.message or "완료되었습니다.")
+        end
+        self._T.pending=nil self._T.sell=nil self._T.selected=nil
+        inv:RefreshUI() _CharacterPersistence:MarkDirty("auction") _CharacterPersistence:FlushToServer() self:Draw() self:Refresh()
+    end
+end

@@ -65,7 +65,7 @@ script CharacterPersistence extends Logic
 			_UserService:DisconnectEvent(UserLeaveEvent, self._T.userLeaveListener)
 			self._T.userLeaveListener = nil
 		end
-		log("[PersistCleanup] timers and listener released server=" .. tostring(self:IsServer()))
+		if Environment:IsMakerPlay() then log("[PersistCleanup] timers and listener released server=" .. tostring(self:IsServer())) end
 		-- Maker Play Test를 정지하는 경우 개별 유저의 UserLeaveEvent가 발생하지 않고 월드 세션이 통째로
 		-- 끝나버릴 수 있다 - 이 경우 10초 주기 flush 전이면 최근 변경분(메소 등)이 저장소에 반영되지
 		-- 않은 채 유실된다. OnEndPlay(월드 세션 종료)에서 클라이언트는 대기 중인 변경분을 즉시 서버로
@@ -213,7 +213,7 @@ script CharacterPersistence extends Logic
 		if purged > 0 then
 			sv.trash = kept
 			sv.charsDirty = true
-			log("[Persist] 유예기간 만료 캐릭터 " .. tostring(purged) .. "개 영구 삭제 (user=" .. userId .. ")")
+			if Environment:IsMakerPlay() then log("[Persist] 유예기간 만료 캐릭터 " .. tostring(purged) .. "개 영구 삭제 (user=" .. userId .. ")") end
 		end
         self._T.accountLoading[userId] = nil
 		return sv
@@ -358,7 +358,7 @@ script CharacterPersistence extends Logic
 	method void OnUserLeave(UserLeaveEvent event)
 		-- 유저 퇴장: 마지막으로 받아둔 상태를 즉시 저장하고 캐시 해제 (로그아웃 시 아이템 유실 방지).
 		local userId = tostring(event.UserId)
-		log("[Persist] 유저 퇴장 - 최종 저장: " .. userId)
+		if Environment:IsMakerPlay() then log("[Persist] 유저 퇴장 - 최종 저장: " .. userId) end
         _OfflineRestRewards:MarkOffline(self._T.sv[userId])
         _RecoveryPotionManager:PauseSession(self._T.sv[userId])
 		self:CaptureLocation(userId)
@@ -376,7 +376,7 @@ script CharacterPersistence extends Logic
 			return
 		end
 		self:UpgradeSelectionAppearance(sv)
-		self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, senderUserId)
+		self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, sv.lastId, senderUserId)
 	end
 
 
@@ -464,7 +464,7 @@ script CharacterPersistence extends Logic
 		sv.charsDirty = (ecW ~= 0)
 		if ecW ~= 0 then log_warning("[Persist] 생성 직후 chars 저장 실패 ec=" .. tostring(ecW) .. " - 재시도 예약") end
 		self:AppendAudit(sv, id, "create:" .. name, 0, 0, false)
-		log("[Persist] 캐릭터 생성: " .. name .. " (id=" .. id .. ", user=" .. senderUserId .. ")")
+		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 생성: " .. name .. " (id=" .. id .. ", user=" .. senderUserId .. ")") end
 		self:OnCreateResult(true, "", self:BuildCharsReply(sv), senderUserId)
 	end
 
@@ -487,14 +487,14 @@ script CharacterPersistence extends Logic
 		if ecD ~= 0 then log_warning("[Persist] 삭제 직후 chars 저장 실패 ec=" .. tostring(ecD) .. " - 재시도 예약") end
 		self:AppendAudit(sv, ch.id, "delete", 0, 0, false)
 		local name = string.match(ch.data, "([^|]+)") or "?"
-		log("[Persist] 캐릭터 삭제(7일 보관): " .. name .. " (id=" .. ch.id .. ")")
+		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 삭제(7일 보관): " .. name .. " (id=" .. ch.id .. ")") end
 		self:OnDeleteResult(self:BuildCharsReply(sv), senderUserId)
 	end
 
 	@ExecSpace("Server")
 	method void RequestEnterCharacter(integer index)
 		-- 채널 선택이 확정되기 전에는 인게임 데이터를 활성화하지 않는다.
-		log("[LoginFlow] character load request index=" .. tostring(index) .. " user=" .. tostring(senderUserId))
+		if Environment:IsMakerPlay() then log("[LoginFlow] character load request index=" .. tostring(index) .. " user=" .. tostring(senderUserId)) end
 		if not _LoginFlow:CanEnterServer(senderUserId) then
 			self:OnPersistLoadError("서버를 먼저 선택해주세요.", senderUserId)
 			return
@@ -543,6 +543,9 @@ script CharacterPersistence extends Logic
             self:OnPersistLoadError("최신 저장 상태를 확인하지 못했습니다.", senderUserId)
             return
         end
+        local auction = _AuctionService:Recover(sv, senderUserId, id, saveStr)
+        if auction.error then sv.recoveryApplying=false self:OnPersistLoadError(auction.error,senderUserId) return end
+        saveStr=auction.snapshot
         local recovery = _RecoveryManager:ApplyPending(sv.storage, senderUserId, id, saveStr)
         if recovery.error then sv.recoveryApplying = false self:OnPersistLoadError(recovery.error, senderUserId) return end
         local rest = _OfflineRestRewards:PrepareEntry(sv, id, recovery.snapshot)
@@ -558,6 +561,7 @@ script CharacterPersistence extends Logic
 		sv.lastName = name
 		sv.accountDirty = true
 		sv.activeId = id
+        sv.testLevel = 0
         _RecoveryPotionManager:AcceptSnapshot(sv,saveStr)
 		sv.newCharacter = saveStr == ""
         _ItemHallOfFame:Queue(senderUserId, id, name, saveStr)
@@ -566,7 +570,7 @@ script CharacterPersistence extends Logic
 		-- 감사용 기준 메소 기록 (세이브 첫 줄 "M\t<메소>")
 		sv.lastMeso[id] = math.floor(tonumber(string.match(saveStr, "^M\t(%-?%d+)")) or 0)
 		self:AppendAudit(sv, id, "enter", sv.lastMeso[id], 0, false)
-		log("[Persist] 캐릭터 입장: " .. name .. " (저장데이터 " .. (saveStr == "" and "없음-신규" or tostring(#saveStr) .. "바이트") .. ")")
+		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 입장: " .. name .. " (저장데이터 " .. (saveStr == "" and "없음-신규" or tostring(#saveStr) .. "바이트") .. ")") end
 		_LoginFlow:AuthorizeEntry(senderUserId)
 		self:ReceiveCharacterSave(saveStr, id, senderUserId)
 	end
@@ -592,15 +596,23 @@ script CharacterPersistence extends Logic
                 if slot==6 and stars>10 then log_warning("[StarterWeapon] snapshot rejected stars="..tostring(stars)) return false end
             end
         end
+        if not _AuctionService:Accept(sv,saveStr) then return false end
+        -- Check the exact reward receipt before reordering server-owned records.
         if not _EventRewards:AcceptSnapshot(sv,saveStr) then return false end
+        saveStr=_AuctionRules:Write(saveStr,_AuctionRules:State(sv.saves[id] or ""))
         if sv.rest ~= nil and sv.restId == id then
-            local merged = _OfflineRestRewards:MergeSnapshot(sv.rest, saveStr)
+            local merged = _OfflineRestRewards:MergeAccountSnapshot(sv.restAccount, id, saveStr)
             if not merged.ok then return false end
             saveStr = merged.snapshot
         end
 		if string.find("\n"..(sv.saves[id] or ""),"\nWARNX\t1",1,true) then saveStr=string.gsub(saveStr,"WARNX\t0","WARNX\t1") end
         if string.match("\n"..(sv.saves[id] or ""),"\nQ\t%d+\t5\t%d+\t%d+\t%d+\t1") then
             saveStr=string.gsub(saveStr,"(Q\t%d+\t5\t%d+\t%d+\t%d+\t)0","%11")
+        end
+        if string.find("\n"..(sv.saves[id] or ""),"\nMINIUSED\t1",1,true) then
+            local kept={}
+            for _,line in ipairs(self:SplitLines(saveStr)) do if string.sub(line,1,9)~="MINIUSED\t" then table.insert(kept,line) end end
+            table.insert(kept,"MINIUSED\t1") saveStr=table.concat(kept,"\n")
         end
         saveStr = self:WithLocation(saveStr, sv.location or "")
         saveStr = _RecoveryManager:PreserveReceipts(sv.saves[id] or "", saveStr)
@@ -635,11 +647,12 @@ script CharacterPersistence extends Logic
 		sv.lastMeso[id] = meso
 		sv.saves[id] = saveStr
 		sv.dirtySaves[id] = true
-        if cashAuditChanged then _CashItemAudit:Flush(sv,false) end
+        local rewardCommit=sv.auctionBusy==true or sv.eventBusy==true or sv.restBusy==true
+        if cashAuditChanged and not rewardCommit then _CashItemAudit:Flush(sv,false) end
 		-- (유실 방지) 강화 계열 스냅샷은 10초 주기 flush를 기다리지 않고 즉시 비동기 기록한다 -
 		-- 그 사이 서버가 내려가도 파괴/성공이 롤백되지 않도록. 성공 시에만 dirty를 내리고(그 사이
 		-- 새 스냅샷이 왔으면 유지), 실패하면 dirty가 남아 다음 틱이 재시도한다.
-		if string.find(reason,"regen_potion",1,true) or string.find(reason,"level_reward",1,true) or string.find(reason,"level_milestone",1,true) or cashAuditChanged or string.find(reason, "enhance", 1, true) ~= nil or string.find(reason, "preferences", 1, true) ~= nil then
+		if not rewardCommit and (string.find(reason,"regen_potion",1,true) or string.find(reason,"level_reward",1,true) or string.find(reason,"level_milestone",1,true) or cashAuditChanged or string.find(reason, "enhance", 1, true) ~= nil or string.find(reason, "preferences", 1, true) ~= nil) then
 			self:WriteCharacterSaves(sv, false)
 		end
 		-- 캐릭터 목록의 외형 필드도 최신 장비로 맞춘다 (선택창 슬롯 아바타가 지금 입은 장비를 보여주도록)
@@ -787,13 +800,14 @@ script CharacterPersistence extends Logic
 	end
 
 	@ExecSpace("Client")
-	method void ReceiveCharacterList(string charsStr, string lastName)
+	method void ReceiveCharacterList(string charsStr, string lastName, string lastId)
 		-- 캐릭터 목록 수신: 캐시 갱신 + 로그인 화면 아이디칸에 최근 접속 캐릭터 닉네임 표시.
 		local cl = self._T.cl
 		cl.listReceived = true
 		cl.chars = self:DecodeCharsReply(charsStr)
 		cl.lastName = tostring(lastName or "")
-		log("[Persist] 캐릭터 목록 수신: " .. tostring(#cl.chars) .. "개, 최근접속=" .. (cl.lastName == "" and "(없음)" or cl.lastName))
+        cl.lastId = tostring(lastId or "")
+		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 목록 수신: " .. tostring(#cl.chars) .. "개, 최근접속=" .. (cl.lastName == "" and "(없음)" or cl.lastName)) end
 
 		if cl.lastName ~= "" then
 			local accountText = _EntityService:GetEntityByPath("/ui/LoginScene/Stage/LoginGroup/LoginBackground/AccountText")
@@ -817,7 +831,7 @@ script CharacterPersistence extends Logic
 		_LoginFlow.busy = false
 		if not success then
 			_LoginFlow:Notice(reason, "")
-			log("[Persist] 캐릭터 생성 거부: " .. reason)
+			if Environment:IsMakerPlay() then log("[Persist] 캐릭터 생성 거부: " .. reason) end
 			return
 		end
 		cl.chars = self:DecodeCharsReply(charsStr)
@@ -870,6 +884,7 @@ script CharacterPersistence extends Logic
 
 	@ExecSpace("Client")
 	method void ReceiveCharacterSave(string saveStr, string characterId)
+        _TestCommandManager:ResetSession()
 		-- 입장한 캐릭터의 저장 데이터 수신: 있으면 복원, 없으면(신규) 현재 초기 지급 상태를 첫 저장.
 		local cl = self._T.cl
 		-- 직전 캐릭터의 보존 라인이 새 캐릭터 세이브에 섞이지 않게 초기화 (RestoreSave가 다시 채움)
@@ -878,6 +893,7 @@ script CharacterPersistence extends Logic
         _LevelCosmeticRewards:Restore(saveStr)
         _BossRewards:Restore(characterId,saveStr)
         _EventRewards:Restore(saveStr,characterId)
+        _AuctionHouse:Restore(saveStr,characterId)
         _MonsterCodex:Restore(characterId, saveStr)
         _FieldRecoveryDrops.characterId = characterId
         _InformationBook._T.fittingEquips = nil
@@ -886,6 +902,7 @@ script CharacterPersistence extends Logic
         _EnhancementManager._T.destructionWarningSeen=string.find("\n"..saveStr,"\nWARNX\t1",1,true)~=nil
         _MapleIslandTutorial:Restore(saveStr)
         _GameSystemMenu:RestorePreferences(saveStr)
+        _BossStageManager:RestoreSelection(saveStr)
 		if saveStr ~= "" then
 			self:RestoreSave(saveStr)
 		else
@@ -899,7 +916,7 @@ script CharacterPersistence extends Logic
 			_SkillManager:ImportRefundedSkillSlots({})
 			_SkillManager:ImportShuriken(1)
 			_SkillManager:ImportShurikenCounts({})
-			log("[Persist] 신규 캐릭터 - 10성 안전 강화 무기 지급 상태를 저장합니다")
+			if Environment:IsMakerPlay() then log("[Persist] 신규 캐릭터 - 10성 안전 강화 무기 지급 상태를 저장합니다") end
 		end
         _ManoTitle:Restore(characterId, saveStr)
         _RecoveryPotionManager:Restore(saveStr)
@@ -931,7 +948,17 @@ script CharacterPersistence extends Logic
 				comp:SetSlotData(i, ch.data)
 			end
 		end
-		comp:RefreshPage()
+        if cl.listReceived and not cl.initialSelectionRestored then
+            cl.initialSelectionRestored=true
+            local chosen=1
+            for i,ch in ipairs(cl.chars) do if ch.id==cl.lastId then chosen=i break end end
+            if #cl.chars>0 then
+                comp.currentPage=comp:PageOfIndex(chosen)
+                comp:SelectSlot(chosen)
+                if Environment:IsMakerPlay() then log("[VRF][Oct12] restored selection="..tostring(chosen).." id="..tostring(cl.lastId)) end
+            end
+        end
+        comp:RefreshPage()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1008,20 +1035,36 @@ script CharacterPersistence extends Logic
         if cl == nil then return end
         cl.flushPending = false
         if cl.flushing or not cl.dirty or not cl.entered then return end
-        cl.flushing = true
-        while cl.dirty and cl.entered do
-            cl.dirty = false
-            local reasons = {}
-            for r, _ in pairs(cl.dirtyReasons) do table.insert(reasons, r) end
-            cl.dirtyReasons = {}
-            local reason = table.concat(reasons, ",")
-            local saveStr = self:BuildSaveString()
-            if cl.entered and self._T.cl == cl and saveStr ~= cl.lastSentStr then
-                cl.lastSentStr = saveStr
-                self:PushCharacterSave(saveStr, reason)
+        -- A receipt owns its provisional snapshot until acknowledged. Keep later gameplay changes dirty.
+        if _AuctionHouse._T.pending~=nil or _EventRewards._T.busy or _EventRewards._T.pending~=nil or _OfflineRestRewards._T.busy or (_OfflineRestRewards._T.view or {}).claim~=nil then
+            if not cl.rewardFlushPending then
+                cl.rewardFlushPending=true
+                _TimerService:SetTimerOnce(function()
+                    cl.rewardFlushPending=false
+                    if self._T.cl==cl and cl.entered then self:FlushToServer() end
+                end,2)
             end
+            return
+        end
+        cl.flushing = true
+        cl.dirty = false
+        local reasons = {}
+        for r, _ in pairs(cl.dirtyReasons) do table.insert(reasons, r) end
+        cl.dirtyReasons = {}
+        local reason = table.concat(reasons, ",")
+        local saveStr = self:BuildSaveString()
+        if cl.entered and self._T.cl == cl and saveStr ~= cl.lastSentStr then
+            cl.lastSentStr = saveStr
+            self:PushCharacterSave(saveStr, reason)
         end
         cl.flushing = false
+        -- Continuous hunting must not keep reward claims waiting in an unbounded save loop.
+        if cl.dirty and cl.entered and self._T.cl==cl and not cl.flushPending then
+            cl.flushPending=true
+            _TimerService:SetTimerOnce(function()
+                if self._T.cl==cl and cl.entered then self:FlushToServer() end
+            end,2)
+        end
     end
 
 	@ExecSpace("ClientOnly")
@@ -1034,6 +1077,7 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 세이브 포맷 버전 - 향후 포맷 변경 시 RestoreSave가 이 값으로 마이그레이션
 		-- 분기를 태운다. 서버 감사 로그가 첫 줄 "M\t"를 앵커로 파싱하므로 M 다음 줄에 둔다.
 		table.insert(lines, "V\t1")
+        table.insert(lines,"MINIUSED\t"..(_StarforceMini._T.minimizeUsed and "1" or "0"))
         table.insert(lines,"HIGH30\t"..(_StarforceMini._T.ever30 and "1" or "0"))
         local spreadFlags=_SkillManager._T.spreadAutoAssigned or {}
         table.insert(lines,"SPREADAUTO\t"..(spreadFlags.pc and "1" or "0").."\t"..(spreadFlags.mobile and "1" or "0"))
@@ -1041,6 +1085,7 @@ script CharacterPersistence extends Logic
         table.insert(lines, "DFR\t"..tostring(t.pendingDestructionShards or 0))
         table.insert(lines, _LevelCosmeticRewards:Export())
         table.insert(lines, _EventRewards:Export())
+        table.insert(lines, _AuctionHouse:Export())
 		table.insert(lines, _MapleIslandTutorial:Export())
         -- 선택 화면용 표시 스냅샷. 게임 전투 판정에는 사용하지 않는다.
         table.insert(lines, "CP\t" .. tostring(math.max(0, math.floor(_CharInfoManager:CalcCombatPower()))))
@@ -1126,6 +1171,7 @@ script CharacterPersistence extends Logic
 		end
 		-- (표창+) 던질 표창으로 고른 번호 - "게임을 꺼도 저장되어 있어야 한다"는 요청.
 		table.insert(lines, _GameSystemMenu:ExportPreferences())
+        table.insert(lines, _BossStageManager:ExportSelection())
         table.insert(lines, _MonsterCodex:StateLine(_MonsterCodex.registered))
         table.insert(lines, _RecoveryPotionManager:Export())
         table.insert(lines, _OfflineRestRewards:Export())
@@ -1152,9 +1198,9 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 복원 때 이 빌드가 해석하지 못해 보존해 둔 라인들을 그대로 재부착한다 -
 		-- 구버전 빌드가 신버전 세이브를 열어도 모르는 데이터를 지우지 않는다(라운드트립 보존).
 		for _, ln in ipairs(self._T.cl.unknownLines or {}) do
-			if string.sub(ln,1,11) ~= "NOTICEFOLD\t" and string.sub(ln,1,5) ~= "REST\t" and string.sub(ln,1,6) ~= "REGEN\t" and string.sub(ln,1,6) ~= "CODEX\t" and string.sub(ln,1,5) ~= "CRWD\t" and string.sub(ln, 1, 13) ~= "WORLDCOSTUME\t" and string.sub(ln, 1, 10) ~= "CHATCOLOR\t" and string.sub(ln, 1, 5) ~= "MUTE\t" and string.sub(ln, 1, 6) ~= "PCUBE\t" and string.sub(ln, 1, 5) ~= "PREF\t" and string.sub(ln, 1, 3) ~= "CP\t" and string.sub(ln, 1, 3) ~= "LV\t" and string.sub(ln, 1, 2) ~= "Q\t" and string.sub(ln, 1, 2) ~= "L\t" then table.insert(lines, ln) end
+			if string.sub(ln,1,8) ~= "BOSSSEL\t" and string.sub(ln,1,11) ~= "NOTICEFOLD\t" and string.sub(ln,1,5) ~= "REST\t" and string.sub(ln,1,6) ~= "REGEN\t" and string.sub(ln,1,6) ~= "CODEX\t" and string.sub(ln,1,5) ~= "CRWD\t" and string.sub(ln, 1, 13) ~= "WORLDCOSTUME\t" and string.sub(ln, 1, 10) ~= "CHATCOLOR\t" and string.sub(ln, 1, 5) ~= "MUTE\t" and string.sub(ln, 1, 6) ~= "PCUBE\t" and string.sub(ln, 1, 5) ~= "PREF\t" and string.sub(ln, 1, 3) ~= "CP\t" and string.sub(ln, 1, 3) ~= "LV\t" and string.sub(ln, 1, 2) ~= "Q\t" and string.sub(ln, 1, 2) ~= "L\t" then table.insert(lines, ln) end
 		end
-		return table.concat(lines, "\n")
+		return _TestCommandManager:PreserveTestBuild(table.concat(lines, "\n"))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1162,6 +1208,7 @@ script CharacterPersistence extends Logic
 		-- 저장 데이터로 클라이언트 상태 복원: 인벤토리/장비/메소 → 스탯 → 아바타 코스튬 → 단축키 순.
 		local t = { equips = {}, tabs = { equip = {}, consume = {}, etc = {}, install = {}, cash = {}, decorate = {} }, meso = 0 }
 		local hotkeys = {}
+        _StarforceMini._T.minimizeUsed=string.find("\n"..saveStr,"\nMINIUSED\t1",1,true)~=nil
         _StarforceMini._T.ever30=string.find("\n"..saveStr,"\nHIGH30\t1",1,true)~=nil or (tonumber(string.match("\n"..saveStr,"\nLV\t(%d+)")) or 0)>=30
         local spreadPC,spreadMobile=string.match("\n"..saveStr,"\nSPREADAUTO\t(%d)\t(%d)")
         _SkillManager._T.spreadAutoAssigned={pc=spreadPC=="1",mobile=spreadMobile=="1"}
@@ -1181,7 +1228,7 @@ script CharacterPersistence extends Logic
 		local unknown = {}       -- (업데이트 내구성) 이 빌드가 모르는 라인 - 버리지 않고 보존
 		for _, line in ipairs(self:SplitLines(saveStr)) do
 			local kind = string.sub(line, 1, 1)
-			if string.sub(line,1,7)=="HIGH30\t" or string.sub(line,1,11)=="SPREADAUTO\t" then
+			if string.sub(line,1,4)=="AUW\t" or string.sub(line,1,5)=="AUCT\t" or string.sub(line,1,9)=="MINIUSED\t" or string.sub(line,1,7)=="HIGH30\t" or string.sub(line,1,11)=="SPREADAUTO\t" then
                 -- Restored before inventory and hotkeys.
             elseif string.sub(line,1,6)=="WARNX\t" then
                 -- Character-wide acknowledgement; the original snapshot stores it.
@@ -1192,7 +1239,7 @@ script CharacterPersistence extends Logic
             elseif string.sub(line,1,7)=="MOBILE\t" then
                 local f=self:SplitTabs(line) mobileSlots=mobileSlots or {}
                 if f[2]~=nil and f[5]~=nil then mobileSlots[f[2]]={ruid=f[3]=="-" and "" or f[3],name=f[4]=="-" and "" or f[4],func=f[5]=="-" and "" or f[5]} end
-            elseif string.sub(line, 1, 6) == "REGEN\t" or string.sub(line, 1, 6) == "CODEX\t" or kind == "Q" or kind == "L" or string.sub(line, 1, 5) == "PREF\t" or string.sub(line, 1, 6) == "PCUBE\t" then
+            elseif string.sub(line, 1, 8) == "BOSSSEL\t" or string.sub(line, 1, 6) == "REGEN\t" or string.sub(line, 1, 6) == "CODEX\t" or kind == "Q" or kind == "L" or string.sub(line, 1, 5) == "PREF\t" or string.sub(line, 1, 6) == "PCUBE\t" then
 				-- 튜토리얼은 Restore, 위치는 서버가 복원한다.
 			elseif string.sub(line, 1, 2) == "M\t" then
 				t.meso = tonumber(string.sub(line, 3)) or 0
@@ -1326,7 +1373,7 @@ script CharacterPersistence extends Logic
 		-- (업데이트 내구성) 보존 라인 저장 - BuildSaveString이 재부착한다.
 		self._T.cl.unknownLines = unknown
 		if #unknown > 0 then
-			log("[Persist] 이 빌드가 해석하지 못한 세이브 라인 " .. tostring(#unknown) .. "개 보존 (재직렬화 시 재부착)")
+			if Environment:IsMakerPlay() then log("[Persist] 이 빌드가 해석하지 못한 세이브 라인 " .. tostring(#unknown) .. "개 보존 (재직렬화 시 재부착)") end
 		end
 		_UIEquipInventoryManager:ImportSaveTable(t)
 		-- (기능 변경) 공격속도 단계도 물약 공격력 보너스와 똑같이 "세션 전용"이다 - 공격 속도의 비약은
@@ -1358,7 +1405,7 @@ script CharacterPersistence extends Logic
 		-- (표창+) 저장된 표창 번호를 복원하고 서버(투사체 스폰 쪽)에도 다시 알린다.
 		_SkillManager:ImportShuriken(shurikenIdx)
 		_SkillManager:ImportShurikenCounts(shurikenCounts)
-		log("[Persist] 캐릭터 데이터 복원 완료 (메소=" .. tostring(t.meso) .. ")")
+		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 데이터 복원 완료 (메소=" .. tostring(t.meso) .. ")") end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1383,7 +1430,7 @@ script CharacterPersistence extends Logic
 		local player = _UserService:GetUserEntityByUserId(userId)
 		if not isvalid(player) or not isvalid(player.CurrentMap) then return end
 		local mapId = _ChannelManager:BaseName(player.CurrentMap.Name)
-		if mapId == "login" or _BossStageManager:IsArena(mapId) then return end
+		if mapId == "login" or _BossStageManager:IsArena(mapId) or _CarnivalRules:IsArena(mapId) then return end
 		local pos = player.TransformComponent.WorldPosition
 		-- 좌표는 서버에서 관측한다. 공중/사다리 좌표 대신 마지막 지상 좌표를 사용한다.
 		local rb = player.RigidbodyComponent
@@ -1449,7 +1496,7 @@ script CharacterPersistence extends Logic
 		local channelMap = _ChannelManager:EnsureMap(mapId, userId)
 		if channelMap == "" then return false end
 		_TeleportService:TeleportToMapPosition(player, pos, channelMap)
-		log("[PersistLocation] entry " .. mapId .. " x=" .. tostring(pos.x) .. " y=" .. tostring(pos.y))
+		if Environment:IsMakerPlay() then log("[PersistLocation] entry " .. mapId .. " x=" .. tostring(pos.x) .. " y=" .. tostring(pos.y)) end
 		return true
 	end
 
@@ -1459,6 +1506,10 @@ script CharacterPersistence extends Logic
         local uid = senderUserId
         local session = _LoginFlow._T.sessions[uid]
         if session == nil or session.leaving then return end
+        local auctionSv=self._T.sv[uid]
+        if auctionSv and (auctionSv.auctionBusy or _AuctionRules:State(auctionSv.saves[auctionSv.activeId] or "").pending~=nil or (_AuctionService._T.locks or {})[uid]) then
+            _GameSystemMenu:ExitResult(false,mode,"경매 거래가 완료된 뒤 캐릭터를 변경해주세요.",uid) return
+        end
         session.leaving = true
         local sv = self._T.sv[uid]
         if sv ~= nil and sv.activeId ~= "" then
@@ -1487,14 +1538,16 @@ script CharacterPersistence extends Logic
         local p = _UserService:GetUserEntityByUserId(uid)
         if isvalid(p) then _TeleportService:TeleportToMapPosition(p, Vector3(0,0,0), "login") end
         -- Refresh the client summary after saving, before showing character selection.
-        if sv ~= nil then self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, uid) end
+        if sv ~= nil then self:ReceiveCharacterList(self:BuildCharsReply(sv), sv.lastName, sv.lastId, uid) end
         _GameSystemMenu:ExitResult(true, mode, "", uid)
-        log("[SessionExit] saved mode=" .. mode)
+        if Environment:IsMakerPlay() then log("[SessionExit] saved mode=" .. mode) end
     end
 
     @ExecSpace("ServerOnly")
     method boolean WriteCharacterSaves(table sv, boolean blocking)
         -- Rest balance, pending receipt and character inventory must commit together.
+        local rewardCommit=sv.auctionBusy==true or sv.eventBusy==true or sv.restBusy==true
+        if rewardCommit and not blocking then return false end
         _OfflineRestRewards:Capture(sv)
         _RecoveryPotionManager:CaptureRemaining(sv,blocking)
         if sv.saveWriting then
@@ -1516,7 +1569,6 @@ script CharacterPersistence extends Logic
         if atomic and count>20 then log_warning("[OfflineRest] transaction too large; preserving dirty data") return false end
         sv.saveWriting=true
         for id,raw in pairs(snapshots) do _RecoveryManager:Checkpoint(sv,id,raw,blocking) end
-        _CashItemAudit:Flush(sv,blocking)
         local complete=function(ec,successKeys)
             local succeeded={}
             for _,key in ipairs(successKeys or {}) do succeeded[key]=true end
@@ -1527,6 +1579,39 @@ script CharacterPersistence extends Logic
             sv.saveWriting=false
             if ec~=0 then log_warning("[Persist] save failed ec="..tostring(ec).."; dirty data retained") end
         end
+        if blocking and rewardCommit then
+            _CashItemAudit:PreparePending(sv)
+            local combined={} local auditSent={} local combinedCount=count
+            for key,value in pairs(payload) do combined[DataStorageKeyInfo(key, "", "")]=value end
+            for key,record in pairs(sv.cashAuditPending or {}) do
+                combined[DataStorageKeyInfo(key,"",record.tag)]=record.value
+                auditSent[key]=record.value combinedCount=combinedCount+1
+            end
+            if not atomic or combinedCount<=20 then
+                local started=DateTime.UtcNow.Elapsed
+                local ec,infos
+                if atomic then ec,infos=sv.storage:TransactSetByInfoAndWait(combined)
+                else ec,infos=sv.storage:BatchSetByInfoAndWait(combined) end
+                local keys={}
+                for _,info in ipairs(infos or {}) do table.insert(keys,info.Key) end
+                if ec==0 then
+                    for key,value in pairs(auditSent) do
+                        local current=sv.cashAuditPending[key]
+                        if current~=nil and current.value==value then sv.cashAuditPending[key]=nil end
+                    end
+                elseif not atomic then
+                    for _,key in ipairs(keys) do
+                        local current=sv.cashAuditPending[key]
+                        if current~=nil and current.value==auditSent[key] then sv.cashAuditPending[key]=nil end
+                    end
+                end
+                complete(ec,keys)
+                if Environment:IsMakerPlay() then log("[VRF][RewardSave] requests=1 keys="..tostring(combinedCount).." ms="..tostring(DateTime.UtcNow.Elapsed-started).." ec="..tostring(ec)) end
+                return ec==0 and next(sv.dirtySaves)==nil
+            end
+            -- A large audit backlog must not exceed the 20-key atomic transaction limit.
+        end
+        _CashItemAudit:Flush(sv,blocking)
         if blocking then
             local ec,keys
             if atomic then ec,keys=sv.storage:TransactSetAndWait(payload)

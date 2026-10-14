@@ -1,0 +1,188 @@
+@Component
+script KingSlimeLiquid extends Component
+    @Sync property Entity Boss = nil
+    @Sync property string Phase = ""
+    @Sync property number Started = 0
+    @Sync property number Duration = 1
+    @Sync property Vector3 Origin = Vector3.zero
+    @Sync property Vector3 Destination = Vector3.zero
+    @Sync property number Spin = 360
+    @Sync property integer Variant = 1
+    @Sync property number FadeMorph = 0
+
+    @ExecSpace("ServerOnly")
+    method void Configure(Entity boss, Vector3 origin, Vector3 destination, number duration)
+        -- The logical point is the icon center; rendering corrects the off-center source pivot.
+        self.Boss=boss self.Origin=origin self.Destination=destination self.Duration=duration
+        self.Spin=(180+_UtilLogic:RandomDouble()*540)*(_UtilLogic:RandomDouble()<0.5 and -1 or 1)
+        self.Started=_UtilLogic.ServerElapsedSeconds self.Phase="fly"
+        if Environment:IsMakerPlay() then log("[KingLiquid] flight duration="..tostring(duration).." landing="..tostring(destination)) end
+    end
+
+    method Vector3 FlightPosition(number now)
+        -- Linear X and ballistic Y land exactly on the chosen foothold, including slow frames.
+        local u=math.max(0,math.min(1,(now-self.Started)/math.max(0.01,self.Duration)))
+        return self.Origin+(self.Destination-self.Origin)*u+Vector3(0,4.8*u*(1-u),0)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Collect()
+        -- Reserve the liquid before any effect or yield; one item can never heal twice.
+        if self.Phase~="fly" and self.Phase~="ground" then return false end
+        self.Origin=self.Entity.TransformComponent.WorldPosition
+        self.Variant=_UtilLogic:RandomIntegerRange(1,3)
+        self.Started=_UtilLogic.ServerElapsedSeconds self.Phase="morph"
+        self:PopEffect("078626efa9b246239b9a03f922c9ae6d",self.Origin-Vector3(0,0.2,0),0.4)
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PlayerConsume()
+        -- Contact is removal, not a normal inventory pickup or a potion reward.
+        if self.Phase=="gone" or self.Phase=="fade" or self.Phase=="merge" then return end
+        self.Origin=self.Entity.TransformComponent.WorldPosition
+        self.FadeMorph=self.Phase=="home" and 1 or (self.Phase=="morph" and math.max(0,math.min(1,(_UtilLogic.ServerElapsedSeconds-self.Started)/0.55)) or 0)
+        self.Phase="fade" self.Started=_UtilLogic.ServerElapsedSeconds
+        self:PopEffect("22e987fe7042429091215d2fa6536029",self.Origin-Vector3(0,0.15,0),0.45)
+        if Environment:IsMakerPlay() then log("[KingLiquid] player removed") end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean TouchesPlayer(Entity player, Vector3 position)
+        -- Compare the center of the liquid against the character body, on PC and mobile alike.
+        if not isvalid(player) or player.PlayerComponent.Hp<=0 or player.CurrentMap~=self.Entity.CurrentMap then return false end
+        local p=player.TransformComponent.WorldPosition
+        return math.abs(p.x-position.x)<=0.38 and position.y>=p.y-0.08 and position.y<=p.y+0.95
+    end
+
+    method void OnUpdate(number delta)
+        -- Server owns claims and healing; local visuals render smooth flights and crossfades.
+        if self:IsClient() then self:Draw(delta) return end
+        if self.Phase=="" or self.Phase=="gone" then return end
+        local boss=self.Boss
+        if not isvalid(boss) then self.Entity:Destroy() return end
+        local ai=boss:GetComponent("script.KingSlimeEncounter")
+        if not isvalid(ai) or ai._T.cleaned then self.Entity:Destroy() return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        local phase=self.Phase
+        local pos=self.Entity.TransformComponent.WorldPosition
+        if phase=="fly" then
+            pos=self:FlightPosition(now) self.Entity.TransformComponent.WorldPosition=pos
+            if now-self.Started>=self.Duration then self.Phase="ground" self.Started=now pos=self.Destination self.Entity.TransformComponent.WorldPosition=pos end
+        elseif phase=="fade" then
+            if now-self.Started>=0.4 then self.Phase="gone" self.Entity:Destroy() end
+            return
+        end
+        if not ai:Active() then return end
+        local player=_UserService:GetUserEntityByUserId(ai.OwnerId)
+        if self.Phase~="merge" and self:TouchesPlayer(player,pos) then self:PlayerConsume() return end
+        if self.Phase=="ground" then
+            local bp=boss.TransformComponent.WorldPosition
+            if math.abs(bp.x-pos.x)<=0.95 and math.abs(bp.y+0.55-pos.y)<=0.85 then
+                self.Origin=pos self.Started=now self.Phase="merge"
+                if Environment:IsMakerPlay() then log("[KingLiquid] contact merge") end
+            end
+        elseif self.Phase=="morph" then
+            if now-self.Started>=0.55 then self.Phase="home" self.Started=now end
+        elseif self.Phase=="home" or self.Phase=="merge" then
+            local goal=boss.TransformComponent.WorldPosition+Vector3(0,0.7,0)
+            local dx,dy=goal.x-pos.x,goal.y-pos.y
+            local dist=math.sqrt(dx*dx+dy*dy)
+            local step=(self.Phase=="merge" and 2.4 or 6)*delta
+            if dist<=math.max(step,0.15) then
+                self.Phase="gone"
+                ai:HealLiquid()
+                self.Entity:Destroy()
+            else self.Entity.TransformComponent.WorldPosition=Vector3(pos.x+dx/dist*step,pos.y+dy/dist*step,0) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity Visual(string name, string ruid)
+        -- Render-only sprites use the same native model, with no pickup or combat components.
+        local e=_SpawnService:SpawnByModelId("kingslimeliquid",name,Vector3.zero,self.Entity.CurrentMap)
+        if not isvalid(e) then return nil end
+        if not isvalid(self.Entity) then e:Destroy() return nil end
+        local sr=e.SpriteRendererComponent
+        sr.Enable=true sr.SpriteRUID=ruid sr.OrderInLayer=10 sr.SortingLayer="MapLayer0"
+        sr.StartFrameIndex=0 sr.EndFrameIndex=2147483647 sr.PlayRate=1 sr.DrawMode=SpriteDrawMode.Simple
+        return e
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PlaceVisual(Entity e, Vector3 center, Vector3 offset, number angle, number scale, number alpha)
+        -- Rotate around the visual center, not the negative item-resource pivot.
+        if not isvalid(e) then return end
+        local rad=math.rad(angle) local x,y=offset.x*scale,offset.y*scale
+        e.TransformComponent.WorldPosition=center-Vector3(x*math.cos(rad)-y*math.sin(rad),x*math.sin(rad)+y*math.cos(rad),0)
+        e.TransformComponent.Scale=Vector3(scale,scale,1) e.TransformComponent.ZRotation=angle
+        e.SpriteRendererComponent.Color=Color(1,1,1,math.max(0,math.min(1,alpha)))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw(number delta)
+        -- Flights use the synchronized arc; home motion follows the same six-unit loot pickup speed.
+        if self.Phase=="" then return end
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or player.CurrentMap~=self.Entity.CurrentMap then return end
+        local t=self._T
+        self.Entity.SpriteRendererComponent.Enable=false
+        if t.building then return end
+        if not isvalid(t.icon) then
+            t.building=true
+            t.icon=self:Visual("KingLiquidIcon","89ff14273d9940eebe8d44b003563915")
+            t.building=false
+            if not isvalid(t.icon) then return end
+        end
+        local now=_UtilLogic.ServerElapsedSeconds local phase=self.Phase
+        local pos=self.Entity.TransformComponent.WorldPosition local angle=0 local alpha=1
+        if phase=="fly" then pos=self:FlightPosition(now) angle=(now-self.Started)*self.Spin
+        elseif phase=="ground" then pos=self.Destination+Vector3(0,math.sin(now*1.8)*0.04,0)
+        elseif phase=="fade" then pos=self.Origin alpha=1-(now-self.Started)/0.4
+        elseif phase=="morph" then pos=self.Origin
+        elseif phase=="home" or phase=="merge" then
+            if isvalid(self.Boss) then
+                local goal=_NetworkMotionVisual:Position(self.Boss)+Vector3(0,0.7,0)
+                local current=t.phase==phase and t.drawPosition or pos
+                local difference=goal-current local dist=math.sqrt(difference.x*difference.x+difference.y*difference.y)
+                local step=math.min(dist,(phase=="merge" and 2.4 or 6)*delta)
+                pos=dist>0.001 and current+difference*(step/dist) or goal
+                alpha=math.max(0,math.min(1,(dist-0.15)/1.05))
+            end
+        elseif phase=="gone" then alpha=0 end
+        t.phase=phase t.drawPosition=pos
+        local morph=phase=="morph" and math.max(0,math.min(1,(now-self.Started)/0.55)) or (phase=="home" and 1 or (phase=="fade" and self.FadeMorph or 0))
+        self:PlaceVisual(t.icon,pos,Vector3(0.17,0.16,0),angle,1,alpha*(1-morph))
+        if morph>0 then
+            local ids={"b1b0cb0b08ce4f6aa6b4bf2b4195941f","8c8c76aa0bf345cc88d50786e082be97","beae50b3bec541e691c4827688c12e4c"}
+            if not isvalid(t.morphed) then t.morphed=self:Visual("KingLiquidMorph",ids[self.Variant]) end
+            local offsets={Vector3(-0.01,0.29,0),Vector3(0.02,0.09,0),Vector3(0.03,0.16,0)}
+            local scales={0.32,0.55,0.43}
+            self:PlaceVisual(t.morphed,pos,offsets[self.Variant],0,scales[self.Variant],alpha*morph)
+        elseif isvalid(t.morphed) then t.morphed.Enable=false end
+        local showAura=phase=="ground" and not _GameSystemMenu.lowSpecMode
+        if showAura and not isvalid(t.aura) then
+            t.aura=self:Visual("KingLiquidAura","cb4b8f3451bb4f0dab53327cce29c873")
+            if isvalid(t.aura) then t.aura.SpriteRendererComponent.OrderInLayer=9 end
+        end
+        if isvalid(t.aura) then
+            t.aura.Enable=showAura
+            self:PlaceVisual(t.aura,pos,_FieldRecoveryDrops._T.recoveryAuraCenter or Vector3.zero,0,1,alpha)
+        end
+    end
+
+    @ExecSpace("Client")
+    method void PopEffect(string ruid, Vector3 position, number scale)
+        -- Visual bursts play once and stay below the icon in the same map layer.
+        local p=_UserService.LocalPlayer
+        if not isvalid(p) or p.CurrentMap~=self.Entity.CurrentMap then return end
+        _EffectService:PlayEffect(ruid,self.Entity,position,0,Vector3(scale,scale,1),false,{SortingLayer="MapLayer0",OrderInLayer=8})
+        if Environment:IsMakerPlay() then log("[KingLiquid] effect="..ruid) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- No local icon, transformed sprite, or floating aura survives its server drop.
+        for _,key in ipairs({"icon","morphed","aura"}) do if isvalid(self._T[key]) then self._T[key]:Destroy() end self._T[key]=nil end
+    end
+end

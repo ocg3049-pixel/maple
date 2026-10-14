@@ -28,8 +28,13 @@ script MiniMapUIManager extends Component
 		if isvalid(windows) then
 			board:AttachTo(windows)
 			_UILogic:SetSiblingIndex(board.UITransformComponent, 1)
-			log("[MiniMap] shared window stack ready: " .. board.Path)
+			if Environment:IsMakerPlay() then log("[MiniMap] shared window stack ready: " .. board.Path) end
 		end
+        board.UITransformComponent.AlignmentOption=AlignmentType.TopLeft
+        board.UITransformComponent.AnchorsMin=Vector2(0,1)
+        board.UITransformComponent.AnchorsMax=Vector2(0,1)
+        board.UITransformComponent.Pivot=Vector2(0,1)
+        board.UITransformComponent.anchoredPosition=Vector2.zero
 		self._T.collapsed = false
 		self._T.expandedSize = board.UITransformComponent.RectSize
 		self._T.viewport = board:GetChildByName("MapViewport", false)
@@ -64,7 +69,7 @@ script MiniMapUIManager extends Component
 		if isvalid(self._T.artwork) then self._T.artwork.Enable = false end
 		self:WireWindowControls()
 		self:LayoutChrome()
-		log("[MiniMap] single collapse toggle ready; follow dead zone enabled")
+		if Environment:IsMakerPlay() then log("[MiniMap] single collapse toggle ready; follow dead zone enabled") end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -138,7 +143,7 @@ script MiniMapUIManager extends Component
 		tf.anchoredPosition = Vector2(
 			math.max(0, math.min(1920 - tf.RectSize.x - 8, pos.x)),
 			math.min(0, math.max(-1080 + tf.RectSize.y + 8, pos.y)))
-		log("[MiniMap] collapsed=" .. tostring(self._T.collapsed) .. " height=" .. tostring(board.UITransformComponent.RectSize.y))
+		if Environment:IsMakerPlay() then log("[MiniMap] collapsed=" .. tostring(self._T.collapsed) .. " height=" .. tostring(board.UITransformComponent.RectSize.y)) end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -158,7 +163,7 @@ script MiniMapUIManager extends Component
 		end
 		if #(self._T.previewRects or {}) == 0 and isvalid(self._T.builtMap) then self:RebuildFootholds(self._T.builtMap) end
 		self:LayoutPreview()
-		log("[MiniMap] 크기 변경 " .. tostring(math.floor(nextWidth)) .. "x" .. tostring(math.floor(nextHeight)))
+		if Environment:IsMakerPlay() then log("[MiniMap] 크기 변경 " .. tostring(math.floor(nextWidth)) .. "x" .. tostring(math.floor(nextHeight))) end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -177,6 +182,7 @@ script MiniMapUIManager extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		self._T.captureRetryDelay = math.max(0, (self._T.captureRetryDelay or 0) - delta)
 		-- 지형/마커는 같은 20Hz 좌표계를 사용하고, 맵 엔티티 검색은 5Hz로 제한한다.
 		self._T.acc = (self._T.acc or 0) + delta
 		self._T.scanAcc = (self._T.scanAcc or 0) + delta
@@ -190,6 +196,16 @@ script MiniMapUIManager extends Component
 		if self._T.capturing then return end
 		if self._T.collapsed then return end
 		if _LoginFlow ~= nil and not _LoginFlow:IsInGame() then return end
+		if self._T.captureVisit ~= map then
+			self._T.captureVisit = map
+			self._T.captureAttempts = 0
+			self._T.captureRetryMap = nil
+			self._T.captureRetryDelay = 0
+		end
+		if self._T.captureRetryMap == map and self._T.captureRetryDelay <= 0 then
+			self._T.captureRetryMap = nil
+			self._T.builtMap = nil
+		end
 		-- 맵이 바뀌면 발판 레이아웃을 다시 그린다(발판은 정적이라 맵 전환 때만).
 		if self._T.builtMap ~= map then
 			self._T.followInitialized = false
@@ -203,7 +219,44 @@ script MiniMapUIManager extends Component
 		local pos = player.TransformComponent.WorldPosition
 		self:FollowPosition(pos.x, pos.y)
 		self:UpdateMarkers(map, player)
+        self:UpdateCameraFrame(map)
 	end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateCameraFrame(Entity map)
+        -- Project the actual rendered camera corners into the same coordinates as the preview tiles.
+        local viewport = self._T.viewport
+        local scale = self._T.mapScale
+        if not isvalid(viewport) or scale == nil or scale <= 0 then return end
+        local a = _UILogic:ScreenToWorldPosition(Vector2.zero)
+        local b = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+        local left = (math.min(a.x,b.x) - self._T.mapCx) * scale
+        local right = (math.max(a.x,b.x) - self._T.mapCx) * scale
+        local bottom = (math.min(a.y,b.y) - self._T.mapCy) * scale
+        local top = (math.max(a.y,b.y) - self._T.mapCy) * scale
+        local hw, hh = self._T.halfW, self._T.halfH
+        local lx, rx = math.max(-hw,left), math.min(hw,right)
+        local by, ty = math.max(-hh,bottom), math.min(hh,top)
+        local edges = {
+            {"CameraTop",(lx+rx)/2,top,rx-lx,1.5,top>=-hh and top<=hh and rx>lx},
+            {"CameraBottom",(lx+rx)/2,bottom,rx-lx,1.5,bottom>=-hh and bottom<=hh and rx>lx},
+            {"CameraLeft",left,(by+ty)/2,1.5,ty-by,left>=-hw and left<=hw and ty>by},
+            {"CameraRight",right,(by+ty)/2,1.5,ty-by,right>=-hw and right<=hw and ty>by}}
+        for _,edge in ipairs(edges) do
+            local e=viewport:GetChildByName(edge[1])
+            if isvalid(e) then
+                e.Enable=edge[6]
+                if e.Enable then
+                    e.UITransformComponent.anchoredPosition=Vector2(edge[2],edge[3])
+                    e.UITransformComponent.RectSize=Vector2(edge[4],edge[5])
+                end
+            end
+        end
+        if Environment:IsMakerPlay() and self._T.cameraFrameMap~=map then
+            self._T.cameraFrameMap=map
+            log("[VRF] MiniMap camera frame map="..map.Name.." worldWidth="..tostring(math.abs(b.x-a.x)).." worldHeight="..tostring(math.abs(b.y-a.y)))
+        end
+    end
 
 	@ExecSpace("ClientOnly")
 	method void ClearPreview()
@@ -219,14 +272,13 @@ script MiniMapUIManager extends Component
 
 	@ExecSpace("ClientOnly")
 	method void LayoutChrome()
-		-- 지형 영역은 뚫어 두고 제목/외곽 프레임만 불투명하게 유지한다.
+		-- Board의 둥근 배경만 사용하고 중복 회색 외곽 프레임은 숨긴다.
 		local board = self._T.board
 		if not isvalid(board) then return end
 		local s = board.UITransformComponent.RectSize
 		local outer = board:GetChildByName("OuterFrame", false)
 		if isvalid(outer) then
-			outer.UITransformComponent.RectSize = s
-			_UILogic:SetSiblingIndex(outer.UITransformComponent, 1000000)
+			outer.Enable = false
 		end
 		local header = board:GetChildByName("HeaderChrome", false)
 		if isvalid(header) then
@@ -396,26 +448,72 @@ script MiniMapUIManager extends Component
 					if canRestore then actor:SetVisible(true, false, false) end
 				end
 			end
-			for _, rec in ipairs(state.backgrounds or {}) do
-				local bg = rec.component
-				if isvalid(bg) then
-					if rec.kind == BackgroundType.Template then bg:ChangeBackgroundByTemplateRUID(rec.template)
-					elseif rec.kind == BackgroundType.SolidColor then bg:ChangeBackgroundBySolidColor(rec.color)
-					elseif rec.kind == BackgroundType.Web then bg:ChangeBackgroundByWebUrl(rec.url)
-					elseif rec.kind == BackgroundType.Gradient then bg:ChangeBackgroundByGradient(bg.TopColor, bg.MiddleTopColor, bg.MiddleBottomColor, bg.BottomColor, bg.MiddleTopRatio, bg.MiddleBottomRatio)
-					else bg.Type = rec.kind end
-				end
-			end
+			self._T.pendingBackgrounds = state.backgrounds
+
 			_CameraService.TransitionBlendTime = state.blend
 		end
 		self._T.captureState = nil
 		if keepCover then return end
+		self:RestoreBackgrounds()
 		local cover = _EntityService:GetEntityByPath("/ui/MiniMapCaptureUI")
 		if isvalid(cover) then
 			cover.Enable = false
 			local screen = cover:GetChildByName("Screen", false)
 			if isvalid(screen) then screen.RawImageGUIRendererComponent:SetRawImage(nil) end
 		end
+	end
+
+
+	@ExecSpace("ClientOnly")
+	method void RestoreBackgrounds()
+		-- 촬영 배율에서 배경 템플릿을 재생성하지 않는다. 필드 시야 정착 뒤 호출한다.
+		local records = self._T.pendingBackgrounds or {}
+		self._T.pendingBackgrounds = nil
+		for _, rec in ipairs(records) do
+			local bg = rec.component
+			if isvalid(bg) and rec.changed then
+				if rec.kind == BackgroundType.Template then bg:ChangeBackgroundByTemplateRUID(rec.template)
+				elseif rec.kind == BackgroundType.SolidColor then bg:ChangeBackgroundBySolidColor(rec.solid) end
+				if Environment:IsMakerPlay() then log("[VRF] MiniMap background rebuilt template=" .. tostring(rec.template) .. " zoom=" .. tostring(_CameraService.currentZoomRatio)) end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsReadyForReveal(Entity map)
+		-- 접힌 미니맵은 촬영하지 않으며, 펼친 상태는 복원이 끝난 뒤에만 맵을 드러낸다.
+		return not self._T.capturing and (self._T.collapsed or self._T.builtMap == map)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean WaitForTerrain(Entity map)
+		-- Wait for static object sprites before capture. Imported tilesets are loaded by the map itself.
+		local resources, seen = {}, {}
+		for _, renderer in ipairs(map:GetChildComponentsByTypeName("MOD.Core.SpriteRendererComponent", true)) do
+			local id = renderer.SpriteRUID
+			if id ~= "" and not seen[id] and not isvalid(renderer.Entity:GetComponent("script.Monster")) then
+				seen[id] = true table.insert(resources, id)
+			end
+		end
+		local pending = #resources > 0 and 1 or 0
+		local loaded = true
+		if #resources > 0 then
+			_ResourceService:PreloadAsync(resources, function(results)
+				for _, result in ipairs(results) do if result ~= PreloadResultStatus.Success then loaded = false end end
+				pending = pending - 1
+			end)
+		end
+		for attempt = 1, 600 do
+			if self._T.ending or not isvalid(map) or not isvalid(_UserService.LocalPlayer) or _UserService.LocalPlayer.CurrentMap ~= map then return false end
+			if pending <= 0 then
+				wait(0.1)
+				if Environment:IsMakerPlay() then log("[VRF] MiniMap terrain ready map=" .. map.Name .. " sprites=" .. tostring(#resources) .. " loaded=" .. tostring(loaded)) end
+				return loaded
+			end
+			wait(0.05)
+		end
+		log_warning("[MiniMap] terrain loading timed out: " .. map.Name)
+		return false
 	end
 
 	@ExecSpace("ClientOnly")
@@ -427,9 +525,14 @@ script MiniMapUIManager extends Component
 		end
 		if not stillHere() then return end
 		self._T.capturing = true
+		self._T.captureAttempts = (self._T.captureAttempts or 0) + 1
+		local attempt = self._T.captureAttempts
 		self:ClearPreview()
 		local completed = false
 		local success, reason = pcall(function()
+			-- A first visit can still be downloading large Kritias object sprites.
+			-- Never permanently cache a screenshot of partially loaded terrain.
+			if not self:WaitForTerrain(map) or not stillHere() then return end
 			local camera = _CameraService:GetCurrentCameraComponent()
 			local cover = _EntityService:GetEntityByPath("/ui/MiniMapCaptureUI")
 			if not isvalid(camera) or not isvalid(cover) then return end
@@ -442,9 +545,17 @@ script MiniMapUIManager extends Component
 			self._T.captureState = state
 			local backgrounds = map:GetChildComponentsByTypeName("MOD.Core.BackgroundComponent", true)
 			if isvalid(map.BackgroundComponent) then table.insert(backgrounds, map.BackgroundComponent) end
+			local seenBackgrounds = {}
 			for _, bg in ipairs(backgrounds) do
-				table.insert(state.backgrounds, {component = bg, kind = bg.Type, template = bg.TemplateRUID, color = bg.SolidColor, url = bg.WebUrl})
-				bg:ChangeBackgroundBySolidColor(Color(0, 0, 0, 0))
+				if seenBackgrounds[bg.Entity.Id] then continue end
+				seenBackgrounds[bg.Entity.Id] = true
+				local rec = {component = bg, kind = bg.Type, template = bg.TemplateRUID, solid = bg.SolidColor, changed = false}
+				-- Enable 재활성화만으로 네이티브 배경 조각이 복원되지 않는 맵이 있다.
+				if bg.Enable and (bg.Type == BackgroundType.Template or bg.Type == BackgroundType.SolidColor) then
+					rec.changed = true
+					bg:ChangeBackgroundBySolidColor(Color(0, 0, 0, 0))
+				end
+				table.insert(state.backgrounds, rec)
 			end
 			-- 렌더러 Enable을 끄면 진행 중인 모션/표정의 종료 이벤트를 놓칠 수 있다.
 			-- 배우 루트의 클라이언트 표시만 숨기고 애니메이션과 서버 상태는 계속 갱신한다.
@@ -458,7 +569,7 @@ script MiniMapUIManager extends Component
 						if isvalid(e.PlayerComponent) or isvalid(e:GetComponent("script.Monster")) or isvalid(e.MovementComponent) then dynamic = true; actor = e; break end
 						e = e.Parent
 					end
-					if dynamic and isvalid(actor.PlayerComponent) then
+					if dynamic and (isvalid(actor.PlayerComponent) or isvalid(actor.AvatarRendererComponent)) then
 						if typeName == "NameTagComponent" then
 							-- 이름표는 애니메이션과 무관하며 플레이어 루트를 숨기지 않고 별도로 제외한다.
 							table.insert(state.hidden, {nameTag = renderer, enabled = renderer.Enable})
@@ -544,31 +655,53 @@ script MiniMapUIManager extends Component
 			for _, e in ipairs(self._T.fhPool) do if isvalid(e) then e.Enable = false end end
 			self:LayoutPreview()
 			completed = true
-			log("[MiniMap] actual terrain captured map=" .. map.Name .. " tiles=" .. tostring(cols*rows) .. " background=false actors=false")
+			if Environment:IsMakerPlay() then log("[VRF] MiniMap actual terrain captured map=" .. map.Name .. " tiles=" .. tostring(cols*rows) .. " background=false actors=false") end
 		end)
 		local state = self._T.captureState
 		self:RestoreCapture(true)
-		-- 복구된 카메라를 한 프레임 정착시킨 뒤 덮개를 해제한다.
+		-- 덮개 아래에서 필드 경계/기본 배율을 먼저 적용하고 배경을 복원한다.
+		self._T.restoringCamera = true
 		if state ~= nil and isvalid(state.camera) and not self._T.ending then
 			state.camera.Damping = Vector2.zero
 			state.camera.DeadZone = Vector2.zero
 			state.camera.SoftZone = Vector2.zero
-			wait(0.1)
+			for settle = 1, 80 do
+				if not stillHere() then break end
+				_FieldCameraBounds:OnUpdate(0.25)
+				wait(0.05)
+				if _FieldCameraBounds:IsReady(map) then break end
+			end
+		end
+		self:RestoreBackgrounds()
+		if state ~= nil and isvalid(state.camera) and not self._T.ending then
+			wait(0.15)
 			if isvalid(state.camera) then
 				state.camera.Damping = state.cameraValues.Damping
 				state.camera.DeadZone = state.cameraValues.DeadZone
 				state.camera.SoftZone = state.cameraValues.SoftZone
 			end
 		end
+		self._T.restoringCamera = nil
+		self._T.capturing = false
 		self:RestoreCapture(false)
+		if stillHere() then if Environment:IsMakerPlay() then log("[VRF] MiniMap reveal map=" .. map.Name .. " cameraReady=" .. tostring(_FieldCameraBounds:IsReady(map)) .. " zoom=" .. tostring(_CameraService.currentZoomRatio)) end end
 		if not stillHere() then completed = false end
 		if not completed then
 			self:ClearPreview()
-			if stillHere() then self:RebuildFootholds(map); self:LayoutPreview()
+			if stillHere() then
+				self:RebuildFootholds(map)
+				self:LayoutPreview()
+				-- 리소스 오류 때 20Hz로 재촬영하면 필드 카메라가 계속 대기한다.
+				-- 발판 미니맵을 유지하고 최대 3회만 간격을 두어 재시도한다.
+				if attempt < 3 then
+					self._T.captureRetryMap = map
+					self._T.captureRetryDelay = 5 * attempt
+				end
+				if Environment:IsMakerPlay() then log("[VRF] MiniMap fallback map=" .. map.Name .. " attempt=" .. tostring(attempt) .. " cameraReleased=true") end
 			else self._T.builtMap = nil end
 		end
 		self._T.capturing = false
-		log("[MiniMap] camera restored zoom=" .. tostring(_CameraService.currentZoomRatio))
+		if Environment:IsMakerPlay() then log("[MiniMap] camera restored zoom=" .. tostring(_CameraService.currentZoomRatio)) end
 		if not success then log_warning("[MiniMap] capture failed: " .. tostring(reason)) end
 	end
 
@@ -579,6 +712,7 @@ script MiniMapUIManager extends Component
 		local region = "빅토리아 아일랜드"
 		local page = _WorldMapManager:GetPageForMap(rawName)
 		local regionNames = {victoria = "빅토리아 아일랜드", sleepywood = "슬리피우드", elnath = "엘나스 산맥", minar = "미나르숲", ludus = "루더스 호수", nautilus = "노틸러스", ellinel = "요정학원 엘리넬", goldbeach = "골드비치", mushroom = "버섯의 성", kerningtower = "커닝타워", ellodin = "비밀의숲 엘로딘", deadmine = "폐광"}
+		for _, entry in ipairs(_RegionExpansionCatalog:Regions()) do regionNames[entry.key] = entry.title end
 		if regionNames[page] ~= nil then
 			region = regionNames[page]
 			local regionalName = _WorldMapManager:GetMapDisplayName(rawName)
@@ -587,7 +721,7 @@ script MiniMapUIManager extends Component
 		if string.match(rawName, "^0%d%d%d%d%d%d%d%d$") then region = "메이플 아일랜드" end
 		if rawName == "001010000" then displayName = "모험가 수련장 입구" end
 		if rawName == "map01" then displayName = "평온한 숲길" end
-        if _BossStageManager:IsArena(rawName) then region="보스 스테이지" displayName=(_BossStageManager._T.stage==2 and "스텀피의 돌풍 고원" or "마노의 초원") end
+        if _BossStageManager:IsArena(rawName) then region="보스 스테이지" displayName=(({[1]="마노의 초원",[2]="스텀피의 돌풍 고원",[3]="킹 슬라임의 숲",[4]="커닝시티 도적단",[5]="해초의 탑 · 세르프"})[_BossStageManager._T.stage or 1] or (_RegionalBossCatalog:Stage(_BossStageManager._T.stage or 1) or {}).mapTitle or "보스 전장") end
 		if isvalid(self._T.mapName) then
 			if isvalid(self._T.mapName.TextComponent) then self._T.mapName.TextComponent.Text = displayName
 			elseif isvalid(self._T.mapName.TextGUIRendererComponent) then self._T.mapName.TextGUIRendererComponent.Text = displayName end
@@ -635,9 +769,17 @@ script MiniMapUIManager extends Component
 		local h = bs.y - 144
         -- Boss arenas frame the combat area above the foothold, not the underground tiles.
         local bossArena=_BossStageManager:IsArena(map.Name)
-        if bossArena then minY=maxY end
-        minX, maxX, minY, maxY = minX - 0.5, maxX + 0.5, minY - (bossArena and 0.35 or 1.2), maxY + (bossArena and 2.1 or 0.7)
-        if bossArena then log("[BossStage] minimap bounds bottom="..tostring(minY).." top="..tostring(maxY)) end
+        if bossArena then
+            minY=-0.15
+            if (_BossStageManager._T.stage or 1)==5 then maxY=5.46 else maxY=math.max(0,maxY) end
+        end
+        minX, maxX, minY, maxY = minX - 0.5, maxX + 0.5, minY - (bossArena and 0.35 or 1.2), maxY + (bossArena and ((_BossStageManager._T.stage or 1)==5 and 0.35 or 2.1) or 0.7)
+        if bossArena then if Environment:IsMakerPlay() then log("[BossStage] minimap bounds bottom="..tostring(minY).." top="..tostring(maxY)) end end
+		local view = _FieldCameraBounds:MapView(map.Name)
+		if view ~= nil and not bossArena then
+			local b = view.mini
+			minX, maxX, minY, maxY = b[1], b[2], b[3], b[4]
+		end
 		self._T.previewBounds = {minX, maxX, minY, maxY}
 		local spanX = math.max(0.1, maxX - minX)
 		local spanY = math.max(0.1, maxY - minY)
@@ -682,7 +824,7 @@ script MiniMapUIManager extends Component
 		end
 		self._T.builtMap = map
 		self:LayoutPreview()
-		log("[MiniMap] 발판 레이아웃 갱신 - " .. tostring(#list) .. "개")
+		if Environment:IsMakerPlay() then log("[MiniMap] 발판 레이아웃 갱신 - " .. tostring(#list) .. "개") end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -743,7 +885,7 @@ script MiniMapUIManager extends Component
 			end
 		end
 		self._T.builtMap = map
-		log("[MiniMap] Map Layer 스프라이트 갱신 - " .. tostring(math.min(#list, self.FhPool)) .. "개")
+		if Environment:IsMakerPlay() then log("[MiniMap] Map Layer 스프라이트 갱신 - " .. tostring(math.min(#list, self.FhPool)) .. "개") end
 		return true
 	end
 
@@ -773,7 +915,7 @@ script MiniMapUIManager extends Component
 		for _, comp in ipairs(mobs or {}) do
 			---@type Monster
 			local mc = comp
-			if isvalid(mc) and isvalid(mc.Entity) and mc.Entity.Enable and not mc.IsDead then
+			if isvalid(mc) and isvalid(mc.Entity) and mc.Entity.Enable and not mc.IsDead and not isvalid(mc.Entity:GetComponent("script.ThiefEncounter")) then
 				local wp = mc.Entity.TransformComponent.WorldPosition
 				local x, y = (wp.x - cx) * scale, (wp.y - cy) * scale
 				if math.abs(x) > hw or math.abs(y) > hh then continue end

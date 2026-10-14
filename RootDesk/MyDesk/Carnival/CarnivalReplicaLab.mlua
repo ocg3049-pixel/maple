@@ -1,0 +1,194 @@
+@Logic
+script CarnivalReplicaLab extends Logic
+    -- Opt-in Maker experiment, not connected to matchmaking.
+    -- Client console: _CarnivalReplicaLab:Run()
+    -- Proven scope: native physics, independent PlayerAttack, original Brandish motion and attached effect.
+    -- Still required: input prediction, all-job skill dispatch, real Carnival monsters, actor-scoped buffs/audio/camera.
+    @ExecSpace("ClientOnly")
+    method void Run()
+        -- Start only on explicit Maker invocation; never create a second logged-in player.
+        if not Environment:IsMakerPlay() or not _LoginFlow:IsInGame() then return end
+        if self._T.client~=nil then return end
+        self:RequestStart()
+    end
+
+    @ExecSpace("Server")
+    method void RequestStart()
+        -- Resolve the real caller on the server; client-supplied entities or stats are not accepted.
+        if not Environment:IsMakerPlay() then return end
+        local source=_UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(source) then return end
+        self._T.cases=self._T.cases or {}
+        if self._T.cases[senderUserId]~=nil then return end
+        local a={x=0,y=0,maxHp=source.PlayerComponent.MaxHp,hp=source.PlayerComponent.Hp}
+        if not _CarnivalPhysics:Ensure(a,source,{{l=-8,r=8,y=0}}) then return end
+        local actor=a.physics.body
+        local case={a=a,actor=actor,source=source,uid=senderUserId,timers={}}
+        self._T.cases[senderUserId]=case
+        table.insert(case.timers,_TimerService:SetTimerOnce(function() self:DisposeCase(case.uid) end,30))
+        for _,name in ipairs({"StateComponent","AvatarRendererComponent","CostumeManagerComponent","AvatarStateAnimationComponent","PlayerControllerComponent","PlayerComponent"}) do actor:AddComponent(name) end
+        actor.PlayerControllerComponent.Enable=false
+        -- Keep native HP fields for the original skill code, but disable account-player respawn processing.
+        -- Otherwise this unregistered actor is teleported to the ordinary map spawn point.
+        actor.PlayerComponent.Enable=false
+        actor.PlayerComponent.MaxHp=source.PlayerComponent.MaxHp
+        actor.PlayerComponent.Hp=source.PlayerComponent.Hp
+        local costume=actor.CostumeManagerComponent
+        local original=source.CostumeManagerComponent
+        costume.UseCustomEquipOnly=original.UseCustomEquipOnly
+        costume.DefaultEquipUserId=original.DefaultEquipUserId
+        for _,key in ipairs(_CarnivalBattle:EquipKeys()) do costume[key]=original[key] end
+        actor:AddComponent("PlayerAttack")
+        _CarnivalPhysics:CopySettings(actor,source)
+        _CarnivalPhysics:Warp(a,0,0.02)
+        actor.PlayerComponent.RespawnPosition=actor.TransformComponent.Position
+        self:ShowActor(actor,a.physics.origin,case.uid)
+        log("[VRF] Carnival replica lab created originalRegistered="..tostring(_UserService:GetUserEntityByUserId(case.uid)==source))
+    end
+
+    @ExecSpace("Client")
+    method void ShowActor(Entity actor, Vector2 origin)
+        -- Observe the actual native avatar output rather than calculating skill poses in CarnivalSkills.
+        if not Environment:IsMakerPlay() or not isvalid(actor) then return end
+        self:CloseView()
+        local p={actor=actor,origin=origin,source=_UserService.LocalPlayer,events={},timers={},opened=_CarnivalUI.opened,focused=_CarnivalUI.focused,minimized=_CarnivalUI.minimized,autoOn=_AutoHuntManager.autoOn}
+        self._T.client=p
+        _CarnivalUI:Open()
+        local scene=_CarnivalUI:UI("Lobby/Scene")
+        local template=_CarnivalUI:UI("Lobby/Scene/Actor1")
+        p.view=_SpawnService:SpawnByEntity(template,"NativeReplicaLab",Vector3.zero,scene,true)
+        p.view.Enable=true
+        p.avatar=p.view:GetChildByName("Body")
+        p.avatar.Enable=true
+        _CarnivalView:CopyAvatar(p.avatar,{},true)
+        local pos=p.source.TransformComponent.WorldPosition
+        local left=_UILogic:ScreenToUIPosition(_UILogic:WorldToScreenPosition(Vector2(pos.x,pos.y)))
+        local right=_UILogic:ScreenToUIPosition(_UILogic:WorldToScreenPosition(Vector2(pos.x+1,pos.y)))
+        p.ppu=math.abs(right.x-left.x)
+        p.avatar.AvatarGUIRendererComponent.PreserveAvatar=PreserveSpriteType.NativeSize
+        p.avatar.UITransformComponent.UIScale=Vector3(p.ppu/100,p.ppu/100,1)
+        p.avatar.UITransformComponent.anchoredPosition=Vector2.zero
+        p.view.UITransformComponent.anchoredPosition=Vector2(0,-140)
+        p.view:GetChildByName("Name").TextGUIRendererComponent.Text="원본 스킬 재사용 검증"
+        _CarnivalActorPresentation:Bind(actor,p.view,p.ppu,p.origin)
+        table.insert(p.timers,_TimerService:SetTimerOnce(function()
+            if self._T.client~=p or not isvalid(actor) then return end
+            p.body=actor.AvatarRendererComponent:GetBodyEntity()
+            p.gui=p.avatar.AvatarGUIRendererComponent:GetBodyEntity()
+            if not isvalid(p.body) or not isvalid(p.gui) then
+                log_warning("[VRF] Carnival replica lab avatar unavailable")
+                self:CloseView() return
+            end
+            p.event=p.body:ConnectEvent(ActionStateChangedEvent,function(e)
+                if not isvalid(p.gui) then return end
+                local signature=e.CoreActionName..":"..tostring(e.PlayRate)..":"..tostring(e.StartFrameIndex)..":"..tostring(e.EndFrameIndex)
+                table.insert(p.events,signature)
+                p.gui:SendEvent(ActionStateChangedEvent(e.CoreActionName,e.PartsActionName,e.PlayRate,e.PlayType,e.StartFrameIndex,e.EndFrameIndex))
+                log("[VRF] Carnival native motion relayed "..signature)
+            end)
+            self:RequestCast()
+        end,0.7))
+        table.insert(p.timers,_TimerService:SetTimerOnce(function() if self._T.client==p then self:CloseView() end end,9))
+    end
+
+    @ExecSpace("Server")
+    method void RequestCast()
+        -- Execute the project's original fourth-job implementation, including its own timers and recovery.
+        if not Environment:IsMakerPlay() then return end
+        local case=(self._T.cases or {})[senderUserId]
+        if case==nil or case.started or not isvalid(case.actor) then return end
+        case.started=true
+        local actor=case.actor
+        local origin=case.a.physics.origin
+        local before=actor.TransformComponent.WorldPosition
+        log("[VRF] Carnival replica isolation x="..tostring(before.x-origin.x).." y="..tostring(before.y-origin.y))
+        if math.abs(before.x-origin.x)>8 or math.abs(before.y-origin.y)>4 then
+            log_warning("[VRF] Carnival replica left isolated floor; cast refused")
+            self:DisposeCase(case.uid) return
+        end
+        actor.PlayerControllerComponent.LookDirectionX=1
+        actor.StateComponent:ChangeState("MOVE")
+        actor.MovementComponent:MoveToDirection(Vector2(1,0),0)
+        table.insert(case.timers,_TimerService:SetTimerOnce(function()
+            if not isvalid(actor) then return end
+            actor.MovementComponent:Stop()
+            actor.StateComponent:ChangeState("IDLE")
+            local moved=actor.TransformComponent.WorldPosition
+            local jumped=actor.PlayerControllerComponent:ActionJump(0)
+            table.insert(case.timers,_TimerService:SetTimerOnce(function()
+                if not isvalid(actor) then return end
+                log("[VRF] Carnival replica native motion dx="..tostring(moved.x-before.x).." jump="..tostring(jumped).." dy="..tostring(actor.TransformComponent.WorldPosition.y-moved.y))
+            end,0.2))
+        end,0.7))
+        table.insert(case.timers,_TimerService:SetTimerOnce(function()
+            if not isvalid(actor) then return end
+            local attack=actor:GetComponent("PlayerAttack")
+            local pos=actor.TransformComponent.WorldPosition
+            local origin=case.a.physics.origin
+            local targets=attack:FindSlashBlastTargets(Vector2(pos.x,pos.y),1,4,2.5,1.0)
+            if math.abs(pos.x-origin.x)>8 or math.abs(pos.y-origin.y)>4 or #targets>0 then
+                log_warning("[VRF] Carnival replica isolation failed; cast refused targets="..tostring(#targets))
+                self:DisposeCase(case.uid) return
+            end
+            log("[VRF] Carnival replica isolated cast targets=0")
+            attack:AttackBrandish(1,1,"",false)
+            table.insert(case.timers,_TimerService:SetTimerOnce(function()
+                if not isvalid(actor) then return end
+                log("[VRF] Carnival original Brandish finished="..tostring(not attack._T.isBrandishing).." sourceRegistered="..tostring(_UserService:GetUserEntityByUserId(case.uid)==case.source))
+            end,2))
+        end,2))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Preserve original pixel scale; this lab follows the actor without stretching the entire arena.
+        local p=self._T.client
+        if p==nil then return end
+        if not isvalid(p.actor) or not isvalid(p.source) or p.source.CurrentMap~=p.actor.CurrentMap or not _CarnivalUI.opened then self:CloseView() return end
+        local pos=p.actor.TransformComponent.WorldPosition
+        p.view.UITransformComponent.anchoredPosition=Vector2((pos.x-p.origin.x)*p.ppu,-140+(pos.y-p.origin.y)*p.ppu)
+        p.avatar.AvatarGUIRendererComponent.FlipX=p.actor.PlayerControllerComponent.LookDirectionX>0
+        p.avatar.AvatarGUIRendererComponent.PlayRate=p.actor.AvatarRendererComponent.PlayRate
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseView()
+        -- Restore the original window focus and release every experimental UI subscription.
+        local p=self._T.client
+        if p==nil then return end
+        self._T.client=nil
+        for _,timer in ipairs(p.timers) do _TimerService:ClearTimer(timer) end
+        if isvalid(p.body) and p.event then p.body:DisconnectEvent(ActionStateChangedEvent,p.event) end
+        if isvalid(p.actor) then _CarnivalActorPresentation:Unbind(p.actor) end
+        if isvalid(p.view) then _EntityService:Destroy(p.view) end
+        if not p.opened then _CarnivalUI:Minimize() _CarnivalUI.minimized=p.minimized else _CarnivalUI:SetFocus(p.focused) end
+        log("[VRF] Carnival replica lab restored original="..tostring(_UserService.LocalPlayer==p.source).." autoUnchanged="..tostring(_AutoHuntManager.autoOn==p.autoOn).." events="..tostring(#p.events))
+        self:RequestStop()
+    end
+
+    @ExecSpace("Server")
+    method void RequestStop()
+        -- Only stop the requesting user's explicitly started Maker experiment.
+        if not Environment:IsMakerPlay() then return end
+        self:DisposeCase(senderUserId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void DisposeCase(string uid)
+        -- Clear controller timers before destroying the isolated native actor and its foothold.
+        local case=(self._T.cases or {})[uid]
+        if case==nil then return end
+        self._T.cases[uid]=nil
+        for _,timer in ipairs(case.timers) do _TimerService:ClearTimer(timer) end
+        _CarnivalPhysics:Dispose(case.a)
+        log("[VRF] Carnival replica lab server cleaned")
+    end
+
+    method void OnEndPlay()
+        -- The experiment never survives a Play Test session.
+        if self:IsClient() then self:CloseView() return end
+        local users={}
+        for uid,_ in pairs(self._T.cases or {}) do table.insert(users,uid) end
+        for _,uid in ipairs(users) do self:DisposeCase(uid) end
+    end
+end

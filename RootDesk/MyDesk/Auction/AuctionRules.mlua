@@ -1,0 +1,149 @@
+@Logic
+script AuctionRules extends Logic
+    method table Fields(string item)
+        -- Preserve empty option fields and provenance metadata.
+        local out={} for field in string.gmatch((item or "").."|","(.-)|") do table.insert(out,field) end return out
+    end
+
+    method string Field(string item, integer index)
+        -- Item strings use the same schema as the equipment inventory.
+        return self:Fields(item)[index] or ""
+    end
+
+    method integer Count(string item)
+        -- Equipment and appearance pieces are individual goods.
+        if self:Field(item,3)~="0" then return 1 end
+        return math.max(1,math.floor(tonumber(self:Field(item,7)) or 1))
+    end
+
+    method string WithCount(string item, integer count)
+        -- A zero quantity removes a stack without changing its source marker.
+        if count<=0 then return "" end
+        if self:Field(item,3)~="0" then return item end
+        local f=self:Fields(item) while #f<7 do table.insert(f,"0") end f[7]=tostring(count) return table.concat(f,"|")
+    end
+
+    method string Hunting(string item)
+        -- Source metadata is beyond positional option fields and survives stacking.
+        if item=="" or string.find(item,"|origin:hunt",1,true) then return item end
+        local f=self:Fields(item) while #f<16 do table.insert(f,"0") end table.insert(f,"origin:hunt") return table.concat(f,"|")
+    end
+
+    method string Category(string item)
+        -- Hair and face rewards are equipment-shaped cosmetic items.
+        local slot=self:Field(item,3)
+        if slot=="deco" or slot=="1" or slot=="2" then return "decorate" end
+        if slot=="0" then return "consume" end
+        return "equip"
+    end
+
+    method string InventoryTab(string item)
+        return self:Category(item)
+    end
+
+    method string NormalizeAppearance(string item)
+        -- Preserve dye, locks and provenance while upgrading legacy hair/face items.
+        local fields=self:Fields(item)
+        if fields[3]~="1" and fields[3]~="2" then return item end
+        fields[4]=fields[3]=="2" and "hair" or "face"
+        fields[3]="deco"
+        return table.concat(fields,"|")
+    end
+
+    method string BindItem(string item)
+        if item=="" or string.find(item,"|trade-bound:1",1,true) then return item end
+        local fields=self:Fields(item)
+        while #fields<16 do table.insert(fields,"0") end
+        table.insert(fields,"trade-bound:1")
+        return table.concat(fields,"|")
+    end
+
+    method string InheritBinding(string source, string item)
+        if string.find(source,"|trade-bound:1",1,true) or string.find(source,"|cosmetic-no-shards:1",1,true) then return self:BindItem(item) end
+        return item
+    end
+
+    method string TradeRestriction(string item)
+        -- Identical rules execute on the client and the server; names cannot bypass them.
+        if item==nil or item=="" or #item>12000 or string.find(item,"[\r\n\t]") then return "올바른 아이템이 아닙니다." end
+        if string.find(item,"|mano_title",1,true) or self:Field(item,3)=="22" then return "보스 칭호는 거래할 수 없습니다." end
+        if string.find(item,"|trade-bound:1",1,true) then return "이벤트 보상 아이템은 거래할 수 없습니다." end
+        if string.find(item,"|starter:1",1,true) then return "기본 지급 장비는 거래할 수 없습니다." end
+        if string.find(item,"|cosmetic-no-shards:1",1,true) or string.find(item,"|transparent:1",1,true) then return "기본·이벤트 치장 아이템은 거래할 수 없습니다." end
+        local cat=self:Category(item)
+        if cat=="decorate" then
+            if not string.find(item,"|cosmetic-earned:1",1,true) then return "획득 경로가 확인되지 않는 치장 아이템입니다." end
+        elseif cat=="consume" then
+            if not string.find(item,"|origin:hunt",1,true) then return "사냥으로 얻은 소비아이템만 판매할 수 있습니다." end
+        else
+            local slot=tonumber(self:Field(item,3)) or 0
+            if slot<3 or slot>29 then return "거래 대상 장비가 아닙니다." end
+        end
+        return ""
+    end
+
+    method string Rejection(string item)
+        local reason=self:TradeRestriction(item)
+        if reason~="" then return reason end
+        if string.find(item,"|locked:1",1,true) then return "잠금을 해제한 후 판매해주세요." end
+        return ""
+    end
+
+    method number SaleTotal(number count, number unitPrice)
+        -- Bound the product before multiplying; the total remains exactly representable.
+        if count~=count or unitPrice~=unitPrice or count<1 or count>1000000000000 or count~=math.floor(count) or unitPrice<1 or unitPrice>1000000000000 or unitPrice~=math.floor(unitPrice) then return 0 end
+        if unitPrice>math.floor(1000000000000/count) then return 0 end
+        return count*unitPrice
+    end
+
+    method number Net(number total)
+        -- The seller receives 70%; rounding always belongs to the fee.
+        return math.floor(total*70/100)
+    end
+
+    method table State(string snapshot)
+        -- One server-owned revision and recoverable pending operation per character.
+        local raw=string.match("\n"..(snapshot or ""),"\nAUCT\t([^\r\n]+)")
+        if raw then local ok,t=pcall(function() return _HttpService:JSONDecode(raw) end) if ok and type(t)=="table" then return t end end
+        return {rev=0}
+    end
+
+    method string Record(table state)
+        -- Use JSON for nested transaction data, not the legacy table serializer.
+        return "AUCT\t".._HttpService:JSONEncode(state)
+    end
+
+    method string Write(string snapshot, table state)
+        -- All ordinary character lines survive the transaction unchanged.
+        local lines={} for line in string.gmatch(snapshot or "","[^\r\n]+") do if string.sub(line,1,5)~="AUCT\t" then table.insert(lines,line) end end
+        table.insert(lines,self:Record(state)) return table.concat(lines,"\n")
+    end
+
+    method string ItemAt(string snapshot, string tab, integer index)
+        -- Only whitelisted tabs may become pattern input.
+        if tab~="equip" and tab~="consume" and tab~="decorate" then return "" end
+        return string.match("\n"..snapshot,"\nI\t"..tab.."\t"..tostring(index).."\t([^\r\n]+)") or ""
+    end
+
+    method string Put(string snapshot, string tab, integer index, string item)
+        -- Replace one cell while preserving the complete item string.
+        local prefix="I\t"..tab.."\t"..tostring(index).."\t" local lines={}
+        for line in string.gmatch(snapshot,"[^\r\n]+") do if string.sub(line,1,#prefix)~=prefix then table.insert(lines,line) end end
+        if item~="" then table.insert(lines,prefix..item) end return table.concat(lines,"\n")
+    end
+
+    method integer EmptySlot(string snapshot, string tab)
+        -- Claims remain in the completed list until an empty cell is available.
+        for i=1,128 do if self:ItemAt(snapshot,tab,i)=="" then return i end end return 0
+    end
+
+    method number Meso(string snapshot)
+        -- Keep currency arithmetic below the integer-exact range of Lua numbers.
+        return tonumber(string.match(snapshot or "","^M\t(%d+)")) or 0
+    end
+
+    method string SetMeso(string snapshot, number amount)
+        -- Meso stays the first line for the existing save auditor.
+        return string.gsub(snapshot,"^M\t%d+","M\t"..string.format("%.0f",amount),1)
+    end
+end

@@ -1,0 +1,105 @@
+@Component
+script ThiefFighterMotion extends Component
+    @Sync property string Motion = "stand1"
+    @Sync property boolean Once = false
+    @Sync property integer Revision = 0
+    @Sync property number HitAt = -10
+
+    @ExecSpace("ServerOnly")
+    method void SetMotion(string motion, boolean once)
+        -- Replicate a new action once; looping locomotion does not restart every frame.
+        if self.Motion==motion and self.Once==once and not once then return end
+        self.Motion=motion self.Once=once self.Revision=self.Revision+1
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginHitBlink()
+        -- Use the same 0.4-second, 0.1-second-step blink as other bosses.
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now-self.HitAt>=0.4 then self.HitAt=now end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateHitBlink()
+        -- Avatar alpha must be changed on the avatar renderer, not the hidden sprite.
+        local renderer=self.Entity.AvatarRendererComponent
+        if not isvalid(renderer) then return end
+        local elapsed=_UtilLogic.ServerElapsedSeconds-self.HitAt
+        local alpha=1
+        if self.Motion~="dead" and elapsed>=0 and elapsed<0.4 and math.floor(elapsed/0.1)%2==0 then alpha=0.15 end
+        if self._T.hitAlpha~=alpha then
+            renderer:SetAlpha(alpha) self._T.hitAlpha=alpha
+            if Environment:IsMakerPlay() then log("[VRF] Thief blink entity="..self.Entity.Name.." alpha="..tostring(alpha)) end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginDeath()
+        local monster=self.Entity.Monster
+        monster.DestroyDelay=3
+        monster.DeathFadeAlpha=1
+        monster.DeathFadeStarted=_UtilLogic.ServerElapsedSeconds+3
+        self.Entity.MovementComponent:Stop()
+        self.Entity.RigidbodyComponent.Enable=false
+        self.Entity.HitComponent.Enable=false
+        self.Entity.MonsterAttack:SetMapActivity(false)
+        self:SetMotion("dead",false)
+        if Environment:IsMakerPlay() then log("[VRF] Thief ghost start="..self.Entity.Name.." duration=3") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Play on the avatar body, with the same pose table as the player's Savage Blow.
+        self:UpdateHitBlink()
+        local renderer=self.Entity.AvatarRendererComponent
+        if not isvalid(renderer) then return end
+        local body=renderer:GetBodyEntity()
+        if not isvalid(body) then return end
+        local changed=self._T.revision~=self.Revision
+        if changed then self._T.motionAge=0 self._T.poseIndex=0 end
+        self._T.motionAge=(self._T.motionAge or 0)+delta
+        if self.Motion=="dead" then
+            local root=renderer:GetAvatarRootEntity()
+            if not isvalid(root) then root=body end
+            if changed or self._T.body~=body then
+                -- Same dead core / standing parts and small orbit as player-like summon death.
+                body:SendEvent(ActionStateChangedEvent("dead","stand1",0.001,SpriteAnimClipPlayType.Onetime,0,1))
+                self._T.ghostBase=root.TransformComponent.Position
+                self._T.body=body self._T.revision=self.Revision self._T.playing="dead"
+                if Environment:IsMakerPlay() then log("[VRF] Thief ghost visual="..self.Entity.Name.." core=dead parts=stand1") end
+            end
+            local origin=self._T.ghostBase
+            local mirror=self.Entity.TransformComponent.Scale.x<0 and -1 or 1
+            local angle=math.rad(self._T.motionAge*150*mirror)
+            root.TransformComponent.Position=Vector3(origin.x+0.048*math.cos(angle),origin.y+0.048*math.sin(angle),origin.z)
+            return
+        end
+        if self.Motion=="savage" then
+            local player=_UserService.LocalPlayer
+            local attack=isvalid(player) and player:GetComponent("script.PlayerAttack") or nil
+            if not isvalid(attack) then return end
+            self._T.savagePoses=self._T.savagePoses or attack:GetSavageBlowPoses()
+            local index=math.min(#self._T.savagePoses,math.floor(self._T.motionAge/0.09)+1)
+            if self._T.poseIndex~=index or self._T.body~=body then
+                local pose=self._T.savagePoses[index]
+                body:SendEvent(ActionStateChangedEvent(pose.action,pose.action,0.001,SpriteAnimClipPlayType.Onetime,pose.frame,pose.frame+1))
+                self._T.poseIndex=index self._T.playing=pose.action
+                if Environment:IsMakerPlay() then log("[VRF] Thief savage pose="..tostring(index).." action="..pose.action.." frame="..tostring(pose.frame)) end
+            end
+            self._T.body=body self._T.revision=self.Revision
+            return
+        end
+        local rate=self.Motion=="walk1" and 1.68*(self.Entity.MovementComponent.InputSpeed/0.85) or 1
+        if self._T.body==body and not changed and self._T.playRate==rate then return end
+        local ev=ActionStateChangedEvent()
+        ev.CoreActionName=self.Motion ev.PartsActionName=self.Motion ev.PlayRate=rate
+        ev.PlayType=self.Once and SpriteAnimClipPlayType.Onetime or ((self.Motion=="stand1" or self.Motion=="alert") and SpriteAnimClipPlayType.ZigzagLoop or SpriteAnimClipPlayType.Loop)
+        body:SendEvent(ev)
+        self._T.body=body self._T.revision=self.Revision self._T.playing=self.Motion self._T.playRate=rate
+        self._T.seen=self._T.seen or {}
+        if not self._T.seen[self.Motion] then
+            self._T.seen[self.Motion]=true
+            if Environment:IsMakerPlay() then log("[VRF] Thief motion "..self.Entity.Name.."="..self.Motion) end
+        end
+    end
+end

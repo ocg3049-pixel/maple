@@ -80,6 +80,10 @@ script LuckySevenProjectile extends Component
 	-- 이 값으로 정해진다(럭키세븐 2발 → 2줄/쉐도우 4줄, 트리플 3발 → 3줄/6줄, 쿼드러플 4발 → 4줄/8줄).
 	property integer TotalShots = 2
 
+	-- 사망 유예는 실제 피해를 주는 표창 수로 판단한다. TotalShots에는 시각 전용 잔상도 포함된다.
+	-- 0은 기존 단발/복제 공격 경로의 TotalShots를 그대로 사용하는 호환 기본값이다.
+	property integer DamageShotCount = 0
+
 	-- 명중 시 재생할 타격 이펙트 animationclip RUID. 스킬마다 다르다(기본값은 럭키세븐 것).
 	property string HitEffectRUID = "458e72f0720a4584a9a7fc3642b6e601"
 
@@ -176,7 +180,7 @@ script LuckySevenProjectile extends Component
 			--   방향 정보가 새로 오면 이전 이펙트를 지우고 올바른 값으로 다시 재생한다.
 			if (name == "FlyDirX" or name == "FlyAngle") and self._T.flyStarted then
 				if self._T.effectSerial ~= nil and self._T.effectSerial ~= 0 then
-					_EffectService:RemoveEffect(self._T.effectSerial)
+					_CarnivalActorPresentation:RemoveEffect(self._T.effectSerial)
 					self._T.effectSerial = nil
 				end
 				self._T.flyStarted = false
@@ -225,15 +229,15 @@ script LuckySevenProjectile extends Component
 		while zrot > 180 do zrot = zrot - 360 end
 		while zrot < -180 do zrot = zrot + 360 end
 		if info.fly ~= "" then
-			self._T.effectSerial = _EffectService:PlayEffectAttached(
+			self._T.effectSerial = _CarnivalActorPresentation:PlayEffectAttached(
 				info.fly, _NetworkMotionVisual:Register(self.Entity),
 				Vector3(0, 0, 0), zrot, Vector3(1, 1, 1), true, opts
 			)
 		end
-		log("[Shuriken] 비행 표창 " .. tostring(self.SkinIndex) .. "번(" .. tostring(info.name)
+		if Environment:IsMakerPlay() then log("[Shuriken] 비행 표창 " .. tostring(self.SkinIndex) .. "번(" .. tostring(info.name)
 			.. ") FlyAngle=" .. tostring(self.FlyAngle) .. " head=" .. tostring(info.head or 0)
 			.. " flipX=" .. tostring(opts["FlipX"]) .. " zrot=" .. tostring(zrot)
-			.. " visualOnly=" .. tostring(self.VisualOnly))
+			.. " visualOnly=" .. tostring(self.VisualOnly)) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -268,11 +272,16 @@ script LuckySevenProjectile extends Component
 		local mc = self._T.targetMonster
 		if mc == nil or not isvalid(mc) then return end
 		local shots = (self.TotalShots ~= nil and self.TotalShots > 0) and self.TotalShots or 1
+		if self.DamageShotCount > 0 then shots = self.DamageShotCount end
 		if self.HitIndex > 0 and self.HitIndex < shots then
 			-- 다음 표창이 도달할 때까지만 버티면 된다(발사 간격 0.07~0.1초 + 비행 시간차).
 			-- 넉넉히 0.8초를 주되 매 타격마다 갱신되고, 마지막 발이 유실돼도 이 시간이면 자동 해제된다.
 			mc:DeferDeath(0.8)
 		else
+			if Environment:IsMakerPlay() and self.ShadowEchoOn and mc._T.pendingDeath == true and mc._T.starFinalDeferLogged ~= true then
+				mc._T.starFinalDeferLogged = true
+				log("[VRF] Star final damage hit releases death defer index=" .. tostring(self.HitIndex) .. " damageShots=" .. tostring(shots) .. " visualShots=" .. tostring(self.TotalShots))
+			end
 			mc:ClearDeathDefer()
 		end
 	end
@@ -358,9 +367,9 @@ script LuckySevenProjectile extends Component
 		end
 		self.Fired = true
 		self:SpawnSpinVisualIfNeeded()
-		log("[Shuriken] Fire skin=" .. tostring(self.SkinIndex)
+		if Environment:IsMakerPlay() then log("[Shuriken] Fire skin=" .. tostring(self.SkinIndex)
 			.. " dirX=" .. tostring(self.FlyDirX) .. " angle=" .. tostring(self.FlyAngle)
-			.. " hasTarget=" .. tostring(isvalid(self._T.target)))
+			.. " hasTarget=" .. tostring(isvalid(self._T.target))) end
 	end
 
 	-- (표창+) 전용 비행 클립이 없는 표창(토피/일비)은 아이콘을 직접 회전시키며 날려야 한다는 요청.
@@ -385,7 +394,7 @@ script LuckySevenProjectile extends Component
 		local map = self.Entity.CurrentMap
 		if not isvalid(map) then return end
 		local pos = self.Entity.TransformComponent.WorldPosition
-		local ent = _SpawnService:SpawnByModelId("spearburstfadingeffect", "shuriken_spin", pos, map)
+		local ent = _CarnivalReplica:SpawnSkillEntity(_BattleStatsManager:ResolveOwner(self.Entity),"spearburstfadingeffect", "shuriken_spin", pos, map)
 		if not isvalid(ent) then return end
 		self._T.curveAligned = curveAligned
 		-- 아이콘 스프라이트의 중심이 엔티티 원점에서 어긋난 양(피벗이 좌하단이라 생기는 값, 실측).
@@ -477,8 +486,8 @@ script LuckySevenProjectile extends Component
 		self._T.targetDied = nil
 		local tp = best.Entity.TransformComponent.Position
 		self._T.fallbackPos = Vector3(tp.x, tp.y + _ShurikenLibrary:GetThrowHeight(), tp.z)
-		log("[Shuriken] 마크 표창 재타게팅 → " .. tostring(best.Entity.Name)
-			.. " (전방 후보 " .. tostring(#cands) .. "마리 중 랜덤)")
+		if Environment:IsMakerPlay() then log("[Shuriken] 마크 표창 재타게팅 → " .. tostring(best.Entity.Name)
+			.. " (전방 후보 " .. tostring(#cands) .. "마리 중 랜덤)") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -656,7 +665,7 @@ script LuckySevenProjectile extends Component
 					if dur < 0.45 then dur = 0.45 elseif dur > 2.2 then dur = 2.2 end
 					self._T.inDur = dur
 					self._T.inChord = chord0
-					log("[Shuriken] 곡선 표창 꼭대기 통과 - 내려꽂히는 시간=" .. tostring(dur))
+					if Environment:IsMakerPlay() then log("[Shuriken] 곡선 표창 꼭대기 통과 - 내려꽂히는 시간=" .. tostring(dur)) end
 				end
 				local s = (t - outDur) / self._T.inDur
 				if s > 1 then s = 1 end
@@ -713,7 +722,7 @@ script LuckySevenProjectile extends Component
 		if self._T.hit then return end
 		self._T.hit = true
 		if self.RetargetOnDeath or self.CurveFly then
-			log("[Shuriken] 마크 표창 적중 (비행 " .. string.format("%.2f", self._T.lifetime or 0) .. "초)")
+			if Environment:IsMakerPlay() then log("[Shuriken] 마크 표창 적중 (비행 " .. string.format("%.2f", self._T.lifetime or 0) .. "초)") end
 		end
 		self:ClearSpinVisual()
 
@@ -790,7 +799,7 @@ script LuckySevenProjectile extends Component
 		-- 아무도 켜지 않는 휴면 상태로 남아 있다.
 		if not landedRealHit and self.SilentOnMiss then
 			-- 애초에 대상이 없어 허공으로 던진 표창: 도달 지점에서 조용히 사라진다(숫자/이펙트 없음).
-			log("[Shuriken] 허공 투척 표창 도달 - 표시 없이 소멸")
+			if Environment:IsMakerPlay() then log("[Shuriken] 허공 투척 표창 도달 - 표시 없이 소멸") end
 			_EntityService:Destroy(self.Entity)
 			return
 		end
@@ -800,7 +809,7 @@ script LuckySevenProjectile extends Component
 			-- 계산해 띄웠는데, 지금은 사망 유예(Monster.DeferDeath)가 "마지막 타에만 죽기"를 보장하므로
 			-- 한 시전의 모든 표창이 살아있는 대상에 정상으로 꽂힌다 - 이 경로는 다른 원인으로 대상이
 			-- 먼저 죽은 예외 상황뿐이고, 그때 빈 자리에 숫자가 뜨는 게 문제였다(신고).
-			log("[Shuriken] 비행 중 대상 사망 - 표시 없이 소멸")
+			if Environment:IsMakerPlay() then log("[Shuriken] 비행 중 대상 사망 - 표시 없이 소멸") end
 			_EntityService:Destroy(self.Entity)
 			return
 		end
@@ -845,7 +854,7 @@ script LuckySevenProjectile extends Component
 		if self._T.targetDied ~= true then
 			self:ShowHitEffect(pos.x, pos.y, pos.z, self.ShadowEchoOn, self.HitEffectRUID)
 		else
-			log("[Shuriken] 대상이 죽은 뒤 도달 - 숫자만 표시, 타격 이펙트 생략")
+			if Environment:IsMakerPlay() then log("[Shuriken] 대상이 죽은 뒤 도달 - 숫자만 표시, 타격 이펙트 생략") end
 		end
 		_EntityService:Destroy(self.Entity)
 	end
@@ -867,7 +876,7 @@ script LuckySevenProjectile extends Component
 		-- 독립적으로 굴린 결과를 그대로 전달한다.
 		local damageAnchor = isvalid(self.DamageAnchor) and self.DamageAnchor or self.Entity
 		if not _AutoHuntPowerSave.active then
-		_DamageSkinService:Play(
+		_CarnivalDamageSkin:Play(
 			damageAnchor, skinRuid, 0,
 			{ damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, damageIsCritical,
 			Vector2(0, offsetY), Vector2(1, 1), 1.0, 1.0, LitMode.Default
@@ -875,14 +884,14 @@ script LuckySevenProjectile extends Component
 		end
 		if bonus > 0 then
 			if not _AutoHuntPowerSave.active then
-			_DamageSkinService:Play(
+			_CarnivalDamageSkin:Play(
 				damageAnchor, skinRuid, 0,
 				{ bonus > 0 and bonus or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, bonusIsCritical,
 				Vector2(0, offsetY + bonusGap), Vector2(1, 1), 1.0, 1.0, LitMode.Default
 			)
 			end
 		end
-		log("[LuckySeven] ShowDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " bonus=" .. tostring(bonus) .. " offsetY=" .. tostring(offsetY) .. " dmgCrit=" .. tostring(damageIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical))
+		if Environment:IsMakerPlay() then log("[LuckySeven] ShowDamageSkin hitIndex=" .. tostring(hitIndex) .. " damage=" .. tostring(damage) .. " bonus=" .. tostring(bonus) .. " offsetY=" .. tostring(offsetY) .. " dmgCrit=" .. tostring(damageIsCritical) .. " bonusCrit=" .. tostring(bonusIsCritical)) end
 	end
 
 	@ExecSpace("Client")
@@ -893,9 +902,9 @@ script LuckySevenProjectile extends Component
 		local mapEnt = self.Entity.CurrentMap
 		if not isvalid(mapEnt) then return end
 		local ruid = (hitRuid ~= nil and hitRuid ~= "") and hitRuid or "458e72f0720a4584a9a7fc3642b6e601"
-		_EffectService:PlayEffect(
+		_CarnivalActorPresentation:PlayEffect(self.Entity,
 			ruid, mapEnt,
-			Vector3(px, py, pz), 0, Vector3(1, 1, 1), false
+			Vector3(px, py, pz), 0, Vector3(1, 1, 1), false, {}
 		)
 		-- 타격음은 표창마다 다를 수 있다(마크 오브 어쌔신 전용음) - @Sync로 내려온 값을 쓴다.
 		local sndRuid = (self.HitSoundRUID ~= nil and self.HitSoundRUID ~= "") and self.HitSoundRUID or "48c2f4049db54b3b88b9144320d3d41a"
@@ -916,14 +925,14 @@ script LuckySevenProjectile extends Component
 		if not isvalid(mapEnt) then return end
 		if showEffect then
 			local ruid = (hitRuid ~= nil and hitRuid ~= "") and hitRuid or "458e72f0720a4584a9a7fc3642b6e601"
-			_EffectService:PlayEffect(
+			_CarnivalActorPresentation:PlayEffect(self.Entity,
 				ruid, mapEnt,
 				Vector3(px, py, pz), 0, Vector3(1, 1, 1), false, { ["Alpha"] = 0.7 }
 			)
 		end
 		_GameAudio:PlaySound("48c2f4049db54b3b88b9144320d3d41a", 1.0)
-		log("[LuckySeven] 그림자 표창 타격음" .. (showEffect and " + 이펙트" or "(이펙트 생략 - 대상 사망)")
-			.. " pos=(" .. tostring(px) .. "," .. tostring(py) .. ")")
+		if Environment:IsMakerPlay() then log("[LuckySeven] 그림자 표창 타격음" .. (showEffect and " + 이펙트" or "(이펙트 생략 - 대상 사망)")
+			.. " pos=(" .. tostring(px) .. "," .. tostring(py) .. ")") end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -932,5 +941,17 @@ script LuckySevenProjectile extends Component
 			self._T.targetMonster:ReleaseIncomingHit(self.ReservationToken)
 		end
 	end
+
+
+    @ExecSpace("ClientOnly")
+    method void RefreshCarnivalFlyVisual()
+        -- Rebinds the original flying clip after the carnival receives this projectile.
+        if self._T.effectSerial~=nil and self._T.effectSerial~=0 then
+            _CarnivalActorPresentation:RemoveEffect(self._T.effectSerial)
+            self._T.effectSerial=nil
+        end
+        self._T.flyStarted=false
+        self:ApplyFlyVisual()
+    end
 
 end

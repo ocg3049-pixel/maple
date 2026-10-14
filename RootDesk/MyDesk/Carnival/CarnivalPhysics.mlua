@@ -1,0 +1,114 @@
+@Logic
+script CarnivalPhysics extends Logic
+    method void Dispose(table actor)
+        -- Physics belongs to this preview/match actor, never to the world character.
+        local p=actor.physics
+        if p==nil then return end
+        if isvalid(p.body) then _EntityService:Destroy(p.body) end
+        if isvalid(p.floor) then _EntityService:Destroy(p.floor) end
+        actor.physics=nil
+    end
+
+    method boolean Ensure(table actor, Entity source, table platforms)
+        -- Use native MapleTile physics in an isolated, non-rendered part of the same map.
+        if not isvalid(source) or not isvalid(source.CurrentMap) then return false end
+        local map=isvalid(actor.arenaMap) and actor.arenaMap or source.CurrentMap
+        if map.MapComponent.TileMapMode~=TileMapMode.MapleTile then return false end
+        local p=actor.physics
+        if p~=nil and isvalid(p.body) and p.map==map then self:CopySettings(p.body,source) return true end
+        self:Dispose(actor)
+        self._T.serial=(self._T.serial or 0)+1
+        local origin=Vector2(map.MapComponent.RightTop.x+(self:IsClient() and 10000 or 1000)+self._T.serial*256,map.MapComponent.LeftBottom.y-100)
+        local floor=_SpawnService:SpawnByModelId("b22db869-cbc2-4e11-8b64-0c4200b50578","CarnivalFloor",Vector3(origin.x,origin.y,0),map)
+        floor.SpriteRendererComponent.Color=Color(1,1,1,0)
+        local edges=floor.CustomFootholdComponent.edgeLists
+        edges:Clear()
+        for _,f in ipairs(platforms.edges or platforms) do edges:Add({Vector2(f.l,f.y),Vector2(f.r,f.y2 or f.y)}) end
+        local body=_SpawnService:SpawnByModelId("11022563-a6d4-4774-8013-8880e249da44","CarnivalPhysics",Vector3(origin.x+actor.x,origin.y+actor.y+0.02,0),map)
+        actor.physics={body=body,floor=floor,map=map,origin=origin,bounds=platforms.bounds,spawn=platforms.spawn}
+        if actor.maxHp==1 then actor.maxHp=source.PlayerComponent.MaxHp actor.hp=source.PlayerComponent.Hp end
+        self:CopySettings(body,source)
+        log("[VRF] Carnival native physics created")
+        return true
+    end
+
+    method void CopySettings(Entity body, Entity source)
+        -- Copy multipliers directly; converting these engine values into guessed velocities loses parity.
+        local rb=body.RigidbodyComponent local original=source.RigidbodyComponent
+        for _,key in ipairs({"AirAccelerationX","AirDecelerationX","DownJumpSpeed","FallSpeedMaxX","FallSpeedMaxY","Gravity","JumpBias","Mass","WalkAcceleration","WalkDrag","WalkJump","WalkSlant","WalkSpeed"}) do rb[key]=original[key] end
+        rb.IgnoreMoveBoundary=true
+        local originalAttack=source:GetComponent("PlayerAttack") local localAttack=body:GetComponent("PlayerAttack")
+        local sourceSprint=isvalid(originalAttack) and (originalAttack._T.speedFactors or {}).sprint or 1
+        local localSprint=isvalid(localAttack) and (localAttack._T.speedFactors or {}).sprint or 1
+        local speed=source.MovementComponent.InputSpeed*localSprint/math.max(0.001,sourceSprint)
+        if isvalid(localAttack) then
+            local sourceFactors=isvalid(originalAttack) and (originalAttack._T.speedFactors or {}) or {}
+            for key,factor in pairs(localAttack._T.speedFactors or {}) do
+                if key~="sprint" and factor~=1 then speed=speed*factor/math.max(0.001,sourceFactors[key] or 1) end
+            end
+        end
+        local jump=source.MovementComponent.JumpForce
+        if isvalid(localAttack) then
+            if localAttack._T.hasteActiveServer then
+                local sourceHaste=isvalid(originalAttack) and originalAttack._T.hasteActiveServer
+                speed=speed*math.max(1,localAttack._T.hasteSpeedMult or 1)/(sourceHaste and math.max(1,originalAttack._T.hasteSpeedMult or 1) or 1)
+                jump=jump*math.max(1,localAttack._T.hasteJumpAssistMult or 1)/(sourceHaste and math.max(1,originalAttack._T.hasteJumpAssistMult or 1) or 1)
+            end
+            if isvalid(originalAttack) and originalAttack._T.hasteBaseCaptured then
+                localAttack._T.hasteBaseCaptured=true
+                localAttack._T.hasteBaseInputSpeed=originalAttack._T.hasteBaseInputSpeed
+                localAttack._T.hasteBaseJumpForce=originalAttack._T.hasteBaseJumpForce
+            end
+        end
+        body.MovementComponent.InputSpeed=speed
+        body.MovementComponent.JumpForce=jump
+    end
+
+    method void Step(table actor, number axis, boolean jump, boolean down, number delta)
+        -- Native movement retains acceleration, air control, jump height and down-jump behavior.
+        local p=actor.physics
+        if p==nil or not isvalid(p.body) then return end
+        local body=p.body local rb=body.RigidbodyComponent local movement=body.MovementComponent
+        local pos=body.TransformComponent.WorldPosition
+        actor.x=pos.x-p.origin.x actor.y=pos.y-p.origin.y actor.ground=not rb.KinematicMove and rb:IsOnGround()
+        if actor.ground then actor.airJumpUsed=false end
+        local bounds=p.bounds or {minX=-8,maxX=8,minY=0}
+        if actor.x<bounds.minX+0.15 or actor.x>bounds.maxX-0.15 then
+            actor.x=math.max(bounds.minX+0.15,math.min(bounds.maxX-0.15,actor.x))
+            rb:SetWorldPosition(Vector2(p.origin.x+actor.x,p.origin.y+actor.y))
+        end
+        if actor.y<bounds.minY-3 then
+            local spawn=p.spawn or {x=0,y=0}
+            self:Warp(actor,spawn.x,spawn.y)
+        end
+        if axis~=0 then actor.face=axis>0 and 1 or -1 end
+        movement:MoveToDirection(Vector2(axis,rb.KinematicMove and (actor.flightY or 0) or 0),delta)
+        if down then movement:DownJump() elseif jump then movement:Jump() end
+    end
+
+    method void Warp(table actor, number x, number y)
+        -- Clamp against the selected original map, including platforms below world zero.
+        local p=actor.physics
+        local bounds=p~=nil and p.bounds or nil
+        actor.x=bounds~=nil and math.max(bounds.minX+0.15,math.min(bounds.maxX-0.15,x)) or x
+        actor.y=y
+        if p~=nil and isvalid(p.body) then p.body.RigidbodyComponent:SetWorldPosition(Vector2(p.origin.x+actor.x,p.origin.y+actor.y)) p.body.RigidbodyComponent:PositionReset() end
+    end
+    @ExecSpace("ClientOnly")
+    method void Predict(table actor, Entity source, table platforms, table authority, number axis, boolean jump, boolean down, number delta)
+        -- Keep native inertia continuous; normal RPC latency is not a reason to warp after stopping.
+        if not self:Ensure(actor,source,platforms) then return end
+        actor.physics.body.MovementComponent.InputSpeed=actor.physics.body.MovementComponent.InputSpeed*(actor.sprintMultiplier or 1)
+        self:Step(actor,axis,jump,down,delta)
+        if authority~=nil and _UtilLogic.ElapsedSeconds>=(actor.authorityAfter or 0) then
+            local dx=authority.x-actor.x local dy=authority.y-actor.y
+            if dx*dx+dy*dy>16 then
+                self:Warp(actor,authority.x,authority.y)
+                actor.reconcileCount=(actor.reconcileCount or 0)+1
+                if Environment:IsMakerPlay() then log("[VRF] Carnival exceptional position correction="..tostring(actor.reconcileCount)) end
+            end
+        end
+        actor.offsetX=0 actor.offsetY=0
+        actor.viewX=actor.x actor.viewY=actor.y
+    end
+end

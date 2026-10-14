@@ -1,0 +1,78 @@
+@Component
+script CarnivalArena extends Component
+    property string MatchId = ""
+    property integer Team = 0
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- This component owns only the slots belonging to its own battle room.
+        self._T.slots={} self._T.serial=0
+        log("[VRF] Carnival arena boot map="..self.Entity.Name)
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity AddMonster(table row)
+        -- Spawn on a real foothold; preserve existing combat AI, hitboxes and animation assets.
+        local model=_CarnivalCatalog:Model(row)
+        if model=="" then return nil end
+        local positions={}
+        for _,fh in ipairs(self.Entity.FootholdComponent:GetFootholdAll()) do
+            if fh:GetWidth()>=1 and math.abs(fh.StartPoint.y-fh.EndPoint.y)<0.2 then table.insert(positions,fh:GetCenter()) end
+        end
+        if #positions==0 then return nil end
+        self._T.serial=self._T.serial+1
+        local at=positions[(self._T.serial*7)%#positions+1]
+        local e=_SpawnService:SpawnByModelId(model,"CarnivalMonster_"..tostring(self._T.serial),Vector3(at.x,at.y+0.15,0),self.Entity)
+        if not isvalid(e) then return nil end
+        local match=(_CarnivalManager._T.matches or {})[self.MatchId]
+        if match==nil or (match.state~="active" and match.state~="starting") then e:Destroy() return nil end
+        local m=e:GetComponent("script.Monster")
+        if not isvalid(m) then e:Destroy() return nil end
+        m.IsStageBoss=false m.IsBossSummon=false m.NeverDie=false m.MinimumHitDamage=0
+        m.MonsterLevel=row.level m.NameTagLevel=row.level m.MonsterDisplayName=row.name
+        m.MaxHp=_RegionTierLogic:GetMonsterHpForLevel(row.level) m.Hp=m.MaxHp
+        m.GroupRespawn=true m.RespawnOn=true m.RespawnDelay=_MonsterZoneRespawn.RespawnInterval
+        m:SetupMonsterNameTag() m:EnsureWanderAI() m:SetMapSimulationActive(true)
+        self._T.slots[e.Id]={entity=e,row=row,serial=-1,due=nil}
+        return e
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Killed(Component m, Entity killer)
+        -- Deduplicate the death generation; time is measured before the death animation finishes.
+        local slot=self._T.slots and self._T.slots[m.Entity.Id]
+        if slot==nil or slot.serial==m.LifeSerial then return false end
+        slot.serial=m.LifeSerial slot.due=_MonsterZoneRespawn:NextRespawnAt(_UtilLogic.ServerElapsedSeconds)
+        _CarnivalManager:AwardKill(self.MatchId,self.Team,killer,slot.row.level)
+        log("[VRF] Carnival killed map="..self.Entity.Name.." respawnDelay=20")
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUpdate(number delta)
+        -- No field scheduler can respawn these slots early or add animation time to the delay.
+        if not _CarnivalManager:IsActive(self.MatchId) then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        for _,slot in pairs(self._T.slots or {}) do
+            if slot.due~=nil and now>=slot.due and isvalid(slot.entity) then
+                slot.due=nil slot.entity:GetComponent("script.Monster"):Respawn()
+                log("[VRF] Carnival respawn map="..self.Entity.Name)
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void StopCombat()
+        -- Freeze all monsters before results and settlement; keep no active respawn deadlines.
+        for _,slot in pairs(self._T.slots or {}) do
+            slot.due=nil
+            if isvalid(slot.entity) then slot.entity:GetComponent("script.Monster"):SetMapSimulationActive(false) slot.entity.HitComponent.Enable=false end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- The map owns and releases its actor references together with its lifetime.
+        self._T.slots=nil
+    end
+end
