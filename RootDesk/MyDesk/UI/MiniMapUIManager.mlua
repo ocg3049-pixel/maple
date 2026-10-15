@@ -219,44 +219,7 @@ script MiniMapUIManager extends Component
 		local pos = player.TransformComponent.WorldPosition
 		self:FollowPosition(pos.x, pos.y)
 		self:UpdateMarkers(map, player)
-        self:UpdateCameraFrame(map)
 	end
-
-    @ExecSpace("ClientOnly")
-    method void UpdateCameraFrame(Entity map)
-        -- Project the actual rendered camera corners into the same coordinates as the preview tiles.
-        local viewport = self._T.viewport
-        local scale = self._T.mapScale
-        if not isvalid(viewport) or scale == nil or scale <= 0 then return end
-        local a = _UILogic:ScreenToWorldPosition(Vector2.zero)
-        local b = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
-        local left = (math.min(a.x,b.x) - self._T.mapCx) * scale
-        local right = (math.max(a.x,b.x) - self._T.mapCx) * scale
-        local bottom = (math.min(a.y,b.y) - self._T.mapCy) * scale
-        local top = (math.max(a.y,b.y) - self._T.mapCy) * scale
-        local hw, hh = self._T.halfW, self._T.halfH
-        local lx, rx = math.max(-hw,left), math.min(hw,right)
-        local by, ty = math.max(-hh,bottom), math.min(hh,top)
-        local edges = {
-            {"CameraTop",(lx+rx)/2,top,rx-lx,1.5,top>=-hh and top<=hh and rx>lx},
-            {"CameraBottom",(lx+rx)/2,bottom,rx-lx,1.5,bottom>=-hh and bottom<=hh and rx>lx},
-            {"CameraLeft",left,(by+ty)/2,1.5,ty-by,left>=-hw and left<=hw and ty>by},
-            {"CameraRight",right,(by+ty)/2,1.5,ty-by,right>=-hw and right<=hw and ty>by}}
-        for _,edge in ipairs(edges) do
-            local e=viewport:GetChildByName(edge[1])
-            if isvalid(e) then
-                e.Enable=edge[6]
-                if e.Enable then
-                    e.UITransformComponent.anchoredPosition=Vector2(edge[2],edge[3])
-                    e.UITransformComponent.RectSize=Vector2(edge[4],edge[5])
-                end
-            end
-        end
-        if Environment:IsMakerPlay() and self._T.cameraFrameMap~=map then
-            self._T.cameraFrameMap=map
-            log("[VRF] MiniMap camera frame map="..map.Name.." worldWidth="..tostring(math.abs(b.x-a.x)).." worldHeight="..tostring(math.abs(b.y-a.y)))
-        end
-    end
 
 	@ExecSpace("ClientOnly")
 	method void ClearPreview()
@@ -272,7 +235,7 @@ script MiniMapUIManager extends Component
 
 	@ExecSpace("ClientOnly")
 	method void LayoutChrome()
-		-- Board의 둥근 배경만 사용하고 중복 회색 외곽 프레임은 숨긴다.
+		-- One filled board joins the title, map name and map preview without stacked frames.
 		local board = self._T.board
 		if not isvalid(board) then return end
 		local s = board.UITransformComponent.RectSize
@@ -282,6 +245,7 @@ script MiniMapUIManager extends Component
 		end
 		local header = board:GetChildByName("HeaderChrome", false)
 		if isvalid(header) then
+			header.Enable = false
 			header.UITransformComponent.RectSize = Vector2(s.x, self._T.collapsed and 38 or 115)
 			local names = header:GetChildByName("NameSurface", false)
 			if isvalid(names) then names.Enable = not self._T.collapsed end
@@ -308,21 +272,68 @@ script MiniMapUIManager extends Component
 		if not isvalid(self._T.board) or self._T.collapsed then return end
 		self:LayoutChrome()
 		local size = self._T.board.UITransformComponent.RectSize
-		local w, h = size.x - 16, size.y - 123
-		self._T.contentOffsetY = -53.5
-		self._T.halfW, self._T.halfH = w / 2 - 6, h / 2 - 6
+		local w, h = size.x - 16, size.y - 112
+		-- Keep the captured map inside the 3px rim and its rounded inner corners.
+		local borderWidth, borderRadius, borderInset = 3, 20, 2
+		local clipInset = borderInset + borderWidth + math.ceil((borderRadius - borderWidth) * (1 - math.sqrt(0.5)))
+		local viewW,viewH=w-clipInset*2,h-clipInset*2
+		self._T.contentOffsetY = -48
+		-- Reserve enough space for the entire player/boss marker, not only its center.
+		self._T.halfW, self._T.halfH = viewW / 2 - 11, viewH / 2 - 11
 		local frame = self._T.board:GetChildByName("MapFrame", false)
 		if isvalid(frame) then
-			frame.UITransformComponent.RectSize = Vector2(w, h)
+			frame.UITransformComponent.RectSize = Vector2(viewW, viewH)
 			frame.UITransformComponent.anchoredPosition = Vector2(0, self._T.contentOffsetY)
 		end
 		if isvalid(self._T.viewport) then
-			self._T.viewport.UITransformComponent.RectSize = Vector2(w, h)
+			self._T.viewport.UITransformComponent.RectSize = Vector2(viewW, viewH)
 			self._T.viewport.UITransformComponent.anchoredPosition = Vector2(0, self._T.contentOffsetY)
+		end
+		-- Eight filled polygon pieces form a closed rim; no line-loop endpoint can disappear.
+		local border=self._T.board:GetChildByName("ViewportBorder")
+		if isvalid(border) then
+			border.Enable=true
+			border.UITransformComponent.anchoredPosition=Vector2(0,self._T.contentOffsetY)
+			border.UITransformComponent.RectSize=Vector2(w,h)
+			local hw,hh=w/2-borderInset,h/2-borderInset
+			local r,t=borderRadius,borderWidth
+			local pieces={
+				{Vector2(-hw+r,hh-t),Vector2(hw-r,hh-t),Vector2(hw-r,hh),Vector2(-hw+r,hh)},
+				{Vector2(-hw+r,-hh),Vector2(hw-r,-hh),Vector2(hw-r,-hh+t),Vector2(-hw+r,-hh+t)},
+				{Vector2(-hw,-hh+r),Vector2(-hw+t,-hh+r),Vector2(-hw+t,hh-r),Vector2(-hw,hh-r)},
+				{Vector2(hw-t,-hh+r),Vector2(hw,-hh+r),Vector2(hw,hh-r),Vector2(hw-t,hh-r)}
+			}
+			for _,corner in ipairs({{hw-r,hh-r,0},{-hw+r,hh-r,90},{-hw+r,-hh+r,180},{hw-r,-hh+r,270}}) do
+				local points={}
+				for step=0,12 do
+					local angle=math.rad(corner[3]+step*90/12)
+					table.insert(points,Vector2(corner[1]+r*math.cos(angle),corner[2]+r*math.sin(angle)))
+				end
+				for step=12,0,-1 do
+					local angle=math.rad(corner[3]+step*90/12)
+					table.insert(points,Vector2(corner[1]+(r-t)*math.cos(angle),corner[2]+(r-t)*math.sin(angle)))
+				end
+				table.insert(pieces,points)
+			end
+			local drawable=true
+			for i,points in ipairs(pieces) do
+				local part=border:GetChildByName("Rim"..tostring(i))
+				if isvalid(part) then
+					part.PolygonGUIRendererComponent.Points:Clear()
+					for _,point in ipairs(points) do part.PolygonGUIRendererComponent.Points:Add(point) end
+					part.PolygonGUIRendererComponent.Color=Color(140/255,129/255,114/255,0.5)
+					drawable=part.PolygonGUIRendererComponent:IsDrawable() and drawable
+				else drawable=false end
+			end
+			_UILogic:SetSiblingIndex(border.UITransformComponent,1000000)
+			if Environment:IsMakerPlay() and not self._T.unifiedVerified then
+				self._T.unifiedVerified=true
+				log("[VRF][MiniMapChrome] closed 3px #8C8172 rim alpha=0.5; drawable="..tostring(drawable).." bottomMargin="..tostring(size.y/2+self._T.contentOffsetY-hh).." view="..tostring(viewW).."x"..tostring(viewH))
+			end
 		end
 		if self._T.previewBounds == nil then return end
 		local bounds = self._T.previewBounds
-		local fit = math.min((w - 12) / math.max(0.1, bounds[2] - bounds[1]), (h - 12) / math.max(0.1, bounds[4] - bounds[3]))
+		local fit = math.min((viewW - 22) / math.max(0.1, bounds[2] - bounds[1]), (viewH - 22) / math.max(0.1, bounds[4] - bounds[3]))
 		local scale = fit * math.max(0.2, math.min(5, self.ZoomMultiplier))
 		self._T.mapScale = scale
 		self._T.fitScale = fit

@@ -4,7 +4,9 @@ script CarnivalActorPresentation extends Logic
     method void Bind(Entity actor, Entity view, number pixelsPerUnit, Vector2 origin)
         -- Register a real world actor's UI surface; unregistered actors retain native rendering.
         self._T.views=self._T.views or {}
-        self._T.views[actor.Id]={actor=actor,view=view,ppu=pixelsPerUnit,origin=origin}
+        local binding=self._T.views[actor.Id]
+        if binding==nil then binding={actor=actor} self._T.views[actor.Id]=binding self._T.sortDirty=true end
+        binding.view=view binding.ppu=pixelsPerUnit binding.origin=origin
     end
 
     @ExecSpace("ClientOnly")
@@ -30,7 +32,7 @@ script CarnivalActorPresentation extends Logic
         if binding==nil or not isvalid(binding.view) then
             return _EffectService:PlayEffectAttached(ruid,actor,offset,rotation,scale,loop,self:ForegroundOptions(actor,options))
         end
-        options=options or {}
+        options=self:ForegroundOptions(actor,options)
         local template=_CarnivalUI:UI("Lobby/Scene/EffectTemplate")
         if not isvalid(template) then return 0 end
         self._T.serial=(self._T.serial or 0)-1
@@ -38,7 +40,8 @@ script CarnivalActorPresentation extends Logic
         local node=_SpawnService:SpawnByEntity(template,"NativeSkillEffect"..tostring(-serial),Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
         if not isvalid(node) then return 0 end
         node.Enable=false
-        local effect={node=node,actor=binding.actor,anchor=actor,offset=offset,rotation=rotation,scale=scale,options=options,frames={},ruid=ruid,worldPosition=options.carnivalWorldPosition}
+        node.Visible=false
+        local effect={node=node,actor=binding.actor,anchor=actor,offset=offset,rotation=rotation,scale=scale,options=options,frames={},ruid=ruid,worldPosition=options.carnivalWorldPosition,loop=loop,born=_UtilLogic.ElapsedSeconds}
         self._T.effects=self._T.effects or {}
         self._T.effects[serial]=effect
         local sprite=node.SpriteGUIRendererComponent
@@ -48,7 +51,7 @@ script CarnivalActorPresentation extends Logic
         sprite.ImageRUID=DataRef(ruid)
         sprite.StartFrameIndex=options.StartFrameIndex or 0
         sprite.EndFrameIndex=options.EndFrameIndex or 2147483647
-        sprite.PlayRate=options.PlayRate or 1
+        sprite.PlayRate=0
         sprite.AnimClipPlayType=loop and SpriteAnimClipPlayType.Loop or SpriteAnimClipPlayType.Onetime
         sprite.FlipX=options.FlipX==true
         sprite.FlipY=options.FlipY==true
@@ -65,11 +68,13 @@ script CarnivalActorPresentation extends Logic
             if loop then return end
             local count=0
             for _,seen in pairs(effect.frames) do if seen then count=count+1 end end
-            log("[VRF] Carnival original effect completed ruid="..ruid.." frames="..tostring(count).."/"..tostring(effect.total).." last="..tostring(effect.last))
+            if self._T.verifyEffects then log("[VRF] Carnival original effect completed ruid="..ruid.." frames="..tostring(count).."/"..tostring(effect.total).." last="..tostring(effect.last)) end
             self:RemoveEffect(serial)
         end)
+        self._T.sortDirty=true
+        self:SortScene()
         node.Enable=true
-        log("[VRF] Carnival original effect routed ruid="..ruid.." rate="..tostring(sprite.PlayRate).." ppu="..tostring(binding.ppu))
+        if self._T.verifyEffects then log("[VRF] Carnival original effect routed ruid="..ruid.." rate="..tostring(sprite.PlayRate).." ppu="..tostring(binding.ppu)) end
         return serial
     end
 
@@ -79,7 +84,7 @@ script CarnivalActorPresentation extends Logic
         if serial>=0 then _EffectService:RemoveEffect(serial) return end
         local effect=(self._T.effects or {})[serial]
         if effect==nil then return end
-        self._T.effects[serial]=nil
+        self._T.effects[serial]=nil self._T.sortDirty=true
         if isvalid(effect.node) then
             effect.node:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,effect.frameEvent)
             effect.node:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,effect.endEvent)
@@ -108,8 +113,9 @@ script CarnivalActorPresentation extends Logic
         local effectOptions={}
         for key,value in pairs(options or {}) do effectOptions[key]=value end
         effectOptions.carnivalWorldPosition=position
-        local actorPos=owner.TransformComponent.WorldPosition
-        local serial=self:PlayEffectAttached(ruid,owner,position-actorPos,rotation,scale,loop,effectOptions)
+        -- A hit flash belongs to its world position, not to the projectile that is destroyed on impact.
+        local actorPos=binding.actor.TransformComponent.WorldPosition
+        local serial=self:PlayEffectAttached(ruid,binding.actor,position-actorPos,rotation,scale,loop,effectOptions)
         local effect=(self._T.effects or {})[serial]
         if effect~=nil then
             effect.worldPosition=position
@@ -138,7 +144,7 @@ script CarnivalActorPresentation extends Logic
         self._T.entities[entity.Id]=record
         self._T.owners=self._T.owners or {}
         self._T.owners[entity.Id]=actor
-        if Environment:IsMakerPlay() then log("[VRF] Carnival native entity tracked name="..entity.Name) end
+        if self._T.verifyEffects then log("[VRF] Carnival native entity tracked name="..entity.Name) end
     end
 
     @ExecSpace("ClientOnly")
@@ -147,7 +153,7 @@ script CarnivalActorPresentation extends Logic
         -- Releases only the UI proxy; the original entity keeps its normal game lifetime.
         local record=(self._T.entities or {})[entityId]
         if record==nil then return end
-        self._T.entities[entityId]=nil
+        self._T.entities[entityId]=nil self._T.sortDirty=true
         if isvalid(record.avatarSource) and record.avatarEvent~=nil then record.avatarSource:DisconnectEvent(ActionStateChangedEvent,record.avatarEvent) end
         if isvalid(record.frameSource) and record.frameEvent~=nil then record.frameSource:DisconnectEvent(SpriteAnimPlayerChangeFrameEvent,record.frameEvent) end
         if self._T.owners~=nil then
@@ -159,7 +165,7 @@ script CarnivalActorPresentation extends Logic
         for _,serial in ipairs(effects) do self:RemoveEffect(serial) end
         if isvalid(record.node) then _EntityService:Destroy(record.node) end
         if isvalid(record.health) then _EntityService:Destroy(record.health) end
-        if Environment:IsMakerPlay() and record.projected then
+        if self._T.verifyEffects and record.projected then
             log("[VRF] Carnival native entity released frames="..tostring(record.frameChanges).." ruid="..tostring(record.ruid))
         end
     end
@@ -192,7 +198,10 @@ script CarnivalActorPresentation extends Logic
             if not isvalid(template) then return end
             record.node=_SpawnService:SpawnByEntity(template,"NativeEntity_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
             if not isvalid(record.node) then return end
-            record.node.Enable=false
+            record.node.Visible=false
+            record.node.Enable=true
+            self._T.sortDirty=true
+            record.publishAt=_UtilLogic.ElapsedSeconds+0.001
             record.node.SpriteGUIRendererComponent.Type=ImageType.Simple
             record.node.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
             record.node.SpriteGUIRendererComponent.RaycastTarget=false
@@ -214,8 +223,8 @@ script CarnivalActorPresentation extends Logic
         sprite.FlipX=source.FlipX sprite.FlipY=source.FlipY
         sprite.Color=source.Color sprite.PlayRate=source.PlayRate
         sprite.MaterialId=source.MaterialID
-        local first=source.StartFrameIndex
-        local last=source.EndFrameIndex
+        local first=record.frame or source.StartFrameIndex
+        local last=record.frame or source.EndFrameIndex
         if sprite.StartFrameIndex~=first or sprite.EndFrameIndex~=last then
             sprite.EndFrameIndex=2147483647
             sprite.StartFrameIndex=first sprite.EndFrameIndex=last
@@ -229,10 +238,11 @@ script CarnivalActorPresentation extends Logic
             cursor=cursor.Parent
         end
         node.UITransformComponent.UIScale=Vector3(sx*binding.ppu/100,sy*binding.ppu/100,1)
-        node.Enable=visual.EnabledInHierarchy and visual.VisibleInHierarchy and source.Enable
+        local visible=visual.EnabledInHierarchy and visual.VisibleInHierarchy and source.Enable and _UtilLogic.ElapsedSeconds>=(record.publishAt or 0)
+        if node.Visible~=visible then node.Visible=visible end
         if not record.projected then
             record.projected=true
-            if Environment:IsMakerPlay() then log("[VRF] Carnival native entity projected name="..entity.Name.." ruid="..tostring(record.ruid)) end
+            if self._T.verifyEffects then log("[VRF] Carnival native entity projected name="..entity.Name.." ruid="..tostring(record.ruid)) end
         end
     end
 
@@ -267,10 +277,20 @@ script CarnivalActorPresentation extends Logic
                 local binding=(self._T.views or {})[effect.actor.Id]
                 if binding~=nil then
                     self:UpdateEffectTransform(effect,binding)
+                    -- Enabling a new UI clone initializes its transform on the next frame.
+                    -- Keep it hidden and paused until that initialization has finished.
+                    if not effect.published and _UtilLogic.ElapsedSeconds>effect.born then
+                        effect.published=true
+                        effect.node.SpriteGUIRendererComponent.PlayRate=effect.options.PlayRate or 1
+                        effect.node.Visible=true
+                        if self._T.verifyEffects then log("[VRF][EffectPublish] ruid="..effect.ruid.." at="..tostring(effect.node.UITransformComponent.anchoredPosition)) end
+                    end
                 end
             end
         end
-        self:SortScene()
+        if self._T.sortDirty or _UtilLogic.ElapsedSeconds>=(self._T.sortAt or 0) then
+            self._T.sortAt=_UtilLogic.ElapsedSeconds+0.1 self:SortScene()
+        end
         _CarnivalDamageSkin:DrawFrame()
     end
 
@@ -357,8 +377,7 @@ script CarnivalActorPresentation extends Logic
         while isvalid(cursor) and cursor~=binding.actor.CurrentMap do
             if cursor==binding.actor then
                 local offset=position-binding.actor.TransformComponent.WorldPosition
-                local base=_CarnivalReplica:PresentationPosition(binding.actor)
-                return self:ProjectWorld(binding,base)+Vector2(offset.x*binding.ppu,offset.y*binding.ppu)
+                return binding.view.UITransformComponent.anchoredPosition+Vector2(offset.x*binding.ppu,offset.y*binding.ppu)
             end
             cursor=cursor.Parent
         end
@@ -510,6 +529,7 @@ script CarnivalActorPresentation extends Logic
         -- Keep the world renderer order inside this window, without global UI overrides.
         local scene=_CarnivalUI:UI("Lobby/Scene")
         if not isvalid(scene) then return end
+        self._T.sortDirty=false
         local list={} local seen={}
         local function add(node, order, depth)
             if not isvalid(node) or node.Parent~=scene or seen[node.Id] then return end

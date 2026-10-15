@@ -8,7 +8,7 @@ script CarnivalView extends Logic
         self._T.expand=0 self._T.sequence=0 self._T.touch={} self._T.models={} self._T.hit={} self._T.links=self._T.links or {}
         self.autoOn=true self._T.blocked={} self._T.fingers={}
         self._T.keys=_InputService:ConnectEvent(KeyDownEvent,function(e)
-            if not self:CanInput() or self:BlockedKey(e.key) then return end
+            if _CarnivalPanel:HandlesKey(e.key) or not self:CanInput() or self:BlockedKey(e.key) then return end
             local func=_KeySettingManager:GetFuncForKeyEnum(e.key)
             if func=="autohunt" and not self._T.autoHeld then self._T.autoHeld=true self:ToggleAuto() end
             local key=_SkillManager:GetSkillKeyName(e.key)
@@ -144,6 +144,7 @@ script CarnivalView extends Logic
         if pos==nil or not battle then pos={x=data.x,y=data.y} self._T.positions[slot]=pos end
         local alpha=data.predicted and 1 or 1-math.exp(-18*delta)
         pos.x=pos.x+(data.x-pos.x)*alpha pos.y=pos.y+(data.y-pos.y)*alpha
+        pos.y=math.max(_CarnivalTerrain:Data(battle and (_CarnivalUI.state.layout or 1) or 0).floorY,pos.y)
         root.UITransformComponent.anchoredPosition=self:Project(pos.x,pos.y)
         local body=root:GetChildByName("Body")
         self:SizeAvatar(body)
@@ -197,7 +198,7 @@ script CarnivalView extends Logic
                 body.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
                 body.UITransformComponent.anchoredPosition=Vector2.zero
                 body.UITransformComponent.UIScale=Vector3(self._T.scale/100,self._T.scale/100,1)
-                local row=_MonsterCodexCatalog:Get(m.id)
+                local row=_CarnivalTactics:Row(m.id)
                 local profile=m.training~=true and _CarnivalCatalog:FieldProfile(row) or nil
                 local motion=m.dead and "die" or (m.motion or "stand")
                 local sprite=m.sprite or (profile~=nil and (profile[motion] or profile.stand)) or (row~=nil and row.sprite or "")
@@ -325,6 +326,8 @@ script CarnivalView extends Logic
         if _UtilLogic.ElapsedSeconds>=(self._T.copyAt or 0) then self._T.copyAt=_UtilLogic.ElapsedSeconds+0.5 end
         _CarnivalActorPresentation:DrawFrame(delta)
         if battle then self:DrawOpponent(delta) end
+        _CarnivalFeedback:Draw()
+        _CarnivalLoot:Draw(delta)
     end
 
     @ExecSpace("ClientOnly")
@@ -568,10 +571,12 @@ script CarnivalView extends Logic
                 if now<landing.untilTime and math.abs(data.x-landing.x)>0.2 then data.x=landing.x data.y=landing.y else replica.landing=nil end
             end
             local dx=data.x-display.x local dy=data.y-display.y
-            local alpha=dx*dx+dy*dy>9 and 1 or 1-math.exp(-18*delta)
+            -- Stop the visual catch-up at cast start instead of sliding through a stationary attack.
+            local alpha=(data.locked or dx*dx+dy*dy>9) and 1 or 1-math.exp(-18*delta)
             display.x=display.x+dx*alpha display.y=display.y+dy*alpha
         end
         self._T.wasManual=manual
+        display.y=math.max(_CarnivalTerrain:Data(_CarnivalUI.state.layout or 1).floorY,display.y)
         view.x=display.x view.y=display.y view.predicted=true
         return view
     end
@@ -621,7 +626,7 @@ script CarnivalView extends Logic
         end
         local mobile=_MobileUIManager:IsMobile()
         for _,item in ipairs(self._T.hudSlots) do
-            local node=self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..item.pos)
+            local node=item.node
             item.key=mobile and ("mobile:"..tostring(math.floor((item.index-1)/6)+1)..":"..tostring((item.index-1)%6+1)) or _SkillManager:GetKeyForBarPos(item.pos)
             local slot=_SkillManager:GetSkillOnKey(item.key)
             item.func=mobile and _MobileUIManager:GetMobileSlot(item.key).func or ((slot.ruid or "")=="" and _KeySettingManager:GetFuncOnKey(item.key) or "")
@@ -639,12 +644,22 @@ script CarnivalView extends Logic
                 node:GetChildByName("KeyLabel").TextComponent.Text=tostring(math.floor((item.index-1)/6)+1).."-"..tostring((item.index-1)%6+1)
                 local label=node:GetChildByName("FuncLabel") label.Enable=item.func~="" label.TextComponent.Text=_KeySettingManager:GetFuncIdLabel(item.func)
             else
-                local original=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_"..item.pos)
+                local original=item.original
+                if not isvalid(original) then original=_EntityService:GetEntityByPath("/ui/DefaultGroup/SkillBar/Slot_"..item.pos) item.original=original end
+                local artwork=(slot.ruid or "")..":"..(slot.name or "")..":"..item.key..":"..item.func
+                local changed=item.artwork~=artwork
+                item.artwork=artwork
                 if isvalid(original) then
                     for _,name in ipairs({"SlotBG","IconBackdrop","Icon","KeyLabel","FuncLabel","RecoveryCooldown"}) do
-                        local sourcePart=_EntityService:GetEntityByPath(original.Path.."/"..name)
-                        local targetPart=self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..item.pos.."/"..name)
-                        if not hiddenFunc or name=="SlotBG" or name=="KeyLabel" then self:MirrorHUDPart(sourcePart,targetPart) end
+                        if not changed and name~="RecoveryCooldown" then continue end
+                        item.parts=item.parts or {}
+                        local pair=item.parts[name]
+                        if pair==nil or not isvalid(pair[1]) or not isvalid(pair[2]) then
+                            pair={_EntityService:GetEntityByPath(original.Path.."/"..name),self:UI("Lobby/PlayerHUD/Quickslots/Slot_"..item.pos.."/"..name)}
+                            item.parts[name]=pair
+                        end
+                        local sourcePart=pair[1] local targetPart=pair[2]
+                        if (changed or name=="RecoveryCooldown") and (not hiddenFunc or name=="SlotBG" or name=="KeyLabel") then self:MirrorHUDPart(sourcePart,targetPart) end
                     end
                 end
             end
@@ -687,18 +702,32 @@ script CarnivalView extends Logic
     method void MirrorHUDPart(Entity source, Entity target)
         -- Copy original rendered icons, labels, potion counts and style without copying events.
         if not isvalid(source) or not isvalid(target) then return end
-        target.Enable=source.Enable
-        target.UITransformComponent.anchoredPosition=source.UITransformComponent.anchoredPosition
-        target.UITransformComponent.RectSize=source.UITransformComponent.RectSize
+        self._T.mirrorParts=self._T.mirrorParts or {}
+        local pair=self._T.mirrorParts[target.Id]
+        if pair==nil or pair.source~=source then
+            pair={source=source,values={},children={}}
+            self._T.mirrorParts[target.Id]=pair
+            for _,child in pairs(source.Children) do
+                table.insert(pair.children,{child,_EntityService:GetEntityByPath(target.Path.."/"..child.Name)})
+            end
+        end
+        local values=pair.values
+        local function copy(key,component,field,value)
+            if values[key]~=value then values[key]=value component[field]=value end
+        end
+        copy("enabled",target,"Enable",source.Enable)
+        copy("pos",target.UITransformComponent,"anchoredPosition",source.UITransformComponent.anchoredPosition)
+        copy("size",target.UITransformComponent,"RectSize",source.UITransformComponent.RectSize)
         local sprite=source.SpriteGUIRendererComponent local output=target.SpriteGUIRendererComponent
         if isvalid(sprite) and isvalid(output) then
-            if output.ImageRUID.DataId~=sprite.ImageRUID.DataId then output.ImageRUID=sprite.ImageRUID end
-            output.Color=sprite.Color output.Type=sprite.Type output.PreserveSprite=sprite.PreserveSprite
-            output.FillAmount=sprite.FillAmount
+            local id=sprite.ImageRUID.DataId
+            if values.image~=id then values.image=id output.ImageRUID=DataRef(id) end
+            copy("color",output,"Color",sprite.Color) copy("type",output,"Type",sprite.Type)
+            copy("preserve",output,"PreserveSprite",sprite.PreserveSprite) copy("fill",output,"FillAmount",sprite.FillAmount)
         end
-        if isvalid(source.TextComponent) and isvalid(target.TextComponent) then target.TextComponent.Text=source.TextComponent.Text end
-        if isvalid(source.TextGUIRendererComponent) and isvalid(target.TextGUIRendererComponent) then target.TextGUIRendererComponent.Text=source.TextGUIRendererComponent.Text end
-        for _,child in pairs(source.Children) do self:MirrorHUDPart(child,_EntityService:GetEntityByPath(target.Path.."/"..child.Name)) end
+        if isvalid(source.TextComponent) and isvalid(target.TextComponent) then copy("text",target.TextComponent,"Text",source.TextComponent.Text) end
+        if isvalid(source.TextGUIRendererComponent) and isvalid(target.TextGUIRendererComponent) then copy("guiText",target.TextGUIRendererComponent,"Text",source.TextGUIRendererComponent.Text) end
+        for _,child in ipairs(pair.children) do self:MirrorHUDPart(child[1],child[2]) end
     end
 
     @ExecSpace("ClientOnly")
@@ -840,6 +869,23 @@ script CarnivalView extends Logic
         local state=_CarnivalUI.state local scene=state.opponent
         local parent=self:UI("Lobby/Opponent/Preview")
         if scene==nil or not isvalid(parent) then return end
+        local members=math.max(1,math.min(2,#(scene.actors or {})))
+        if self._T.opponentMembers~=members then
+            self._T.opponentMembers=members
+            local height=200+60*members
+            local panel=self:UI("Lobby/Opponent").UITransformComponent
+            panel.RectSize=Vector2(286,height) panel.anchoredPosition=Vector2(-435,264-height/2)
+            self:UI("Lobby/Opponent/Title").UITransformComponent.anchoredPosition=Vector2(0,height/2-22)
+            for i=1,2 do
+                local label=self:UI("Lobby/Opponent/Member"..tostring(i)).UITransformComponent
+                label.RectSize=Vector2(264,42) label.anchoredPosition=Vector2(0,height/2-55-(i-1)*60)
+                self:UI("Lobby/Opponent/HP"..tostring(i)).UITransformComponent.anchoredPosition=Vector2(0,height/2-82-(i-1)*60)
+            end
+            local countY=height/2-104-(members-1)*60
+            self:UI("Lobby/Opponent/Count").UITransformComponent.anchoredPosition=Vector2(0,countY)
+            parent.UITransformComponent.anchoredPosition=Vector2(0,countY-78)
+            if Environment:IsMakerPlay() then log("[VRF][CarnivalOpponent] compact members="..tostring(members).." height="..tostring(height)) end
+        end
         self._T.enemyActors=self._T.enemyActors or {} self._T.enemyMobs=self._T.enemyMobs or {}
         local now=_UtilLogic.ElapsedSeconds local scale=262/18
         local focus=(scene.actors or {})[1]
@@ -919,7 +965,7 @@ script CarnivalView extends Logic
                 node.UITransformComponent.UIScale=Vector3(scale/100,scale/100,1)
             end
             local node=record.node local renderer=node.SpriteGUIRendererComponent
-            local profile=_CarnivalCatalog:FieldProfile(_MonsterCodexCatalog:Get(m.id))
+            local profile=_CarnivalCatalog:FieldProfile(_CarnivalTactics:Row(m.id))
             local motion=m.dead and "die" or (m.motion or "stand")
             local clip=profile~=nil and (profile[motion] or profile.stand) or m.sprite or ""
             if record.clip~=clip or record.life~=m.life then
@@ -936,7 +982,7 @@ script CarnivalView extends Logic
             renderer.Color=Color(1,1,1,alpha)
             local visible=alpha>0 if node.Enable~=visible then node.Enable=visible end
         end
-        _CarnivalUI:Text("Lobby/Opponent/Count","몬스터 "..tostring(state.enemyMonsterCount or 0).." / 150")
+        _CarnivalUI:Text("Lobby/Opponent/Count","몬스터 "..tostring(state.enemyMonsterCount or 0).." / "..tostring(_CarnivalRules.MonsterLimit))
         if not self._T.enemyVerified then self._T.enemyVerified=true log("[VRF] Carnival opponent preview actors="..tostring(#(scene.actors or {})).." monsters="..tostring(#monsters)) end
     end
 

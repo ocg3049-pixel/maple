@@ -84,7 +84,12 @@ script CarnivalManager extends Logic
         local registered=_MonsterCodex:ReadState(sv.saves[p.id] or "")
         local ids={}
         for _,row in ipairs(_MonsterCodexCatalog:All()) do if registered[row.id] and _CarnivalCatalog:Model(row)~="" then table.insert(ids,row.id) end end
+        for _,id in ipairs(_CarnivalTactics:DefaultSlots()) do
+            local found=false for _,entry in ipairs(ids) do if entry==id then found=true break end end
+            if not found then table.insert(ids,id) end
+        end
         self:ReceiveProfile(p.id,p.profile,ids,p.uid)
+        _CarnivalTactics:SendLoadout(p)
     end
 
     @ExecSpace("ServerOnly")
@@ -244,16 +249,20 @@ script CarnivalManager extends Logic
         local now=_UtilLogic.ServerElapsedSeconds
         if now<(p.nextSummon or 0) then return end
         p.nextSummon=now+0.25
-        local row=_MonsterCodexCatalog:Get(codexId)
+        local row=_CarnivalTactics:Row(codexId)
         local sv=_CharacterPersistence._T.sv[senderUserId]
-        if row==nil or sv==nil or sv.activeId~=p.id or not _MonsterCodex:ReadState(sv.saves[p.id] or "")[codexId] then return end
+        if row==nil or sv==nil or sv.activeId~=p.id or not _CarnivalTactics:CanRegister(p,codexId) then return end
+        local roster=_CarnivalTactics:Loadout(p) local assigned=false
+        for _,entry in ipairs(roster or {}) do if entry==codexId then assigned=true break end end
+        if not assigned then return end
         local cost=_CarnivalRules:Cost(row.level) local other=3-p.team
         if r.cp[p.team]<cost then self:Notice("소환 점수가 부족합니다.",senderUserId) return end
-        if r.summons[other]>=_CarnivalRules.MaxSummons then self:Notice("상대 방의 소환 한도에 도달했습니다.",senderUserId) return end
+        if not _CarnivalRules:CanSummon(p) then self:Notice("소환권 20회를 모두 사용했습니다.",senderUserId) return end
         r.cp[p.team]=r.cp[p.team]-cost r.summons[other]=r.summons[other]+1
         if _CarnivalBattle:AddSpawn(r.rooms[other],row)==nil then
             r.cp[p.team]=r.cp[p.team]+cost r.summons[other]=r.summons[other]-1 return
         end
+        p.summonsUsed=(p.summonsUsed or 0)+1
         self:CheckOutcome(r)
         self:Broadcast(r)
         log("[VRF] Carnival window summon opponent="..tostring(other).." cost="..tostring(cost))
@@ -455,7 +464,15 @@ script CarnivalManager extends Logic
         end
         if alive[1]==0 and alive[2]==0 then self:Abort(r,"양 팀이 모두 전멸하여 무승부입니다. 승점은 변하지 않습니다.")
         elseif alive[1]==0 then self:Finish(r,2)
-        elseif alive[2]==0 then self:Finish(r,1) end
+        elseif alive[2]==0 then self:Finish(r,1)
+        else
+            local winner=_CarnivalRules:TimeWinner(_UtilLogic.ServerElapsedSeconds-r.at,r.earned or r.cp)
+            if winner==0 then self:Abort(r,"10분 종료 · 획득 CP가 같아 무승부입니다. 승점은 변하지 않습니다.")
+            elseif winner>0 then
+                log("[VRF][CarnivalTime] winner="..tostring(winner).." earned="..tostring((r.earned or r.cp)[1])..":"..tostring((r.earned or r.cp)[2]))
+                self:Finish(r,winner)
+            end
+        end
     end
 
     @ExecSpace("ServerOnly")
@@ -496,7 +513,7 @@ script CarnivalManager extends Logic
         local snapshots={_CarnivalBattle:Snapshot(r,1),_CarnivalBattle:Snapshot(r,2)}
         for uid,p in pairs(r.members) do
             if not p.returned and isvalid(_UserService:GetUserEntityByUserId(uid)) then
-                self:MatchState({id=r.id,state="active",team=p.team,layout=r.layout,mode=r.mode,cp=r.cp[p.team],enemyCP=r.cp[3-p.team],alive=alive[p.team],enemyAlive=alive[3-p.team],summons=r.summons[p.team],enemySummons=r.summons[3-p.team],dead=p.dead,monsterCount=_CarnivalBattle:LivingCount(r.rooms[p.team]),monsterLimit=_CarnivalRules.MonsterLimit,upgrades=p.actor.upgrades or {},scene=snapshots[p.team],opponent=snapshots[3-p.team],enemyMonsterCount=_CarnivalBattle:LivingCount(r.rooms[3-p.team])},uid)
+                self:MatchState({id=r.id,state="active",team=p.team,layout=r.layout,mode=r.mode,cp=r.cp[p.team],enemyCP=r.cp[3-p.team],earned=(r.earned or {})[p.team] or r.cp[p.team],enemyEarned=(r.earned or {})[3-p.team] or r.cp[3-p.team],tacticCooldowns=p.tacticCooldowns or {},recoverySlowUntil=p.actor.recoverySlowUntil or 0,stunUntil=p.actor.stunUntil or 0,alive=alive[p.team],enemyAlive=alive[3-p.team],summons=r.summons[p.team],enemySummons=r.summons[3-p.team],dead=p.dead,summonsUsed=p.summonsUsed or 0,summonLimit=_CarnivalRules.MaxSummons,endsAt=r.at+_CarnivalRules.MatchSeconds,monsterCount=_CarnivalBattle:LivingCount(r.rooms[p.team]),monsterLimit=_CarnivalRules.MonsterLimit,upgrades=p.actor.upgrades or {},scene=snapshots[p.team],opponent=snapshots[3-p.team],enemyMonsterCount=_CarnivalBattle:LivingCount(r.rooms[3-p.team])},uid)
             end
         end
     end
@@ -535,7 +552,7 @@ script CarnivalManager extends Logic
                     end
                 end
             else a.manualUntil=now+0.3 end
-            if autoAllowed and d~=nil and now>=(a.skillCooldowns[d.name] or 0) and (d.lock==0 or now>=(a.skillLock or 0)) and (not d.airBlock or a.ground) then
+            if autoAllowed and now>=(a.stunUntil or 0) and d~=nil and now>=(a.skillCooldowns[d.name] or 0) and (d.lock==0 or now>=(a.skillLock or 0)) and (not d.airBlock or a.ground) then
                 _CarnivalPhysics:Ensure(a,p.player,r.rooms[p.team].platforms)
                 accepted=_CarnivalSkills:Apply(a,r.rooms[p.team],d,dx<0 and -1 or 1,dy==0 and 0 or (dy<0 and -1 or 1),now)
                 if accepted then a.skillCooldowns[d.name]=now+d.cooldown end
@@ -568,11 +585,13 @@ script CarnivalManager extends Logic
         if r.cp[p.team]<cost then self:Notice("소환 점수가 부족합니다.",senderUserId) return end
         r.cp[p.team]=r.cp[p.team]-cost
         if kind=="heal" then
-            a.hp=math.min(a.maxHp,a.hp+math.ceil(a.maxHp*0.3*(1+0.1*(a.upgrades.recovery or 0))))
+            a.hp=math.min(a.maxHp,a.hp+math.ceil(a.maxHp*0.3*(1+0.1*(a.upgrades.recovery or 0))*_CarnivalRules:TuningOptions().healing))
             if a.physics~=nil and isvalid(a.physics.body) then a.physics.body.PlayerComponent.Hp=math.floor(a.hp) end
         elseif kind=="clear" then _CarnivalBattle:ClearRoom(r.rooms[p.team])
         else a.upgrades[kind]=(a.upgrades[kind] or 0)+1 end
         self:Broadcast(r)
+        local names={recovery="HP 회복량 강화",power="전투력 강화",heal="HP 즉시 회복",clear="몬스터 제거"}
+        _CarnivalFeedback:Announce(r,p,names[kind],false)
         log("[VRF] Carnival upgrade kind="..kind.." cost="..tostring(cost).." remaining="..tostring(r.cp[p.team]))
     end
 

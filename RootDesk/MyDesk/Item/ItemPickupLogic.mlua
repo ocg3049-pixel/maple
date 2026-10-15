@@ -20,10 +20,71 @@ script ItemPickupLogic extends Logic
             if Environment:IsMakerPlay() then log("[ItemPickup] 아이템 자동 습득: " .. itemName) end
             local added = _UIEquipInventoryManager:AddItemToInventory(itemName, itemRUID, "hunt:"..itemType)
             if added then
+                self:ShowDropNotice(itemName,itemRUID,itemType)
                 if itemRUID == "47841bc4d3554cf0a68bd05f19de1f18" and string.sub(itemType or "",1,9)~="cosmetic:" then itemName = "드롭 아이템" end
                 _AcquisitionLog:Push(itemName .. " +1", false)
             end
         end
+    end
+
+    method boolean ShouldAnnounce(string name, string ruid, string itemType)
+        -- Cosmetic boxes share an old normal-box icon, so identity includes their type.
+        if itemType=="meso" then return false end
+        if string.sub(itemType or "",1,9)=="cosmetic:" then return true end
+        return name~="장비 상자" and name~="드롭 아이템" and ruid~="47841bc4d3554cf0a68bd05f19de1f18" and ruid~="90d3412612004466b328850446cb1d68"
+    end
+
+    @ExecSpace("Client")
+    method void ShowDropNotice(string name, string ruid, string itemType)
+        -- Only successful pickup paths call this; exclude meso and ordinary equipment boxes.
+        if not self:ShouldAnnounce(name,ruid,itemType) then return end
+        local gear=_FieldEquipmentDrops:ItemFromDescriptor(itemType)
+        if gear~="" then name=name.." ("..tostring(_UIEquipInventoryManager:ParseStars(gear)).."성)" end
+        self._T.noticeQueue=self._T.noticeQueue or {}
+        table.insert(self._T.noticeQueue,name.." 아이템을 획득하셨습니다.")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- A short queue preserves each pickup during bursts, with at most four visible messages.
+        local now=_UtilLogic.ElapsedSeconds
+        self._T.notices=self._T.notices or {}
+        for i=#self._T.notices,1,-1 do
+            local rec=self._T.notices[i] local age=now-rec.at
+            if age>=2.8 or not isvalid(rec.node) or not _LoginFlow:IsInGame() then
+                if isvalid(rec.node) then rec.node:Destroy() end
+                table.remove(self._T.notices,i)
+                if Environment:IsMakerPlay() then log("[VRF][DropNotice] expired") end
+            else
+                rec.node.UITransformComponent.anchoredPosition=Vector2(0,rec.y+age*30)
+                rec.node.CanvasGroupComponent.GroupAlpha=math.max(0,1-age/2.8)
+            end
+        end
+        if not _LoginFlow:IsInGame() then self._T.noticeQueue={} return end
+        if #(self._T.noticeQueue or {})==0 or #self._T.notices>=4 or now<(self._T.nextNotice or 0) then return end
+        local template=_EntityService:GetEntityByPath("/ui/CarnivalFeedbackUI/MessageTemplate")
+        if not isvalid(template) then return end
+        local node=_SpawnService:SpawnByEntity(template,"ItemPickupNotice",Vector3.zero,template.Parent,false)
+        if not isvalid(node) then return end
+        for _,rec in ipairs(self._T.notices) do rec.y=rec.y+38 end
+        local tr=node.UITransformComponent
+        tr.AlignmentOption=AlignmentType.Center tr.AnchorsMin=Vector2(.5,.5) tr.AnchorsMax=Vector2(.5,.5) tr.Pivot=Vector2(.5,.5)
+        tr.anchoredPosition=Vector2.zero
+        node.TextGUIRendererComponent.Text=table.remove(self._T.noticeQueue,1)
+        node.TextGUIRendererComponent.FontColor=Color(1,0.82,0.32,1)
+        node.SpriteGUIRendererComponent.Enable=false
+        node.CanvasGroupComponent.GroupAlpha=1 node.CanvasGroupComponent.BlocksRaycasts=false
+        node.Enable=true
+        table.insert(self._T.notices,{node=node,at=now,y=0})
+        self._T.nextNotice=now+.25
+        if Environment:IsMakerPlay() then log("[VRF][DropNotice] created gold center text: "..node.TextGUIRendererComponent.Text) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Clear all clones and queued messages when the session ends.
+        for _,rec in ipairs(self._T.notices or {}) do if isvalid(rec.node) then rec.node:Destroy() end end
+        self._T.notices={} self._T.noticeQueue={}
     end
 
 end

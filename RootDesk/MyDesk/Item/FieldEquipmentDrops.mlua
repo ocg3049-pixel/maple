@@ -1,0 +1,130 @@
+@Logic
+script FieldEquipmentDrops extends Logic
+    method number BaseChance()
+        -- One independent equipment roll per field monster kill.
+        return 0.0001
+    end
+
+    method table Bands()
+        -- Non-overlapping integer level ranges; each bracket rolls uniformly within its star range.
+        return {
+            {max=10,label="0~10",groups={{70,0,0},{20,1,1},{10,2,2}}},
+            {max=20,label="11~20",groups={{70,0,1},{20,2,2},{10,3,3}}},
+            {max=40,label="21~40",groups={{70,0,3},{20,4,5},{10,6,6}}},
+            {max=60,label="41~60",groups={{70,2,4},{20,5,6},{10,7,8}}},
+            {max=80,label="61~80",groups={{70,4,7},{20,7,12},{10,12,15}}},
+            {max=120,label="81~120",groups={{65,4,7},{20,7,12},{10,12,15},{5,15,20}}},
+            {max=159,label="121~159",groups={{60,4,7},{20,7,12},{10,12,15},{10,15,22}}},
+            {max=2147483647,label="160 이상",groups={{50,10,15},{30,15,20},{20,20,25}}}
+        }
+    end
+
+    method table Band(integer level)
+        -- Clamp negative levels into the first band.
+        for _,band in ipairs(self:Bands()) do if level<=band.max then return band end end
+        return self:Bands()[8]
+    end
+
+    method integer RollStars(integer level, number bracketRoll, number starRoll)
+        -- Independent rolls avoid biasing individual stars within a selected bracket.
+        local groups=self:Band(level).groups
+        local cutoff=0 local selected=groups[#groups]
+        for _,g in ipairs(groups) do
+            cutoff=cutoff+g[1]
+            if bracketRoll*100<cutoff then selected=g break end
+        end
+        local offset=math.min(selected[3]-selected[2],math.max(0,math.floor(starRoll*(selected[3]-selected[2]+1))))
+        return selected[2]+offset
+    end
+
+    method table Slots()
+        -- The same six equipment categories offered by a normal equipment box.
+        return {7,3,8,9,5,6}
+    end
+
+    method table Weapons()
+        -- Shared by box opening and server-side field drops.
+		return {
+			[1]  = {name = "목검",        ruid = "43ad7bfeb9184252b24e6d60f76c17e5"},  -- 히어로
+			[2]  = {name = "카알대검",      ruid = "444f1da6365d4599a27bbfd207585856"},  -- 팔라딘 (요청으로 나무망치 → 카알대검 교체)
+			[3]  = {name = "창",          ruid = "dcaddf14378045cdbc6f512fa1a29d39"},  -- 다크나이트
+			[4]  = {name = "우드완드",      ruid = "061712eadf7d4357a6c306dfd5368860"},  -- 비숍
+			[5]  = {name = "나무 스태프",   ruid = "7380b5e5754a4e338e65fa232a8a095b"},  -- 아크메이지(썬,콜)
+			[6]  = {name = "나무 스태프",   ruid = "7380b5e5754a4e338e65fa232a8a095b"},  -- 아크메이지(불,독)
+			[7]  = {name = "석궁",        ruid = "8601845b98014cec9b336041be103015"},  -- 신궁
+			[8]  = {name = "합금활",       ruid = "33f389c9f73e45dc9c55a251b3cc2646"},  -- 보우마스터
+			[9]  = {name = "가니어",       ruid = "985e44451afc4730a46eb206716e7ecf"},  -- 나이트로드
+			[10] = {name = "후르츠 대거",   ruid = "1489702f013a4ba4a1ec080da4df17c3"},  -- 섀도어
+		}
+    end
+
+    method string BaseItem(integer slot, integer job)
+        -- Preserve the original box equipment's upgrade slots and base appearance.
+        local items={
+            [7]="연두색 머리띠|274b50c184c047d8abf1b520c958ce98|7|0|0|7",
+            [8]="엔틱 벨벳 망토|aa8d1e49ff93486986fbb0f9b16d9565|8|0|0|0",
+            [3]="흰색 반팔티|ae8d3590a96e48c3b7cd75d46ebd3f15|3|0|0|0",
+            [9]="노가다 목장갑|2e58683f2f094f099a0813c36e278dd5|9|0|0|0",
+            [5]="가죽 샌들|202544d7095c42c5bfb3046619ab58cc|5|0|0|0"}
+        if slot==6 then
+            local weapon=self:Weapons()[job] or self:Weapons()[1]
+            return weapon.name.."|"..weapon.ruid.."|6|0|0|7"
+        end
+        return items[slot] or ""
+    end
+
+    method string ItemFromDescriptor(string descriptor)
+        -- Stars and category are fixed at monster death, never rerolled at pickup.
+        local slot,stars,job=string.match(descriptor or "","^equipment_drop:(%d+):(%d+):(%d+)$")
+        slot,stars,job=tonumber(slot),tonumber(stars),tonumber(job)
+        if slot==nil or stars==nil or stars>25 or job==nil or job<1 or job>10 then return "" end
+        local base=self:BaseItem(slot,job)
+        if base=="" then return "" end
+        local fields={} for field in string.gmatch(base,"[^|]+") do table.insert(fields,field) end
+        fields[4]=tostring(stars)
+        return table.concat(fields,"|")
+    end
+
+    @ExecSpace("ServerOnly")
+    method Entity Spawn(Entity map, Vector3 position, Entity killer, integer level)
+        -- Use the normal world drop motion and pickup transport with a server-rolled descriptor.
+        if not isvalid(map) then return nil end
+        local job=1
+        if isvalid(killer) then
+            local pa=killer:GetComponent("script.PlayerAttack")
+            if isvalid(pa) then job=math.max(1,math.min(10,pa._T.archerJobIdx or 1)) end
+        end
+        local slot=self:Slots()[_UtilLogic:RandomIntegerRange(1,6)]
+        local stars=self:RollStars(level,_UtilLogic:RandomDouble(),_UtilLogic:RandomDouble())
+        local descriptor="equipment_drop:"..tostring(slot)..":"..tostring(stars)..":"..tostring(job)
+        local item=self:ItemFromDescriptor(descriptor)
+        local name,ruid=string.match(item,"^([^|]+)|([^|]+)")
+        local entity=_SpawnService:SpawnByModelId("droppedshell","FieldEquipment",position,map)
+        if not isvalid(entity) then return nil end
+        local drop=entity:GetComponent("script.DroppedItemComponent")
+        drop.ItemName=name drop.ItemRUID=ruid drop.ItemType=descriptor
+        if isvalid(killer) and isvalid(killer.PlayerComponent) then drop.KillerUserId=killer.PlayerComponent.UserId end
+        entity.SpriteRendererComponent.SpriteRUID="thumbnail://"..ruid
+        entity.SpriteRendererComponent.DrawMode=SpriteDrawMode.Sliced
+        entity.SpriteRendererComponent.TiledSize=Vector2(.36,.36)
+        if Environment:IsMakerPlay() then log("[VRF][EquipmentDrop] spawned level="..tostring(level).." slot="..tostring(slot).." stars="..tostring(stars)) end
+        return entity
+    end
+
+    method table GuideLines()
+        -- Information UI uses the same bracket data as the actual server rolls.
+        local lines={"스타포스 장비 직접 드롭 · 기본 "..string.format("%.2f%%",100*self:BaseChance()), "모자·상의·망토·장갑·신발·무기 중 1종 (각 1/6)",
+            "장비 상자와 별도 추첨 / 드롭률·레벨 차이 보정 적용", "무기는 처치자 직업 기준 / 별 수는 몬스터 레벨 기준",
+            "아래 확률은 장비 드롭에 성공한 뒤의 조건부 확률", "범위 안 별 수는 균등 추첨, 겹치는 별 수는 확률 합산"}
+        for _,band in ipairs(self:Bands()) do
+            table.insert(lines,"몬스터 Lv."..band.label)
+            local parts={}
+            for _,g in ipairs(band.groups) do
+                local range=g[2]==g[3] and tostring(g[2]) or tostring(g[2]).."~"..tostring(g[3])
+                table.insert(parts,range.."성 "..tostring(g[1]).."%")
+            end
+            table.insert(lines,table.concat(parts," / "))
+        end
+        return lines
+    end
+end

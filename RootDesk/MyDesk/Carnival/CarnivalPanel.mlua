@@ -1,0 +1,229 @@
+@Logic
+script CarnivalPanel extends Logic
+    property integer tab = 1
+    property boolean collapsed = false
+
+    @ExecSpace("ClientOnly")
+    method Entity UI(string path)
+        -- The compact controls are a sibling of the battle viewport and cannot close it.
+        return _CarnivalUI:UI(path=="" and "CommandPanel" or "CommandPanel/"..path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Visible()
+        -- During a match the panel stays available even when the battle viewport is minimized.
+        return _LoginFlow:IsInGame() and not _CarnivalUI._T.closed and (_CarnivalUI.opened or _CarnivalUI.state.state=="active")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Reuse normal UI audio and keep every subscription paired with OnEndPlay.
+        self.tab=1 self.collapsed=false self._T.links={} self._T.buttons={}
+        local function bind(path,action)
+            local entity=self:UI(path)
+            if not isvalid(entity) then log_error("[CarnivalPanel] missing "..path) return end
+            table.insert(self._T.buttons,{entity=entity,action=action,path=path})
+            local h=entity:ConnectEvent(ButtonClickEvent,function()
+                if _UIClickArbiter:AcceptClickAt("/ui/CarnivalUI/CommandPanel",_InputService:GetCursorPosition()) then self:Click(path,action) end
+            end)
+            table.insert(self._T.links,{entity=entity,event=ButtonClickEvent,h=h})
+        end
+        bind("Header/Collapse",function() self:ToggleCollapse() end)
+        for i=1,3 do local index=i bind("Body/Tab"..tostring(i),function() self:SelectTab(index) end) end
+        for i=1,10 do local index=i bind("Body/Row"..tostring(i),function() self:Activate(index) end) end
+        bind("Body/Settings",function()
+            self.tab=1 _CarnivalUI._T.editSummons=not _CarnivalUI._T.editSummons
+            self:Draw()
+        end)
+        local function input(event,callback)
+            local h=_InputService:ConnectEvent(event,callback)
+            table.insert(self._T.links,{entity=_InputService,event=event,h=h})
+        end
+        input(KeyDownEvent,function(e) self:HandleKey(e.key) end)
+        input(ScreenTouchEvent,function(e) self:TouchDown(e.TouchPoint,e.TouchId) end)
+        input(ScreenTouchHoldEvent,function(e) self:TouchMove(e.TouchPoint,e.TouchId) end)
+        input(ScreenTouchReleaseEvent,function(e) if self._T.drag~=nil and self._T.drag.id==e.TouchId then self._T.drag=nil end end)
+        local blur=_ApplicationService:ConnectEvent(ApplicationFocusOutEvent,function() self._T.drag=nil end)
+        table.insert(self._T.links,{entity=_ApplicationService,event=ApplicationFocusOutEvent,h=blur})
+        self:UI("").Enable=false
+        log("[VRF][CARNIVAL] panel boot tabs=3 slots=10 close=false")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Click(string path, any action)
+        -- Screen input and the native button event can describe the same click.
+        local now=_UtilLogic.ElapsedSeconds
+        if self._T.lastClick==path and now<(self._T.clickAt or 0)+0.15 then return end
+        self._T.lastClick=path self._T.clickAt=now
+        _UIAudio:Play("Tab") action()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectTab(integer index)
+        -- Switching restores the body if the panel was collapsed.
+        self.tab=math.max(1,math.min(3,index)) self.collapsed=false
+        _CarnivalUI._T.editSummons=false self:Draw() self:ClampPosition()
+        log("[VRF][CARNIVAL] panel tab="..tostring(self.tab))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ToggleCollapse()
+        -- Keep title, CP totals and both monster counts visible in the compact state.
+        self.collapsed=not self.collapsed self:Draw() self:ClampPosition()
+        log("[VRF][CARNIVAL] panel collapsed="..tostring(self.collapsed))
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean HandlesKey(any key)
+        -- Reserve panel shortcuts only while carnival controls are visible and no text input owns them.
+        if not self:Visible() or _MapleHUDManager:IsChatTyping() or _KeySettingManager:IsWindowOpen() or _KeySettingManager._T.dialogOpen==true or (_KeySettingManager._T.remapPos~=nil and _KeySettingManager._T.remapPos~="") or _KeySettingManager:BlocksCloseConfirmation() or _SkillManager:BlocksAmountInput() or _GameSystemMenu:BlocksInput() or _MapleIslandTutorial:IsTyping() then return false end
+        if _CarnivalUI:UI("Summons").Enable or _CarnivalUI:UI("ConfirmLeave").Enable then return false end
+        if key==KeyboardKey.Tab then return true end
+        for i=1,10 do if key==KeyboardKey["F"..tostring(i)] then return true end end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void HandleKey(any key)
+        -- Tab cycles all three tabs; F1–F10 activate the corresponding visible row.
+        if not self:HandlesKey(key) then return end
+        if key==KeyboardKey.Tab then self:SelectTab(self.tab%3+1) return end
+        for i=1,10 do if key==KeyboardKey["F"..tostring(i)] then self:Activate(i) return end end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Activate(integer index)
+        -- Buttons and keyboard shortcuts share exactly the same action routing.
+        if self.tab==1 then _CarnivalUI:SelectSummonSlot(index,false)
+        elseif self.tab==2 then
+            local skill=_CarnivalTactics:Skills()[index]
+            if skill~=nil then _CarnivalTactics:RequestCast(_CarnivalUI.state.id or "",skill.id) end
+        else
+            local kinds={"recovery","power","heal","clear"}
+            if kinds[index]~=nil then _CarnivalManager:RequestUpgrade(_CarnivalUI.state.id or "",kinds[index]) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TouchDown(Vector2 point, integer touchId)
+        -- A title drag works with mouse and touch, including Maker's screen input simulator.
+        if not self:Visible() or not _UIClickArbiter:IsTopmostAt("/ui/CarnivalUI/CommandPanel",point) then return end
+        for _,button in ipairs(self._T.buttons or {}) do
+            if _UIClickArbiter:ContainsScreenPoint(button.entity,point) then
+                self:Click(button.path,button.action)
+                return
+            end
+        end
+        if _UIClickArbiter:ContainsScreenPoint(self:UI("Header"),point) then
+            local panel=self:UI("")
+            self._T.drag={id=touchId,start=_UILogic:ScreenToLocalUIPosition(point,panel.Parent.UITransformComponent),position=panel.UITransformComponent.anchoredPosition}
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void TouchMove(Vector2 point, integer touchId)
+        -- Convert screen deltas into parent UI units so dragging respects UI scaling.
+        local drag=self._T.drag if drag==nil or drag.id~=touchId then return end
+        local panel=self:UI("")
+        local current=_UILogic:ScreenToLocalUIPosition(point,panel.Parent.UITransformComponent)
+        panel.UITransformComponent.anchoredPosition=drag.position+current-drag.start
+        self:ClampPosition()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClampPosition()
+        -- Keep the entire panel and its restore button inside the current reference canvas.
+        local panel=self:UI("") local tr=panel.UITransformComponent
+        local canvas=panel.Parent.UITransformComponent.RectSize
+        local p=tr.anchoredPosition local size=tr.RectSize
+        tr.anchoredPosition=Vector2(math.max(-canvas.x/2+8,math.min(canvas.x/2-size.x-8,p.x)),math.max(-canvas.y/2+size.y+8,math.min(canvas.y/2-8,p.y)))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Label(string path, string text)
+        -- Avoid dirtying text meshes when repeated snapshots have identical values.
+        _CarnivalUI:Text("CommandPanel/"..path,text)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- The palette and three-column list follow the classic monster carnival window.
+        local panel=self:UI("") if not isvalid(panel) then return end
+        panel.Enable=self:Visible() if not panel.Enable then return end
+        local state=_CarnivalUI.state local now=_UtilLogic.ServerElapsedSeconds
+        panel.UITransformComponent.RectSize=Vector2(380,self.collapsed and 184 or 666)
+        self:UI("Inset").UITransformComponent.RectSize=Vector2(374,self.collapsed and 178 or 660)
+        self:UI("Body").Enable=not self.collapsed
+        self:Label("Header/Collapse",self.collapsed and "+" or "−")
+        self:Label("CP/Personal","소환권 : "..tostring(state.summonsUsed or 0).." / "..tostring(_CarnivalRules.MaxSummons).."  ·  "..(state.state=="active" and _CarnivalRules:ClockText(state.endsAt or now) or "10:00"))
+        self:Label("CP/Our","아군 CP : "..tostring(state.cp or 0).." / "..tostring(state.earned or 0))
+        self:Label("CP/Enemy","상대 CP : "..tostring(state.enemyCP or 0).." / "..tostring(state.enemyEarned or 0))
+        self:Label("CP/Count","몬스터  아군 "..tostring(state.monsterCount or 0).."/100  ·  상대 "..tostring(state.enemyMonsterCount or 0).."/100")
+        if self.collapsed then return end
+        for i=1,3 do
+            local button=self:UI("Body/Tab"..tostring(i))
+            _UITheme:Button(button,i==self.tab and Color(.88,.29,.40,1) or Color(.63,.69,.74,1))
+        end
+        self:Label("Body/Settings",_CarnivalUI._T.editSummons and "등록 완료" or "소환물 설정")
+        self:UI("Body/Settings").Enable=self.tab==1
+        self:Label("Body/Hint",self.tab==1 and (_CarnivalUI._T.editSummons and "바꿀 칸을 누르세요 · 다음 판에도 유지" or "Tab 탭 전환 · F1~F10 소환") or "Tab 탭 전환 · F키 또는 클릭으로 사용")
+        local status={}
+        if (state.recoverySlowUntil or 0)>now then table.insert(status,"회복 방해 "..tostring(math.ceil(state.recoverySlowUntil-now)).."초") end
+        if (state.stunUntil or 0)>now then table.insert(status,"스턴 "..tostring(math.ceil(state.stunUntil-now)).."초") end
+        self:Label("Body/Status",table.concat(status," · "))
+        local skills=_CarnivalTactics:Skills() local upgrades=state.upgrades or {}
+        local statNames={"HP 회복량 +10%","전투력 +5%","HP 즉시 회복","내 진영 몬스터 제거"}
+        local kinds={"recovery","power","heal","clear"}
+        for i=1,10 do
+            local path="Body/Row"..tostring(i) local row=self:UI(path)
+            local name="" local detail="" local cost="" local enabled=true
+            if self.tab==1 then
+                local id=(_CarnivalUI._T.summonSlots or _CarnivalTactics:DefaultSlots())[i]
+                local monster=id~=nil and _CarnivalTactics:Row(id) or nil
+                name=monster~=nil and monster.name or "등록하기"
+                cost=monster~=nil and tostring(_CarnivalRules:Cost(monster.level)) or "-"
+            elseif self.tab==2 then
+                local skill=skills[i] enabled=skill~=nil
+                if enabled then
+                    name=skill.name detail=skill.desc cost=tostring(skill.cost)
+                    local remaining=math.max(0,((state.tacticCooldowns or {})[skill.id] or 0)-now)
+                    if remaining>0 then detail="재사용 "..tostring(math.ceil(remaining)).."초 · "..skill.desc end
+                end
+            else
+                enabled=kinds[i]~=nil
+                if enabled then
+                    name=statNames[i] cost=tostring(_CarnivalRules:UpgradeCost(kinds[i],upgrades))
+                    if i==1 then detail="현재 +"..tostring((upgrades.recovery or 0)*10).."% · 이번 경기 적용"
+                    elseif i==2 then detail="현재 +"..tostring((upgrades.power or 0)*5).."% · 이번 경기 적용"
+                    elseif i==3 then detail="최대 HP의 "..tostring(30*_CarnivalRules:TuningOptions().healing).."% 회복"
+                    else detail="현재 살아 있는 아군 진영 몬스터 제거" end
+                end
+            end
+            row.Enable=enabled
+            if enabled then
+                local tall=self.tab~=1
+                row.UITransformComponent.RectSize=Vector2(354,tall and 80 or 34)
+                row.UITransformComponent.anchoredPosition=Vector2(13,-80-(i-1)*(tall and 84 or 34))
+                self:UI(path.."/Name").UITransformComponent.anchoredPosition=Vector2(10,tall and -8 or -3)
+                self:UI(path.."/Detail").Enable=tall
+                self:Label(path.."/Name",name) self:Label(path.."/Detail",detail)
+                self:Label(path.."/Cost",cost) self:Label(path.."/Key","F"..tostring(i))
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- A modest refresh rate is enough for countdown labels; drag uses input events.
+        if _UtilLogic.ElapsedSeconds<(self._T.nextDraw or 0) then return end
+        self._T.nextDraw=_UtilLogic.ElapsedSeconds+0.1 self:Draw()
+        if not self:Visible() then self._T.drag=nil end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Do not retain input handlers across play sessions.
+        for _,link in ipairs(self._T.links or {}) do link.entity:DisconnectEvent(link.event,link.h) end
+        self._T.links={} self._T.buttons={} self._T.drag=nil
+    end
+end

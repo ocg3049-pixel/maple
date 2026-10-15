@@ -1,0 +1,192 @@
+@Logic
+script CarnivalLoot extends Logic
+    method table Items()
+        -- Carnival consumables apply their stated percentage without skill-healing penalties.
+        if self._T.items~=nil then return self._T.items end
+        self._T.items={
+            {name="파워엘릭서",ruid="2be16f5135ae4fb2bd07b7b13c63f26e",hp=1,mp=1},
+            {name="엘릭서",ruid="1a0816991d0b4274ad2ab5e0abfafbb4",hp=0.5,mp=0.5},
+            {name="마나엘릭서",ruid="821fe9d81c25444b95c517254016e557",hp=0,mp=0.3}
+        }
+        return self._T.items
+    end
+
+    method integer RollKind(integer roll)
+        -- One uniform roll: 1/1000, 1/1000 and 10/1000, with no overlapping awards.
+        if roll==1 then return 1 end
+        if roll==2 then return 2 end
+        if roll>=3 and roll<=12 then return 3 end
+        return 0
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Roll(table match, integer team, table monster)
+        -- Only the authoritative non-training death path rolls once per monster life.
+        if match.training or match.state~="active" then return end
+        local kind=self:RollKind(_UtilLogic:RandomIntegerRange(1,1000))
+        if kind>0 then self:Drop(match,team,monster.x,monster.y,kind) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Drop(table match, integer team, number x, number y, integer kind)
+        -- Match-owned data needs no world entity and can never enter the field inventory.
+        if match.state~="active" or self:Items()[kind]==nil then return end
+        local room=match.rooms[team] if room==nil then return end
+        room.drops=room.drops or {} match.dropSerial=(match.dropSerial or 0)+1
+        local floorY=(room.platforms.floorY or 0)+0.15 local startY=math.max(floorY,y+0.15)
+        local landAfter=(7.8+math.sqrt(7.8*7.8+40*(startY-floorY)))/20
+        table.insert(room.drops,{id=match.dropSerial,kind=kind,x=x,y=startY,startX=x,startY=startY,floorY=floorY,landAfter=landAfter,vx=(_UtilLogic:RandomDouble()*2-1)*2.2,bornAt=_UtilLogic.ServerElapsedSeconds,phase=0,alpha=1})
+        if Environment:IsMakerPlay() then log("[VRF][CarnivalLoot] drop id="..tostring(match.dropSerial).." kind="..tostring(kind).." team="..tostring(team)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Collect(table match, integer team, table drop)
+        -- One pickup restores every surviving teammate, regardless of distance.
+        if match.state~="active" or drop.claimed then return end
+        local item=self:Items()[drop.kind] if item==nil then return end
+        drop.claimed=true
+        for _,participant in ipairs(match.teams[team] or {}) do
+            local actor=participant.actor
+            if not participant.dead and not participant.left and not participant.returned and actor~=nil and actor.hp>0 then
+                local replica=(_CarnivalReplica._T.cases or {})[participant.uid]
+                local native=replica~=nil and replica.match==match and replica.actor or nil
+                local before=isvalid(native) and native.PlayerComponent.Hp or actor.hp
+                if before>0 then
+                    actor.hp=math.min(actor.maxHp,before+math.floor(actor.maxHp*item.hp))
+                    if isvalid(native) then
+                        native.PlayerComponent.Hp=math.floor(actor.hp)
+                        self:ReceiveRecovery(match.id,replica.generation,drop.id,actor.hp-before,item.mp,participant.uid)
+                    end
+                    if Environment:IsMakerPlay() then log("[VRF][CarnivalLoot] recovered uid="..participant.uid.." kind="..tostring(drop.kind).." hp="..tostring(actor.hp-before).." mpRatio="..tostring(item.mp)) end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Step(table match, integer team, number delta)
+        -- Match field loot: a 7.8-up/-20-gravity pop, 0.15-second settle, then 6-unit homing.
+        local room=match.rooms[team] local now=_UtilLogic.ServerElapsedSeconds
+        local bounds=room.platforms.bounds
+        for i=#(room.drops or {}),1,-1 do
+            local drop=room.drops[i] local age=now-drop.bornAt
+            if drop.claimed or age>10 then table.remove(room.drops,i)
+            elseif drop.phase==0 then
+                local pop=math.min(age,drop.landAfter)
+                drop.x=drop.startX+drop.vx*pop
+                if bounds~=nil then drop.x=math.max(bounds.minX+0.2,math.min(bounds.maxX-0.2,drop.x)) end
+                drop.y=drop.startY+7.8*pop-10*pop*pop
+                if age>=drop.landAfter then drop.y=drop.floorY drop.phase=2 drop.settleAt=now end
+            elseif drop.phase==2 then
+                if now-drop.settleAt>=0.15 then drop.phase=1 end
+            else
+                local nearest=nil local best=math.huge
+                for _,p in ipairs(match.teams[team] or {}) do
+                    local a=p.actor
+                    if not p.dead and not p.left and not p.returned and a~=nil and a.hp>0 then
+                        local distance=(a.x-drop.x)^2+(a.y+0.5-drop.y)^2
+                        if distance<best then nearest=a best=distance end
+                    end
+                end
+                if nearest~=nil then
+                    local distance=math.sqrt(best) local step=6*delta
+                    if distance<=math.max(0.35,step) then self:Collect(match,team,drop) table.remove(room.drops,i)
+                    else
+                        drop.x=drop.x+(nearest.x-drop.x)/distance*step
+                        drop.y=drop.y+(nearest.y+0.5-drop.y)/distance*step
+                        drop.alpha=math.max(0,math.min(1,(distance-0.35)/0.85))
+                    end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveRecovery(string matchId, integer generation, integer dropId, number hpAmount, number mpRatio)
+        -- The server authorizes each pickup; MP stays in the existing private replica resource store.
+        local p=_CarnivalReplica._T.client
+        if p==nil or p.generation~=generation or _CarnivalUI.state.id~=matchId or _CarnivalUI.state.state~="active" then return end
+        p.lootReceipts=p.lootReceipts or {}
+        if p.lootReceipts[dropId] then return end
+        p.lootReceipts[dropId]=true
+        local before=_CarnivalReplica:GetCurrentMp()
+        _CarnivalReplica:RestoreMp(math.floor(_CarnivalReplica:GetMaxMp()*mpRatio))
+        local gained=_CarnivalReplica:GetCurrentMp()-before
+        if hpAmount>0 then self:Flash("hp") end
+        if gained>0 then self:Flash("mp") end
+        if Environment:IsMakerPlay() then log("[VRF][CarnivalLoot] receipt id="..tostring(dropId).." hp="..tostring(hpAmount).." mp="..tostring(gained)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Flash(string resource)
+        -- Pulse the carnival gauge twice using the same timings as the field recovery gauge.
+        local bar=_CarnivalUI:UI("Lobby/PlayerHUD/"..(resource=="hp" and "HpBar" or "MpBar"))
+        if not isvalid(bar) then return end
+        self._T.flashes=self._T.flashes or {}
+        local group=bar.CanvasGroupComponent
+        if not isvalid(group) then group=bar:AddComponent("CanvasGroupComponent") end
+        local old=self._T.flashes[resource]
+        local alpha=old~=nil and old.alpha or group.GroupAlpha
+        self._T.flashes[resource]={group=group,alpha=alpha,at=_UtilLogic.ElapsedSeconds}
+        group.GroupAlpha=alpha*0.25
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw(number delta)
+        -- Position before enabling so rare drops never flash at the middle of the viewport.
+        local state=_CarnivalUI.state
+        self._T.nodes=self._T.nodes or {}
+        local visible=_CarnivalUI.opened and not _CarnivalUI.minimized and state.state=="active"
+        local seen={} local items=self:Items() local scale=_CarnivalView._T.scale or 100
+        for _,drop in ipairs(visible and ((state.scene or {}).drops or {}) or {}) do
+            local key=tostring(state.id)..":"..tostring(drop.id) seen[key]=true
+            local record=self._T.nodes[key]
+            if record==nil then
+                local parent=_CarnivalUI:UI("Lobby/Scene/StatusEffects")
+                local node=_SpawnService:SpawnByEntity(_CarnivalUI:UI("Lobby/Scene/EffectTemplate"),"CarnivalDrop"..tostring(drop.id),Vector3.zero,parent,false)
+                node.Enable=false
+                local sprite=node.SpriteGUIRendererComponent
+                sprite.ImageRUID=DataRef(items[drop.kind].ruid) sprite.Type=ImageType.Simple
+                sprite.PreserveSprite=PreserveSpriteType.NativeSize sprite.RaycastTarget=false sprite.PlayRate=1
+                record={node=node,x=drop.x,y=drop.y} self._T.nodes[key]=record
+                if Environment:IsMakerPlay() then log("[VRF][CarnivalLoot] visual created "..key.." ruid="..items[drop.kind].ruid) end
+            end
+            local blend=math.min(1,delta*18)
+            record.x=record.x+(drop.x-record.x)*blend record.y=record.y+(drop.y-record.y)*blend
+            local point=_CarnivalView:Project(record.x,record.y)
+            record.node.UITransformComponent.anchoredPosition=point
+            record.node.UITransformComponent.UIScale=Vector3(scale/100,scale/100,1)
+            record.node.SpriteGUIRendererComponent.Color=Color(1,1,1,drop.alpha or 1)
+            record.node.Enable=true
+        end
+        for key,record in pairs(self._T.nodes) do
+            if not seen[key] then
+                if isvalid(record.node) then _EntityService:Destroy(record.node) end
+                self._T.nodes[key]=nil
+                if Environment:IsMakerPlay() then log("[VRF][CarnivalLoot] visual removed "..key) end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Expiry runs while minimized too; leave no dimmed gauge behind after a match.
+        for resource,record in pairs(self._T.flashes or {}) do
+            local step=math.floor((_UtilLogic.ElapsedSeconds-record.at)/0.18)
+            if not isvalid(record.group) or step>=3 then
+                if isvalid(record.group) then record.group.GroupAlpha=record.alpha end
+                self._T.flashes[resource]=nil
+                if Environment:IsMakerPlay() then log("[VRF][CarnivalLoot] "..resource.." blink completed twice") end
+            else record.group.GroupAlpha=record.alpha*(step==1 and 1 or 0.25) end
+        end
+        if not _CarnivalUI.opened or _CarnivalUI.minimized or _CarnivalUI.state.state~="active" then self:Draw(delta) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- All presentation objects and gauge alpha belong to this session only.
+        for _,record in pairs(self._T.nodes or {}) do if isvalid(record.node) then _EntityService:Destroy(record.node) end end
+        for _,record in pairs(self._T.flashes or {}) do if isvalid(record.group) then record.group.GroupAlpha=record.alpha end end
+        self._T.nodes={} self._T.flashes={}
+    end
+end

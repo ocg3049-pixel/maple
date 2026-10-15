@@ -1,0 +1,164 @@
+@Logic
+script CarnivalTactics extends Logic
+    method table DefaultSlots()
+        -- The reference roster uses existing world monsters; Rombot has its official resource pack.
+        return {"monster-645@30","monster-2274@35","monster-3310@32","monster-946@37","monster-3115@39","monster-1909@40","monster-3102@41","monster-2566@45","monster-2141@46","carnival-rombot"}
+    end
+
+    method table Row(string id)
+        -- Keep carnival defaults independent of field codex completion.
+        if id=="carnival-rombot" then return {id=id,name="롬바드",level=47,sprite="b41def4288404055b3b8850daa99cfbf",kinds={}} end
+        return _MonsterCodexCatalog:Get(id)
+    end
+
+    method boolean IsDefault(string id)
+        -- Default summons are available even before the player completes their codex entries.
+        for _,value in ipairs(self:DefaultSlots()) do if value==id then return true end end
+        return false
+    end
+
+    method table NormalizeSlots(table source)
+        -- Invalid old entries fall back by position; the roster always has exactly ten slots.
+        local slots=self:DefaultSlots()
+        for i=1,10 do if type(source[i])=="string" and self:Row(source[i])~=nil then slots[i]=source[i] end end
+        return slots
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Loadout(table player)
+        -- Store the roster under its own key so rating settlement cannot overwrite it.
+        self._T.loadouts=self._T.loadouts or {} self._T.loading=self._T.loading or {}
+        if self._T.loadouts[player.id]~=nil then return self._T.loadouts[player.id] end
+        if self._T.loading[player.id] then return nil end
+        self._T.loading[player.id]=true
+        local ec,raw=_CarnivalManager._T.storage:GetAndWait("loadout_"..player.id)
+        self._T.loading[player.id]=nil
+        if ec~=0 and ec~=1000002 then return nil end
+        local slots=self:DefaultSlots()
+        if raw~=nil and raw~="" then
+            local ok,data=pcall(function() return _HttpService:JSONDecode(raw) end)
+            if not ok or type(data)~="table" or type(data.slots)~="table" then return nil end
+            slots=self:NormalizeSlots(data.slots)
+        end
+        self._T.loadouts[player.id]=slots
+        return slots
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendLoadout(table player)
+        -- Send only confirmed saved data, or the default roster for a new character.
+        local slots=self:Loadout(player)
+        if slots~=nil then self:ReceiveLoadout(player.id,slots,player.uid) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean CanRegister(table player, string id)
+        -- Validate collection ownership on the server; clients cannot register arbitrary bosses.
+        if self:IsDefault(id) then return true end
+        local row=self:Row(id)
+        local sv=_CharacterPersistence._T.sv[player.uid]
+        return row~=nil and _CarnivalCatalog:Model(row)~="" and sv~=nil and sv.activeId==player.id and _MonsterCodex:ReadState(sv.saves[player.id] or "")[id]==true
+    end
+
+    @ExecSpace("Server")
+    method void RequestSlot(integer index, string id)
+        -- Serialize saves per character and acknowledge only successful storage writes.
+        if index<1 or index>10 then return end
+        local player=_CarnivalManager:Player(senderUserId)
+        if player==nil or not self:CanRegister(player,id) then return end
+        self._T.saving=self._T.saving or {}
+        if self._T.saving[player.id] then _CarnivalManager:Notice("이전 등록을 저장 중입니다.",senderUserId) return end
+        local old=self:Loadout(player) if old==nil then _CarnivalManager:Notice("소환 목록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.",senderUserId) return end
+        if old[index]==id then self:ReceiveLoadout(player.id,old,senderUserId) return end
+        local slots=self:NormalizeSlots(old) slots[index]=id
+        self._T.saving[player.id]=true
+        local ec=_CarnivalManager._T.storage:SetAndWait("loadout_"..player.id,_HttpService:JSONEncode({slots=slots}))
+        self._T.saving[player.id]=nil
+        if ec~=0 then _CarnivalManager:Notice("소환 목록 저장에 실패했습니다. 다시 시도해 주세요.",senderUserId) return end
+        self._T.loadouts[player.id]=slots
+        self:ReceiveLoadout(player.id,slots,senderUserId)
+        log("[VRF][CARNIVAL] roster saved slots=10 changed="..tostring(index))
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveLoadout(string id, table slots)
+        -- Ignore replies for a character that has since been switched out.
+        if _CarnivalUI._T.character~=id then return end
+        _CarnivalUI._T.summonSlots=self:NormalizeSlots(slots)
+        _CarnivalUI:DrawSummonSlots()
+        _CarnivalPanel:Draw()
+    end
+
+    method table Skills()
+        -- Costs, durations and cooldowns have one authoritative definition shared with the panel.
+        return {
+            {id="slowRecovery",name="회복 방해",cost=50,duration=10,cooldown=15,desc="상대 HP·MP 지속 회복 속도 50% · 10초"},
+            {id="monsterPower",name="몬스터 강화",cost=100,duration=10,cooldown=20,desc="상대 진영의 현재 몬스터 공격력 ×1.5 · 10초"},
+            {id="stun",name="스턴",cost=150,duration=3,cooldown=15,desc="상대 이동·공격·스킬 사용 불가 · 3초"}
+        }
+    end
+
+    method number RecoveryRate(table actor)
+        -- Recovery speed affects HP/MP regeneration; instant healing retains the Tuning rule.
+        return actor~=nil and (actor.recoverySlowUntil or 0)>_UtilLogic.ServerElapsedSeconds and 0.5 or 1
+    end
+
+    method number MonsterPower(table monster)
+        -- Timed non-stacking buff only on monsters alive when the skill was cast.
+        return (monster.powerUntil or 0)>_UtilLogic.ServerElapsedSeconds and 1.5 or 1
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean Cast(table match, table player, string kind)
+        -- Every effect is confined to the opponent team in this live match.
+        if match.state~="active" or player.dead or player.left or player.actor.hp<=0 then return false end
+        local def=nil for _,skill in ipairs(self:Skills()) do if skill.id==kind then def=skill break end end
+        if def==nil then return false end
+        local now=_UtilLogic.ServerElapsedSeconds
+        player.tacticCooldowns=player.tacticCooldowns or {}
+        if now<(player.tacticCooldowns[kind] or 0) or now<(player.actor.stunUntil or 0) or match.cp[player.team]<def.cost then return false end
+        local other=3-player.team
+        if kind=="monsterPower" and _CarnivalBattle:LivingCount(match.rooms[other])==0 then return false end
+        match.cp[player.team]=match.cp[player.team]-def.cost
+        player.tacticCooldowns[kind]=now+def.cooldown
+        if kind=="monsterPower" then
+            for _,monster in ipairs(match.rooms[other].monsters) do if not monster.dead then monster.powerUntil=now+def.duration end end
+        else
+            for _,target in ipairs(match.teams[other]) do
+                if not target.dead and not target.left then
+                    local actor=target.actor
+                    if kind=="slowRecovery" then actor.recoverySlowUntil=now+def.duration
+                    else
+                        actor.stunUntil=now+def.duration actor.recovery=nil actor.flightY=0
+                        actor.input={axis=0,jump=false,down=false,attack=false,crouch=false,at=now,seq=actor.input.seq}
+                        local body=actor.physics~=nil and actor.physics.body or nil
+                        if isvalid(body) then
+                            body.MovementComponent:Stop()
+                            local attack=body:GetComponent("PlayerAttack")
+                            if isvalid(attack) then attack.CarnivalStunUntil=actor.stunUntil end
+                        end
+                    end
+                end
+            end
+        end
+        _CarnivalFeedback:Announce(match,player,def.name,true)
+        log("[VRF][CARNIVAL] tactic="..kind.." team="..tostring(player.team).." target="..tostring(other).." duration="..tostring(def.duration))
+        return true
+    end
+
+    @ExecSpace("Server")
+    method void RequestCast(string id, string kind)
+        -- Authenticate the caller before any CP or opponent state mutation.
+        local match=(_CarnivalManager._T.users or {})[senderUserId]
+        local player=match~=nil and match.members[senderUserId] or nil
+        if match==nil or match.id~=id or player==nil then return end
+        if not self:Cast(match,player,kind) then _CarnivalManager:Notice("CP·재사용 대기시간·전투 상태를 확인해 주세요.",senderUserId) return end
+        _CarnivalManager:Broadcast(match)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- A new play session reloads storage instead of retaining stale character data.
+        self._T.loadouts={} self._T.loading={} self._T.saving={}
+    end
+end

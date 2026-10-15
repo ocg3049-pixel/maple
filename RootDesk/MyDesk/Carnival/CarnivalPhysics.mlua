@@ -25,7 +25,7 @@ script CarnivalPhysics extends Logic
         edges:Clear()
         for _,f in ipairs(platforms.edges or platforms) do edges:Add({Vector2(f.l,f.y),Vector2(f.r,f.y2 or f.y)}) end
         local body=_SpawnService:SpawnByModelId("11022563-a6d4-4774-8013-8880e249da44","CarnivalPhysics",Vector3(origin.x+actor.x,origin.y+actor.y+0.02,0),map)
-        actor.physics={body=body,floor=floor,map=map,origin=origin,bounds=platforms.bounds,spawn=platforms.spawn}
+        actor.physics={body=body,floor=floor,map=map,origin=origin,bounds=platforms.bounds,spawn=platforms.spawn,floorY=platforms.floorY}
         if actor.maxHp==1 then actor.maxHp=source.PlayerComponent.MaxHp actor.hp=source.PlayerComponent.Hp end
         self:CopySettings(body,source)
         log("[VRF] Carnival native physics created")
@@ -69,6 +69,13 @@ script CarnivalPhysics extends Logic
         local p=actor.physics
         if p==nil or not isvalid(p.body) then return end
         local body=p.body local rb=body.RigidbodyComponent local movement=body.MovementComponent
+        self:ConstrainFloor(actor)
+        if p.floorY~=nil then down=false end
+        local locked=(actor.nativeLocked or actor.castLocked) and not actor.forcedMotion
+        if locked then
+            self:StopAttackMovement(actor)
+            axis=0 jump=false down=false
+        else actor.attackStopped=false end
         local pos=body.TransformComponent.WorldPosition
         actor.x=pos.x-p.origin.x actor.y=pos.y-p.origin.y actor.ground=not rb.KinematicMove and rb:IsOnGround()
         if actor.ground then actor.airJumpUsed=false end
@@ -82,8 +89,18 @@ script CarnivalPhysics extends Logic
             self:Warp(actor,spawn.x,spawn.y)
         end
         if axis~=0 then actor.face=axis>0 and 1 or -1 end
-        movement:MoveToDirection(Vector2(axis,rb.KinematicMove and (actor.flightY or 0) or 0),delta)
+        if not locked then movement:MoveToDirection(Vector2(axis,rb.KinematicMove and (actor.flightY or 0) or 0),delta) end
         if down then movement:DownJump() elseif jump then movement:Jump() end
+    end
+
+    method void StopAttackMovement(table actor)
+        -- Clear grounded walking inertia once; airborne attacks retain gravity and jump momentum.
+        local p=actor.physics
+        if p==nil or not isvalid(p.body) or actor.forcedMotion then return end
+        local body=p.body local rb=body.RigidbodyComponent
+        body.MovementComponent:Stop()
+        if not actor.attackStopped and rb:IsOnGround() and not rb.KinematicMove then rb:PositionReset() end
+        actor.attackStopped=true
     end
 
     method void Warp(table actor, number x, number y)
@@ -91,8 +108,19 @@ script CarnivalPhysics extends Logic
         local p=actor.physics
         local bounds=p~=nil and p.bounds or nil
         actor.x=bounds~=nil and math.max(bounds.minX+0.15,math.min(bounds.maxX-0.15,x)) or x
-        actor.y=y
+        actor.y=p~=nil and p.floorY~=nil and math.max(p.floorY+0.02,y) or y
         if p~=nil and isvalid(p.body) then p.body.RigidbodyComponent:SetWorldPosition(Vector2(p.origin.x+actor.x,p.origin.y+actor.y)) p.body.RigidbodyComponent:PositionReset() end
+    end
+
+    method void ConstrainFloor(table actor)
+        -- The carnival has one solid bottom floor, not a lower platform to drop onto.
+        local p=actor.physics
+        if p==nil or p.floorY==nil or not isvalid(p.body) then return end
+        local position=p.body.TransformComponent.WorldPosition
+        if position.y-p.origin.y<p.floorY-0.02 then
+            self:Warp(actor,position.x-p.origin.x,p.floorY+0.02)
+            if self._T.verifyFloor then log("[VRF][CarnivalFloor] recovered at x="..tostring(actor.x).." y="..tostring(actor.y)) end
+        end
     end
     @ExecSpace("ClientOnly")
     method void Predict(table actor, Entity source, table platforms, table authority, number axis, boolean jump, boolean down, number delta)

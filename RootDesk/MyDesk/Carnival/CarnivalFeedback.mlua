@@ -1,0 +1,159 @@
+@Logic
+script CarnivalFeedback extends Logic
+    method string Message(string name, string role)
+        if role=="self" then return name.." 버프를 사용하셨습니다." end
+        return (role=="enemy" and "상대방이 " or "아군이 ")..name.." 버프를 사용했습니다."
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Announce(table match, table caster, string name, boolean affectsOpponent)
+        -- Only the server's successful purchase/cast path announces, scoped to this match.
+        for uid,participant in pairs(match.members or {}) do
+            if not participant.left and not participant.returned and (participant.team==caster.team or affectsOpponent) then
+                local role=uid==caster.uid and "self" or (participant.team==caster.team and "ally" or "enemy")
+                self:ReceiveNotice(match.id,name,role,uid)
+            end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveNotice(string matchId, string name, string role)
+        if _CarnivalUI.state.id~=matchId or _CarnivalUI.state.state~="active" then return end
+        self:ShowNotice(self:Message(name,role))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ShowNotice(string message)
+        local template=_EntityService:GetEntityByPath("/ui/CarnivalFeedbackUI/MessageTemplate")
+        if not isvalid(template) then return end
+        self._T.notices=self._T.notices or {}
+        if #self._T.notices>=4 then
+            local old=table.remove(self._T.notices,1)
+            if isvalid(old.node) then _EntityService:Destroy(old.node) end
+        end
+        for _,record in ipairs(self._T.notices) do record.y=record.y+42 end
+        self._T.serial=(self._T.serial or 0)+1
+        local node=_SpawnService:SpawnByEntity(template,"CarnivalNotice"..tostring(self._T.serial),Vector3.zero,template.Parent,false)
+        if not isvalid(node) then return end
+        node.TextGUIRendererComponent.Text=message
+        node.CanvasGroupComponent.GroupAlpha=1 node.Enable=true
+        table.insert(self._T.notices,{node=node,at=_UtilLogic.ElapsedSeconds,y=-200})
+        log("[VRF][CARNIVAL-FX] notice created "..message)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Effect(string key, Entity parent, Vector2 position, number scale, string ruid, number untilTime, string life)
+        -- One looping instance per status/target. Snapshots refresh its deadline, never its animation.
+        -- Reject malformed resource IDs instead of creating an invisible, repeatedly requested asset.
+        if #ruid~=32 then return end
+        if untilTime<=_UtilLogic.ServerElapsedSeconds or not isvalid(parent) or not parent.EnabledInHierarchy then return end
+        self._T.effects=self._T.effects or {}
+        local record=self._T.effects[key]
+        if record~=nil and (record.life~=life or not isvalid(record.node) or record.node.Parent~=parent) then self:RemoveEffect(key) record=nil end
+        if record==nil then
+            local template=_CarnivalUI:UI("Lobby/Scene/EffectTemplate")
+            if not isvalid(template) then return end
+            local node=_SpawnService:SpawnByEntity(template,"CarnivalStatus",Vector3.zero,parent,false)
+            if not isvalid(node) then return end
+            local sprite=node.SpriteGUIRendererComponent
+            sprite.Type=ImageType.Simple sprite.PreserveSprite=PreserveSpriteType.NativeSize
+            sprite.RaycastTarget=false sprite.Color=Color.white sprite.PlayRate=1
+            sprite.StartFrameIndex=0 sprite.EndFrameIndex=2147483647
+            sprite.AnimClipPlayType=SpriteAnimClipPlayType.Loop sprite.ImageRUID=DataRef(ruid)
+            record={node=node,life=life,ruid=ruid,frames={}}
+            if Environment:IsMakerPlay() then record.frameEvent=node:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,function(e) record.frames[e.FrameIndex]=true end) end
+            self._T.effects[key]=record node.Enable=true
+            log("[VRF][CARNIVAL-FX] status created key="..key.." ruid="..ruid)
+        end
+        record.untilTime=untilTime record.seen=self._T.frame
+        record.node.UITransformComponent.anchoredPosition=position
+        record.node.UITransformComponent.UIScale=Vector3(scale/100,scale/100,1)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RemoveEffect(string key)
+        local record=(self._T.effects or {})[key] if record==nil then return end
+        if isvalid(record.node) then
+            if record.frameEvent~=nil then record.node:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,record.frameEvent) end
+            _EntityService:Destroy(record.node)
+        end
+        self._T.effects[key]=nil
+        local count=0 for _,_ in pairs(record.frames) do count=count+1 end
+        log("[VRF][CARNIVAL-FX] status removed key="..key.." frames="..tostring(count))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawActor(string key, Entity root, Entity overlay, table actor, number scale)
+        if actor==nil or actor.dead or actor.hp<=0 or not isvalid(root) or not root.EnabledInHierarchy then return end
+        local point=root.UITransformComponent.anchoredPosition
+        local life=tostring(actor.nativeId or actor.uid or "")
+        self:Effect(key.."-recovery",overlay,point+Vector2(0,scale*1.05),scale,"3289d175e2cf42bb85039159c4643815",actor.recoverySlowUntil or 0,life)
+        -- Dragon Roar's overhead immobilization marker, for the full carnival stun duration.
+        self:Effect(key.."-stun",overlay,point+Vector2(0,scale*.7),scale,"6337b66c57a947e7b2cda8bbf8697094",actor.stunUntil or 0,life)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DrawMonster(string key, Entity root, Entity overlay, table monster, number scale)
+        if monster==nil or monster.dead or monster.hp<=0 or (monster.powerUntil or 0)<=_UtilLogic.ServerElapsedSeconds or not isvalid(root) or not root.EnabledInHierarchy then return end
+        local profile=_CarnivalCatalog:FieldProfile(_CarnivalTactics:Row(monster.id))
+        local height=profile~=nil and profile.height or 1
+        local center=profile~=nil and profile.oy or height/2
+        local point=root.UITransformComponent.anchoredPosition
+        local life=tostring(monster.nativeId)..":"..tostring(monster.life)
+        self:Effect(key.."-power-head",overlay,point+Vector2(0,(center+height/2+.12)*scale),scale,"034e109c950b495b919906d6382b0796",monster.powerUntil or 0,life)
+        self:Effect(key.."-power-body",overlay,point+Vector2(0,center*scale),scale,"116d8cedbc4af4f23a7ef35fc104f1746",monster.powerUntil or 0,life)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Draw()
+        -- Run after both viewports have positioned their targets, including native replica prediction.
+        self._T.frame=(self._T.frame or 0)+1
+        local state=_CarnivalUI.state
+        if state.state=="active" and _CarnivalUI.opened and not _CarnivalUI.minimized then
+            local scene=state.scene or {} local enemy=state.opponent or {}
+            local own=_CarnivalUI:UI("Lobby/Scene/StatusEffects")
+            local other=_CarnivalUI:UI("Lobby/Opponent/Preview/StatusEffects")
+            local scale=_CarnivalView._T.scale or 100
+            for i,a in ipairs(scene.actors or {}) do self:DrawActor("own-actor-"..tostring(i),_CarnivalUI:UI("Lobby/Scene/Actor"..tostring(i)),own,a,scale) end
+            for i,m in ipairs(scene.monsters or {}) do self:DrawMonster("own-mob-"..tostring(i),_CarnivalUI:UI("Lobby/Scene/Mob"..tostring(i)),own,m,scale) end
+            for i,a in ipairs(enemy.actors or {}) do
+                local record=(_CarnivalView._T.enemyActors or {})[i]
+                if record~=nil then self:DrawActor("enemy-actor-"..tostring(i),record.node,other,a,262/18) end
+            end
+            for i,m in ipairs(enemy.monsters or {}) do
+                local record=(_CarnivalView._T.enemyMobs or {})[i]
+                if record~=nil then self:DrawMonster("enemy-mob-"..tostring(i),record.node,other,m,262/18) end
+            end
+            if isvalid(own) then _UILogic:SetSiblingIndex(own.UITransformComponent,1000000) end
+            if isvalid(other) then _UILogic:SetSiblingIndex(other.UITransformComponent,1000000) end
+        end
+        local remove={}
+        for key,record in pairs(self._T.effects or {}) do if record.seen~=self._T.frame then table.insert(remove,key) end end
+        for _,key in ipairs(remove) do self:RemoveEffect(key) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        local now=_UtilLogic.ElapsedSeconds
+        for i=#(self._T.notices or {}),1,-1 do
+            local record=self._T.notices[i] local age=now-record.at
+            if not _LoginFlow:IsInGame() or age>=2.8 or not isvalid(record.node) then
+                if isvalid(record.node) then _EntityService:Destroy(record.node) end
+                table.remove(self._T.notices,i)
+                log("[VRF][CARNIVAL-FX] notice expired")
+            else
+                record.node.UITransformComponent.anchoredPosition=Vector2(0,record.y+age*26)
+                record.node.CanvasGroupComponent.GroupAlpha=math.max(0,1-age/2.8)
+            end
+        end
+        if not _CarnivalUI.opened or _CarnivalUI.minimized or _CarnivalUI.state.state~="active" then self:Draw() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        local remove={} for key,_ in pairs(self._T.effects or {}) do table.insert(remove,key) end
+        for _,key in ipairs(remove) do self:RemoveEffect(key) end
+        for _,record in ipairs(self._T.notices or {}) do if isvalid(record.node) then _EntityService:Destroy(record.node) end end
+        self._T.notices={} self._T.effects={}
+    end
+end

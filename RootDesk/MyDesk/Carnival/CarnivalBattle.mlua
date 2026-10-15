@@ -43,6 +43,7 @@ script CarnivalBattle extends Logic
             a.crit=math.max(0,math.min(100,pa:GetServerCritRatePercent()))
             a.critMult=math.max(1,pa:GetCriticalDamageRate())
             a.interval=math.max(0.12,math.min(2,0.65*(pa._T.lastAtkMultiplier or 1)))
+            a.basicRange=(pa._T.clawEquipped==true or pa:IsArcherJobServer()) and pa:GetBasicProjectileRange()*0.8 or 1.65
         end
         local movement=p.player.MovementComponent
         a.speed=isvalid(movement) and math.max(1,math.min(8,3.2*movement.InputSpeed)) or 3.2
@@ -103,7 +104,10 @@ script CarnivalBattle extends Logic
             return
         end
         monster.dead=true monster.hp=0 monster.due=_MonsterZoneRespawn:NextRespawnAt(_UtilLogic.ServerElapsedSeconds)-r.at
-        r.cp[team]=r.cp[team]+_CarnivalRules:KillPoints(monster.level) r.kills[team]=r.kills[team]+1
+        local earned=_CarnivalRules:KillPoints(monster.level)
+        r.cp[team]=r.cp[team]+earned r.kills[team]=r.kills[team]+1
+        r.earned=r.earned or {0,0} r.earned[team]=r.earned[team]+earned
+        _CarnivalLoot:Roll(r,team,monster)
         -- Native hitboxes report damage here; ordinary monster drops and rewards are bypassed.
         log("[VRF] Carnival window kill team="..tostring(team).." slot="..tostring(monster.slot).." respawnWait="..tostring(monster.due-r.clock).." fieldInterval="..tostring(_MonsterZoneRespawn.RespawnInterval))
     end
@@ -117,6 +121,7 @@ script CarnivalBattle extends Logic
         _CarnivalManager:CheckOutcome(r)
         if r.state~="active" then return end
         for team,room in ipairs(r.rooms) do
+            _CarnivalLoot:Step(r,team,delta)
             for _,p in ipairs(r.teams[team]) do if not p.dead then _CarnivalReplica:EnsureBattle(p,r,room) end end
             _CarnivalReplica:SyncMonsters(r,team,room)
             for _,p in ipairs(r.teams[team]) do
@@ -124,7 +129,7 @@ script CarnivalBattle extends Logic
                 if not p.dead then
                     if r.clock>=(a.statsAt or 0) then a.statsAt=r.clock+0.1 self:RefreshStats(p) end
                     _CarnivalPhysics:Ensure(a,p.player,room.platforms)
-                    a.hp=math.min(a.maxHp,a.hp+a.maxHp*a.regen/100*delta*math.max(a.worldRecovery or 1,(a.recovery~=nil and a.recovery.kind=="hp" and _UtilLogic.ServerElapsedSeconds>=a.recovery.ready) and 5 or 1))
+                    a.hp=math.min(a.maxHp,a.hp+a.maxHp*a.regen/100*delta*_CarnivalTactics:RecoveryRate(a)*_CarnivalRules:RecoveryUseMultiplier("hp",math.max(a.worldRecovery or 1,(a.recovery~=nil and a.recovery.kind=="hp" and _UtilLogic.ServerElapsedSeconds>=a.recovery.ready) and 5 or 1)))
                     local native=isvalid(a.physics.body) and a.physics.body:GetComponent("PlayerAttack") or nil
                     local input=a.input local fresh=_UtilLogic.ServerElapsedSeconds-(input.at or -99)<0.4
                     local axis=fresh and input.axis or 0
@@ -155,9 +160,15 @@ script CarnivalBattle extends Logic
                         else axis=0 jump=false down=false attack=false end
                     end
                     if crouch and a.ground then axis=0 end
-                    a.nativeLocked=isvalid(native) and native:IsAutoAttackMotionLocked()
+                    local stunned=(a.stunUntil or 0)>_UtilLogic.ServerElapsedSeconds
+                    if stunned and isvalid(native) then native.CarnivalStunUntil=a.stunUntil end
+                    a.nativeLocked=self:IsActionLocked(a)
+                    if a.nativeLocked then
+                        a.lockedFace=a.lockedFace or (isvalid(native) and a.physics.body.PlayerControllerComponent.LookDirectionX or a.face)
+                        a.face=a.lockedFace
+                    else a.lockedFace=nil end
                     a.forcedMotion=isvalid(native) and native._T.isRushing==true
-                    if a.nativeLocked or (a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds then axis=0 jump=false down=false attack=false end
+                    if a.nativeLocked or (a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds then axis=0 jump=false down=false attack=false crouch=false end
                     local facing=a.face
                     self:Move(a,room.platforms,axis,jump,down,delta)
                     if a.nativeLocked then a.face=facing elseif a.autoMode and a.autoFace~=nil then a.face=a.autoFace end
@@ -170,14 +181,14 @@ script CarnivalBattle extends Logic
                     end
                     a.action=not a.ground and "jump" or (crouch and "prone" or (axis~=0 and "walk1" or "stand1"))
                     if attack and nearest~=nil then a.recovery=nil end
-                    if attack and nearest~=nil and r.clock>=a.attackAt and math.abs(nearest.x-a.x)<=1.65 and math.abs(nearest.y-a.y)<1 then
-                        a.face=nearest.x>=a.x and 1 or -1 a.attackAt=r.clock+a.interval+(a.autoMode and 0.3 or 0) a.swingUntil=r.clock+0.32
+                    if attack and r.clock>=a.attackAt and (not a.autoMode or (nearest~=nil and math.abs(nearest.x-a.x)<=(a.basicRange or 1.65) and math.abs(nearest.y-a.y)<1)) then
+                        if a.autoMode then a.face=nearest.x>=a.x and 1 or -1 end
                         if isvalid(native) then
                             a.physics.body.PlayerControllerComponent.LookDirectionX=a.face
-                            a.physics.body.PlayerControllerComponent:ActionAttack()
+                            local recovery=_CarnivalReplica:BasicAttack(a.physics.body)
+                            if recovery>0 then a.attackAt=r.clock+recovery a.skillLock=_UtilLogic.ServerElapsedSeconds+recovery end
                         end
                     end
-                    if (a.swingUntil or 0)>r.clock then a.action="swingO1" end
                     _CarnivalSkills:Advance(a,room,_UtilLogic.ServerElapsedSeconds,delta,r,p)
                     if (a.skillUntil or 0)>_UtilLogic.ServerElapsedSeconds then a.action=a.skillAction end
                     if a.recovery~=nil then a.action="alert" end
@@ -218,7 +229,7 @@ script CarnivalBattle extends Logic
                     if not spawning and not stunned and target~=nil and best<((m.profile~=nil and m.profile.width or 0.8)*0.5+0.3) and r.clock>=m.attackAt and r.clock>=target.actor.hitAt then
                         m.attackAt=r.clock+1 target.actor.hitAt=r.clock+0.65
                         local range=_RegionTierLogic:GetMonsterDamageRange(m.level)
-                        local damage=_UtilLogic:RandomIntegerRange(range.min,range.max)
+                        local damage=math.floor(_UtilLogic:RandomIntegerRange(range.min,range.max)*_CarnivalTactics:MonsterPower(m))
                         local native=target.actor.physics~=nil and target.actor.physics.body or nil
                         local hit=isvalid(native) and native:GetComponent("PlayerHit") or nil
                         if isvalid(hit) then
@@ -230,7 +241,7 @@ script CarnivalBattle extends Logic
                         local native=target.actor.physics~=nil and target.actor.physics.body or nil
                         if isvalid(native) then
                             native.PlayerComponent.Hp=math.floor(target.actor.hp)
-                            if isvalid(hit) then hit:SchedulePowerGuardRecovery(native,damage) end
+                            if isvalid(hit) then hit:ShowTakenDamage(damage) hit:SchedulePowerGuardRecovery(native,damage) end
                         end
                         if target.actor.hp<=0 then target.dead=true target.actor.action="dead" end
                     end
@@ -245,19 +256,34 @@ script CarnivalBattle extends Logic
         local actors={} local monsters={}
         for _,p in ipairs(r.teams[team]) do
             local a=p.actor
-            table.insert(actors,{uid=p.uid,name=p.name,level=p.level,job=p.job or 1,nativeId=a.nativeId,originX=a.physics~=nil and a.physics.origin.x or 0,originY=a.physics~=nil and a.physics.origin.y or 0,x=a.x,y=a.y,face=a.face,hp=math.ceil(a.hp),maxHp=a.maxHp,dead=p.dead,action=a.action,auto=a.auto,autoMode=a.autoMode==true,autoTarget=a.autoTarget,ground=a.ground,airJumpUsed=a.airJumpUsed,skillRate=a.skillRate,inputSeq=a.input.seq,forcedMotion=a.forcedMotion==true,locked=a.nativeLocked==true or (a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds,recovery=a.recovery,visuals=_CarnivalSkills:Visuals(a),owner=a.owner or p.uid,custom=a.custom or false,equip=a.equip})
+            table.insert(actors,{uid=p.uid,name=p.name,level=p.level,job=p.job or 1,nativeId=a.nativeId,originX=a.physics~=nil and a.physics.origin.x or 0,originY=a.physics~=nil and a.physics.origin.y or 0,x=a.x,y=a.y,face=a.face,hp=math.ceil(a.hp),maxHp=a.maxHp,dead=p.dead,action=a.action,auto=a.auto,autoMode=a.autoMode==true,autoTarget=a.autoTarget,basicRange=a.basicRange or 1.65,ground=a.ground,airJumpUsed=a.airJumpUsed,skillRate=a.skillRate,inputSeq=a.input.seq,forcedMotion=a.forcedMotion==true,locked=a.nativeLocked==true or (a.skillLock or 0)>_UtilLogic.ServerElapsedSeconds,recovery=a.recovery,recoverySlowUntil=a.recoverySlowUntil or 0,stunUntil=a.stunUntil or 0,visuals=_CarnivalSkills:Visuals(a),owner=a.owner or p.uid,custom=a.custom or false,equip=a.equip})
         end
         for _,m in ipairs(r.rooms[team].monsters) do
-            table.insert(monsters,{slot=m.slot,id=m.id,sprite=m.training and m.sprite or nil,training=m.training==true,nativeId=isvalid(m.entity) and m.entity.Id or "",x=m.x,y=m.y,face=m.face,hp=m.hp,maxHp=m.maxHp,dead=m.dead,respawn=math.max(0,m.due-r.clock),hit=m.hit,hitSeq=m.hitSeq,life=m.life,motion=m.motion,bornAt=m.bornAt,deathAt=m.deathAt})
+            table.insert(monsters,{slot=m.slot,id=m.id,sprite=m.training and m.sprite or nil,training=m.training==true,nativeId=isvalid(m.entity) and m.entity.Id or "",x=m.x,y=m.y,face=m.face,hp=m.hp,maxHp=m.maxHp,dead=m.dead,respawn=math.max(0,m.due-r.clock),hit=m.hit,hitSeq=m.hitSeq,life=m.life,motion=m.motion,bornAt=m.bornAt,deathAt=m.deathAt,powerUntil=m.powerUntil or 0})
         end
-        return {actors=actors,monsters=monsters}
+        return {actors=actors,monsters=monsters,drops=r.rooms[team].drops or {}}
     end
 
     method boolean LivingTarget(table monster)
-        -- Death/respawn entries stay in the room but must never be selected as active targets.
-        return monster~=nil and monster.dead~=true and (monster.hp or 0)>0
+        -- Target selection includes committed projectile damage; impact still owns actual death and CP.
+        local living=monster~=nil and monster.dead~=true and (monster.hp or 0)>0
             and type(monster.x)=="number" and type(monster.y)=="number"
             and monster.x==monster.x and monster.y==monster.y
+        if not living then return false end
+        local entity=monster.entity
+        if not isvalid(entity) and monster.nativeId~=nil and monster.nativeId~="" then entity=_EntityService:GetEntity(monster.nativeId) end
+        local native=isvalid(entity) and entity:GetComponent("Monster") or nil
+        if isvalid(native) then return not native.IsDead and native.Hp>0 and not native:IsDeathPending() end
+        return true
+    end
+
+    method boolean IsActionLocked(table actor)
+        -- Use the same recovery gate before movement, retargeting and facing changes.
+        local now=_UtilLogic.ServerElapsedSeconds
+        if (actor.skillLock or 0)>now or (actor.stunUntil or 0)>now then return true end
+        local body=actor.physics~=nil and actor.physics.body or nil
+        local native=isvalid(body) and body:GetComponent("PlayerAttack") or nil
+        return isvalid(native) and native:IsAutoAttackMotionLocked()
     end
 
     method table AutoRoute(table a, table room, table target)
@@ -301,21 +327,29 @@ script CarnivalBattle extends Logic
     end
 
     method table AutoIntent(table a, table room, number now)
-        -- Flat-floor hunting keeps its target, never jumps, and uses a stop/resume margin.
-        local target=nil local best=math.huge
+        -- Re-evaluate distance before following the old target; a small margin avoids equal-distance flicker.
+        if self:IsActionLocked(a) then
+            a.autoAxis=0
+            return {axis=0,jump=false,down=false,attack=false}
+        end
+        local target=nil local best=math.huge local current=nil local currentDistance=math.huge
         for _,m in ipairs(room.monsters) do
             if self:LivingTarget(m) and math.abs(m.y-a.y)<1.5 then
-                if m.slot==a.autoTarget then target=m break end
-                local distance=math.abs(m.x-a.x)
+                local distance=math.abs(m.x-a.x)+math.abs(m.y-a.y)*2.5
+                if m.slot==a.autoTarget then current=m currentDistance=distance end
                 if distance<best then target=m best=distance end
             end
         end
+        if current~=nil and currentDistance<=best+0.25 then target=current end
         local selected=target~=nil and target.slot or nil
-        if selected~=a.autoTarget then a.autoTarget=selected a.autoHolding=false end
+        if selected~=a.autoTarget then
+            a.autoTarget=selected a.autoHolding=false a.autoHop=nil
+            if Environment:IsMakerPlay() then log("[VRF][CarnivalTarget] nearest="..tostring(selected).." distance="..tostring(best)) end
+        end
         local intent={axis=0,jump=false,down=false,attack=false,target=target}
         if target==nil then a.autoAxis=0 a.autoHolding=false return intent end
         local dx=target.x-a.x local distance=math.abs(dx)
-        local stop=math.max(0.65,math.min(7,a.autoRange or 1.05))
+        local stop=math.max(0.65,math.min(7,a.autoRange or math.max(1.05,(a.basicRange or 1.65)-0.4)))
         if a.autoHolding and distance>stop+0.45 then a.autoHolding=false
         elseif not a.autoHolding and distance<=stop then a.autoHolding=true end
         local native=a.physics~=nil and isvalid(a.physics.body) and a.physics.body:GetComponent("PlayerAttack") or nil
@@ -342,7 +376,7 @@ script CarnivalBattle extends Logic
             end
         end
         intent.face=dx>=0 and 1 or -1
-        intent.attack=distance<=1.65 and math.abs(target.y-a.y)<1
+        intent.attack=distance<=(a.basicRange or 1.65) and math.abs(target.y-a.y)<1
         a.autoAxis=intent.axis
         return intent
     end

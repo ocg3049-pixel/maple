@@ -1,5 +1,6 @@
 @Component
 script PlayerAttack extends AttackComponent
+    @Sync property number CarnivalStunUntil = 0
 
 	@HideFromInspector
 	property any CombatMotionHandler = nil
@@ -2339,13 +2340,17 @@ script PlayerAttack extends AttackComponent
 		        -- 서로 다른 적에게 한 발씩 나눠 던진다. 꺼져 있으면 기존과 완전히 같은 단일 표적 동작이다.
 		        -- ⚠ 이 시전이 분산이었는지는 발사(FireLuckySevenShuriken)까지 유지돼야 하므로 _T에 새긴다.
             local spreadOn = self._T.starSpreadOn == true
+            local automatic=self._T.autoHuntActive==true
+            if self._T.carnivalPreview then automatic=_CarnivalReplica:IsAutoActor(self.Entity) end
             local spreadTargets = {}
-            if spreadOn or self._T.autoHuntActive == true then
+            if spreadOn or automatic then
                 spreadTargets = self:FindStarThrowTargets(Vector2(worldPos.x,worldPos.y),dirX,shots)
             end
-            if self._T.autoHuntActive == true then
+            if automatic then
                 spreadOn = self:ShouldAutoSpread(spreadTargets,combatPower,shots)
-                if self._T.starSpreadOn ~= spreadOn then
+                if self._T.carnivalPreview then
+                    _CarnivalReplica:SyncStarSpread(self.Entity,spreadOn)
+                elseif self._T.starSpreadOn ~= spreadOn then
                     self._T.starSpreadOn = spreadOn
                     _SkillManager:ReceiveAutoStarSpread(spreadOn,self.Entity.PlayerComponent.UserId)
                     if Environment:IsMakerPlay() then log("[AutoStarSpread] enabled="..tostring(spreadOn).." targets="..tostring(#spreadTargets)) end
@@ -3277,6 +3282,10 @@ script PlayerAttack extends AttackComponent
 		        -- 클라이언트가 공격 키를 받은 그 자리에서 CastClawBasicAttack이 전부 처리한다
 		        -- (위 "아대 기본공격 = 스킬처럼 처리" 주석 참고). 서버는 투척과 판정만 담당한다.
 		        self:BeginBasicAttackRecovery(0.72)
+                if self._T.carnivalPreview then
+                    local swing=self:GetLuckySevenSwing()
+                    self:PlayCarnivalClawBasicMotion(self.Entity,swing.name,dirX)
+                end
                 self:PlayClawThrowEffect(self.Entity, dirX)
 		        self:PlayClawThrowSound(self.Entity)
 
@@ -3395,6 +3404,20 @@ script PlayerAttack extends AttackComponent
 		        if Environment:IsMakerPlay() then log("[ClawThrow] 표창 발사 target=" .. tostring(isvalid(target) and target.Name or "(대상 없음/허공)")
 		            .. " skin=" .. tostring(pc.SkinIndex) .. " combatPower=" .. tostring(pc.CombatPower)) end
 	end
+
+	@ExecSpace("Multicast")
+	method void PlayCarnivalClawBasicMotion(Entity attacker, string motionName, number dirX)
+        if not self:IsClient() or not isvalid(attacker) then return end
+        self:BeginBasicAttackRecovery(0.72)
+        local renderer=attacker.AvatarRendererComponent
+        if isvalid(renderer) then renderer.ShowDefaultWeaponEffects=false end
+        self:PlayLuckySevenMotionLocal(attacker,motionName,dirX,1.0,0.60,0.65,false)
+        local generation=self._T.combatMotionGeneration
+        self:SetActorTimerOnce(function()
+            if self:IsCurrentCombatMotion(generation) and isvalid(renderer) then renderer.ShowDefaultWeaponEffects=true end
+        end,0.70)
+        if Environment:IsMakerPlay() then log("[VRF][CarnivalBasic] motion="..motionName.." rate=1 release=0.5") end
+    end
 
 	@ExecSpace("Multicast")
 	method void PlayClawThrowEffect(Entity attacker, number dirX)
@@ -3545,7 +3568,7 @@ script PlayerAttack extends AttackComponent
 			---@type Monster
 			local mc = comp
 			if isvalid(mc) and isvalid(mc.Entity) and mc.Entity.Enable
-				and not mc.IsDead and not mc:IsDeathPending() and not mc:IsSpawnProtected() then
+				and self:IsCarnivalTarget(mc.Entity) and not mc.IsDead and not mc:IsDeathPending() and not mc:IsSpawnProtected() then
 				local pos = mc.Entity.TransformComponent.WorldPosition
 				local dx = pos.x - fromPos.x
 				local dy = pos.y - fromPos.y
@@ -9443,7 +9466,7 @@ script PlayerAttack extends AttackComponent
 		---@type HeroSummon
 		local hs = heroEntity:GetComponent("script.HeroSummon")
 		if not isvalid(hs) or hs.HeroHp <= 0 then return end
-		local healAmount = math.floor(hs.HeroMaxHp * (self._T.pendingHealPercent or 1) / 100)
+		local healAmount = math.floor(hs.HeroMaxHp * (self._T.pendingHealPercent or 1) / 100 * _CarnivalRules:TuningMultiplier("healing",hs.OwnerEntity))
 		if healAmount <= 0 then return end
 		local newHp = math.min(hs.HeroHp + healAmount, hs.HeroMaxHp)
 		local actualHealed = newHp - hs.HeroHp
@@ -9462,7 +9485,7 @@ script PlayerAttack extends AttackComponent
 		---@type HealerSummon
 		local hs = healerEntity:GetComponent("script.HealerSummon")
 		if not isvalid(hs) or hs.HealerHp <= 0 then return end
-		local healAmount = math.floor(hs.HealerMaxHp * (self._T.pendingHealPercent or 1) / 100)
+		local healAmount = math.floor(hs.HealerMaxHp * (self._T.pendingHealPercent or 1) / 100 * _CarnivalRules:TuningMultiplier("healing",hs.OwnerEntity))
 		if healAmount <= 0 then return end
 		local newHp = math.min(hs.HealerHp + healAmount, hs.HealerMaxHp)
 		local actualHealed = newHp - hs.HealerHp
@@ -9486,6 +9509,7 @@ script PlayerAttack extends AttackComponent
 		---@type HeroSummon
 		local hs = target:GetComponent("script.HeroSummon")
 		if isvalid(hs) and hs.HeroHp > 0 then
+			heal = math.floor(heal * _CarnivalRules:TuningMultiplier("healing",hs.OwnerEntity))
 			local newHp = math.min(hs.HeroHp + heal, hs.HeroMaxHp)
 			local actual = newHp - hs.HeroHp
 			if actual <= 0 then return end
@@ -9498,6 +9522,7 @@ script PlayerAttack extends AttackComponent
 		---@type SummonDragon
 		local sd = target:GetComponent("script.SummonDragon")
 		if isvalid(sd) and sd.DragonHp > 0 then
+			heal = math.floor(heal * _CarnivalRules:TuningMultiplier("healing",sd.OwnerEntity))
 			local newHp = math.min(sd.DragonHp + heal, sd.DragonMaxHp)
 			local actual = newHp - sd.DragonHp
 			if actual <= 0 then return end
@@ -9510,6 +9535,7 @@ script PlayerAttack extends AttackComponent
 		---@type HealerSummon
 		local hl = target:GetComponent("script.HealerSummon")
 		if isvalid(hl) and hl.HealerHp > 0 then
+			heal = math.floor(heal * _CarnivalRules:TuningMultiplier("healing",hl.OwnerEntity))
 			local newHp = math.min(hl.HealerHp + heal, hl.HealerMaxHp)
 			local actual = newHp - hl.HealerHp
 			if actual <= 0 then return end
@@ -26395,7 +26421,7 @@ script PlayerAttack extends AttackComponent
 		local sd = dragonEntity:GetComponent("script.SummonDragon")
 		if not isvalid(sd) or sd.DragonHp <= 0 then return end
 		if sd.Dying then return end   -- 사망 모션 중인 용은 회복 대상이 아니다(HP바도 이미 내려갔다)
-		local healAmount = math.floor(sd.DragonMaxHp * (self._T.pendingHealPercent or 1) / 100)
+		local healAmount = math.floor(sd.DragonMaxHp * (self._T.pendingHealPercent or 1) / 100 * _CarnivalRules:TuningMultiplier("healing",sd.OwnerEntity))
 		if healAmount <= 0 then return end
 		local newHp = math.min(sd.DragonHp + healAmount, sd.DragonMaxHp)
 		local actualHealed = newHp - sd.DragonHp
@@ -28657,10 +28683,11 @@ script PlayerAttack extends AttackComponent
 
     @ExecSpace("ServerOnly")
     method void PlanFlyingDamage(any attack, number dirX, number dirY, number reach, integer count, number halfHeight, string tag, number duration)
+        -- Query the caster's room and include hitbox edges, not just centers, in the flight prediction.
         if attack._T.flyingDamage ~= nil then return end
         local origin = attack.Entity.TransformComponent.WorldPosition
         local candidates = {}
-        local simulator = _CollisionService:GetSimulator(attack.Entity)
+        local simulator = _CollisionService:GetSimulator(self.Entity)
         if simulator == nil then return end
         local center = Vector2(origin.x+dirX*reach/2,origin.y+dirY*reach/2)
         local hits = simulator:OverlapAll(CollisionGroups.HitBox,BoxShape(center,Vector2(reach+2,reach+2),0))
@@ -28669,13 +28696,17 @@ script PlayerAttack extends AttackComponent
             local target = collider.Entity
             local mon = isvalid(target) and target:GetComponent("script.Monster") or nil
             local hit = isvalid(target) and target.HitComponent or nil
-            if not seen[target] and isvalid(mon) and not mon.IsDead and not mon:IsDeathPending() and mon.Hp > 0 and not mon:IsSpawnProtected() and isvalid(hit) and hit.Enable then
+            if not seen[target] and isvalid(mon) and self:IsCarnivalTarget(target) and not mon.IsDead and not mon:IsDeathPending() and mon.Hp > 0 and not mon:IsSpawnProtected() and isvalid(hit) and hit.Enable then
                 local p = target.TransformComponent:ToWorldPoint(Vector3(hit.ColliderOffset.x, hit.ColliderOffset.y, 0))
                 local dx, dy = p.x-origin.x, p.y-origin.y
                 local along = dx*dirX + dy*dirY
                 local across = math.abs(dx*dirY - dy*dirX)
-                local body = hit.ColliderType == ColliderType.Box and hit.BoxSize.y/2 or hit.CircleRadius
-                if along >= -0.1 and along <= reach and across <= halfHeight + body then
+                local alongRadius=hit.CircleRadius local acrossRadius=hit.CircleRadius
+                if hit.ColliderType==ColliderType.Box then
+                    alongRadius=math.abs(dirX)*hit.BoxSize.x/2+math.abs(dirY)*hit.BoxSize.y/2
+                    acrossRadius=math.abs(dirY)*hit.BoxSize.x/2+math.abs(dirX)*hit.BoxSize.y/2
+                end
+                if along >= -halfHeight-alongRadius and along <= reach+halfHeight+alongRadius and across <= halfHeight+acrossRadius then
                     seen[target] = true
                     table.insert(candidates, {target=target, distance=along})
                 end
@@ -28758,6 +28789,7 @@ script PlayerAttack extends AttackComponent
 
     method boolean IsActorControlLocked()
         -- Uses original combat state flags so window input cannot interrupt native casts.
+        if self.CarnivalStunUntil>_UtilLogic.ServerElapsedSeconds then return true end
         if self:IsDeathBlocked() then return true end
         if (self._T.buffControlUntil or 0)>_UtilLogic.ElapsedSeconds then return true end
         if self:GetBasicAttackRecoveryRemaining()>0 or self:IsFinalAttackLocked() then return true end
@@ -29054,8 +29086,10 @@ script PlayerAttack extends AttackComponent
 
 
     method boolean IsAutoAttackMotionLocked()
-        -- Retarget only after the visible attack and its follow-up have finished.
-        return self:HasActiveCombatMotion() or self:IsSwingMotionActive()
+        -- Sprint owns the running pose, but must not stop the movement it accelerates.
+        -- Actual attack, recovery and stun locks still take precedence during sprint.
+        local attackMotion=self:HasActiveCombatMotion() and self._T.combatMotionSource~="PlaySprintPose"
+        return attackMotion or self:IsSwingMotionActive()
             or self:IsBrandishMotionGuardOn() or self:IsActorControlLocked()
     end
 
