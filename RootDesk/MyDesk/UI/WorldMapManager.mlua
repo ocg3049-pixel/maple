@@ -13,7 +13,10 @@ script WorldMapManager extends Logic
                 if event.key==KeyboardKey.Mouse0 then self:HandleMapPointer(_InputService:GetCursorPosition()) end
             end)
             self._T.mapTouch=_InputService:ConnectEvent(ScreenTouchEvent,function(event)
-                if event.TouchId==1 then self:HandleMapPointer(event.TouchPoint) end
+                if event.TouchId==1 then self._T.mapTouchHeld=true self:HandleMapPointer(event.TouchPoint) end
+            end)
+            self._T.mapTouchRelease=_InputService:ConnectEvent(ScreenTouchReleaseEvent,function(event)
+                if event.TouchId==1 then self._T.mapTouchHeld=false end
             end)
             self:WireMapCloseButtons()
             local randomButton = _EntityService:GetEntityByPath("/ui/WorldMapGroup/RandomHunt")
@@ -47,6 +50,8 @@ script WorldMapManager extends Logic
             if isvalid(self._T.randomButton) and self._T.randomClick then self._T.randomButton:DisconnectEvent(ButtonClickEvent,self._T.randomClick) end
             if self._T.mapMouse then _InputService:DisconnectEvent(KeyDownEvent,self._T.mapMouse) end
             if self._T.mapTouch then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.mapTouch) end
+            if self._T.mapTouchRelease then _InputService:DisconnectEvent(ScreenTouchReleaseEvent,self._T.mapTouchRelease) end
+            self._T.mapTouchHeld=false self._T.mapTransitionPending=false
             self:UnwireMapCloseButtons()
             self:UnwireVictoriaTouch()
             self:UnwireSleepywoodTouch()
@@ -152,6 +157,7 @@ script WorldMapManager extends Logic
 
     method void OnUpdate(number delta)
         if not self:IsClient() then return end
+        self:PageInputBlocked()
         self:FollowMapTooltip(delta)
         self:UpdateLevelRecommendations(delta)
         local mapGroup=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
@@ -244,6 +250,7 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnVictoriaClick()
+        if self:PageInputBlocked() then return end
         -- 전체 지도에서 빅토리아 상세 지도로 내려간다.
         self:ShowMapPage("victoria")
     end
@@ -273,6 +280,9 @@ script WorldMapManager extends Logic
             end
             return
         end
+        -- Native UI, mouse and touch callbacks can all receive the same press.
+        self._T.mapTransitionPending=true
+        self._T.mapTransitionUntil=_UtilLogic.ElapsedSeconds+0.18
         self:ResetDots() self:HideGlow() self:ClearRegionGlows() self:ClearRegionSelection()
         self._T.mapPage=page self._T.regionMapFilter=nil self._T.lastRegionDot=nil
         for key,name in pairs(panels) do
@@ -347,7 +357,8 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void OnSleepywoodDown(UITouchDownEvent event)
-        if _UIPopup.isOpen or _RegionUnlock:HandlePointer(event.TouchPoint) then return end
+        if self:PageInputBlocked() then return end
+        if _UIPopup:BlocksInput() or _RegionUnlock:HandlePointer(event.TouchPoint) then return end
         -- 지역 영역 클릭은 지도 탐색이며 플레이어를 이동시키지 않는다.
         self:ShowMapPage("sleepywood")
     end
@@ -1827,7 +1838,7 @@ script WorldMapManager extends Logic
                     self:SetSubregionGlow(captured.key, false)
                     -- 툴팁 종료는 공통 커서 판정에서 처리한다.
                 end)
-                local down = touch:ConnectEvent(UITouchDownEvent, function() self:ShowMapPage(captured.key) end)
+                local down = touch:ConnectEvent(UITouchDownEvent, function() if not self:PageInputBlocked() then self:ShowMapPage(captured.key) end end)
                 table.insert(self._T.destinationHandlers, {entity=touch, enter=enter, leave=leave, down=down})
             end
         end
@@ -2654,7 +2665,7 @@ script WorldMapManager extends Logic
         if not self:AcceptMapPress(dot) then return end
         local entry = self._T.regionPointByEntity and self._T.regionPointByEntity[dot.Id]
         if entry == nil then return end
-        if _UIPopup.isOpen then return end
+        if _UIPopup:BlocksInput() then return end
         if entry.targetPage~=nil and _RegionUnlock:CanBrowsePage(entry.targetPage) then
             self:ShowMapPage(entry.targetPage) return
         end
@@ -2696,7 +2707,16 @@ script WorldMapManager extends Logic
         _MobileUIManager:DrawMobileWorldMap()
     end
     @ExecSpace("ClientOnly")
+    method boolean PageInputBlocked()
+        if not self._T.mapTransitionPending then return false end
+        if _UtilLogic.ElapsedSeconds<(self._T.mapTransitionUntil or 0) or self._T.mapTouchHeld or _InputService:IsKeyPressed(KeyboardKey.Mouse0) then return true end
+        self._T.mapTransitionPending=false
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
     method boolean AcceptMapPress(Entity target)
+        if self:PageInputBlocked() then return false end
         local now=_UtilLogic.ElapsedSeconds
         if not isvalid(target) or now-(self._T.mapPressAt or -10)<0.06 then return false end
         self._T.mapPressAt=now
@@ -2726,6 +2746,7 @@ script WorldMapManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void HandleMapPointer(Vector2 cursor)
+        if self:PageInputBlocked() then return end
         local group=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
         if not isvalid(group) or not group.EnabledInHierarchy or _GameSystemMenu:BlocksInput() or _UIItemDiscardManager:BlocksInput() then return end
         local top=_UIClickArbiter:GetTopmostWindowAt(cursor)
@@ -2733,7 +2754,7 @@ script WorldMapManager extends Logic
         if top~="" and string.sub(top,1,#mapRoot)~=mapRoot then return end
         local browser=_MobileUIManager:UI("WorldMap")
         if _UIClickArbiter:ContainsScreenPoint(browser,cursor) then return end
-        if _UIPopup.isOpen or self:HandleContinentPointer(cursor) then return end
+        if _UIPopup:BlocksInput() or self:HandleContinentPointer(cursor) then return end
         local panelName=self:GetMapPanels()[self._T.mapPage or ""]
         local panel=panelName and group:GetChildByName(panelName)
         if not isvalid(panel) or not panel.EnabledInHierarchy then return end
