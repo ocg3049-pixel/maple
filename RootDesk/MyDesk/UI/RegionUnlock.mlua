@@ -1,0 +1,243 @@
+@Logic
+script RegionUnlock extends Logic
+    method table Rules()
+        return {henesys={stage=1,name="헤네시스",boss="마노"},perion={stage=2,name="페리온",boss="스텀피"},ellinia={stage=3,name="엘리니아",boss="킹 슬라임"},kerning={stage=4,name="커닝시티",boss="커닝시티 도적단"},goldbeach={stage=5,name="골드비치",boss="세르프"},ellinel={stage=6,name="요정학원 엘리넬",boss="파우스트"}}
+    end
+
+    method string Region(string mapId)
+        local id=string.match(mapId or "", "^(.-)__channel_%d+$") or mapId or ""
+        -- Tutorial and private encounters are not field regions. Boss entry stays available.
+        if id=="login" or id=="001010000" then return "service" end
+        if not string.match(id,"^%d%d%d%d%d%d%d%d%d$") then
+            if _BossStageManager:IsArena(id) or _CarnivalRules:IsArena(id) then return "service" end
+            return "locked"
+        end
+        if string.sub(id,1,3)=="104" then return "lith" end
+        if string.sub(id,1,5)=="10004" then return "golem" end
+        if string.sub(id,1,5)=="10304" then return "kerningtower" end
+        if string.sub(id,1,5)=="10107" then return "ellinel" end
+        if string.sub(id,1,5)=="10108" then return "ellodin" end
+        if string.sub(id,1,5)=="12004" then return "goldbeach" end
+        if string.sub(id,1,3)=="100" then return "henesys" end
+        if string.sub(id,1,3)=="101" then return "ellinia" end
+        if string.sub(id,1,3)=="102" then return "perion" end
+        if string.sub(id,1,3)=="103" then return "kerning" end
+        return "locked"
+    end
+
+    method table Read(string snapshot)
+        local opened={}
+        for key in string.gmatch(string.match("\n"..(snapshot or ""),"\nREGIONS_V1\t([^\n]*)") or "","[a-z]+") do
+            if self:Rules()[key]~=nil then opened[key]=true end
+        end
+        return opened
+    end
+
+    method string Write(string snapshot, table opened)
+        local lines={} local keys={}
+        for line in string.gmatch(snapshot or "","[^\r\n]+") do
+            if string.sub(line,1,11)~="REGIONS_V1\t" then table.insert(lines,line) end
+        end
+        for key,_ in pairs(self:Rules()) do if opened[key] then table.insert(keys,key) end end
+        table.sort(keys)
+        table.insert(lines,"REGIONS_V1\t"..table.concat(keys,","))
+        return table.concat(lines,"\n")
+    end
+
+    method boolean OpenIn(string mapId, table opened)
+        local key=self:Region(mapId)
+        return key=="lith" or key=="service" or (opened or {})[key]==true
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen(string mapId)
+        return self:OpenIn(mapId,self._T.opened)
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean CanEnter(string uid, string mapId)
+        local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        return self:OpenIn(mapId,self:Read(sv and sv.activeId~="" and sv.saves[sv.activeId] or ""))
+    end
+
+    @ExecSpace("Client")
+    method void Notice(string key)
+        local rule=self:Rules()[key]
+        local message="이 지역은 봉인되어 있습니다.\n해금 조건은 아직 공개되지 않았습니다."
+        if rule~=nil then
+            message=rule.name.." 봉인 해제\n"..rule.boss.." 처치 후 지도 위 사슬을 눌러 주세요."
+            if (self._T.cleared or 0)>=rule.stage then message=message.."\n보스 처치 완료 · 사슬을 눌러 해금할 수 있습니다." end
+            if key=="henesys" then message=message.."\n골렘사원은 별도 봉인 지역입니다." end
+            if key=="kerning" then message=message.."\n커닝타워는 별도 봉인 지역입니다." end
+        end
+        if isvalid(_UIPopup.popupGroup) then _UIPopup.popupGroup.UIGroupComponent.GroupOrder=1000 end
+        _UIPopup:Open(message,nil,nil)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean Check(string mapId)
+        if self:IsOpen(mapId) then return true end
+        self:Notice(self:Region(mapId))
+        return false
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean CheckServer(string uid, string mapId)
+        if self:CanEnter(uid,mapId) then return true end
+        self:Notice(self:Region(mapId),uid)
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Restore(string id, string snapshot)
+        self._T.character=id self._T.opened=self:Read(snapshot)
+        self._T.cleared=_BossStageManager:ReadClear(snapshot)
+        self._T.fades={} self._T.pending=nil
+        self:Invalidate()
+    end
+
+    @ExecSpace("Server")
+    method void RequestStatus()
+        self:SendStatus(senderUserId,"")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendStatus(string uid, string unlocked)
+        local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId=="" then return end
+        local snapshot=sv.saves[sv.activeId] or ""
+        self:Receive(sv.activeId,self:Write("",self:Read(snapshot)),_BossStageManager:ReadClear(snapshot),unlocked,uid)
+    end
+
+    @ExecSpace("Server")
+    method void RequestUnlock(string character, string key)
+        local uid=senderUserId
+        local sv=_CharacterPersistence._T.sv and _CharacterPersistence._T.sv[uid]
+        if sv==nil or sv.activeId=="" or sv.activeId~=character then return end
+        local rule=self:Rules()[key]
+        local raw=sv.saves[character] or ""
+        local opened=self:Read(raw)
+        if opened[key] then self:SendStatus(uid,"") return end
+        if rule==nil or _BossStageManager:ReadClear(raw)<rule.stage then
+            self:SendStatus(uid,"") self:Notice(key,uid) return
+        end
+        opened[key]=true
+        sv.saves[character]=self:Write(raw,opened)
+        sv.dirtySaves[character]=true
+        _CharacterPersistence:WriteCharacterSaves(sv,false)
+        self:SendStatus(uid,key)
+        if Environment:IsMakerPlay() then log("[VRF] region unlocked="..key.." character="..character) end
+    end
+
+    @ExecSpace("Client")
+    method void Receive(string character, string record, integer cleared, string unlocked)
+        if character~=self._T.character then return end
+        self._T.opened=self:Read(record) self._T.cleared=cleared self._T.pending=nil
+        if unlocked~="" then
+            self._T.fades=self._T.fades or {} self._T.fades[unlocked]=_UtilLogic.ElapsedSeconds
+            _UIAudio:Play("BtMouseClick")
+            _UIToast:ShowMessage(self:Rules()[unlocked].name.."의 봉인이 해제되었습니다.")
+        end
+        self:Invalidate()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Invalidate()
+        self._T.allowed=nil
+        for _,entry in ipairs(_WorldMapManager._T.regionPointEntries or {}) do entry.recommendLevel=nil end
+        local browser=_MobileUIManager:UI("WorldMap")
+        if isvalid(browser) and browser.EnabledInHierarchy and _MobileUIManager._T.mobileRegions~=nil then _MobileUIManager:DrawMobileWorldMap() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method table AllowedMaps()
+        -- Bulk filters use one snapshot of access, rather than repeated cross-logic calls per map.
+        if self._T.allowed~=nil then return self._T.allowed end
+        local allowed={} local opened=self._T.opened or {}
+        local broad={["104"]="lith",["100"]="henesys",["101"]="ellinia",["102"]="perion",["103"]="kerning",["120"]="locked"}
+        local narrow={["10004"]="golem",["10304"]="kerningtower",["10107"]="ellinel",["10108"]="ellodin",["12004"]="goldbeach"}
+        for _,entry in ipairs(_WorldMapManager._T.regionDestinations or {}) do
+            local key=broad[string.sub(entry.id,1,3)]
+            if key~=nil then
+                key=narrow[string.sub(entry.id,1,5)] or key
+                if key=="lith" or opened[key] then allowed[entry.id]=true end
+            end
+        end
+        self._T.allowed=allowed
+        return allowed
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClickSeal(string key)
+        if _UIPopup.isOpen then return end
+        local rule=self:Rules()[key]
+        if rule==nil or (self._T.cleared or 0)<rule.stage then self:Notice(key) return end
+        if self._T.opened and self._T.opened[key] then return end
+        if self._T.pending and _UtilLogic.ElapsedSeconds-self._T.pending<3 then return end
+        self._T.pending=_UtilLogic.ElapsedSeconds
+        self:RequestUnlock(self._T.character or "",key)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self._T.opened={} self._T.fades={} self._T.seals={}
+        local group=_EntityService:GetEntityByPath("/ui/WorldMapGroup")
+        if not isvalid(group) then return end
+        for _,panel in ipairs(group.Children:ToTable()) do
+            local seals=panel:GetChildByName("Seals")
+            if not isvalid(seals) then continue end
+            for _,entity in ipairs(seals.Children:ToTable()) do
+                local key=string.match(entity.Name,"^Seal_(.+)$")
+                if key==nil then continue end
+                local entry={entity=entity,key=key,hover=false}
+                entry.enter=entity:ConnectEvent(UITouchEnterEvent,function() entry.hover=true _UIAudio:Play("BtMouseOver") end)
+                entry.exit=entity:ConnectEvent(UITouchExitEvent,function() entry.hover=false end)
+                entry.down=entity:ConnectEvent(UITouchDownEvent,function() self:ClickSeal(key) end)
+                table.insert(self._T.seals,entry)
+            end
+        end
+        if Environment:IsMakerPlay() then log("[VRF] region seals bound="..tostring(#self._T.seals)) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean HandlePointer(Vector2 cursor)
+        for _,entry in ipairs(self._T.seals or {}) do
+            if isvalid(entry.entity) and entry.entity.EnabledInHierarchy and _UICursorManager:Hit(entry.entity,cursor) then
+                self:ClickSeal(entry.key) return true
+            end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        local now=_UtilLogic.ElapsedSeconds
+        for _,entry in ipairs(self._T.seals or {}) do
+            local e=entry.entity
+            if not isvalid(e) then continue end
+            local began=self._T.fades[entry.key]
+            local alpha=began and math.max(0,1-(now-began)/1.2) or 1
+            local locked=not (self._T.opened or {})[entry.key]
+            e.Enable=locked or (began~=nil and alpha>0)
+            if e.EnabledInHierarchy then
+                local cursor=_InputService:GetCursorPosition()
+                entry.hover=_UICursorManager:Hit(e,cursor)
+                local brightness=entry.hover and (0.86+0.14*math.sin(now*8)) or 0.68
+                e.SpriteGUIRendererComponent.Color=Color(brightness,brightness,brightness,alpha)
+                local glow=e:GetChildByName("Glow")
+                if isvalid(glow) then glow.Enable=entry.hover glow.SpriteGUIRendererComponent.Color=Color(0.8,0.55,1,alpha*0.4) end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for _,entry in ipairs(self._T.seals or {}) do
+            if isvalid(entry.entity) then
+                entry.entity:DisconnectEvent(UITouchEnterEvent,entry.enter)
+                entry.entity:DisconnectEvent(UITouchExitEvent,entry.exit)
+                entry.entity:DisconnectEvent(UITouchDownEvent,entry.down)
+            end
+        end
+    end
+end
