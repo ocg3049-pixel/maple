@@ -23,6 +23,28 @@ script CarnivalActorPresentation extends Logic
             if effect.actor==actor then table.insert(remove,serial) end
         end
         for _,serial in ipairs(remove) do self:RemoveEffect(serial) end
+        -- Hit-effect anchors can be owned without a tracked entity proxy. Release those too.
+        local owners={}
+        for id,owner in pairs(self._T.owners or {}) do if owner==actor then table.insert(owners,id) end end
+        for _,id in ipairs(owners) do self._T.owners[id]=nil end
+        self._T.sortDirty=true
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity CreateEffectNode(string name)
+        -- Clone the complete anchor/Visual tree and keep it hidden until its caller positions it.
+        local scene=_CarnivalUI:UI("Lobby/Scene")
+        local template=_CarnivalUI:UI("Lobby/Scene/EffectAnchorTemplate")
+        if not isvalid(scene) or not isvalid(template) then return nil end
+        local node=_SpawnService:SpawnByEntity(template,name,Vector3.zero,scene,true)
+        if not isvalid(node) then return nil end
+        node.Enable=false node.Visible=false
+        local visual=node:GetChildByName("Visual")
+        if not isvalid(visual) or not isvalid(visual.SpriteGUIRendererComponent) then
+            _EntityService:Destroy(node)
+            return nil
+        end
+        return node
     end
 
     @ExecSpace("ClientOnly")
@@ -33,17 +55,11 @@ script CarnivalActorPresentation extends Logic
             return _EffectService:PlayEffectAttached(ruid,actor,offset,rotation,scale,loop,self:ForegroundOptions(actor,options))
         end
         options=self:ForegroundOptions(actor,options)
-        local template=_CarnivalUI:UI("Lobby/Scene/EffectAnchorTemplate")
-        if not isvalid(template) then return 0 end
         self._T.serial=(self._T.serial or 0)-1
         local serial=self._T.serial
-        -- The anchor template owns a Visual child; clone the complete tree before publishing.
-        local node=_SpawnService:SpawnByEntity(template,"NativeSkillEffect"..tostring(-serial),Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),true)
+        local node=self:CreateEffectNode("NativeSkillEffect"..tostring(-serial))
         if not isvalid(node) then return 0 end
-        node.Enable=false
-        node.Visible=false
         local visual=node:GetChildByName("Visual")
-        if not isvalid(visual) then _EntityService:Destroy(node) return 0 end
         local effect={node=node,visual=visual,actor=binding.actor,anchor=actor,offset=offset,rotation=rotation,scale=scale,options=options,frames={},ruid=ruid,worldPosition=options.carnivalWorldPosition,loop=loop,born=_UtilLogic.ElapsedSeconds,readyFrame=(self._T.frameSerial or 0)+2}
         self._T.effects=self._T.effects or {}
         self._T.effects[serial]=effect
@@ -199,14 +215,9 @@ script CarnivalActorPresentation extends Logic
             return
         end
         if not isvalid(record.node) then
-            local template=_CarnivalUI:UI("Lobby/Scene/EffectAnchorTemplate")
-            if not isvalid(template) then return end
-            -- Native projectiles use the same anchor/Visual tree as skill effects.
-            record.node=_SpawnService:SpawnByEntity(template,"NativeEntity_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),true)
+            record.node=self:CreateEffectNode("NativeEntity_"..entity.Id)
             if not isvalid(record.node) then return end
             record.spriteNode=record.node:GetChildByName("Visual")
-            if not isvalid(record.spriteNode) then _EntityService:Destroy(record.node) record.node=nil return end
-            record.node.Visible=false
             record.node.Enable=true
             self._T.sortDirty=true
             record.readyFrame=(self._T.frameSerial or 0)+2
@@ -239,13 +250,8 @@ script CarnivalActorPresentation extends Logic
         end
         node.UITransformComponent.anchoredPosition=self:ProjectAnchor(binding,entity,visual.TransformComponent.WorldPosition)
         node.UITransformComponent.UIRotation=Vector3(0,0,visual.TransformComponent.WorldZRotation)
-        local sx=1 local sy=1 local cursor=visual
-        while isvalid(cursor) and cursor~=entity.CurrentMap do
-            local transform=cursor.TransformComponent
-            if isvalid(transform) then sx=sx*transform.Scale.x sy=sy*transform.Scale.y end
-            cursor=cursor.Parent
-        end
-        node.UITransformComponent.UIScale=Vector3(sx*binding.ppu/100,sy*binding.ppu/100,1)
+        local scale=self:WorldScale(visual)
+        node.UITransformComponent.UIScale=Vector3(scale.x*binding.ppu/100,scale.y*binding.ppu/100,1)
         local visible=visual.EnabledInHierarchy and visual.VisibleInHierarchy and source.Enable and (self._T.frameSerial or 0)>=(record.readyFrame or 0)
         if node.Visible~=visible then node.Visible=visible end
         if not record.projected then
@@ -261,10 +267,7 @@ script CarnivalActorPresentation extends Logic
         -- Native hit flashes are often child sprites spawned directly by projectile components.
         for id,binding in pairs(self._T.views or {}) do
             if not isvalid(binding.actor) then
-                self._T.views[id]=nil
-                local stale={}
-                for serial,effect in pairs(self._T.effects or {}) do if effect.actor==binding.actor then table.insert(stale,serial) end end
-                for _,serial in ipairs(stale) do self:RemoveEffect(serial) end
+                self:Unbind(binding.actor)
             else
                 for _,child in pairs(binding.actor.Children) do
                     self:TrackEntity(binding.actor,child)
