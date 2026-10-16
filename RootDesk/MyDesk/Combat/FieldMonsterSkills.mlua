@@ -1,0 +1,484 @@
+@Logic
+script FieldMonsterSkills extends Logic
+    method any Profile(Entity entity)
+        -- Native placement names retain a numeric instance suffix.
+        if not isvalid(entity) then return nil end
+        local kind=string.gsub(entity.Name,"_%d+$","")
+        local monster=entity:GetComponent("script.Monster")
+        if isvalid(monster) and monster._T.specialProfile~=nil then return monster._T.specialProfile or nil end
+        local profile=_FieldMonsterCatalog:Get(kind)
+        if isvalid(monster) then monster._T.specialProfile=profile or false end
+        return profile
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Tick(any monster, number delta)
+        -- Inactive maps and bespoke encounters keep their existing simulation owner.
+        local entity=monster.Entity
+        if monster.IsStageBoss or monster.NeverDie or monster.CarnivalRoom~="" or string.sub(entity.Name,1,12)=="CarnivalMob_" then return end
+        if isvalid(monster.EncounterController) then return end
+        local p=self:Profile(entity)
+        if p==nil then return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if monster._T.specialLife~=monster.LifeSerial then
+            self:Reset(monster)
+            monster._T.specialLife=monster.LifeSerial
+            monster._T.specialMP=p.maxMP
+        end
+        if monster.IsDead or monster.Hp<=0 or monster._T.mapSimulationActive==false then self:Cancel(monster) monster._T.specialShots=nil return end
+        if now>=(monster._T.specialMpAt or 0) then
+            monster._T.specialMpAt=now+10
+            monster._T.specialMP=math.min(p.maxMP,(monster._T.specialMP or 0)+(p.mpRecovery or 0))
+        end
+        self:TickShots(monster,delta)
+        if monster:HoldHitReaction() or not entity.MovementComponent.Enable or not entity.RigidbodyComponent.Enable then self:Cancel(monster) return end
+        local cast=monster._T.specialCast
+        if cast~=nil then
+            entity.MovementComponent:Stop()
+            entity.RigidbodyComponent.MoveVelocity=Vector2.zero
+            entity.RigidbodyComponent:SetForce(Vector2.zero)
+            if not cast.effectPlayed and now>=cast.effectAt then self:CastEffect(monster,cast) end
+            if not cast.fired and now>=cast.fireAt then cast.fired=true self:Resolve(monster,cast) end
+            if now>=cast.endAt then monster._T.specialCast=nil monster.SpecialPoseUntil=0 end
+            return
+        end
+        if now<(monster._T.specialDecisionAt or 0) or monster:IsSpawnProtected() then return end
+        monster._T.specialDecisionAt=now+0.2
+        if now<(monster._T.specialRecovery or 0) then return end
+        local target=monster._T.patrolTarget
+        if not self:ValidPlayer(target,entity.CurrentMap) then
+            target=nil
+            if p.firstAttack==1 or p.selfDestruction~=nil then
+                local best=math.huge
+                for _,player in pairs(_UserService:GetUsersByMapName(entity.CurrentMap.Name)) do
+                    if self:ValidPlayer(player,entity.CurrentMap) then
+                        local offset=player.TransformComponent.WorldPosition-entity.TransformComponent.WorldPosition
+                        local distance=offset.x*offset.x+offset.y*offset.y
+                        if distance<best and distance<100 then target=player best=distance end
+                    end
+                end
+            end
+        end
+        if not self:ValidPlayer(target,entity.CurrentMap) then return end
+        local origin=entity.TransformComponent.WorldPosition
+        local direction=target.TransformComponent.WorldPosition.x>=origin.x and 1 or -1
+        local choices={}
+        monster._T.specialCooldowns=monster._T.specialCooldowns or {}
+        for index,a in ipairs(p.actions) do
+            local available=now>=(monster._T.specialCooldowns[index] or 0) and a.skill~=121 and a.skill~=124
+            if a.hp~=nil and monster.Hp/monster.MaxHp*100>a.hp then available=false end
+            if (monster._T.specialMP or 0)<(a.conMP or a.mpCon or 0) then available=false end
+            if p.selfDestruction~=nil and monster.Hp/monster.MaxHp>p.selfDestruction.hp/p.baseHP then available=false end
+            if available and self:InRange(a,origin,direction,target.TransformComponent.WorldPosition,true) then table.insert(choices,index) end
+        end
+        if #choices==0 then return end
+        local index=choices[_UtilLogic:RandomIntegerRange(1,#choices)]
+        self:Begin(monster,index,target,direction)
+    end
+
+    method boolean ValidPlayer(Entity player, Entity map)
+        -- Targets must stay alive and in this map for every delayed resolution.
+        return isvalid(player) and player.Enable and player.CurrentMap==map and isvalid(player.PlayerComponent) and not player.PlayerComponent:IsDead()
+    end
+
+    method boolean InRange(any a, Vector3 origin, number direction, Vector3 target, boolean acquire)
+        -- Reflect the original left-facing WZ rectangle and invert its pixel Y axis.
+        local r=a.range or {}
+        local x=(target.x-origin.x)*-direction*100
+        local y=-(target.y-origin.y)*100
+        if a.type==3 and acquire then return math.abs(x)<=math.max(300,(r.areaCount or 1)*100) and math.abs(y)<=200 end
+        if r.sp~=nil and r.r~=nil then return (x-r.sp.x)^2+(y-r.sp.y)^2<=r.r*r.r end
+        if r.lt~=nil and r.rb~=nil then return x>=r.lt.x and x<=r.rb.x and y>=r.lt.y and y<=r.rb.y end
+        -- Self buffs have no hit box; only use them during nearby combat.
+        return a.skill>0 and math.abs(x)<=500 and math.abs(y)<=250
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Begin(any monster, integer index, Entity target, number direction)
+        -- The cast captures its origin, facing and life; walking/hit reactions cannot drag it.
+        local p=self:Profile(monster.Entity)
+        local a=p.actions[index]
+        local now=_UtilLogic.ServerElapsedSeconds
+        local origin=monster.Entity.TransformComponent.WorldPosition
+        local duration=math.max(a.duration or 0,a.delay or 0,(a.effectAfter or 0)/1000,0.1)
+        local cast={action=a,index=index,target=target,origin=origin,direction=direction,fireAt=now+(a.delay or 0),effectAt=now+(a.effectAfter~=nil and a.effectAfter/1000 or a.delay or 0),endAt=now+duration,life=monster.LifeSerial}
+        monster._T.specialCast=cast
+        monster._T.specialCooldowns=monster._T.specialCooldowns or {}
+        monster._T.specialCooldowns[index]=now+math.max(a.interval or 0,duration+0.8)
+        monster._T.specialRecovery=now+duration+0.8
+        monster._T.specialMP=math.max(0,(monster._T.specialMP or p.maxMP)-(a.conMP or a.mpCon or 0))
+        local scale=monster.Entity.TransformComponent.Scale
+        monster.Entity.TransformComponent.Scale=Vector3(-direction*math.abs(scale.x),scale.y,scale.z)
+        monster.Entity.MovementComponent:Stop()
+        monster.SpecialPoseRUID=a.clip or ""
+        monster.SpecialPoseUntil=cast.endAt
+        monster.SpecialPoseSerial=monster.SpecialPoseSerial+1
+        if a.type==3 then
+            cast.areas={}
+            local slots={}
+            for i=1,(a.range.areaCount or 1) do table.insert(slots,i) end
+            for i=1,math.min(a.range.attackCount or 1,#slots) do
+                local at=_UtilLogic:RandomIntegerRange(1,#slots)
+                local slot=table.remove(slots,at)
+                local pos=origin+Vector3(-direction*((a.range.start or 0)+slot-1),0,0)
+                table.insert(cast.areas,pos)
+                self:Feedback(monster.Entity,a.warning or "","",pos,direction,nil)
+            end
+        end
+        self:Feedback(monster.Entity,"",a.sound or "",origin,direction,nil)
+        if Environment:IsMakerPlay() and not monster._T.specialLogged then
+            monster._T.specialLogged=true log("[VRF] field special "..p.name.." "..a.key.." delay="..tostring(a.delay).." source="..p.source)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Cancel(any monster)
+        -- Cancel only unfired casts. Already launched missiles retain their own lifetime.
+        monster._T.specialCast=nil
+        monster.SpecialPoseUntil=0
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Reset(any monster)
+        -- Respawn must not inherit buffs, summons, MP or delayed damage from a prior life.
+        self:Cancel(monster)
+        monster._T.specialShots=nil monster._T.specialBuffs=nil monster._T.specialCooldowns=nil monster._T.specialRecovery=0
+        for _,entity in pairs(monster._T.specialSummons or {}) do if isvalid(entity) then _EntityService:Destroy(entity) end end
+        monster._T.specialSummons={}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Resolve(any monster, any cast)
+        -- Source identity and life are rechecked before any delayed gameplay effect.
+        if monster.IsDead or cast.life~=monster.LifeSerial then return end
+        local a=cast.action
+        if a.skill>0 then self:ResolveSkill(monster,cast) return end
+        if not cast.effectPlayed and _UtilLogic.ServerElapsedSeconds>=cast.effectAt then self:CastEffect(monster,cast) end
+        if a.type==2 and a.ball~="" then self:Launch(monster,cast) return end
+        if a.type==3 then
+            for _,pos in ipairs(cast.areas or {}) do
+                self:HitArea(monster,a,pos,cast.direction,nil)
+            end
+        elseif a.type==1 then
+            if self:ValidPlayer(cast.target,monster.Entity.CurrentMap) and self:InRange(a,cast.origin,cast.direction,cast.target.TransformComponent.WorldPosition,false) then
+                self:HitPlayer(monster,a,cast.target)
+            end
+        else
+            self:HitArea(monster,a,cast.origin,cast.direction,nil)
+        end
+        local p=self:Profile(monster.Entity)
+        if p.selfDestruction~=nil then monster:Dead() end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void CastEffect(any monster, any cast)
+        -- WZ effectAfter and attackAfter are independent timestamps.
+        cast.effectPlayed=true
+        local a=cast.action
+        if a.type==3 then
+            for _,position in ipairs(cast.areas or {}) do self:Feedback(monster.Entity,a.effect or "","",position,cast.direction,nil) end
+        else self:Feedback(monster.Entity,a.effect or "","",cast.origin,cast.direction,nil) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HitArea(any monster, any action, Vector3 origin, number direction, Entity only)
+        -- Test the player's native box against the source rectangle, through AttackFast.
+        local r=action.range or {}
+        if r.lt==nil or r.rb==nil then return end
+        local center=origin+Vector3(-(r.lt.x+r.rb.x)*direction/200,-(r.lt.y+r.rb.y)/200,0)
+        local size=Vector2(math.max(0.01,(r.rb.x-r.lt.x)/100),math.max(0.01,(r.rb.y-r.lt.y)/100))
+        local attack=monster.Entity:GetComponent("script.MonsterAttack")
+        attack._T.fieldSpecial={action=action,only=only}
+        attack:AttackFast(BoxShape(Vector2(center.x,center.y),size,0),"field.special",CollisionGroups.HitBox)
+        attack._T.fieldSpecial=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HitPlayer(any monster, any action, Entity target)
+        -- Targeted/projectile hits retain normal shield, invulnerability and PvE filtering.
+        if not self:ValidPlayer(target,monster.Entity.CurrentMap) then return end
+        local pos=target.TransformComponent.WorldPosition
+        local attack=monster.Entity:GetComponent("script.MonsterAttack")
+        attack._T.fieldSpecial={action=action,only=target}
+        attack:AttackFast(BoxShape(Vector2(pos.x,pos.y+0.5),Vector2(1,2),0),"field.special",CollisionGroups.HitBox)
+        attack._T.fieldSpecial=nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method void AcceptedHit(any monster, any action, Entity target)
+        -- Statuses and hit feedback are attached only after PlayerHit accepts the hit.
+        local direction=monster.Entity.TransformComponent.Scale.x<0 and 1 or -1
+        self:Feedback(monster.Entity,action.hit or "",action.hitSound or "",target.TransformComponent.WorldPosition,direction,target)
+        if action.diseaseData~=nil then self:Debuff(target,action.diseaseData,monster.Entity,true) end
+        if action.deadlyAttack==1 then self:DrainMP(target,1,true) end
+        if (action.mpBurn or 0)>0 then self:DrainMP(target,action.mpBurn,false) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Launch(any monster, any cast)
+        -- Original ball is a straight missile; it does not home after launch.
+        local a=cast.action
+        if not self:ValidPlayer(cast.target,monster.Entity.CurrentMap) then return end
+        local sp=a.range.sp or {x=0,y=0}
+        local start=cast.origin+Vector3(-cast.direction*sp.x/100,-sp.y/100,0)
+        local destination=cast.target.TransformComponent.WorldPosition+Vector3(0,0.4,0)
+        local offset=destination-start
+        local length=math.sqrt(offset.x*offset.x+offset.y*offset.y)
+        if length<0.01 then length=0.01 end
+        -- Preserve explicit WZ speed; this world uses 100 px/s when the source omits it.
+        local speed=(a.bulletSpeed or 100)/100
+        local velocity=Vector3(offset.x/length*speed,offset.y/length*speed,0)
+        local duration=(a.range.r/100+1)/speed
+        monster._T.specialShots=monster._T.specialShots or {}
+        monster._T.shotSerial=(monster._T.shotSerial or 0)+1
+        local serial=monster._T.shotSerial
+        table.insert(monster._T.specialShots,{pos=start,velocity=velocity,remaining=duration,action=a,life=monster.LifeSerial,serial=serial})
+        self:ShowMissile(monster.Entity,a.ball,start,velocity,duration,monster.LifeSerial,serial)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void TickShots(any monster, number delta)
+        -- Swept collision prevents fast missiles passing through a player between frames.
+        local shots=monster._T.specialShots
+        if shots==nil then return end
+        for i=#shots,1,-1 do
+            local shot=shots[i]
+            local old=shot.pos
+            local step=math.min(delta,shot.remaining)
+            shot.pos=old+shot.velocity*step shot.remaining=shot.remaining-step
+            local hit=false
+            for _,player in pairs(_UserService:GetUsersByMapName(monster.Entity.CurrentMap.Name)) do
+                if self:ValidPlayer(player,monster.Entity.CurrentMap) then
+                    local p=player.TransformComponent.WorldPosition+Vector3(0,0.4,0)
+                    local dx,dy=shot.pos.x-old.x,shot.pos.y-old.y
+                    local denom=dx*dx+dy*dy
+                    local t=denom>0 and math.max(0,math.min(1,((p.x-old.x)*dx+(p.y-old.y)*dy)/denom)) or 0
+                    if math.abs(p.x-old.x-t*dx)<0.35 and math.abs(p.y-old.y-t*dy)<0.6 then
+                        self:HitPlayer(monster,shot.action,player) hit=true break
+                    end
+                end
+            end
+            if hit or shot.remaining<=0 or shot.life~=monster.LifeSerial then self:RemoveMissile(monster.Entity,shot.serial) table.remove(shots,i) end
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ShowMissile(Entity owner, string ruid, Vector3 start, Vector3 velocity, number duration, integer life, integer serial)
+        -- Client visuals interpolate locally; server owns the swept hit tests.
+        local player=_UserService.LocalPlayer
+        if not isvalid(owner) or not isvalid(player) or owner.CurrentMap~=player.CurrentMap then return end
+        local visual=_SpawnService:SpawnByModelId("fieldmonstermissile","FieldMissile",start,owner.CurrentMap)
+        if not isvalid(visual) then return end
+        visual.SpriteRendererComponent.SpriteRUID=ruid
+        visual.SpriteRendererComponent.FlipX=velocity.x>0
+        self._T.visualShots=self._T.visualShots or {}
+        table.insert(self._T.visualShots,{entity=visual,owner=owner,life=life,velocity=velocity,remaining=duration,serial=serial})
+    end
+
+    @ExecSpace("Client")
+    method void RemoveMissile(Entity owner, integer serial)
+        -- Remove the matching visual immediately when the authoritative missile hits.
+        local shots=self._T.visualShots or {}
+        for i=#shots,1,-1 do
+            local shot=shots[i]
+            if shot.owner==owner and shot.serial==serial then
+                if isvalid(shot.entity) then _EntityService:Destroy(shot.entity) end
+                table.remove(shots,i)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Local projectile entities are removed on map change, death, expiry and teardown.
+        local player=_UserService.LocalPlayer
+        local shots=self._T.visualShots or {}
+        for i=#shots,1,-1 do
+            local s=shots[i]
+            local m=isvalid(s.owner) and s.owner:GetComponent("script.Monster") or nil
+            s.remaining=s.remaining-delta
+            if not isvalid(s.entity) or not isvalid(m) or m.IsDead or m.LifeSerial~=s.life or not isvalid(player) or s.owner.CurrentMap~=player.CurrentMap or s.remaining<=0 then
+                if isvalid(s.entity) then _EntityService:Destroy(s.entity) end table.remove(shots,i)
+            else s.entity.TransformComponent:Translate(s.velocity*delta) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- No locally spawned visuals survive the play session.
+        for _,s in ipairs(self._T.visualShots or {}) do if isvalid(s.entity) then _EntityService:Destroy(s.entity) end end
+        self._T.visualShots=nil
+    end
+
+    @ExecSpace("Client")
+    method void Feedback(Entity owner, string ruid, string sound, Vector3 position, number direction, Entity attached)
+        -- Always use a valid world owner, never the screen/world origin as a fallback.
+        local player=_UserService.LocalPlayer
+        if not isvalid(player) or not isvalid(owner) or player.CurrentMap~=owner.CurrentMap then return end
+        if ruid~="" then
+            local options={FlipX=direction>0,SortingLayer="MapLayer0",OrderInLayer=12}
+            if isvalid(attached) then _EffectService:PlayEffectAttached(ruid,attached,Vector3.zero,0,Vector3.one,false,options)
+            else _EffectService:PlayEffect(ruid,owner,position,0,Vector3.one,false,options) end
+        end
+        if sound~="" then _SoundService:PlaySoundAtPos(sound,position,player,0.6) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ResolveSkill(any monster, any cast)
+        -- Individual MobSkill IDs determine behavior; animation names never imply damage.
+        local a=cast.action local id=a.skill
+        local now=_UtilLogic.ServerElapsedSeconds
+        if id<120 or id==140 or id==141 then
+            if _UtilLogic:RandomIntegerRange(1,100)>(a.prop or 100) then return end
+        end
+        if (id==140 and self:Buff(monster,141)>0) or (id==141 and self:Buff(monster,140)>0) then return end
+        if id==100 or id==101 or id==102 or id==103 or id==140 or id==141 then
+            monster._T.specialBuffs=monster._T.specialBuffs or {}
+            monster._T.specialBuffs[id]={untilTime=now+(a.time or 0),value=a.x or 100}
+        elseif id==110 or id==111 or id==112 or id==113 or id==114 then
+            for _,entity in pairs(monster.Entity.CurrentMap.Children) do
+                local other=entity:GetComponent("script.Monster")
+                if isvalid(other) and not other.IsDead and self:InRange(a,cast.origin,cast.direction,entity.TransformComponent.WorldPosition,false) then
+                    if id==114 then
+                        local profile=self:Profile(monster.Entity)
+                        local amount=(a.x or 0)+_UtilLogic:RandomIntegerRange(0,a.y or 0)
+                        other.Hp=math.min(other.MaxHp,other.Hp+math.max(1,math.floor(amount/profile.baseHP*other.MaxHp)))
+                    else
+                        other._T.specialBuffs=other._T.specialBuffs or {}
+                        other._T.specialBuffs[id-10]={untilTime=now+(a.time or 0),value=a.x or 100}
+                    end
+                end
+            end
+        elseif id==200 or id==201 then self:Summon(monster,a,cast.origin,cast.direction)
+        elseif id==131 then self:Mist(monster,a,cast.origin,cast.direction)
+        else
+            for _,player in pairs(_UserService:GetUsersByMapName(monster.Entity.CurrentMap.Name)) do
+                if self:ValidPlayer(player,monster.Entity.CurrentMap) and self:InRange(a,cast.origin,cast.direction,player.TransformComponent.WorldPosition,false) then
+                    if id==129 then
+                        local p=self:Profile(monster.Entity)
+                        local ban=p.ban and p.ban.banMap and p.ban.banMap["0"] or nil
+                        -- The project uses the later Subway Ticketing Booth map ID.
+                        local mapId=ban and tostring(ban.field) or ""
+                        if mapId=="103000100" then mapId="103020000" end
+                        local map=_EntityService:GetEntityByPath("/maps/"..mapId)
+                        if isvalid(map) then
+                            local spawn=map:GetFirstChildComponentByTypeName("MOD.Core.SpawnLocationComponent",true)
+                            local channelMap=_ChannelManager:EnsureMap(mapId,player.PlayerComponent.UserId)
+                            if isvalid(spawn) and channelMap~="" then
+                                _MapPortalSystem:NotifyMapTravel(mapId,player.PlayerComponent.UserId)
+                                _TeleportService:TeleportToMapPosition(player,spawn.Entity.TransformComponent.WorldPosition,channelMap)
+                            end
+                        end
+                    else self:Debuff(player,a,monster.Entity,false) end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Summon(any monster, any a, Vector3 origin, number direction)
+        -- Respect the source cap and clean minions up with their summoner's life.
+        local catalog=_FieldMonsterCatalog:Summons()
+        local live={}
+        for _,entity in pairs(monster._T.specialSummons or {}) do
+            if isvalid(entity) and not entity.Monster.IsDead then table.insert(live,entity) end
+        end
+        monster._T.specialSummons=live
+        local limit=a.limit or 1
+        for i=0,100 do
+            local id=a[tostring(i)]
+            if id==nil or #live>=limit then break end
+            local data=catalog[tostring(id)]
+            if data~=nil then
+                local left=a.lt and a.lt.x/100 or -1
+                local right=a.rb and a.rb.x/100 or 1
+                local pos=origin+Vector3(-direction*(left+_UtilLogic:RandomDouble()*(right-left)),0,0)
+                local entity=_SpawnService:SpawnByModelId(data.model,data.kind.."_"..tostring(i+1),pos,monster.Entity.CurrentMap)
+                if isvalid(entity) then
+                    table.insert(live,entity)
+                    if data.removeAfter>0 then _TimerService:SetTimerOnce(function() if isvalid(entity) then _EntityService:Destroy(entity) end end,data.removeAfter) end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Mist(any monster, any a, Vector3 origin, number direction)
+        -- The source x encodes mist lifetime in 100 ms units; time is poison duration.
+        -- Project adaptation: mist poison ticks use 1% player max HP, nonlethally.
+        local life=monster.LifeSerial
+        local endAt=_UtilLogic.ServerElapsedSeconds+(a.mistDuration or 0)
+        self:ShowMist(monster.Entity,origin,Vector2(a.lt.x,a.lt.y),Vector2(a.rb.x,a.rb.y),direction,a.mistDuration or 0,life)
+        local tick=nil
+        tick=function()
+            if not isvalid(monster.Entity) or monster.IsDead or monster.LifeSerial~=life or _UtilLogic.ServerElapsedSeconds>=endAt then return end
+            for _,player in pairs(_UserService:GetUsersByMapName(monster.Entity.CurrentMap.Name)) do
+                if self:ValidPlayer(player,monster.Entity.CurrentMap) and self:InRange(a,origin,direction,player.TransformComponent.WorldPosition,false) then
+                    self:Debuff(player,{skill=125,time=a.time or 5,x=math.max(1,math.floor(player.PlayerComponent.MaxHp/100)),prop=a.prop or 100},monster.Entity,false)
+                end
+            end
+            _TimerService:SetTimerOnce(tick,1)
+        end
+        tick()
+    end
+
+    @ExecSpace("Client")
+    method void ShowMist(Entity owner, Vector3 origin, Vector2 lt, Vector2 rb, number direction, number duration, integer life)
+        -- MobSkill tiles are absent from the MSW catalog. Reuse the existing official
+        -- Poison Mist tile for presentation only; WZ bounds/lifetime still own gameplay.
+        local player=_UserService.LocalPlayer
+        if not isvalid(owner) or not isvalid(player) or owner.CurrentMap~=player.CurrentMap then return end
+        local columns=math.max(1,math.ceil((rb.x-lt.x)/100))
+        local rows=math.max(1,math.ceil((rb.y-lt.y)/100))
+        for x=1,columns do for y=1,rows do
+            local position=origin+Vector3(-direction*(lt.x+(x-0.5)*(rb.x-lt.x)/columns)/100,-(lt.y+(y-0.5)*(rb.y-lt.y)/rows)/100,0)
+            self:ShowMissile(owner,"8bfddf0644494979ba02ef5a59b5a336",position,Vector3.zero,duration,life,-1)
+        end end
+    end
+
+    method number Buff(any monster, integer id)
+        -- Expired buffs cannot affect damage even if the monster is sleeping.
+        local buff=monster._T.specialBuffs and monster._T.specialBuffs[id] or nil
+        if buff~=nil and buff.untilTime>_UtilLogic.ServerElapsedSeconds then return buff.value end
+        return 0
+    end
+
+    method boolean IsMagic(string tag)
+        -- Explicit magic tags keep elemental arrows (fire/ice shot) physical.
+        local value=tag or ""
+        for _,prefix in ipairs({"skill.magicclaw","skill.magicmissile","skill.energybolt","skill.firearrow","skill.holyarrow","skill.angelray","skill.heal","skill.thunderbolt","skill.coldbeam","skill.shiningray","skill.explosion","skill.chainlightning","skill.firedemon","skill.icedemon","skill.blizzard","skill.meteor","skill.genesis","skill.ifrit","skill.elquines","skill.bahamut","skill.summondragon","skill.darkdragon","dot.poisonmist","dot.firezone","dot.glacierzone"}) do
+            if value==prefix or string.sub(value,1,#prefix+1)==prefix.."." then return true end
+        end
+        return false
+    end
+
+    method number DefenseFactor(any monster, string tag)
+        -- Project adaptation: use WZ guard x as incoming damage percent on this world's curve.
+        -- The original client defense formula is not reproduced by this project.
+        local magic=self:IsMagic(tag)
+        if self:Buff(monster,magic and 141 or 140)>0 then return 0 end
+        local value=self:Buff(monster,magic and 103 or 102)
+        return value>0 and value/100 or 1
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Debuff(Entity player, any data, Entity source, boolean acceptedHit)
+        -- Apply only verified MobSkill probability/duration to a living player.
+        -- This world has no accuracy or EXP stat: do not invent replacement penalties.
+        if data.skill==121 or data.skill==124 then return end
+        if not self:ValidPlayer(player,source.CurrentMap) then return end
+        if _UtilLogic:RandomIntegerRange(1,100)>(data.prop or 100) then return end
+        local hit=player:GetComponent("script.PlayerHit")
+        if not isvalid(hit) or (not acceptedHit and (hit.IsInvincible or hit._T.climbInvincible)) then return end
+        local status=player:GetComponent("script.MonsterDebuff")
+        if not isvalid(status) then player:AddComponent("script.MonsterDebuff") status=player:GetComponent("script.MonsterDebuff") end
+        if isvalid(status) then status:Apply(data.skill,data.time or 0,data.x or 0,source) end
+    end
+
+    @ExecSpace("Client")
+    method void DrainMP(Entity player, integer amount, boolean leaveOne)
+        -- MP is owned by the existing local manager, including recovery potion updates.
+        if player~=_UserService.LocalPlayer then return end
+        _MpManager:SpendMonsterMP(amount,leaveOne)
+    end
+end

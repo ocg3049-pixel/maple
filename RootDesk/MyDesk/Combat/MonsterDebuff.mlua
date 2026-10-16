@@ -1,0 +1,118 @@
+@Component
+script MonsterDebuff extends Component
+    @Sync property number SealUntil = 0
+    @Sync property number BlindUntil = 0
+    @Sync property number WeakUntil = 0
+    @Sync property number StunUntil = 0
+    @Sync property number CurseUntil = 0
+    @Sync property number PoisonUntil = 0
+    @Sync property number SlowUntil = 0
+    @Sync property number SlowRate = 1
+    property integer PoisonDamage = 0
+
+    @ExecSpace("ServerOnly")
+    method void Apply(integer id, number duration, number value, Entity source)
+        -- Status duration and magnitude come from the verified MobSkill level.
+        local untilTime=_UtilLogic.ServerElapsedSeconds+duration
+        if id==120 then self.SealUntil=untilTime
+        elseif id==121 then self.BlindUntil=untilTime
+        elseif id==122 then self.WeakUntil=untilTime
+        elseif id==123 or id==137 then self.StunUntil=untilTime
+        elseif id==124 then self.CurseUntil=untilTime
+        elseif id==125 then self.PoisonUntil=untilTime self.PoisonDamage=math.max(1,math.floor(value))
+        elseif id==126 then self.SlowUntil=untilTime self.SlowRate=math.max(0,math.min(1,value/100))
+        elseif id==127 then self:Dispel() end
+        self._T.statusMap=self.Entity.CurrentMap
+        local pa=self.Entity:GetComponent("script.PlayerAttack")
+        if isvalid(pa) then pa:RecomputeMoveJumpBuffs() end
+        self:Notify(id,duration)
+        if Environment:IsMakerPlay() then log("[VRF] monster debuff id="..tostring(id).." seconds="..tostring(duration)) end
+    end
+
+    method boolean BlocksAttack(boolean skill)
+        -- The same synced clocks gate manual, auto-hunt and mobile inputs.
+        local now=_UtilLogic.ServerElapsedSeconds
+        return now<self.StunUntil or (skill and now<self.SealUntil)
+    end
+
+    method number SpeedFactor()
+        -- Multiply the existing speed ledger instead of restoring stale movement values.
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<self.StunUntil then return 0 end
+        return now<self.SlowUntil and self.SlowRate or 1
+    end
+
+    method number JumpFactor()
+        -- Weakness prevents jumping without overwriting permanent jump upgrades.
+        local now=_UtilLogic.ServerElapsedSeconds
+        return (now<self.StunUntil or now<self.WeakUntil) and 0 or 1
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Clear()
+        -- Statuses do not persist through death, respawn or leaving the affected field.
+        self.SealUntil=0 self.BlindUntil=0 self.WeakUntil=0 self.StunUntil=0
+        self.CurseUntil=0 self.PoisonUntil=0 self.SlowUntil=0 self.SlowRate=1
+        local pa=self.Entity:GetComponent("script.PlayerAttack")
+        if isvalid(pa) then pa:RecomputeMoveJumpBuffs() end
+        self._T.statusMap=nil
+    end
+
+    method void OnUpdate(number delta)
+        -- Keep client-controlled motion still while the authoritative stun is active.
+        if self:IsClient() then
+            if self.Entity==_UserService.LocalPlayer and _UtilLogic.ServerElapsedSeconds<self.StunUntil then
+                self.Entity.MovementComponent:Stop()
+                self.Entity.RigidbodyComponent.MoveVelocity=Vector2.zero
+            end
+            return
+        end
+        if self._T.statusMap==nil then return end
+        if self.Entity.PlayerComponent:IsDead() or self.Entity.CurrentMap~=self._T.statusMap then self:Clear() return end
+        local now=_UtilLogic.ServerElapsedSeconds
+        if now<(self._T.tickAt or 0) then return end
+        self._T.tickAt=now+0.2
+        local signature=tostring(self:SpeedFactor())..":"..tostring(self:JumpFactor())
+        if signature~=self._T.speedSignature then
+            self._T.speedSignature=signature
+            local pa=self.Entity:GetComponent("script.PlayerAttack")
+            if isvalid(pa) then pa:RecomputeMoveJumpBuffs() end
+        end
+        if now<self.PoisonUntil and now>=(self._T.poisonAt or 0) then
+            self._T.poisonAt=now+1
+            local player=self.Entity.PlayerComponent
+            local damage=math.min(math.max(0,player.Hp-1),self.PoisonDamage)
+            player.Hp=player.Hp-damage
+            local hit=self.Entity:GetComponent("script.PlayerHit")
+            if damage>0 and isvalid(hit) then hit:ShowTakenDamage(damage) end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void Dispel()
+        -- Reuse every existing buff's cleanup rather than leaving timers or stat bonuses.
+        for _,kind in ipairs({"powerguard","darksight","smokescreen","amhaeng","amhaeng2","parry","restoration","haste","combo","shadowpartner","firezone","glacier","dragonride","herosummon","knightsummon","healersummon","sixdragons","darkdragon","dragonblood","elemfield","battojutsu","awakening","shadowclone","ironwall","guardshield","bahamut","ifrit","elquines","freezer","phoenix","archersummon","thiefsummon"}) do
+            _SkillManager:CancelBuffForActor(self.Entity,kind)
+        end
+        self:ClearBuffPresentation()
+    end
+
+    @ExecSpace("Client")
+    method void ClearBuffPresentation()
+        -- Local-only stat buffs have their existing cancellation callbacks.
+        if self.Entity~=_UserService.LocalPlayer then return end
+        for _,entry in ipairs(_BuffBarManager._T.buffList or {}) do
+            local protected=string.find(entry.path,"RecoveryPotion",1,true)~=nil or string.find(entry.path,"AttackSpeedPotion",1,true)~=nil or string.find(entry.path,"BossBattle",1,true)~=nil
+            if not protected and entry.cancel~=nil and entry.getRemaining()>0 then entry.cancel() end
+        end
+        _BuffBarManager:Reorder()
+    end
+
+    @ExecSpace("Client")
+    method void Notify(integer id, number duration)
+        -- Show only to the affected player; never broadcast another player's debuff UI.
+        if self.Entity~=_UserService.LocalPlayer then return end
+        local names={[120]="봉인",[121]="암흑",[122]="허약",[123]="기절",[124]="저주",[125]="중독",[126]="슬로우",[127]="버프 해제",[137]="빙결"}
+        _UIToast:ShowMessage((names[id] or "상태 이상")..(duration>0 and (" · "..tostring(duration).."초") or ""))
+    end
+end

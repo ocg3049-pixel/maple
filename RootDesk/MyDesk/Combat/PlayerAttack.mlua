@@ -366,6 +366,8 @@ script PlayerAttack extends AttackComponent
 
     @ExecSpace("ClientOnly")
     method boolean CanStartBasicAttack()
+        local status=self.Entity:GetComponent("script.MonsterDebuff")
+        if isvalid(status) and status:BlocksAttack(false) then return false end
         -- All manual, mobile and auto-hunt ranged inputs use this gate before starting a motion.
         if self.Entity~=_UserService.LocalPlayer or self:IsDeathBlocked() or self:IsFinalAttackLocked() then return false end
         return self:GetBasicAttackRecoveryRemaining()<=0 and not _SkillManager._T.skillOnCooldown
@@ -500,6 +502,8 @@ script PlayerAttack extends AttackComponent
 
 	@ExecSpace("ServerOnly")
 	method void AttackNormal()
+        local status=self.Entity:GetComponent("script.MonsterDebuff")
+        if isvalid(status) and status:BlocksAttack(false) then return end
         -- Basic attacks and incoming skills share recovery on the authoritative side.
         if self:IsDeathBlocked() or self:IsFinalAttackLocked() or self:GetBasicAttackRecoveryRemaining()>0 or self._T.basicRecoveryQueued then return end
         if self._T.isMagicClawing then return end
@@ -552,6 +556,9 @@ script PlayerAttack extends AttackComponent
 	end
 
 	method boolean IsAttackTarget(Entity defender, string attackInfo)
+        -- Server hit validation also rejects attacks while sealed or stunned.
+        local status=self.Entity:GetComponent("script.MonsterDebuff")
+        if isvalid(status) and status:BlocksAttack(string.sub(attackInfo or "",1,6)=="skill.") then return false end
         -- Preview actors must never damage or lock onto ordinary-map monsters.
         if not self:IsCarnivalTarget(defender) then return false end
         if attackInfo=="boss.faust.holywater" and defender~=self._T.holyWaterTarget then return false end
@@ -977,6 +984,14 @@ script PlayerAttack extends AttackComponent
     method integer CalcDamage(Entity attacker, Entity defender, string attackInfo)
         if attackInfo=="boss.faust.holywater" then return self._T.holyWaterDamage or 0 end
         local damage=self:CalcUnfilteredDamage(attacker,defender,attackInfo)
+        local fieldMonster=isvalid(defender) and defender:GetComponent("script.Monster") or nil
+        if isvalid(fieldMonster) and not self._T.planningFieldDamage then
+            local factor=_FieldMonsterSkills:DefenseFactor(fieldMonster,attackInfo)
+            damage=math.floor(damage*factor)
+            for _,key in ipairs({"lastDoubleStabDamage","lastMagicClawDamage","lastSpearBurstDamage","lastSavageBlowDamage","lastBrandishFinishDamage","lastStrafeDamage","lastHeroStabDamage","lastAmhaeng2Damage","lastShadowCloneDamage","shadowEchoOriginal","shadowEchoBonus"}) do
+                if self._T[key]~=nil then self._T[key]=math.floor(self._T[key]*factor) end
+            end
+        end
         local monster=isvalid(defender) and defender:GetComponent("script.Monster") or nil
         if isvalid(monster) and monster.MinimumHitDamage>0 and damage<=monster.MinimumHitDamage then
             for _,key in ipairs({"lastDoubleStabDamage","lastMagicClawDamage","lastSpearBurstDamage","lastSavageBlowDamage","lastBrandishFinishDamage","lastStrafeDamage","lastHeroStabDamage","lastAmhaeng2Damage","lastShadowCloneDamage","shadowEchoOriginal","shadowEchoBonus"}) do
@@ -11891,6 +11906,8 @@ script PlayerAttack extends AttackComponent
 		for _, f in pairs(self._T.speedFactors or {}) do
 			speedMult = speedMult * f
 		end
+		local status=self.Entity:GetComponent("script.MonsterDebuff")
+        if isvalid(status) then speedMult=speedMult*status:SpeedFactor() jumpMult=jumpMult*status:JumpFactor() end
 		movement.InputSpeed = self._T.hasteBaseInputSpeed * speedMult
 		movement.JumpForce = self._T.hasteBaseJumpForce * jumpMult
 	end
@@ -28727,15 +28744,21 @@ script PlayerAttack extends AttackComponent
 
     @ExecSpace("ServerOnly")
     method table ResolveFlyingDamage(any attack, Entity target, string tag)
-        local plan = attack._T.flyingDamage
-        local roll = plan ~= nil and plan[target.Id] or nil
-        if roll ~= nil and roll.tag == tag then
-            plan[target.Id] = nil
-            local mon = target:GetComponent("script.Monster")
+        -- Apply temporary defenses at impact, after releasing the unfiltered reservation.
+        local plan=attack._T.flyingDamage
+        local roll=plan~=nil and plan[target.Id] or nil
+        if roll~=nil and roll.tag==tag then
+            plan[target.Id]=nil
+            local mon=target:GetComponent("script.Monster")
             if isvalid(mon) then mon:ReleaseIncomingHit(roll.token) end
-            return roll
+        else roll=attack:RollPlannedDamage(target,tag) end
+        local monster=target:GetComponent("script.Monster")
+        if isvalid(monster) then
+            local factor=_FieldMonsterSkills:DefenseFactor(monster,tag)
+            roll.dmg=math.floor(roll.dmg*factor)
+            roll.bonus=math.floor((roll.bonus or 0)*factor)
         end
-        return attack:RollPlannedDamage(target, tag)
+        return roll
     end
 
     @ExecSpace("ServerOnly")
@@ -28817,7 +28840,10 @@ script PlayerAttack extends AttackComponent
         local keys={"shadowEchoOriginal","shadowEchoBonus","shadowEchoOriginalIsCritical","shadowEchoBonusIsCritical","shadowEchoIsManualSkin"}
         local previous={}
         for _,key in ipairs(keys) do previous[key]=self._T[key] end
+        local wasPlanning=self._T.planningFieldDamage
+        self._T.planningFieldDamage=true
         local damage=self:CalcDamage(self.Entity,target,tag)
+        self._T.planningFieldDamage=wasPlanning
         local critical=self:CalcCritical(self.Entity,target,tag)
         if critical then damage=math.floor(damage*self:GetCriticalDamageRate()) end
         local roll={dmg=damage,bonus=0,critical=critical,shadow={}}
