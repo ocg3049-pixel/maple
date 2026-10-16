@@ -1599,6 +1599,8 @@ script AutoHuntManager extends Logic
 						local stepH = self:GetStepUpHeightAhead(player, pp, dir)
 						if (stepH <= 0 or stepH > self:GetPlainJumpReach(player))
 							and not self:IsWalkConnectedToTarget(player, pp, mp) then
+							-- 낮은 턱은 실제 착지 지면이 목표까지 연결되면 하강 경로로 이어간다.
+							if self:TryWalkDownRoute(now, player, target, dir, delta) then return end
 							-- (신고 2026-08-10 2차) 걸어서 못 가는 너머의 적이 **약간 위**(0.5↑)면 제외하기
 							-- 전에 가장자리 점프 공격을 시도한다 - "걸어서는 못 가는 위치의 적에게 점프
 							-- 공격을 안 한다"의 직접 해결(가능 여부는 TryJumpAttack의 높이 reach+1.15 /
@@ -4153,6 +4155,7 @@ script AutoHuntManager extends Logic
 						--   ⚠ 끊겨 있어도 **앞점프로 그 발판에 올라설 수 있으면** 정상 후보다(작은 턱/선반).
 						if relY > -0.8 and relY < 1.1
 							and not self:IsWalkConnectedToPoint(player, myFhId, wp.x, wp.y)
+							and not self:CanWalkDownToPoint(player, myFhId, wp.x, wp.y)
 							and not self:CanReachTargetLayer(player, pp, wp, plainReach) then
 							-- (신고 2026-08-10 2차) **약간 위**(0.5↑)의 끊긴 선반 위 적은 점프 정점
 							-- 공격이 닿으면 후보에 남긴다 - 실제 공격은 추적 분기의 가장자리 점프
@@ -5399,12 +5402,46 @@ script AutoHuntManager extends Logic
 				if span==nil then bounds[group]={left=surface.l,right=surface.r}
 				else span.left=math.min(span.left,surface.l) span.right=math.max(span.right,surface.r) end
 			end
+			-- 낮은 수직 턱으로 직접 연결된 지면은 높은 쪽에서만 걸어 내려갈 수 있다.
+			-- 보행 구역 자체를 합치면 반대 방향의 벽이나 끊긴 발판도 평지로 오인한다.
+			local downLinks, downCount = {}, 0
+			for _, wall in pairs(fh:GetFootholdAll()) do
+				if not wall:IsVertical() then continue end
+				local drop = wall.StartPoint.y - wall.EndPoint.y
+				if math.abs(drop) <= 0.05 or math.abs(drop) > 1.2 then continue end
+				local left = fh:GetFoothold(wall.PreviousFootholdId)
+				local right = fh:GetFoothold(wall.NextFootholdId)
+				if left == nil or right == nil or left:IsVertical() or right:IsVertical() then continue end
+				local a, b = left.EndPoint, right.StartPoint
+				if math.abs(a.x-wall.StartPoint.x) > 0.03 or math.abs(a.y-wall.StartPoint.y) > 0.03
+					or math.abs(b.x-wall.EndPoint.x) > 0.03 or math.abs(b.y-wall.EndPoint.y) > 0.03 then continue end
+				local high = drop > 0 and groups[left.Id] or groups[right.Id]
+				local low = drop > 0 and groups[right.Id] or groups[left.Id]
+				if high == nil or low == nil or high == low then continue end
+				downLinks[high] = downLinks[high] or {}
+				if not downLinks[high][low] then downCount += 1 end
+				downLinks[high][low] = true
+			end
+			self._T.walkDownLinks = downLinks
+			if Environment:IsMakerPlay() then log("[VRF] AutoHunt walk-down links="..tostring(downCount).." map="..map.Name) end
 			self._T.walkGroupBounds=bounds
 			self._T.walkGroups = groups
 			self._T.walkGroupsMap = map
 		end
 		local groups = self._T.walkGroups
 		return groups[aId] ~= nil and groups[aId] == groups[bId]
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanWalkDownToPoint(Entity player, integer myFhId, number x, number y)
+		-- 연결된 낮은 턱의 하강 방향만 허용한다. 빈틈/깊은 절벽/오르막은 기존 경로 판정을 쓴다.
+		local targetId = self:GetFootholdIdBelow(player, x, y + 0.1, 2.0)
+		if myFhId <= 0 or targetId <= 0 then return false end
+		if self:AreFootholdIdsConnected(player, myFhId, targetId) then return false end
+		local groups, links = self._T.walkGroups, self._T.walkDownLinks
+		if self._T.walkGroupsMap ~= player.CurrentMap or groups == nil or links == nil then return false end
+		local from, to = groups[myFhId], groups[targetId]
+		return from ~= nil and to ~= nil and links[from] ~= nil and links[from][to] == true
 	end
 
 	@ExecSpace("ClientOnly")
