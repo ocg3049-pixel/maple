@@ -2988,23 +2988,39 @@ script PlayerAttack extends AttackComponent
 
 
 	@ExecSpace("ClientOnly")
-	method void PinCombatMotionFacing()
-		-- Lock facing in the input controller itself, before its next movement tick can flip a held attack pose.
-		if self.Entity ~= _UserService.LocalPlayer or not self:ShouldPinLookDirection() then return end
-		local ctrl = self.Entity.PlayerControllerComponent
-		if not isvalid(ctrl) then return end
-		if self._T.combatFixedLookBefore == nil then self._T.combatFixedLookBefore = ctrl.FixedLookAt end
-		ctrl.FixedLookAt = ctrl.LookDirectionX < 0 and -1 or 1
-	end
+    method void PinCombatMotionFacing()
+        -- Sprint is a movement pose; only attacks and ladder holds own fixed facing.
+        if self.Entity ~= _UserService.LocalPlayer or not self:ShouldPinLookDirection() then return end
+        if self._T.combatMotionSource == "PlaySprintPose" then return end
+        local ctrl = self.Entity.PlayerControllerComponent
+        if not isvalid(ctrl) then return end
+        self._T.combatFacing = ctrl.LookDirectionX < 0 and -1 or 1
+        self:RefreshFacingLock()
+    end
 
 	@ExecSpace("ClientOnly")
-	method void ReleaseCombatMotionFacing()
-		-- Call only after the attack pose has been replaced, including when a newer cast cancels it.
-		if self._T.combatFixedLookBefore == nil then return end
-		local ctrl = isvalid(self.Entity) and self.Entity.PlayerControllerComponent or nil
-		if isvalid(ctrl) then ctrl.FixedLookAt = self._T.combatFixedLookBefore end
-		self._T.combatFixedLookBefore = nil
-	end
+    method void ReleaseCombatMotionFacing()
+        -- Release this owner without restoring a snapshot of another temporary lock.
+        self._T.combatFacing = nil
+        self:RefreshFacingLock()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshFacingLock()
+        -- Derive the native lock from live owners, repairing orphaned locks after interruption.
+        if not isvalid(self.Entity) or self.Entity ~= _UserService.LocalPlayer then return end
+        local ctrl = self.Entity.PlayerControllerComponent
+        if not isvalid(ctrl) then return end
+        local attacking = (self:HasActiveCombatMotion() and self._T.combatMotionSource ~= "PlaySprintPose")
+            or self._T.basicAttackInputLocked == true or self:GetBasicAttackRecoveryRemaining() > 0
+        if not attacking or self:IsDeathBlocked() then self._T.combatFacing = nil end
+        local ladder = self:IsHanging(self.Entity) and self._T.ladderFacing or nil
+        local direction = ladder or self._T.combatFacing or 0
+        if ctrl.FixedLookAt ~= direction then
+            ctrl.FixedLookAt = direction
+            if Environment:IsMakerPlay() and direction == 0 then log("[VRF] Facing lock released; no active owner") end
+        end
+    end
 
 	@ExecSpace("ClientOnly")
 	method void ObserveCombatMotion(Entity body)
@@ -29186,21 +29202,21 @@ script PlayerAttack extends AttackComponent
 
     @ExecSpace("ClientOnly")
     method void UpdateLadderFacing()
-        -- Pin only facing; vertical movement and the native hanging animation stay active.
-        if self.Entity~=_UserService.LocalPlayer then return end
-        local ctrl=self.Entity.PlayerControllerComponent
+        -- Keep ladder facing as an owner, never as a saved copy of an attack's FixedLookAt.
+        if self.Entity ~= _UserService.LocalPlayer then return end
+        local ctrl = self.Entity.PlayerControllerComponent
         if not isvalid(ctrl) then return end
-        if self:IsHanging(self.Entity) then
-            if self._T.ladderFacing==nil then
-                self._T.ladderFacing=ctrl.LookDirectionX
-                self._T.ladderFixedBefore=ctrl.FixedLookAt
+        if self:IsHanging(self.Entity) and not self:IsDeathBlocked() then
+            if self._T.ladderFacing == nil or self._T.ladderFacingMap ~= self.Entity.CurrentMap then
+                self._T.ladderFacing = ctrl.LookDirectionX < 0 and -1 or 1
+                self._T.ladderFacingMap = self.Entity.CurrentMap
             end
-            ctrl.FixedLookAt=self._T.ladderFacing
-            ctrl.LookDirectionX=self._T.ladderFacing
-        elseif self._T.ladderFacing~=nil then
-            ctrl.FixedLookAt=self._T.ladderFixedBefore or 0
-            self._T.ladderFacing=nil self._T.ladderFixedBefore=nil
+            ctrl.LookDirectionX = self._T.ladderFacing
+        else
+            self._T.ladderFacing = nil
+            self._T.ladderFacingMap = nil
         end
+        self:RefreshFacingLock()
     end
 
     @ExecSpace("ClientOnly")
