@@ -299,60 +299,82 @@ script CharacterPersistence extends Logic
 		return table.concat(lines, "\n")
 	end
 
+    @ExecSpace("ServerOnly")
+    method boolean WriteMetadata(table sv, boolean blocking)
+        -- Serialize chars and audit logs behind one writer; retain failed or newer values.
+        if sv.metadataWriting then
+            if not blocking then return false end
+            local deadline = _UtilLogic.ElapsedSeconds + 15
+            while sv.metadataWriting and _UtilLogic.ElapsedSeconds < deadline do wait(0.05) end
+            if sv.metadataWriting then return false end
+        end
+        sv.metadataWriting = true
+        local payload = {}
+        local logs = {}
+        local chars = nil
+        if sv.charsDirty then
+            chars = self:EncodeCharsStore(sv)
+            payload["chars"] = chars
+        end
+        for id, _ in pairs(sv.dirtyLogs) do
+            if sv.logs[id] ~= nil then
+                logs[id] = self:EncodeLogs(sv.logs[id])
+                payload["log_" .. id] = logs[id]
+            end
+        end
+        if next(payload) == nil then
+            sv.metadataWriting = false
+            return not sv.charsDirty and next(sv.dirtyLogs) == nil
+        end
+        local complete = function(ec, successKeys)
+            local succeeded = {}
+            for _, key in ipairs(successKeys or {}) do succeeded[key] = true end
+            if chars ~= nil and (ec == 0 or succeeded["chars"]) and self:EncodeCharsStore(sv) == chars then
+                sv.charsDirty = false
+            end
+            for id, raw in pairs(logs) do
+                if (ec == 0 or succeeded["log_" .. id]) and sv.logs[id] ~= nil and self:EncodeLogs(sv.logs[id]) == raw then
+                    sv.dirtyLogs[id] = nil
+                end
+            end
+            sv.metadataWriting = false
+            if ec ~= 0 then log_warning("[Persist] metadata save failed ec=" .. tostring(ec) .. "; pending data retained") end
+            if Environment:IsMakerPlay() then log("[VRF][PersistMetadata] ec=" .. tostring(ec) .. " charsDirty=" .. tostring(sv.charsDirty) .. " logsDirty=" .. tostring(next(sv.dirtyLogs) ~= nil)) end
+        end
+        if blocking then
+            local ec, keys = sv.storage:BatchSetAndWait(payload)
+            complete(ec, keys)
+            return not sv.charsDirty and next(sv.dirtyLogs) == nil
+        end
+        sv.storage:BatchSetAsync(payload, complete)
+        return true
+    end
+
 	@ExecSpace("ServerOnly")
 	method boolean FlushUserNow(string userId)
+        -- Keep the session cache until every persistence domain confirms its write.
         _ItemHallOfFame:Flush()
-		-- 해당 유저의 dirty 데이터를 전부 동기 저장 (퇴장 시점 - 블로킹 허용).
-		local sv = self._T.sv[userId]
-		if sv == nil then return true end
-		local storage = sv.storage
-        _CashItemAudit:Flush(sv,true)
-		if sv.charsDirty then
-			storage:SetAndWait("chars", self:EncodeCharsStore(sv))
-			sv.charsDirty = false
-		end
+        local sv = self._T.sv[userId]
+        if sv == nil then return true end
+        _CashItemAudit:Flush(sv, true)
+        local metadataOK = self:WriteMetadata(sv, true)
         local accountOK = self:WriteAccountPreferences(sv, true)
-		local savesOK = self:WriteCharacterSaves(sv, true)
-		for id, _ in pairs(sv.dirtyLogs) do
-			local lg = sv.logs[id]
-			if lg ~= nil then
-				storage:SetAndWait("log_" .. id, self:EncodeLogs(lg))
-			end
-		end
-		sv.dirtyLogs = {}
-		local auditOK = (sv.cashAuditPending == nil or next(sv.cashAuditPending) == nil) and (sv.mesoAudit == nil or next(sv.mesoAudit) == nil)
-		if not auditOK then log_warning("[Persist] 복구 기록 저장 미완료 - 캐시를 유지하고 재시도합니다.") end
-		return savesOK and auditOK and accountOK
-	end
+        local savesOK = self:WriteCharacterSaves(sv, true)
+        local auditOK = (sv.cashAuditPending == nil or next(sv.cashAuditPending) == nil) and (sv.mesoAudit == nil or next(sv.mesoAudit) == nil)
+        if not auditOK then log_warning("[Persist] 복구 기록 저장 미완료 - 캐시를 유지하고 재시도합니다.") end
+        return savesOK and auditOK and accountOK and metadataOK
+    end
 
 	@ExecSpace("ServerOnly")
 	method void ServerFlushTick()
-		-- 10초 주기: dirty인 것만 비동기 저장 (변경 없으면 아무것도 안 씀).
-		for userId, sv in pairs(self._T.sv) do
-			local storage = sv.storage
-            _CashItemAudit:Flush(sv,false)
-			-- (유실 방지) 실패 콜백에서 dirty를 복원해 다음 틱이 재시도하게 한다 - 기존에는 발행과
-			-- 동시에 dirty를 내려버려, 쓰기 실패 + 이후 변경 없음이면 세션 진행분이 통째로 증발했다.
-			if sv.charsDirty then
-				sv.charsDirty = false
-				storage:SetAsync("chars", self:EncodeCharsStore(sv), function(ec, key)
-					if ec ~= 0 then
-						log_warning("[Persist] chars 저장 실패 ec=" .. tostring(ec) .. " - 재시도 예약")
-						sv.charsDirty = true
-					end
-				end)
-			end
+        -- Each writer batches its domain and retains changes until acknowledgement.
+        for _, sv in pairs(self._T.sv) do
+            _CashItemAudit:Flush(sv, false)
+            self:WriteMetadata(sv, false)
             self:WriteAccountPreferences(sv, false)
-			self:WriteCharacterSaves(sv, false)
-			for id, _ in pairs(sv.dirtyLogs) do
-				local lg = sv.logs[id]
-				if lg ~= nil then
-					storage:SetAsync("log_" .. id, self:EncodeLogs(lg), function(ec, key) end)
-				end
-			end
-			sv.dirtyLogs = {}
-		end
-	end
+            self:WriteCharacterSaves(sv, false)
+        end
+    end
 
 	@ExecSpace("ServerOnly")
 	method void OnUserLeave(UserLeaveEvent event)
@@ -460,9 +482,8 @@ script CharacterPersistence extends Logic
 			log_warning("[Persist] 닉네임 레지스트리 등록 실패 ec=" .. tostring(ec2))
 		end
 		-- 캐릭터 목록은 중요 데이터라 즉시 저장. 실패하면 dirty를 유지해 주기 flush가 재시도한다.
-		local ecW = sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
-		sv.charsDirty = (ecW ~= 0)
-		if ecW ~= 0 then log_warning("[Persist] 생성 직후 chars 저장 실패 ec=" .. tostring(ecW) .. " - 재시도 예약") end
+		sv.charsDirty = true
+        if not self:WriteMetadata(sv, true) then log_warning("[Persist] 생성 직후 목록 저장 재시도 예약") end
 		self:AppendAudit(sv, id, "create:" .. name, 0, 0, false)
 		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 생성: " .. name .. " (id=" .. id .. ", user=" .. senderUserId .. ")") end
 		self:OnCreateResult(true, "", self:BuildCharsReply(sv), senderUserId)
@@ -482,9 +503,8 @@ script CharacterPersistence extends Logic
 		table.remove(sv.list, index)
         _ItemHallOfFame:Queue(senderUserId, ch.id, "", "")
 		table.insert(sv.trash, { id = ch.id, deletedAt = DateTime.UtcNow.Elapsed, data = ch.data })
-		local ecD = sv.storage:SetAndWait("chars", self:EncodeCharsStore(sv))
-		sv.charsDirty = (ecD ~= 0)
-		if ecD ~= 0 then log_warning("[Persist] 삭제 직후 chars 저장 실패 ec=" .. tostring(ecD) .. " - 재시도 예약") end
+		sv.charsDirty = true
+        if not self:WriteMetadata(sv, true) then log_warning("[Persist] 삭제 직후 목록 저장 재시도 예약") end
 		self:AppendAudit(sv, ch.id, "delete", 0, 0, false)
 		local name = string.match(ch.data, "([^|]+)") or "?"
 		if Environment:IsMakerPlay() then log("[Persist] 캐릭터 삭제(7일 보관): " .. name .. " (id=" .. ch.id .. ")") end
