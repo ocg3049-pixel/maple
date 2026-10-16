@@ -16,6 +16,7 @@ script DroppedItemComponent extends Component
     --       (그 뒤 습득/소멸). phase는 @Sync가 아닌 일반 프로퍼티라 서버에서 다른 인스턴스도 읽을 수 있다.
     property number GroundOffset = 0
     @Sync property integer phase = 0
+    @Sync property string HomingUserId = ""
     @Sync property number FloatBaseY = 0
     @Sync property number RecoveryExpiresAt = 0
     property string KillerUserId = ""
@@ -43,8 +44,9 @@ script DroppedItemComponent extends Component
     property number homeElapsed = 0.0
     property number homeTimeout = 9.0       -- 안전장치: 이 시간 안에 못 닿으면 강제 습득/소멸
 
-    @ExecSpace("ServerOnly")
     method void OnBeginPlay()
+        -- Apply known sprite dimensions on the client before its first rendered frame.
+        if self:IsClient() then self:ApplyDropVisualScale() return end
         -- 초기 속도: 위로 튀되 좌우로 살짝 랜덤(여러 개가 겹쳐 떨어져도 흩어져 착지하게).
         self._T.vx = (_UtilLogic:RandomDouble() * 2.0 - 1.0) * 2.2
         self._T.vy = self.popUpSpeed
@@ -58,6 +60,10 @@ script DroppedItemComponent extends Component
 
     method void OnUpdate(number delta)
         if self:IsClient() then
+            self:ApplyDropVisualScale()
+            if not isvalid(self._T.motionVisual) then
+                self._T.motionVisual=_NetworkMotionVisual:Register(self.Entity)
+            end
             if self.ItemRUID=="3eb056d03f034a29b52bfa917319d71a" then self:UpdateShellVisual() end
             if self:IsRecoveryPotion() then
                 local now=_UtilLogic.ElapsedSeconds
@@ -73,6 +79,39 @@ script DroppedItemComponent extends Component
         elseif self.phase == 2 then self:UpdateSettle(delta)
         elseif self.phase == 1 then self:UpdateHome(delta)
         elseif self.phase == 4 then self:UpdateFall(delta) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyDropVisualScale()
+        -- Image and Scale sync separately; never display the uploaded box at its native 1254px.
+        local sr=self.Entity.SpriteRendererComponent
+        if isvalid(sr) and sr.SpriteRUID=="90d3412612004466b328850446cb1d68" then
+            local scale=_MonsterDropRules:EquipmentBoxScale()
+            local size=Vector3(scale,scale,1)
+            if self.Entity.TransformComponent.Scale~=size then self.Entity.TransformComponent.Scale=size end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector3 VisualHomePosition(Vector3 current, number delta)
+        -- Only the visual moves locally. The server still selects the recipient and grants the item.
+        local target=_UserService:GetUserEntityByUserId(self.HomingUserId)
+        if self.phase~=1 or not isvalid(target) or target.CurrentMap~=self.Entity.CurrentMap then return current end
+        local goal=target.TransformComponent.WorldPosition+Vector3(0,0.5,0)
+        local dx,dy=goal.x-current.x,goal.y-current.y
+        local distance=math.sqrt(dx*dx+dy*dy)
+        local step=self.homeSpeed*math.max(0,delta)
+        if distance<=step or distance<0.001 then return goal end
+        return Vector3(current.x+dx/distance*step,current.y+dy/distance*step,current.z)
+    end
+
+    @ExecSpace("ClientOnly")
+    method number VisualHomeAlpha(Vector3 current)
+        local target=_UserService:GetUserEntityByUserId(self.HomingUserId)
+        if self.phase~=1 or not isvalid(target) then return -1 end
+        local goal=target.TransformComponent.WorldPosition+Vector3(0,0.5,0)
+        local dx,dy=goal.x-current.x,goal.y-current.y
+        return math.max(0,math.min(1,(math.sqrt(dx*dx+dy*dy)-0.35)/0.85))
     end
 
     @ExecSpace("ServerOnly")
@@ -163,6 +202,7 @@ script DroppedItemComponent extends Component
             return
         end
 
+        self.HomingUserId=target.PlayerComponent.UserId
         local pos = self.Entity.TransformComponent.WorldPosition
         local tPos = target.TransformComponent.WorldPosition
         local tx, ty = tPos.x, tPos.y + 0.5           -- 몸통(살짝 위)으로
@@ -316,6 +356,7 @@ script DroppedItemComponent extends Component
 
     @ExecSpace("ClientOnly")
     method void OnEndPlay()
+        _NetworkMotionVisual:Remove(self.Entity.Id)
         if isvalid(self._T.shellAura) then self._T.shellAura:Destroy() end
         self._T.shellAura=nil
         if isvalid(self._T.potionHint) then self._T.potionHint:Destroy() end
@@ -400,7 +441,7 @@ script DroppedItemComponent extends Component
             end
         end
         if isvalid(aura) then
-            aura.TransformComponent.WorldPosition=self.Entity.TransformComponent.WorldPosition+(_BossRewards._T.auraOffset or Vector3.zero)
+            aura.TransformComponent.WorldPosition=_NetworkMotionVisual:Position(self.Entity)+(_BossRewards._T.auraOffset or Vector3.zero)
             aura.SpriteRendererComponent.Color=self.Entity.SpriteRendererComponent.Color
         end
     end

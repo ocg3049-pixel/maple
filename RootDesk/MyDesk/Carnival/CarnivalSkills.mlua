@@ -379,25 +379,50 @@ script CarnivalSkills extends Logic
     end
 
     @ExecSpace("ClientOnly")
+    method boolean IsAutoDamageSkill(string name)
+        -- Utility skills do not become attacks merely because their buff is already active.
+        local role=_AutoHuntManager:GetSkillRole(name)
+        return role=="single" or role=="aoe" or role=="archer" or role=="sniping"
+            or role=="piercing" or role=="drainshot" or role=="coma" or role=="panic"
+    end
+
+    @ExecSpace("ClientOnly")
     method void AutoTick()
-        -- Use native skill execution, replica resources and utility priorities before attacks.
+        -- Publish skill priority before casting so server basic attacks cannot steal the next action.
         local a=self:Actor() local now=_UtilLogic.ElapsedSeconds
         for i,row in ipairs((_CarnivalUI.state.scene or {}).actors or {}) do if a~=nil and row.uid==a.uid then _CarnivalReplica:BindBattle(i,row) break end end
         local p=_CarnivalReplica._T.client
         if a==nil or a.dead or not a.autoMode or p==nil or not isvalid(p.actor) then return end
-        if a.locked or now<(self._T.lockUntil or 0) or now<(_CarnivalView._T.manualUntil or 0) then return end
-        for _,pending in pairs(self._T.pending or {}) do if pending~=nil then return end end
-        if self:TryAutoRecovery(a,p) then return end
         local target=nil local monsters=(_CarnivalUI.state.scene or {}).monsters or {}
         for _,m in ipairs(monsters) do if m.slot==a.autoTarget and _CarnivalBattle:LivingTarget(m) then target=m break end end
         local slots=_MobileUIManager:IsMobile() and _MobileUIManager:ExportMobileSkills() or _SkillManager:ExportHotkeys()
-        local candidates={} local desiredRange=math.max(1.05,(a.basicRange or 1.65)-0.4)
+        local attackTier=0 local available={} local seen={}
+        local mp=_CarnivalReplica:GetCurrentMp()
         for key,slot in pairs(slots) do
             local name=slot.name or ""
-            if not _SkillManager:IsSkillUsableByInvestment(name) or _SkillManager:IsPassiveSkillName(name) then continue end
-            if _CarnivalView:SlotCooldown(name)>0 or _CarnivalReplica:GetCurrentMp()<_SkillManager:GetSkillMpCost(name) then continue end
-            if name=="슬래시블러스트" and a.hp<=_SkillManager:GetSlashBlastHpCost() then continue end
-            local d=self:Definition(name) local role=_AutoHuntManager:GetSkillRole(name)
+            if seen[name] or not _SkillManager:IsSkillUsableByInvestment(name) or _SkillManager:IsPassiveSkillName(name) then continue end
+            seen[name]=true
+            local damage=self:IsAutoDamageSkill(name)
+            local tier=name=="달팽이 세마리" and 0 or _SkillManager:GetSkillTier(name)
+            if damage then attackTier=math.max(attackTier,tier) end
+            table.insert(available,{key=key,name=name,damage=damage,tier=tier,
+                cooldown=_CarnivalView:SlotCooldown(name),cost=_SkillManager:GetSkillMpCost(name)})
+        end
+        local desiredRange=math.max(0.65,(a.basicRange or 1.65)*0.8)
+        local planTier=-1 local preferSkills=false local candidates={}
+        for _,slot in ipairs(available) do
+            local name=slot.name local role=_AutoHuntManager:GetSkillRole(name)
+            if name=="달팽이 세마리" and attackTier>=2 then continue end
+            if mp<slot.cost or (name=="슬래시블러스트" and a.hp<=_SkillManager:GetSlashBlastHpCost()) then continue end
+            if role=="drainshot" and a.hp>=a.maxHp*0.7 then continue end
+            local d=self:Definition(name)
+            if slot.damage and slot.cooldown<=0.35 then
+                local range=self:AutoAttackRange(name,d,p.actor)*0.9
+                if slot.tier>planTier then desiredRange=range planTier=slot.tier
+                elseif slot.tier==planTier then desiredRange=math.max(desiredRange,range) end
+                preferSkills=true
+            end
+            if slot.cooldown>0 then continue end
             local score=0 local buff=_CarnivalUI:BuffRemaining(name)
             local retry=((p.autoBuffRetry or {})[name] or 0)
             if role=="heal" and self:NeedsAutoHeal(a,p) then score=100000
@@ -405,39 +430,53 @@ script CarnivalSkills extends Logic
             elseif (role=="buff" or role=="summon" or role=="dragonride" or role=="shadowclone" or role=="awakening") and buff<=1 and now>=retry then score=20000
             elseif role=="dragonblood" and a.hp>=a.maxHp*0.5 and buff<=1 and now>=retry then score=19000
             elseif role=="recoveryaura" and target~=nil then score=18000
-            elseif target~=nil and role~="manual" and role~="mobility" and role~="teleport" and role~="dash" and role~="darksight" and role~="chargemode" then
-                if role=="buff" or role=="summon" or role=="dragonride" or role=="shadowclone" or role=="dragonblood" or role=="awakening" then continue end
-                local range=self:AutoAttackRange(name,d,p.actor) local height=d~=nil and d.height or 2.5
-                desiredRange=math.max(desiredRange,math.min(7,range*0.9))
-                if math.abs(target.x-a.x)<=range and math.abs(target.y-a.y)<=height then
-                    local count=0
-                    for _,m in ipairs(monsters) do if _CarnivalBattle:LivingTarget(m) and math.abs(m.x-a.x)<=range and math.abs(m.y-a.y)<=height then count=count+1 end end
-                    score=d~=nil and (d.min or 1)+(d.max or 1) or 200
-                    score=score*(d~=nil and d.hits or 1)*math.min(d~=nil and d.targets or 6,count)
-                    if role=="drainshot" and a.hp<a.maxHp*0.7 then score=90000 end
+            elseif slot.damage and target~=nil and self:CanAutoAttackReach(name,a,target,p.actor) then
+                local count=0
+                for _,m in ipairs(monsters) do
+                    if _CarnivalBattle:LivingTarget(m) and (m.x-a.x)*(target.x>=a.x and 1 or -1)>=-0.15
+                        and self:CanAutoAttackReach(name,a,m,p.actor) then count=count+1 end
                 end
+                score=d~=nil and ((d.min or 1)+(d.max or 1))*(d.hits or 1)*math.min(d.targets or 1,count)
+                    or math.max(1,slot.tier)*math.min(role=="single" and 1 or 6,count)
+                if role=="drainshot" then score=90000 end
             end
-            if score>0 and (_SkillManager:SupportsActorSkill(name) or d~=nil) then table.insert(candidates,{key=key,name=name,score=score,role=role}) end
+            if score>0 then table.insert(candidates,{key=slot.key,name=name,score=score,w=score,role=role}) end
         end
-        if now>=(self._T.rangeAt or 0) then self._T.rangeAt=now+0.5 _CarnivalReplica:SetAutoRange(_CarnivalUI.state.id,desiredRange) end
+        if now>=(self._T.rangeAt or 0) or p.preferSkills~=preferSkills or p.desiredRange~=desiredRange then
+            self._T.rangeAt=now+0.5 p.preferSkills=preferSkills p.desiredRange=desiredRange
+            _CarnivalReplica:SetAutoRange(_CarnivalUI.state.id,desiredRange,preferSkills)
+        end
+        if a.locked or now<(self._T.lockUntil or 0) or now<(_CarnivalView._T.manualUntil or 0) then return end
+        for _,pending in pairs(self._T.pending or {}) do if pending~=nil then return end end
+        if self:TryAutoRecovery(a,p) then return end
         table.sort(candidates,function(l,r) if l.score==r.score then return l.key<r.key end return l.score>r.score end)
         if #candidates>0 and candidates[1].score<18000 then
-            local pool={} local frontCount=0
-            local face=target~=nil and (target.x>=a.x and 1 or -1) or a.face
+            local frontCount=0 local nearby=0 local face=target~=nil and (target.x>=a.x and 1 or -1) or a.face
             for _,m in ipairs(monsters) do
                 local dx=(m.x-a.x)*face
-                if _CarnivalBattle:LivingTarget(m) and dx>=0 and dx<=8 and math.abs(m.y-a.y)<=1 then frontCount=frontCount+1 end
+                if _CarnivalBattle:LivingTarget(m) then
+                    if dx>=0 and dx<=8 and math.abs(m.y-a.y)<=1 then frontCount=frontCount+1 end
+                    if math.abs(m.x-a.x)<=4.95 and math.abs(m.y-a.y)<=1.65 then nearby=nearby+1 end
+                end
             end
+            _AutoHuntManager:ApplyNightLordWeights(candidates,frontCount)
+            _AutoHuntManager:ApplyAttackHierarchyForContext(candidates,attackTier,target~=nil and math.abs(target.y-a.y)>=1.2)
+            local strafe=false
+            for _,c in ipairs(candidates) do if c.name=="스트레이프" then strafe=true end end
+            if strafe and nearby==1 then
+                for _,c in ipairs(candidates) do
+                    if c.name=="파이어 샷" or c.name=="아이스 샷" or c.name=="아이언 에로우"
+                        or c.name=="에로우 봄" or c.name=="더블샷" or c.name=="에로우 블로우" then c.w=0 end
+                end
+            end
+            -- Pick once from eligible attacks; a failed preferred cast must not fall through to snail/basic spam.
+            local total=0 for _,c in ipairs(candidates) do total=total+c.w end
+            if total<=0 then return end
+            local roll=_UtilLogic:RandomDouble()*total local chosen=nil
             for _,c in ipairs(candidates) do
-                if c.name=="럭키세븐" or c.name=="트리플 스로우" or c.name=="쿼드러플 스로우" or c.name=="어벤져" then c.w=1 table.insert(pool,c) end
+                if c.w>0 then chosen=c roll=roll-c.w if roll<=0 then break end end
             end
-            if #pool>0 then
-                _AutoHuntManager:ApplyNightLordWeights(pool,frontCount)
-                local total=0 for _,c in ipairs(pool) do total=total+c.w end
-                local roll=_UtilLogic:RandomDouble()*total local chosen=pool[#pool]
-                for _,c in ipairs(pool) do roll=roll-c.w if c.w>0 and roll<=0 then chosen=c break end end
-                candidates={chosen}
-            end
+            candidates=chosen~=nil and {chosen} or {}
         end
         for _,candidate in ipairs(candidates) do
             if self:TryCast(candidate.key,true,target~=nil and target.slot or 0) then
@@ -448,7 +487,6 @@ script CarnivalSkills extends Logic
             end
         end
     end
-
 
     @ExecSpace("ClientOnly")
     method number AutoAttackRange(string name, table definition, Entity actor)
@@ -463,10 +501,42 @@ script CarnivalSkills extends Logic
         end
         if name=="럭키세븐" or name=="트리플 스로우" or name=="쿼드러플 스로우" or name=="드레인 샷" then
             local attack=isvalid(actor) and actor:GetComponent("PlayerAttack") or nil
-            return _ShurikenLibrary:GetSkillReach(isvalid(attack) and attack._T.awakeningActive==true).x*0.8
+            local awakened=isvalid(attack) and attack._T.awakeningActive==true
+            local reach=name=="드레인 샷" and _ShurikenLibrary:GetSkillReach(awakened) or _ShurikenLibrary:GetThrowReach(awakened)
+            return reach.x*0.8
         end
         local reach=self._T.projectileRanges[name]
-        return reach~=nil and reach*0.8 or (definition~=nil and definition.range or 7)
+        if reach~=nil then return reach*0.8 end
+        local box=_AutoHuntManager:GetAttackRangeBox(name)
+        if box~=nil then return box[1] end
+        if name=="암살" then return 4.3 end
+        if name=="패닉" then return 3.8 end
+        if name=="코마" then return _AutoHuntManager:GetComaHalfWidth(math.max(1,_AutoHuntManager:GetComboOrbCount(actor))) end
+        if name=="체인라이트닝" then return 5.5 end
+        return 1.3
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean CanAutoAttackReach(string name, table actor, table target, Entity native)
+        -- Signed vertical bands and special shapes match field hunting; unknown attacks stay melee-sized.
+        local dx=math.abs(target.x-actor.x) local dy=target.y-actor.y
+        local range=self:AutoAttackRange(name,nil,native)
+        if dx>range then return false end
+        if name=="럭키세븐" or name=="트리플 스로우" or name=="쿼드러플 스로우" or name=="드레인 샷" then
+            local attack=native:GetComponent("PlayerAttack")
+            return _ShurikenLibrary:InVerticalReach(dy,isvalid(attack) and attack._T.awakeningActive==true)
+        end
+        if name=="달팽이 세마리" then return actor.ground and math.abs(dy)<=0.7 and dx*dx+dy*dy<=range*range end
+        if name=="패닉" or name=="암살" then return dx*dx+dy*dy<=range*range end
+        if name=="코마" then return _AutoHuntManager:GetComboOrbCount(native)>0 and math.abs(dy)<=range*0.5 end
+        if name=="체인라이트닝" then return dx>=0.5 and math.abs(dy)<=0.8+dx*0.45 end
+        if name=="스나이핑" or name=="피어싱" then return math.abs(dy)<=0.6 end
+        local box=_AutoHuntManager:GetAttackRangeBox(name)
+        if box~=nil then
+            if name=="아이언 에로우" and dx*dx+dy*dy>range*range then return false end
+            return dy>=box[2] and dy<=box[3]
+        end
+        return dx*dx+dy*dy<=range*range and dy>-0.6 and dy<1.2
     end
 
     @ExecSpace("ClientOnly")

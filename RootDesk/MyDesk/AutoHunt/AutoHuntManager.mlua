@@ -751,6 +751,7 @@ script AutoHuntManager extends Logic
 	-- 스킬바에 배정된 스킬을 역할별로 나눈다. 미분류 스킬은 "manual"(자동사냥이 건드리지 않음).
 	@ExecSpace("ClientOnly")
 	method string GetSkillRole(string skillName)
+		if self._T.skillRoles~=nil then return self._T.skillRoles[skillName] or "manual" end
 		local roles = {
             ["달팽이 세마리"] = "single",
 			-- 버프 (지속형 - 만료 전 주기 재시전)
@@ -849,6 +850,7 @@ script AutoHuntManager extends Logic
 			-- 쿨타임 상태도 SkillManager에서 공유하므로 역할도 같다(메테오 난사 콤보의 축).
 			["리커버리 마나"] = "recoveryaura",
 		}
+		self._T.skillRoles=roles
 		return roles[skillName] or "manual"
 	end
 
@@ -1331,7 +1333,7 @@ script AutoHuntManager extends Logic
 		-- 조준하므로 **제자리에서 거의 다 닿는다** - 굳이 걸어가지 않고 그 자리에서 계속 던진다.
 		-- 표창 스킬이 하나도 배정돼 있지 않으면(근접 위주 구성) 평소처럼 접근한다.
 		if self:IsAwakeningOn() and self:HasStarThrowSlot()
-			and math.abs(dx) <= _ShurikenLibrary:GetSkillReach(true).x and math.abs(dy) <= _ShurikenLibrary:GetSkillReach(true).y then
+			and math.abs(dx) <= _ShurikenLibrary:GetThrowReach(true).x and math.abs(dy) <= _ShurikenLibrary:GetThrowReach(true).y then
 			if self._T.moving then self:StopMoving() end
 			self._T.chaseStart = now
 			if math.abs(dx) > 0.05 then
@@ -1539,6 +1541,7 @@ script AutoHuntManager extends Logic
 			if holdEdge then
 				self:StopMoving()
 				if self:TryStepUpOverWall(player,pp,dir,now) then return end
+                if self:TryWalkDownRoute(now,player,target,dir,delta) then return end
 			end
 			if (self._T.layerHoldUntil or 0) > now then
 				local rbHold = player.RigidbodyComponent
@@ -1741,12 +1744,10 @@ script AutoHuntManager extends Logic
 						end
 					end
 					if not canLand then
-						if self._T.banned == nil then self._T.banned = {} end
-						self._T.banned[target] = now + 4.0
-						self._T.target = nil
-						self._T.nextScan = 0
-						self:StopMoving()
-						if Environment:IsMakerPlay() then log("[AutoHunt] 아래 발판 없음 - 다운점프 불가 대상 제외 후 재선정") end
+                        -- A solid stair may have no landing directly underneath. The tracked
+                        -- descent checks both ends of the connected floor before abandoning it.
+                        if (self._T.lastAttackAt or -99)+1.0>now then return end
+                        self:BeginTrackedDownJump(now,player)
 						return
 					end
 					if landOvershoot then
@@ -1788,14 +1789,9 @@ script AutoHuntManager extends Logic
 					--   낙하 중에는 자동사냥이 이동 입력을 주지 않으므로 컨트롤러를 켜도 조작이 충돌하지 않고,
 					--   오히려 엔진이 낙하/착지 모션을 스스로 재생해준다. 착지 후 정리는 OnUpdate 상단의
 					--   "착지 복귀"(jumpedAt) 로직이 담당한다.
-					-- ⚠ (신고 2026-08-09, 사용자 가설이 정확했다) 공격 모션 중에는 PlayerAttack이
-					--   FALL/JUMP 몸동작 매핑을 통째로 빼둔다(SuppressBrandishStateMotions). 그 구간에
-					--   다운점프하면 상태는 FALL이 되어도 재생할 클립이 없어 **선 자세로 내려간다**.
-					--   실측: 자동사냥 중 FALL 매핑이 빠져 있는 시간이 **396 샘플 중 182(46%)**나 됐다.
-					--   매핑이 돌아올 때까지 이번 틱은 미룬다 - 공격이 끝나면 곧 복구되고, 대상은 그대로라
-					--   다음 틱에 정상적으로 내려간다.
-					local asacDJ = player.AvatarStateAnimationComponent
-					if isvalid(asacDJ) and asacDJ.StateToAvatarBodyActionSheet["FALL"] == nil then
+                    -- A missing override can use the native FALL animation. Only a live
+                    -- attack lock blocks descent; a missing table entry must never deadlock AI.
+					if isvalid(attack) and (attack:IsSwingMotionActive() or attack:HasActiveCombatMotion()) then
 						return
 					end
 					-- (요청 2026-08-09) 방금 공격했다면 다운점프를 **1초 미룬다.**
@@ -2806,7 +2802,7 @@ script AutoHuntManager extends Logic
 			and ((self:HasBlizzardSlot() and _SkillManager:IsBlizzardReady())
 				or (self:HasMeteorSlot() and _SkillManager:IsMeteorReady()))
 		if awakeningOn and self:HasStarThrowSlot() then
-			local reach = _ShurikenLibrary:GetSkillReach(true)
+			local reach = _ShurikenLibrary:GetThrowReach(true)
             if math.abs(cdx) > reach.x or math.abs(cdy) > reach.y then return end
 		elseif self:ShouldSnipeWithAssassinate(cdx, cdy) then
 			-- 연막 중 암살 사거리(9유닛) 안이면 붙지 않고 그대로 시전한다.
@@ -4215,6 +4211,32 @@ script AutoHuntManager extends Logic
 	end
 
     @ExecSpace("ClientOnly")
+    method boolean TryWalkDownRoute(number now, Entity player, Entity target, number dir, number delta)
+        -- A shallow drop is a route when its landing floor connects to the target's floor.
+        -- Target height alone cannot distinguish a valley from a dangerous cliff.
+        if (self._T.layerHoldUntil or 0)>now or (self._T.noDownJumpUntil or 0)>now then return false end
+        local rb=player.RigidbodyComponent
+        if not isvalid(rb) or not rb:IsOnGround() then return false end
+        local floor=rb:GetCurrentFoothold()
+        if floor==nil or not isvalid(target) then return false end
+        local pp=player.TransformComponent.WorldPosition
+        local tp=target.TransformComponent.WorldPosition
+        local edge=dir>0 and floor.EndPoint or floor.StartPoint
+        if math.abs(edge.x-pp.x)>0.85 then return false end
+        local x=edge.x+dir*0.35
+        local fh=player.CurrentMap.FootholdComponent
+        local landing=fh:Raycast(Vector2(x,edge.y+0.05),Vector2(0,-1),1.3)
+        if landing==nil or landing:IsVertical() then return false end
+        local drop=pp.y-landing:GetYByX(x)
+        if drop<0.15 or drop>1.2 then return false end
+        local goal=self:GetFootholdIdBelow(player,tp.x,tp.y+0.15,0.8)
+        if goal<=0 or not self:AreFootholdIdsConnected(player,landing.Id,goal) then return false end
+        self._T.downJumpRecovery={map=player.CurrentMap,floor=floor.Id,y=pp.y,target=target,x=x,untilTime=now+2.5}
+        if Environment:IsMakerPlay() then log("[VRF][AutoHunt] connected step-down from="..floor.Id.." landing="..landing.Id.." goal="..goal.." drop="..tostring(drop)) end
+        return self:DownJumpProgressTick(now,player,delta)
+    end
+
+    @ExecSpace("ClientOnly")
     method boolean EscapeNarrowPlatform(number now, Entity player)
         -- 발판 전체 폭으로 정체를 판단하고, 공격할 수 없는 적 근처에서는 안전하게 내려간다.
         local rb=player.RigidbodyComponent
@@ -4601,7 +4623,7 @@ script AutoHuntManager extends Logic
 		local dx, dy = math.abs(tp.x - pp.x), tp.y - pp.y
         dx = dx + self:GetChaseRangeInset(player, target, 0.65)
 		if name == "럭키세븐" or name == "트리플 스로우" or name == "쿼드러플 스로우" then
-            local reach=_ShurikenLibrary:GetSkillReach(self:IsAwakeningOn())
+            local reach=_ShurikenLibrary:GetThrowReach(self:IsAwakeningOn())
             return dx<=reach.x-0.2 and _ShurikenLibrary:InVerticalReach(dy,self:IsAwakeningOn())
         end
         if name == "드레인 샷" then
@@ -4621,6 +4643,16 @@ script AutoHuntManager extends Logic
 		if name == "체인라이트닝" then return dx >= 0.5 and dx <= 5.5 and math.abs(dy) <= 0.8 + dx*0.45 end
 		-- 서버의 전방/광역 박스와 투사체 수명에 맞춘 값(이동 여유 포함).
 		-- {가로, 발 위치 기준 최소 y, 최대 y}. 짧은 스킬이 긴 스킬의 사거리를 물려받지 않는다.
+
+		if name == "아이언 에로우" and dx*dx+dy*dy > 4.7*4.7 then return false end
+		local box = self:GetAttackRangeBox(name)
+		if box ~= nil then return dx <= box[1] and dy >= box[2] and dy <= box[3] end
+		return dx*dx + dy*dy <= 1.3*1.3 and dy > -0.6 and dy < 1.2
+	end
+
+    @ExecSpace("ClientOnly")
+    method table GetAttackRangeBox(string name)
+        -- Shared field/carnival reach: horizontal distance and signed vertical limits.
 		if self._T.attackRanges == nil then
 			self._T.attackRanges = {
 				["더블샷"]={5.1,-0.35,1.0}, ["에로우 블로우"]={5.1,-0.35,1.0},
@@ -4639,11 +4671,8 @@ script AutoHuntManager extends Logic
 				["차지 블로우"]={1.8,-0.9,0.9}, ["어썰터"]={8.5,-1.8,1.8}
 			}
 		end
-		if name == "아이언 에로우" and dx*dx+dy*dy > 4.7*4.7 then return false end
-		local box = self._T.attackRanges[name]
-		if box ~= nil then return dx <= box[1] and dy >= box[2] and dy <= box[3] end
-		return dx*dx + dy*dy <= 1.3*1.3 and dy > -0.6 and dy < 1.2
-	end
+        return self._T.attackRanges[name]
+    end
 
 	@ExecSpace("ClientOnly")
 	method boolean HasUsableAttackInRange(Entity player, Entity target)
@@ -6771,20 +6800,27 @@ script AutoHuntManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void ApplyAttackHierarchy(table pool, Entity player)
+        -- Field context stays separate from the carnival replica and its target.
+        local diagonal=false
+        if isvalid(self._T.target) then diagonal=math.abs(self._T.target.TransformComponent.WorldPosition.y-player.TransformComponent.WorldPosition.y)>=1.2 end
+        self:ApplyAttackHierarchyForContext(pool,self._T.slottedAttackTier or 0,diagonal)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyAttackHierarchyForContext(table pool, integer attackTier, boolean diagonal)
+        -- Both hunting modes share the same lower-tier and beginner attack policy.
         local weights={}
         local firstWeight=0
         for _,candidate in ipairs(pool) do
             weights[candidate.name]=(weights[candidate.name] or 0)+math.max(0,candidate.w)
             if candidate.name~="달팽이 세마리" then firstWeight=math.max(firstWeight,candidate.w) end
         end
-        local diagonal=false
-        if isvalid(self._T.target) then diagonal=math.abs(self._T.target.TransformComponent.WorldPosition.y-player.TransformComponent.WorldPosition.y)>=1.2 end
         for _,candidate in ipairs(pool) do
             if candidate.w<=0 then continue end
             if candidate.name=="홀리 에로우" and (weights["엔젤레이"] or 0)>0 then candidate.w=weights["엔젤레이"]/99
             elseif candidate.name=="아이언 에로우" and not diagonal and (weights["아이스 샷"] or 0)>0 then candidate.w=weights["아이스 샷"]/99
             elseif candidate.name=="달팽이 세마리" then
-                if (self._T.slottedAttackTier or 0)>=2 then candidate.w=0
+                if attackTier>=2 then candidate.w=0
                 elseif firstWeight>0 then candidate.w=math.min(candidate.w,firstWeight/99) end
             end
         end

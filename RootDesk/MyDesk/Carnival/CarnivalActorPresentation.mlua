@@ -33,18 +33,21 @@ script CarnivalActorPresentation extends Logic
             return _EffectService:PlayEffectAttached(ruid,actor,offset,rotation,scale,loop,self:ForegroundOptions(actor,options))
         end
         options=self:ForegroundOptions(actor,options)
-        local template=_CarnivalUI:UI("Lobby/Scene/EffectTemplate")
+        local template=_CarnivalUI:UI("Lobby/Scene/EffectAnchorTemplate")
         if not isvalid(template) then return 0 end
         self._T.serial=(self._T.serial or 0)-1
         local serial=self._T.serial
-        local node=_SpawnService:SpawnByEntity(template,"NativeSkillEffect"..tostring(-serial),Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
+        -- The anchor template owns a Visual child; clone the complete tree before publishing.
+        local node=_SpawnService:SpawnByEntity(template,"NativeSkillEffect"..tostring(-serial),Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),true)
         if not isvalid(node) then return 0 end
         node.Enable=false
         node.Visible=false
-        local effect={node=node,actor=binding.actor,anchor=actor,offset=offset,rotation=rotation,scale=scale,options=options,frames={},ruid=ruid,worldPosition=options.carnivalWorldPosition,loop=loop,born=_UtilLogic.ElapsedSeconds}
+        local visual=node:GetChildByName("Visual")
+        if not isvalid(visual) then _EntityService:Destroy(node) return 0 end
+        local effect={node=node,visual=visual,actor=binding.actor,anchor=actor,offset=offset,rotation=rotation,scale=scale,options=options,frames={},ruid=ruid,worldPosition=options.carnivalWorldPosition,loop=loop,born=_UtilLogic.ElapsedSeconds,readyFrame=(self._T.frameSerial or 0)+2}
         self._T.effects=self._T.effects or {}
         self._T.effects[serial]=effect
-        local sprite=node.SpriteGUIRendererComponent
+        local sprite=visual.SpriteGUIRendererComponent
         sprite.Type=ImageType.Simple
         sprite.PreserveSprite=PreserveSpriteType.NativeSize
         sprite.RaycastTarget=false
@@ -59,12 +62,12 @@ script CarnivalActorPresentation extends Logic
         sprite.Color=Color(color.r,color.g,color.b,color.a*(options.Alpha or 1))
         if options.MaterialID~=nil then sprite.MaterialId=options.MaterialID end
         self:UpdateEffectTransform(effect,binding)
-        effect.frameEvent=node:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,function(e)
+        effect.frameEvent=visual:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,function(e)
             effect.frames[e.FrameIndex]=true
             effect.total=e.TotalFrameCount
             effect.last=e.FrameIndex
         end)
-        effect.endEvent=node:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function()
+        effect.endEvent=visual:ConnectEvent(SpriteGUIAnimPlayerEndEvent,function()
             if loop then return end
             local count=0
             for _,seen in pairs(effect.frames) do if seen then count=count+1 end end
@@ -72,7 +75,6 @@ script CarnivalActorPresentation extends Logic
             self:RemoveEffect(serial)
         end)
         self._T.sortDirty=true
-        self:SortScene()
         node.Enable=true
         if self._T.verifyEffects then log("[VRF] Carnival original effect routed ruid="..ruid.." rate="..tostring(sprite.PlayRate).." ppu="..tostring(binding.ppu)) end
         return serial
@@ -86,8 +88,10 @@ script CarnivalActorPresentation extends Logic
         if effect==nil then return end
         self._T.effects[serial]=nil self._T.sortDirty=true
         if isvalid(effect.node) then
-            effect.node:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,effect.frameEvent)
-            effect.node:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,effect.endEvent)
+            if isvalid(effect.visual) then
+                effect.visual:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent,effect.frameEvent)
+                effect.visual:DisconnectEvent(SpriteGUIAnimPlayerEndEvent,effect.endEvent)
+            end
             _EntityService:Destroy(effect.node)
         end
     end
@@ -128,12 +132,13 @@ script CarnivalActorPresentation extends Logic
     method void TrackEntity(Entity actor, Entity entity)
         -- Watches the native entity rather than simulating a second projectile.
         if not isvalid(actor) or not isvalid(entity) or actor==entity then return end
+        if (self._T.entities or {})[entity.Id]~=nil then return end
         -- Avatar internals already render through AvatarGUIRenderer; never project them a second time.
         local avatar=actor.AvatarRendererComponent
         local avatarRoot=isvalid(avatar) and avatar:GetAvatarRootEntity() or nil
         local cursor=entity
         while isvalid(cursor) and cursor~=actor do
-            if cursor==avatarRoot or cursor.Name=="HealerHpBar" or cursor.Name=="HeroHpBar" then return end
+            if cursor==avatarRoot or cursor.Name=="HealerHpBar" or cursor.Name=="HeroHpBar" or cursor.Name=="ShadowCloneHpBar" then return end
             local parent=cursor.Parent
             if isvalid(parent) and isvalid(parent.AvatarRendererComponent) and cursor==parent.AvatarRendererComponent:GetAvatarRootEntity() then return end
             cursor=cursor.Parent
@@ -194,20 +199,23 @@ script CarnivalActorPresentation extends Logic
             return
         end
         if not isvalid(record.node) then
-            local template=_CarnivalUI:UI("Lobby/Scene/EffectTemplate")
+            local template=_CarnivalUI:UI("Lobby/Scene/EffectAnchorTemplate")
             if not isvalid(template) then return end
-            record.node=_SpawnService:SpawnByEntity(template,"NativeEntity_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),false)
+            -- Native projectiles use the same anchor/Visual tree as skill effects.
+            record.node=_SpawnService:SpawnByEntity(template,"NativeEntity_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),true)
             if not isvalid(record.node) then return end
+            record.spriteNode=record.node:GetChildByName("Visual")
+            if not isvalid(record.spriteNode) then _EntityService:Destroy(record.node) record.node=nil return end
             record.node.Visible=false
             record.node.Enable=true
             self._T.sortDirty=true
-            record.publishAt=_UtilLogic.ElapsedSeconds+0.001
-            record.node.SpriteGUIRendererComponent.Type=ImageType.Simple
-            record.node.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
-            record.node.SpriteGUIRendererComponent.RaycastTarget=false
-            record.node.SpriteGUIRendererComponent.AnimClipPlayType=SpriteAnimClipPlayType.Loop
+            record.readyFrame=(self._T.frameSerial or 0)+2
+            record.spriteNode.SpriteGUIRendererComponent.Type=ImageType.Simple
+            record.spriteNode.SpriteGUIRendererComponent.PreserveSprite=PreserveSpriteType.NativeSize
+            record.spriteNode.SpriteGUIRendererComponent.RaycastTarget=false
+            record.spriteNode.SpriteGUIRendererComponent.AnimClipPlayType=SpriteAnimClipPlayType.Loop
         end
-        local node=record.node local sprite=node.SpriteGUIRendererComponent
+        local node=record.node local sprite=record.spriteNode.SpriteGUIRendererComponent
         -- Publish only after costume, image and transform are initialized.
         if record.ruid~=source.SpriteRUID then
             record.ruid=source.SpriteRUID record.frame=nil
@@ -216,7 +224,7 @@ script CarnivalActorPresentation extends Logic
         if source.DrawMode~=SpriteDrawMode.Simple then
             sprite.Type=source.DrawMode==SpriteDrawMode.Sliced and ImageType.Sliced or ImageType.Tiled
             sprite.PreserveSprite=PreserveSpriteType.None
-            node.UITransformComponent.RectSize=source.TiledSize*100
+            record.spriteNode.UITransformComponent.RectSize=source.TiledSize*100
         else
             sprite.Type=ImageType.Simple sprite.PreserveSprite=PreserveSpriteType.NativeSize
         end
@@ -238,7 +246,7 @@ script CarnivalActorPresentation extends Logic
             cursor=cursor.Parent
         end
         node.UITransformComponent.UIScale=Vector3(sx*binding.ppu/100,sy*binding.ppu/100,1)
-        local visible=visual.EnabledInHierarchy and visual.VisibleInHierarchy and source.Enable and _UtilLogic.ElapsedSeconds>=(record.publishAt or 0)
+        local visible=visual.EnabledInHierarchy and visual.VisibleInHierarchy and source.Enable and (self._T.frameSerial or 0)>=(record.readyFrame or 0)
         if node.Visible~=visible then node.Visible=visible end
         if not record.projected then
             record.projected=true
@@ -249,6 +257,7 @@ script CarnivalActorPresentation extends Logic
     @ExecSpace("ClientOnly")
     method void DrawFrame(number delta)
         -- Run after the window camera and actor views have been updated for this frame.
+        self._T.frameSerial=(self._T.frameSerial or 0)+1
         -- Native hit flashes are often child sprites spawned directly by projectile components.
         for id,binding in pairs(self._T.views or {}) do
             if not isvalid(binding.actor) then
@@ -272,22 +281,31 @@ script CarnivalActorPresentation extends Logic
             end
         end
         for _,id in ipairs(remove) do self:RemoveEntity(id) end
-        for _,effect in pairs(self._T.effects or {}) do
-            if isvalid(effect.actor) and isvalid(effect.node) then
+        local expired={}
+        for serial,effect in pairs(self._T.effects or {}) do
+            if isvalid(effect.actor) and isvalid(effect.node) and isvalid(effect.visual) then
                 local binding=(self._T.views or {})[effect.actor.Id]
                 if binding~=nil then
-                    self:UpdateEffectTransform(effect,binding)
+                    local positioned=self:UpdateEffectTransform(effect,binding)
                     -- Enabling a new UI clone initializes its transform on the next frame.
                     -- Keep it hidden and paused until that initialization has finished.
-                    if not effect.published and _UtilLogic.ElapsedSeconds>effect.born then
+                    if not positioned then
+                        effect.node.Visible=false
+                        table.insert(expired,serial)
+                    elseif not effect.published and self._T.frameSerial>=effect.readyFrame then
                         effect.published=true
-                        effect.node.SpriteGUIRendererComponent.PlayRate=effect.options.PlayRate or 1
+                        effect.visual.SpriteGUIRendererComponent.PlayRate=effect.options.PlayRate or 1
                         effect.node.Visible=true
                         if self._T.verifyEffects then log("[VRF][EffectPublish] ruid="..effect.ruid.." at="..tostring(effect.node.UITransformComponent.anchoredPosition)) end
+                        if Environment:IsMakerPlay() and not self._T.anchorVerified then
+                            self._T.anchorVerified=true
+                            log("[VRF][CarnivalEffectAnchor] separate visual positioned at="..tostring(effect.node.UITransformComponent.anchoredPosition))
+                        end
                     end
-                end
-            end
+                else table.insert(expired,serial) end
+            else table.insert(expired,serial) end
         end
+        for _,serial in ipairs(expired) do self:RemoveEffect(serial) end
         if self._T.sortDirty or _UtilLogic.ElapsedSeconds>=(self._T.sortAt or 0) then
             self._T.sortAt=_UtilLogic.ElapsedSeconds+0.1 self:SortScene()
         end
@@ -429,20 +447,35 @@ script CarnivalActorPresentation extends Logic
         -- Reuse the real summon-party health gauge above each summoned avatar.
         local entity=record.entity local hp=0 local maximum=0
         local hero=entity:GetComponent("HeroSummon") local healer=entity:GetComponent("HealerSummon")
+        local clone=entity:GetComponent("ShadowClone")
         if isvalid(hero) then hp=hero.HeroHp maximum=hero.HeroMaxHp
-        elseif isvalid(healer) then hp=healer.HealerHp maximum=healer.HealerMaxHp else return end
+        elseif isvalid(healer) then hp=healer.HealerHp maximum=healer.HealerMaxHp
+        elseif isvalid(clone) then hp=clone.CloneHp maximum=clone.CloneMaxHp else return end
         if not isvalid(record.health) then
             local template=_EntityService:GetEntityByPath("/ui/SummonPartyUI/Board/Row1/HpBg")
             if not isvalid(template) then return end
             record.health=_SpawnService:SpawnByEntity(template,"SummonHP_"..entity.Id,Vector3.zero,_CarnivalUI:UI("Lobby/Scene"),true)
             if not isvalid(record.health) then return end
-            record.health.UITransformComponent.RectSize=Vector2(55,6)
+            -- The shared gauge uses polygon points, so scale the whole tree instead of only its rect.
+            record.health.Enable=false
+            local transform=record.health.UITransformComponent
+            transform.AlignmentOption=AlignmentType.Center
+            transform.AnchorsMin=Vector2(0.5,0.5)
+            transform.AnchorsMax=Vector2(0.5,0.5)
+            transform.Pivot=Vector2(0.5,0.5)
+            transform.RectSize=Vector2(110,12)
+            transform.UIScale=Vector3(0.5,0.5,1)
         end
         record.health.UITransformComponent.anchoredPosition=self:ProjectAnchor(binding,entity,entity.TransformComponent.WorldPosition+Vector3(0,1.05,0))
         local fill=record.health:GetChildByName("HpFill")
         if not isvalid(fill) then return end
-        fill.SpriteGUIRendererComponent.FillAmount=maximum>0 and math.max(0,math.min(1,hp/maximum)) or 0
-        record.health.Enable=entity.EnabledInHierarchy and hp>0
+        local ratio=maximum>0 and math.max(0,math.min(1,hp/maximum)) or 0
+        _SummonPartyUI:UpdateFill(fill,ratio)
+        record.health.Enable=entity.EnabledInHierarchy and hp>0 and maximum>0
+        if Environment:IsMakerPlay() and not record.healthVerified and isvalid(fill.PolygonGUIRendererComponent) then
+            record.healthVerified=true
+            log("[VRF] Carnival summon polygon HP ready ratio="..tostring(ratio).." size=55x6")
+        end
     end
 
 
@@ -498,8 +531,9 @@ script CarnivalActorPresentation extends Logic
     end
 
     @ExecSpace("ClientOnly")
-    method void UpdateEffectTransform(table effect, table binding)
+    method boolean UpdateEffectTransform(table effect, table binding)
         -- Attached effects use local coordinates, whereas world effects remain fixed.
+        if not isvalid(effect.node) or not isvalid(binding.view) then return false end
         local tr=effect.node.UITransformComponent
         local scale=effect.scale
         local rotation=effect.rotation
@@ -511,16 +545,17 @@ script CarnivalActorPresentation extends Logic
             local parentScale=self:WorldScale(effect.anchor)
             scale=Vector3(scale.x*parentScale.x,scale.y*parentScale.y,scale.z*parentScale.z)
             rotation=rotation+anchor.WorldZRotation
-        end
+        else return false end
         tr.UIRotation=Vector3(0,0,rotation)
         tr.UIScale=Vector3(scale.x*binding.ppu/100,scale.y*binding.ppu/100,scale.z)
         if effect.options.SyncFlip==true and isvalid(effect.anchor) then
             local source=effect.anchor.SpriteRendererComponent
             local controller=effect.anchor.PlayerControllerComponent
-            local sprite=effect.node.SpriteGUIRendererComponent
+            local sprite=effect.visual.SpriteGUIRendererComponent
             if isvalid(source) then sprite.FlipX=source.FlipX sprite.FlipY=source.FlipY
             elseif isvalid(controller) then sprite.FlipX=_CarnivalReplica:PresentationFacing(effect.anchor)>0 end
         end
+        return true
     end
 
 
@@ -565,7 +600,15 @@ script CarnivalActorPresentation extends Logic
         if self._T.sortSignature==signature then return end
         self._T.sortSignature=signature
         local first=#scene.Children:ToTable()-#list
-        for i,item in ipairs(list) do _UILogic:SetSiblingIndex(item.node.UITransformComponent,first+i-1) end
+        for i,item in ipairs(list) do
+            local transform=item.node.UITransformComponent local index=first+i-1
+            if _UILogic:GetSiblingIndex(transform)~=index then
+                -- Preserve the current frame's layout when the UI hierarchy changes.
+                local position=transform.anchoredPosition local scale=transform.UIScale local rotation=transform.UIRotation
+                _UILogic:SetSiblingIndex(transform,index)
+                transform.anchoredPosition=position transform.UIScale=scale transform.UIRotation=rotation
+            end
+        end
     end
 
 

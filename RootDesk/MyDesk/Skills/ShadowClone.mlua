@@ -8,9 +8,7 @@ script ShadowClone extends Component
 	--  정확히 같다. 전용 모델을 새로 만들면 같은 내용이 두 벌로 갈라져 드리프트만 생긴다).
 	--
 	-- 용사 소환과 다른 점 3가지:
-	--   ① **HP가 없다** - 분신은 피격 대상이 아니다. `herosummon` 모델에는 HitComponent가 없고
-	--      script.HeroSummon도 붙이지 않으므로, 몬스터의 IsAttackTarget(script.HeroSummon 확인)에
-	--      걸리지 않아 자동으로 무적이 된다. 아군 투사체 제외 처리도 필요 없다.
+	--   ① 소환 시점의 주인 최대 HP를 그대로 받으며, HP가 0이면 소멸한다.
 	--   ② 외형은 랜덤이 아니라 **주인의 장비를 그대로 복사**한다(PlayerAttack.SummonShadowClone이
 	--      스폰 직후 CostumeManager에 입힌다 - 서버는 플레이어 장비를 직접 읽을 수 없어 클라가
 	--      RUID 목록을 RPC로 올려준다).
@@ -25,6 +23,8 @@ script ShadowClone extends Component
 	--   나거나 프로퍼티 대입이 유실된다(실측) - 실제 초기화는 첫 ServerTick에서 지연 실행한다.
 
 	property Entity OwnerEntity = nil
+	@Sync property number CloneMaxHp = 1
+	@Sync property number CloneHp = 1
 
 	-- 주인이 소환 시점에 넣어주는 값들(전부 SkillManager가 투자 레벨로 계산해 RPC로 올린 것).
 	property number Lifetime = 30
@@ -67,6 +67,16 @@ script ShadowClone extends Component
 	method void InitServer()
 		-- 첫 ServerTick에서 한 번만 도는 지연 초기화(상단 ⚠ 주석 참고).
 		local now = _UtilLogic.ServerElapsedSeconds
+		if not isvalid(self.Entity.HitComponent) then
+			self.Entity:AddComponent("HitComponent")
+			local hit = self.Entity.HitComponent
+			hit.CollisionGroup = CollisionGroups.HitBox
+			hit.BoxSize = Vector2(0.4, 0.7)
+			hit.ColliderOffset = Vector2(0, 0.35)
+		end
+		self._T.hitEventHandler = self.Entity:ConnectEvent(HitEvent, self.OnCloneHit)
+		self:SpawnHpBar()
+		if Environment:IsMakerPlay() then log("[VRF] ShadowClone HP="..tostring(self.CloneHp).."/"..tostring(self.CloneMaxHp)) end
 		self._T.faceDir = -1
 		self._T.nextTargetAt = 0
 		self._T.nextAttackAt = now + 0.4
@@ -115,6 +125,103 @@ script ShadowClone extends Component
 			.. " / 소유자 레벨 " .. tostring(self.OwnerLevel)) end
 	end
 
+
+	@ExecSpace("ServerOnly")
+	method void OnCloneHit(HitEvent event)
+		if self.CloneHp <= 0 or event.TotalDamage <= 0 then return end
+		if isvalid(_BattleStatsManager:ResolveOwner(event.AttackerEntity)) then return end
+		local now = _UtilLogic.ServerElapsedSeconds
+		if self._T.ropeClimb ~= nil or now < (self._T.dsHiddenUntil or 0) then return end
+		if now < (self._T.hitImmuneUntil or 0) then return end
+		self._T.hitImmuneUntil = now + 2
+		self.CloneHp = math.max(0, self.CloneHp - event.TotalDamage)
+		self:UpdateHpBar()
+		self:ShowReceivedDamage(event.TotalDamage)
+		if Environment:IsMakerPlay() then log("[VRF] ShadowClone hit HP="..tostring(self.CloneHp).."/"..tostring(self.CloneMaxHp)) end
+		if self.CloneHp <= 0 then
+			local pa = self:GetOwnerAttack()
+			if isvalid(pa) and pa._T.shadowCloneEntity == self.Entity then
+				pa._T.shadowCloneEntity = nil
+				pa:NotifyShadowCloneDeath()
+			end
+			self.Entity:Destroy()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		if self._T.hitEventHandler ~= nil then
+			self.Entity:DisconnectEvent(HitEvent, self._T.hitEventHandler)
+			self._T.hitEventHandler = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnHpBar()
+        -- Carnival draws one party-style HP bar in its own viewport.
+        local ownerAttack=isvalid(self.OwnerEntity) and self.OwnerEntity:GetComponent("PlayerAttack") or nil
+        if isvalid(ownerAttack) and ownerAttack._T.carnivalPreview then return end
+		-- 머리 위 HP바: 스나이핑 게이지와 같은 snipinggaugetext 모델(Bg/Fill/Pct)을 용사 자식으로
+		-- 스폰해 재사용한다. Pct 텍스트는 대입하지 않아 빈 문자열(수치 숫자 미표시 - 요청 사항).
+		-- Color/Transform이 @Sync라 서버 대입만으로 모든 클라이언트에 표시된다.
+		local bar = _CarnivalReplica:SpawnSkillEntity(self.OwnerEntity,"snipinggaugetext", "ShadowCloneHpBar", Vector3(0, 1.05, 0), self.Entity)
+		if not isvalid(bar) then
+			log_warning("[ShadowClone] HP바 스폰 실패")
+			return
+		end
+		-- (피드백) 바 아트(keydownbar full 클립)는 애니메이션 클립이라 그대로 두면 프레임이 계속 돌며
+		-- 반짝인다 - PlayRate=0으로 정지시켜 평소에는 반짝이지 않게 한다(피격 플래시는 FlashHpBar가 담당).
+		local bg = bar:GetChildByName("Bg", false)
+		if isvalid(bg) and isvalid(bg.SpriteRendererComponent) then
+			bg.SpriteRendererComponent.Color = Color(0.25, 0.25, 0.25, 0.8)
+			bg.SpriteRendererComponent.PlayRate = 0
+		end
+		local fill = bar:GetChildByName("Fill", false)
+		if isvalid(fill) and isvalid(fill.SpriteRendererComponent) then
+			-- 차지 게이지가 아니라 HP로 읽히도록 붉게 틴트한다.
+			fill.SpriteRendererComponent.Color = Color(1, 0.3, 0.3, 1)
+			fill.SpriteRendererComponent.PlayRate = 0
+		end
+		bar.TransformComponent.Position = Vector3(0, 1.05, 0)
+		for _,part in ipairs({bg,fill}) do
+			if isvalid(part) and not isvalid(part.PixelRendererComponent) then part:AddComponent("PixelRendererComponent") end
+		end
+		bar:AddComponent("SummonHealthBar")
+		if isvalid(bg) then
+			bg.TransformComponent.Position = Vector3.zero
+			bg.TransformComponent.Scale = Vector3(4.625, 5, 1)
+		end
+		self._T.hpBar = bar
+		self:UpdateHpBar()
+		if Environment:IsMakerPlay() then log("[ShadowClone] HP바 표시 " .. tostring(math.floor(self.CloneHp)) .. "/" .. tostring(math.floor(self.CloneMaxHp))) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateHpBar()
+		-- 채움 바 갱신: 스나이핑 게이지와 동일하게 왼쪽 끝 고정 + 가로 스케일 = HP 비율.
+		local bar = self._T.hpBar
+		if not isvalid(bar) then return end
+		local fill = bar:GetChildByName("Fill", false)
+		if not isvalid(fill) then return end
+		local ratio = 0
+		if self.CloneMaxHp > 0 then
+			ratio = math.max(0, math.min(1, self.CloneHp / self.CloneMaxHp))
+		end
+		fill.TransformComponent.Scale = Vector3(4.375 * ratio, 4, 1)
+		fill.TransformComponent.Position = Vector3(-0.35 * (1 - ratio), 0, 0)
+	end
+
+	@ExecSpace("Multicast")
+	method void ShowReceivedDamage(integer damage)
+		if not self:IsClient() or damage <= 0 then return end
+		local skin = "3271c3e79bf04ecba9a107d55495970d"
+		if isvalid(self.OwnerEntity) then local pa = self.OwnerEntity:GetComponent("script.PlayerAttack") if isvalid(pa) then skin = pa:GetHitDamageSkinId() end end
+		if not _AutoHuntPowerSave.active then
+		_CarnivalDamageSkin:Play(self.Entity, skin, 0, { damage > 0 and damage or DamageSkinTextType.Miss }, DamageSkinTweenType.Default, false, Vector2(0, 0.55), Vector2(1, 1), 1.0, 1.0, LitMode.Default)
+		end
+	end
+
+
 	@ExecSpace("ServerOnly")
 	method void CastShadowPartner(number now)
 		-- 쉐도우 파트너(60초): 공격 타수를 복제한다. 시전 모션 동안 공격보다 버프가 우선되도록 잠근다.
@@ -144,6 +251,7 @@ script ShadowClone extends Component
 			self:InitServer()
 		end
 		if not isvalid(self.Entity) then return end
+		if self.CloneHp <= 0 then return end
 		-- 주인이 사라졌으면(퇴장/사망 정리) 2초 유예 후 소멸.
 		if not isvalid(self.OwnerEntity) then
 			self._T.ownerGoneAt = self._T.ownerGoneAt or _UtilLogic.ServerElapsedSeconds

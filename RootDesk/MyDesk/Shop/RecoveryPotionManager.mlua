@@ -93,8 +93,8 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method boolean BlockUse()
+        -- A potion click is silent; restrictions still prevent consumption and effects.
         if not self:IsBossRestricted(_UserService.LocalPlayer) then return false end
-        _UIToast:ShowMessage("상점 포션은 보스전에서 사용할 수 없습니다.")
         return true
     end
 
@@ -113,43 +113,73 @@ script RecoveryPotionManager extends Logic
 
     @ExecSpace("ClientOnly")
     method void FitIcon(Entity icon, string ruid, number width, number height)
-        -- Never suspend a viewport refresh; only the current slot binding may apply loaded dimensions.
+        -- Bind once, then publish loaded artwork and its exact aspect together.
         if not isvalid(icon) then return end
         local renderer=icon.SpriteGUIRendererComponent
         local transform=icon.UITransformComponent
-        self._T.iconSizes=self._T.iconSizes or {}
+        self._T.iconArtwork=self._T.iconArtwork or {}
         self._T.iconRequests=self._T.iconRequests or {}
-        local request={ruid=ruid,width=width,height=height}
-        self._T.iconRequests[icon.Id]=request
+        self._T.iconLoads=self._T.iconLoads or {}
+        local request=self._T.iconRequests[icon.Id]
+        if request==nil or request.ruid~=ruid then
+            request={ruid=ruid,width=width,height=height,icon=icon}
+            self._T.iconRequests[icon.Id]=request
+            renderer.Enable=false
+        else request.width=width request.height=height end
+        transform.AlignmentOption=AlignmentType.Center
+        transform.AnchorsMin=Vector2(.5,.5) transform.AnchorsMax=Vector2(.5,.5)
+        transform.Pivot=Vector2(.5,.5) transform.UIScale=Vector3.one
         renderer.Type=ImageType.Simple
-        renderer.PreserveSprite=PreserveSpriteType.AspectOnly
         renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
-        transform.Pivot=Vector2(0.5,0.5) transform.UIScale=Vector3.one
-        transform.RectSize=Vector2(width,height)
-        if renderer.ImageRUID.DataId~=ruid then renderer.ImageRUID=DataRef(ruid) end
-        if ruid=="" or string.sub(ruid,1,12)=="thumbnail://" then return end
-        local size=self._T.iconSizes[ruid]
-        if size~=nil then self:ApplyIconSize(icon,request,size) return end
+        if ruid=="" then renderer.ImageRUID=DataRef("") return end
+        local artwork=self._T.iconArtwork[ruid]
+        if artwork~=nil then self:ApplyIconArtwork(icon,request,artwork) return end
+        -- Avatar thumbnails are generated square canvases, not loadable Sprite resources.
+        if string.sub(ruid,1,12)=="thumbnail://" then
+            artwork={width=1,height=1,ruid=ruid}
+            self._T.iconArtwork[ruid]=artwork
+            self:ApplyIconArtwork(icon,request,artwork)
+            return
+        end
+        -- One resource load serves all slots displaying the same icon.
+        if self._T.iconLoads[ruid] then return end
+        self._T.iconLoads[ruid]=true
         _ResourceService:PreloadAsync({ruid},function()
-            if not isvalid(icon) or self._T.iconRequests[icon.Id].ruid~=request.ruid or renderer.ImageRUID.DataId~=ruid then return end
-            local sprite=_ResourceService:LoadSpriteAndWait(ruid)
-            if sprite==nil or not sprite.IsLoadComplete or sprite.Width<=0 or sprite.Height<=0 then return end
-            local loaded=Vector2(sprite.Width,sprite.Height)
-            self._T.iconSizes[ruid]=loaded
-            self:ApplyIconSize(icon,self._T.iconRequests[icon.Id],loaded)
+            local sprite=nil
+            local kind=_ResourceService:GetTypeAndWait(ruid)
+            if kind==ResourceType.Sprite then sprite=_ResourceService:LoadSpriteAndWait(ruid)
+            elseif kind==ResourceType.AnimationClip then
+                local clip=_ResourceService:LoadAnimationClipAndWait(ruid)
+                if clip~=nil then for _,frame in ipairs(clip.Frames:ToTable()) do
+                    local candidate=frame.FrameSprite
+                    if candidate~=nil and (sprite==nil or candidate.Width*candidate.Height>sprite.Width*sprite.Height) then sprite=candidate end
+                end end
+            end
+            self._T.iconLoads[ruid]=nil
+            -- Loaded metadata can be ready before IsLoadComplete changes (e.g. box icons).
+            if sprite==nil or sprite.Width<=0 or sprite.Height<=0 then return end
+            local loaded={width=sprite.Width,height=sprite.Height,ruid=sprite.RUID}
+            self._T.iconArtwork[ruid]=loaded
+            for id,current in pairs(self._T.iconRequests) do
+                if not isvalid(current.icon) then self._T.iconRequests[id]=nil
+                elseif current.ruid==ruid then self:ApplyIconArtwork(current.icon,current,loaded) end
+            end
+            if Environment:IsMakerPlay() then log("[VRF] Icon artwork ready "..ruid.." "..tostring(loaded.width).."x"..tostring(loaded.height)) end
         end)
     end
 
     @ExecSpace("ClientOnly")
-    method void ApplyIconSize(Entity icon, table request, Vector2 size)
-        -- A delayed image load cannot resize a reused or cleared slot.
-        if not isvalid(icon) or self._T.iconRequests[icon.Id].ruid~=request.ruid then return end
+    method void ApplyIconArtwork(Entity icon, table request, table artwork)
+        -- Ignore stale bindings; None removes source pivots after aspect-correct sizing.
+        if not isvalid(icon) or self._T.iconRequests[icon.Id]~=request then return end
         local renderer=icon.SpriteGUIRendererComponent
-        if renderer.ImageRUID.DataId~=request.ruid then return end
-        local scale=math.min(request.width/size.x,request.height/size.y)
-        icon.UITransformComponent.RectSize=Vector2(size.x*scale,size.y*scale)
+        local scale=math.min(request.width/artwork.width,request.height/artwork.height)
+        if scale>1 then scale=math.max(1,math.floor(scale)) end
+        icon.UITransformComponent.RectSize=Vector2(artwork.width*scale,artwork.height*scale)
         renderer.PreserveSprite=PreserveSpriteType.None
         renderer.LocalPosition=Vector2.zero renderer.LocalScale=Vector2.one
+        if renderer.ImageRUID.DataId~=artwork.ruid then renderer.ImageRUID=DataRef(artwork.ruid) end
+        renderer.Enable=true
     end
 
     @ExecSpace("ClientOnly")
@@ -182,7 +212,7 @@ script RecoveryPotionManager extends Logic
         if self:BlockUse() then return false end
         local inv = _UIEquipInventoryManager
         local item = inv:GetTabItem("consume", slot)
-        if item~=expected then _UIToast:ShowMessage("아이템이 변경되어 사용을 취소했습니다.") return false end
+        if item~=expected then return false end
         local row = self:ByName(inv:ParseName(item))
         if row == nil or inv:ParseRUID(item) ~= row.ruid or inv:ParseCount(item) < 1 then return false end
         if self._T.using then return false end
@@ -380,7 +410,7 @@ script RecoveryPotionManager extends Logic
                 if Environment:IsMakerPlay() then log("[QuickslotPotion] consumed "..name) end return
             end
         end
-        _UIToast:ShowMessage("인벤토리에 "..name.."이(가) 없습니다.")
+        -- Empty potion slots do not generate a center-screen message.
     end
 
 

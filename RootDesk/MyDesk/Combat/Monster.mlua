@@ -17,6 +17,8 @@ script Monster extends Component
     @Sync property number DeathFadeStarted = -1
     @Sync property number DeathFadeAlpha = 1
     @Sync property number HealthBarUntil = 0
+    @Sync property number HitReactionUntil = 0
+    @Sync property string HitReactionRUID = ""
     property number HealthBarOffsetY = 0
     @Sync property integer NameTagLevel = 0
     @Sync property string NameTagText = ""
@@ -93,6 +95,8 @@ script Monster extends Component
         -- Disable the native hitbox as well as guarding custom HitEvents.
         self.SpawnFadeStarted = _UtilLogic.ServerElapsedSeconds
         self.DeathFadeStarted = -1
+        self.HitReactionUntil = 0
+        self._T.nextHitReaction = nil
         local serial = self.LifeSerial
         local hit = self.Entity.HitComponent
         if isvalid(hit) then
@@ -326,9 +330,11 @@ script Monster extends Component
 
     @ExecSpace("ServerOnly")
     method void OnBeginPlay()
+        -- This component owns hit movement timing, including protection between reactions.
+        -- Native HIT transitions would otherwise stop monsters on every protected hit.
+        if isvalid(self.Entity.StateComponent) then self.Entity.StateComponent:DisconnectHitEvent() end
         -- Carnival owns this entity's lifecycle; never register it with field spawns or rewards.
         if string.sub(self.Entity.Name,1,12)=="CarnivalMob_" then
-            if isvalid(self.Entity.StateComponent) then self.Entity.StateComponent:DisconnectHitEvent() end
             return
         end
         -- 수동 MISS/숫자 표시와 엔진 자동 숫자의 중복을 차단한다.
@@ -406,6 +412,7 @@ script Monster extends Component
         end
         local actualDamage=math.max(0,math.min(self.Hp,event.TotalDamage))
         self.Hp = self.Hp - event.TotalDamage
+        if actualDamage>0 and self.Hp>0 then self:BeginHitReaction(event.AttackerEntity) end
         local thiefVisual=self.Entity:GetComponent("script.ThiefFighterMotion")
         if actualDamage>0 and isvalid(thiefVisual) then thiefVisual:BeginHitBlink() end
         local king=self.Entity:GetComponent("script.KingSlimeEncounter")
@@ -774,9 +781,100 @@ script Monster extends Component
     end
 
     @ExecSpace("ServerOnly")
+    method boolean BeginHitReaction(Entity attacker)
+        local now=_UtilLogic.ServerElapsedSeconds
+        if self.IsDead or self.Hp<=0 or now<(self._T.nextHitReaction or 0) then return false end
+        local snail=self.Entity:GetComponent("script.ManoSnail")
+        -- Damage still applies, but a special snail's charge cannot be interrupted.
+        if isvalid(snail) and snail.Special and snail.Phase=="flight" then return false end
+        self._T.hitRecoilUntil=now+0.25
+        local animation=self.Entity.StateAnimationComponent
+        self.HitReactionRUID=isvalid(animation) and (animation.ActionSheet[animation:StateStringToAnimationKey("HIT")] or "") or ""
+        if isvalid(snail) and snail._T.appearance~=nil then self.HitReactionRUID=snail._T.appearance.hit or self.HitReactionRUID end
+        -- Scripted bosses replace the inherited Mano sprite; never use that template's hit pose.
+        if self.IsStageBoss or self._T.hitReactionBoss==true or isvalid(self.Entity:GetComponent("script.SerufEncounter")) then
+            local ownHit=self._T.bossHitRUID
+            self.HitReactionRUID=(ownHit~=nil and ownHit~="") and ownHit or self.Entity.SpriteRendererComponent.SpriteRUID
+        end
+        self.HitReactionUntil=self._T.hitRecoilUntil+1
+        self._T.nextHitReaction=self.HitReactionUntil+2.5
+        self:PauseHitReactionAI()
+        local source=_BattleStatsManager:ResolveOwner(attacker)
+        if not isvalid(source) then source=attacker end
+        local x=self.Entity.TransformComponent.WorldPosition.x
+        local direction=isvalid(source) and (x>=source.TransformComponent.WorldPosition.x and 1 or -1) or 1
+        self._T.hitReactionDirection=direction
+        local boss=self.IsStageBoss or self._T.hitReactionBoss==true
+        local movement=self.Entity.MovementComponent
+        if isvalid(movement) then movement:Stop() end
+        local body=self.Entity.RigidbodyComponent
+        if isvalid(body) then
+            body.MoveVelocity=Vector2.zero
+            if boss then body:SetForce(Vector2.zero)
+            elseif not self.NeverDie and body.Enable and not body.KinematicMove then
+                -- Measured 2.2 -> 1.4: ground travel is approximately halved after native friction.
+                body:AddForce(Vector2(direction*1.4,0))
+            end
+        end
+        if not boss and not self.NeverDie and (not isvalid(body) or not body.Enable) then
+            -- Script-driven swimmers have no active physics body.
+            self.Entity.TransformComponent:Translate(direction*0.2,0)
+        end
+        if Environment:IsMakerPlay() and not self._T.hitReactionVerified then
+            self._T.hitReactionVerified=true
+            log("[VRF] Hit reaction recoil=0.25 stop=1 protection=2.5 groundForce=1.4 flightDistance=0.2 boss="..tostring(boss))
+        end
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean HoldHitReaction()
+        if self.IsDead or _UtilLogic.ServerElapsedSeconds>=self.HitReactionUntil then return false end
+        local movement=self.Entity.MovementComponent
+        if isvalid(movement) then movement:Stop() end
+        local body=self.Entity.RigidbodyComponent
+        if isvalid(body) then
+            local recoiling=_UtilLogic.ServerElapsedSeconds<(self._T.hitRecoilUntil or 0)
+            local boss=self.IsStageBoss or self._T.hitReactionBoss==true or self.NeverDie
+            -- Only the first 0.25 s pushes; the following second stays stationary.
+            body.MoveVelocity=Vector2(body.KinematicMove and recoiling and not boss and (self._T.hitReactionDirection or 0)*0.8 or 0,0)
+            if not recoiling or boss then body:SetForce(Vector2.zero) end
+        end
+        return true
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PauseHitReactionAI()
+        for _,name in ipairs({"MOD.Core.AIChaseComponent","MOD.Core.AIWanderComponent","MOD.Core.AIComponent"}) do
+            local ai=self.Entity:GetComponent(name)
+            if isvalid(ai) and ai.Enable then
+                self._T.hitPausedAI=self._T.hitPausedAI or {}
+                self._T.hitPausedAI[name]=true ai.Enable=false
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ResumeHitReactionAI()
+        if self._T.hitPausedAI==nil then return end
+        if not self.IsDead and self._T.mapSimulationActive~=false then
+            for name,_ in pairs(self._T.hitPausedAI) do
+                local ai=self.Entity:GetComponent(name)
+                if isvalid(ai) then ai.Enable=true end
+            end
+            self:ApplyAggroState((self._T.aggroUntil or 0)>_UtilLogic.ServerElapsedSeconds,self._T.lastKiller)
+        elseif not self.IsDead then
+            self._T.sleepAI=self._T.sleepAI or {}
+            for name,_ in pairs(self._T.hitPausedAI) do self._T.sleepAI[name]=true end
+        end
+        self._T.hitPausedAI=nil
+    end
+
+    @ExecSpace("ServerOnly")
     method void TickFieldPatrol(number delta)
         -- AI 트리만 이동을 소유하며 피격·빙결·사망 중의 모션을 덮어쓰지 않는다.
         if self._T.mapSimulationActive == false then return end
+        if self:HoldHitReaction() then return end
         local movement = self.Entity.MovementComponent
         local body = self.Entity.RigidbodyComponent
         local state = self.Entity.StateComponent
@@ -1160,6 +1258,35 @@ script Monster extends Component
     end
 
     @ExecSpace("ClientOnly")
+    method boolean SyncHitReactionPose()
+        local sprite=self.Entity.SpriteRendererComponent
+        if not isvalid(sprite) then return false end
+        local holding=not self.IsDead and _UtilLogic.ServerElapsedSeconds<self.HitReactionUntil and self.HitReactionRUID~=""
+        local saved=self._T.hitPose
+        if holding then
+            if saved==nil then
+                saved={ruid=sprite.SpriteRUID,first=sprite.StartFrameIndex,last=sprite.EndFrameIndex,rate=sprite.PlayRate}
+                self._T.hitPose=saved
+                if Environment:IsMakerPlay() then log("[VRF] Hit pose held "..self.Entity.Name.." ruid="..self.HitReactionRUID) end
+            end
+            -- Keep the actual hit pose throughout recoil and the following one-second stop.
+            if sprite.SpriteRUID~=self.HitReactionRUID then sprite.SpriteRUID=self.HitReactionRUID end
+            sprite.StartFrameIndex=0 sprite.EndFrameIndex=0 sprite.PlayRate=0
+            return true
+        end
+        if saved~=nil then
+            if sprite.StartFrameIndex==0 and sprite.EndFrameIndex==0 then
+                sprite.EndFrameIndex=saved.last sprite.StartFrameIndex=saved.first
+            end
+            if sprite.PlayRate==0 then sprite.PlayRate=saved.rate end
+            if not self.IsDead and sprite.SpriteRUID==self.HitReactionRUID then sprite.SpriteRUID=saved.ruid end
+            self._T.hitPose=nil self._T.fieldAnimationState=nil
+            if Environment:IsMakerPlay() then log("[VRF] Hit pose released "..self.Entity.Name) end
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
     method void SyncFieldAnimation()
         -- 일부 필드 모델은 AnimationClipEvent의 이름만 받고 실제 SpriteRUID를 바꾸지 않는다.
         -- 현재 상태를 처음 볼 때와 상태 전환 때만 실제 클립을 연결해 늦은 맵 입장도 처리한다.
@@ -1174,6 +1301,7 @@ script Monster extends Component
             return
         end
         local stateName = state.CurrentStateName
+        if not self.IsDead and _UtilLogic.ServerElapsedSeconds<self.HitReactionUntil then stateName="HIT" end
         if self._T.fieldAnimationState == stateName and self._T.fieldAnimationRenderer == sprite then return end
         local key = animation:StateStringToAnimationKey(stateName)
         local ruid = animation.ActionSheet[key]
@@ -1188,8 +1316,13 @@ script Monster extends Component
         -- 빙결·히트스톱이 소유하는 PlayRate와 커스텀 스킬의 프레임 범위는 변경하지 않는다.
     end
 
-    @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
+        if self:IsServer() then
+            if self:HoldHitReaction() then self:PauseHitReactionAI()
+            else self:ResumeHitReactionAI() end
+            return
+        end
+        local holdingHitPose=self:SyncHitReactionPose()
         -- The carnival window supplies monster sprites and HP bars.
         if self.CarnivalRoom~="" or string.sub(self.Entity.Name,1,12)=="CarnivalMob_" then return end
         if not self.NeverDie then _NetworkMotionVisual:Register(self.Entity) end
@@ -1197,7 +1330,7 @@ script Monster extends Component
         local spawner = self.Entity.DamageSkinSpawnerComponent
         if isvalid(spawner) and spawner.Enable then spawner.Enable = false end
         -- 서버가 승인한 마지막 플레이어 피격 시각을 기준으로 5초간 머리 위를 따라간다.
-        self:SyncFieldAnimation()
+        if not holdingHitPose then self:SyncFieldAnimation() end
         self:UpdateMonsterNameTag()
         self._T.nameTagColorElapsed = (self._T.nameTagColorElapsed or 0) + delta
         if self._T.nameTagColorElapsed >= 0.25 then

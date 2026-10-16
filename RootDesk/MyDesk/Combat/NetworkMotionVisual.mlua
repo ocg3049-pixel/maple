@@ -4,7 +4,7 @@ script NetworkMotionVisual extends Logic
     @ExecSpace("ClientOnly")
     method void OnBeginPlay()
         self._T.entries = self._T.entries or {}
-        if Environment:IsMakerPlay() then log("[NetworkMotion] client visual interpolation ready") end
+        if Environment:IsMakerPlay() then log("[VRF][NetworkMotion] adaptive visual interpolation ready") end
     end
 
     @ExecSpace("ClientOnly")
@@ -22,10 +22,11 @@ script NetworkMotionVisual extends Logic
         local alpha = isvalid(sr) and sr.Color.a or 1
         local monster = source:GetComponent("script.Monster")
         local entry = {source=source, visual=visual, raw=p, from=p, target=p, elapsed=0, duration=0.016,
-            receivedAt=_UtilLogic.ElapsedSeconds, alpha=alpha, visible=false,
+            receivedAt=_UtilLogic.ElapsedSeconds, interval=0.05, alpha=alpha, visible=false,
             life=isvalid(monster) and monster.LifeSerial or 0}
         self._T.entries[source.Id] = entry
         self:CopyAppearance(entry)
+        if Environment:IsMakerPlay() and isvalid(source:GetComponent("script.DroppedItemComponent")) then log("[VRF] Drop motion interpolation registered") end
         return visual
     end
 
@@ -40,15 +41,27 @@ script NetworkMotionVisual extends Logic
     method void CopyAppearance(table entry)
         local source, visual = entry.source, entry.visual
         local st, vt = source.TransformComponent, visual.TransformComponent
-        if vt.Scale ~= st.Scale then vt.Scale = st.Scale end
+        local sr, vr = source.SpriteRendererComponent, visual.SpriteRendererComponent
+        if not isvalid(sr) then vr.Enable = false; return end
+        local scale=st.Scale
+        -- Sprite and transform updates can arrive separately. Size the box before assigning its art.
+        local drop=source:GetComponent("script.DroppedItemComponent")
+        if isvalid(drop) and sr.SpriteRUID=="90d3412612004466b328850446cb1d68" then
+            local boxScale=_MonsterDropRules:EquipmentBoxScale()
+            scale=Vector3(boxScale,boxScale,1)
+            if not entry.boxScaleLogged and Environment:IsMakerPlay() then
+                entry.boxScaleLogged=true log("[VRF] Equipment box first-frame scale="..tostring(boxScale))
+            end
+        end
+        if vt.Scale ~= scale then vt.Scale = scale end
         if vt.WorldZRotation ~= st.WorldZRotation then vt.WorldZRotation = st.WorldZRotation end
         local visible=source.VisibleInHierarchy and source.EnabledInHierarchy
         if visual.Visible~=visible then visual.Visible=visible end
-        local sr, vr = source.SpriteRendererComponent, visual.SpriteRendererComponent
-        if not isvalid(sr) then vr.Enable = false; return end
         if vr.Enable ~= sr.Enable then vr.Enable = sr.Enable end
         local king=source:GetComponent("script.KingSlimeEncounter")
-        local kingPose=isvalid(king) and king:ApplySlamPose(vr)
+        local hitMonster=source:GetComponent("script.Monster")
+        local hitPose=isvalid(hitMonster) and not hitMonster.IsDead and _UtilLogic.ServerElapsedSeconds<hitMonster.HitReactionUntil
+        local kingPose=not hitPose and isvalid(king) and king:ApplySlamPose(vr)
         if not kingPose and vr.SpriteRUID ~= sr.SpriteRUID then vr.SpriteRUID = sr.SpriteRUID end
         if vr.FlipX ~= sr.FlipX then vr.FlipX = sr.FlipX end
         if vr.FlipY ~= sr.FlipY then vr.FlipY = sr.FlipY end
@@ -62,6 +75,8 @@ script NetworkMotionVisual extends Logic
         if vr.OrderInLayer ~= sr.OrderInLayer then vr.OrderInLayer = sr.OrderInLayer end
         if vr.IgnoreMapLayerCheck ~= sr.IgnoreMapLayerCheck then vr.IgnoreMapLayerCheck = sr.IgnoreMapLayerCheck end
         if vr.MaterialID ~= sr.MaterialID then vr.MaterialID = sr.MaterialID end
+        if vr.DrawMode ~= sr.DrawMode then vr.DrawMode = sr.DrawMode end
+        if vr.TiledSize ~= sr.TiledSize then vr.TiledSize = sr.TiledSize end
         local c = sr.Color
         if c.a ~= 0 then entry.alpha = c.a end
         local monster = source:GetComponent("script.Monster")
@@ -74,6 +89,10 @@ script NetworkMotionVisual extends Logic
         end
         local fade = isvalid(monster) and monster:GetLifecycleAlpha() or 1
         local alpha=entry.alpha*fade
+        if isvalid(drop) then
+            local homeAlpha=drop:VisualHomeAlpha(vt.WorldPosition)
+            if homeAlpha>=0 then alpha=homeAlpha end
+        end
         if entry.r~=c.r or entry.g~=c.g or entry.b~=c.b or entry.fadeAlpha~=alpha then
             vr.Color=Color(c.r,c.g,c.b,alpha) entry.r=c.r entry.g=c.g entry.b=c.b entry.fadeAlpha=alpha
         end
@@ -84,7 +103,7 @@ script NetworkMotionVisual extends Logic
 
     @ExecSpace("ClientOnly")
     method void Remove(string id)
-        local entry = self._T.entries[id]
+        local entry = (self._T.entries or {})[id]
         if entry == nil then return end
         if (entry.faustAuraId or 0)~=0 then _EffectService:RemoveEffect(entry.faustAuraId) end
         if isvalid(entry.source) and isvalid(entry.source.SpriteRendererComponent) then
@@ -94,6 +113,15 @@ script NetworkMotionVisual extends Logic
         end
         if isvalid(entry.visual) then entry.visual:Destroy() end
         self._T.entries[id] = nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method Vector3 SmoothPosition(Vector3 current, Vector3 target, number interval, number delta)
+        -- Continue approaching between uneven packets without predicting through walls.
+        local dx,dy=target.x-current.x,target.y-current.y
+        if dx*dx+dy*dy<0.000001 or delta>=0.25 then return target end
+        local amount=1-math.exp(-math.max(0,delta)/math.max(0.016,interval*0.5))
+        return Vector3(current.x+dx*amount,current.y+dy*amount,target.z)
     end
 
     @ExecSpace("ClientOnly")
@@ -128,18 +156,18 @@ script NetworkMotionVisual extends Logic
                     visual.TransformComponent.WorldPosition=raw
                     entry.receivedAt=now
                 elseif dx*dx+dy*dy > 0.00000001 then
-                    entry.from=visual.TransformComponent.WorldPosition
                     entry.target=raw
-                    entry.elapsed=0
-                    entry.duration=math.max(0.016, math.min(0.12, now-entry.receivedAt))
+                    local gap=now-entry.receivedAt
+                    -- A pause in movement is not a slow network sample.
+                    if gap<0.3 then entry.interval=math.max(0.016,math.min(0.16,(entry.interval or 0.05)*0.75+gap*0.25)) end
                     entry.receivedAt=now
                 end
                 entry.raw=raw; entry.life=life; entry.visible=visible
-                entry.elapsed=entry.elapsed+delta
-                local t=math.min(1,entry.elapsed/entry.duration)
-                local a,b=entry.from,entry.target
-                visual.TransformComponent.WorldPosition=Vector3(a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,raw.z)
-                if scriptedJump then visual.TransformComponent.WorldPosition=raw end
+                local current=visual.TransformComponent.WorldPosition
+                local nextPosition=scriptedJump and raw or self:SmoothPosition(current,entry.target,entry.interval or 0.05,delta)
+                local drop=source:GetComponent("script.DroppedItemComponent")
+                if isvalid(drop) and drop.phase==1 and drop.HomingUserId~="" then nextPosition=drop:VisualHomePosition(current,delta) end
+                if current~=nextPosition then visual.TransformComponent.WorldPosition=nextPosition end
                 self:CopyAppearance(entry)
                 _CarnivalActorPresentation:RefreshEntity(source)
             end

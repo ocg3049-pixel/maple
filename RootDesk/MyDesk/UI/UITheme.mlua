@@ -2,6 +2,95 @@
 script UITheme extends Logic
 
     @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Upgrade older cached UI instances too; published UI already carries these renderers.
+        local root=_EntityService:GetEntityByPath("/ui/DefaultGroup/CharInfoWindow")
+        self:UpgradeTextTree(root)
+        for _,path in ipairs({"EquipWindow/TabEquip/Label","EquipWindow/TabPet/Label","EquipWindow/PetNotice","InvenWindow/MesoBar/EnhanceOpenBtn/BtnLabel"}) do
+            self:UpgradeTextTree(_EntityService:GetEntityByPath("/ui/DefaultGroup/"..path))
+        end
+        for _,name in ipairs({"BtnReward","BtnAutoHunt","BtnSkill","BtnEnhance","BtnInven","BtnMap"}) do
+            self:SharpHUDButton(_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..name))
+        end
+        if Environment:IsMakerPlay() then log("[VRF] Sharp UI text renderers and six HUD buttons ready") end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SharpHUDButton(Entity entity)
+        if not isvalid(entity) then return end
+        -- A separate surface avoids two GUI renderers sharing the button's transparent hit target.
+        local surface=entity:GetChildByName("SharpSurface")
+        if not isvalid(surface) then
+            surface=_SpawnService:SpawnByModelId("uisprite","SharpSurface",Vector3.zero,entity)
+            if not isvalid(surface) then return end
+            surface:RemoveComponent("MOD.Core.SpriteGUIRendererComponent")
+        end
+        local size=entity.UITransformComponent.RectSize
+        local tr=surface.UITransformComponent
+        tr.AlignmentOption=AlignmentType.Center tr.AnchorsMin=Vector2(.5,.5) tr.AnchorsMax=Vector2(.5,.5)
+        tr.Pivot=Vector2(.5,.5) tr.anchoredPosition=Vector2.zero tr.RectSize=size
+        local pixel=surface.PixelGUIRendererComponent
+        if not isvalid(pixel) then pixel=surface:AddComponent("MOD.Core.PixelGUIRendererComponent") end
+        -- Supersample rounded corners at 2x; reuse the generated pixels across all six buttons.
+        local width,height=math.floor(size.x*2),math.floor(size.y*2)
+        local key=tostring(width)..":"..tostring(height)
+        self._T.hudPixels=self._T.hudPixels or {}
+        local pixels=self._T.hudPixels[key]
+        if pixels==nil then
+            pixels={}
+            local r=16
+            for y=1,height do
+                local shade=.11+.07*(y-1)/math.max(1,height-1)
+                local fill=Color(shade,shade+.01,shade+.02,.96)
+                for x=1,width do
+                    local dx=math.max(r-(x-.5),(x-.5)-(width-r),0)
+                    local dy=math.max(r-(y-.5),(y-.5)-(height-r),0)
+                    local edge=r-math.sqrt(dx*dx+dy*dy)
+                    edge=math.min(edge,x-.5,width-x+.5,y-.5,height-y+.5)
+                    if edge>=2 then pixels[#pixels+1]=fill
+                    else pixels[#pixels+1]=Color(.34,.37,.40,math.max(0,math.min(1,edge+.5))*.96) end
+                end
+            end
+            self._T.hudPixels[key]=pixels
+        end
+        pixel:ResetWithColors(width,height,pixels) pixel.RaycastTarget=false
+        _UILogic:SetSiblingIndex(tr,0)
+        local sprite=entity.SpriteGUIRendererComponent
+        sprite.Color=Color(1,1,1,0) sprite.DropShadow=false
+        entity.ButtonComponent.Transition=TransitionType.None
+        if not isvalid(entity.UITouchReceiveComponent) then entity:AddComponent("MOD.Core.UITouchReceiveComponent") end
+        self._T.sharpHUDHandlers=self._T.sharpHUDHandlers or {}
+        table.insert(self._T.sharpHUDHandlers,{entity=entity,enter=entity:ConnectEvent(UITouchEnterEvent,function() pixel:SetAlpha(1) end),leave=entity:ConnectEvent(UITouchExitEvent,function() pixel:SetAlpha(.96) end)})
+        local icon=entity:GetChildByName("Icon")
+        if isvalid(icon) then
+            icon.UITransformComponent.anchoredPosition=Vector2(0,17)
+            _RecoveryPotionManager:FitIcon(icon,icon.SpriteGUIRendererComponent.ImageRUID.DataId,46,46)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpgradeTextTree(Entity entity)
+        -- Preserve all layout and text bindings while replacing bitmap glyph rendering with SDF text.
+        if not isvalid(entity) then return end
+        local old=entity.TextComponent
+        local text=entity.TextGUIRendererComponent
+        if isvalid(old) and not isvalid(text) then
+            text=entity:AddComponent("MOD.Core.TextGUIRendererComponent")
+            if isvalid(text) then
+                text.Text=old.Text text.FontSize=old.FontSize text.FontColor=old.FontColor
+                text.FontStyle=old.Bold and FontStyleType.Bold or FontStyleType.Normal
+                text.BestFit=old.BestFit text.MinSize=old.MinSize text.MaxSize=old.MaxSize
+                text.Padding=old.Padding text.SizeFit=old.SizeFit
+                local a=tonumber(old.Alignment) or 4
+                text.HorizontalAlignment=({TextHorizontalAlignmentOption.Left,TextHorizontalAlignmentOption.Center,TextHorizontalAlignmentOption.Right})[a%3+1]
+                text.VerticalAlignment=({TextVerticalAlignmentOption.Top,TextVerticalAlignmentOption.Middle,TextVerticalAlignmentOption.Bottom})[math.floor(a/3)+1]
+                old.Enable=false
+            end
+        end
+        for _,child in ipairs(entity.Children:ToTable()) do self:UpgradeTextTree(child) end
+    end
+
+    @ExecSpace("ClientOnly")
     method void ShadedTab(Entity entity, boolean selected)
         if not isvalid(entity) then return end
         local sprite = entity.SpriteGUIRendererComponent
@@ -51,9 +140,12 @@ script UITheme extends Logic
         if not isvalid(entity) then return end
         if isvalid(entity.SpriteGUIRendererComponent) then
             entity.SpriteGUIRendererComponent.Color = background
-            entity.SpriteGUIRendererComponent.Outline = false
-            entity.SpriteGUIRendererComponent.OutlineWidth = 1
-            entity.SpriteGUIRendererComponent.OutlineColor = background.r >= .2 and Color(.82,.96,.31,1) or Color(.32,.35,.38,1)
+            local outlined=string.find(entity.Path,"/ui/BossStage/",1,true)==1 or string.find(entity.Path,"/ui/MapleTutorial/",1,true)==1
+            if entity.Path=="/ui/MapleTutorial/FirstGoal/Collapsed"
+                or entity.Path=="/ui/MapleTutorial/Guide/Collapsed" then outlined=false end
+            entity.SpriteGUIRendererComponent.Outline = outlined
+            entity.SpriteGUIRendererComponent.OutlineWidth = outlined and 2 or 1
+            entity.SpriteGUIRendererComponent.OutlineColor = outlined and Color.white or (background.r >= .2 and Color(.82,.96,.31,1) or Color(.32,.35,.38,1))
         end
         local foreground = background.r >= .2 and Color(.82,.96,.31,1) or Color(.88,.9,.92,1)
         self:Label(entity, foreground)
@@ -143,4 +235,15 @@ script UITheme extends Logic
         if entry.background ~= nil or entry.foreground ~= nil then table.insert(self._T.appearance,entry) end
         for _, child in ipairs(entity.Children:ToTable()) do self:CacheAppearance(child) end
     end
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        for _,h in ipairs(self._T.sharpHUDHandlers or {}) do
+            if isvalid(h.entity) then
+                h.entity:DisconnectEvent(UITouchEnterEvent,h.enter)
+                h.entity:DisconnectEvent(UITouchExitEvent,h.leave)
+            end
+        end
+        self._T.sharpHUDHandlers=nil
+    end
+
 end

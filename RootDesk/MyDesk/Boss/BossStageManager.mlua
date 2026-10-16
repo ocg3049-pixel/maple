@@ -27,6 +27,13 @@ script BossStageManager extends Logic
         return math.floor(7324*2/3)
     end
 
+    method string StageHitRUID(integer stage)
+        local regional=_RegionalBossCatalog:Stage(stage)
+        if regional and regional.hit then return regional.hit end
+        local initialHits={[1]="452cb740ddcb4837a46b75d7935e2ffc",[2]="68ca2cd0ecc04b318660b2b3f14e2acd",[3]="a660f29769d74e4b81c49d9435a7f5b2",[5]="704897beea32477bbc42493e4327f138"}
+        return initialHits[stage] or ""
+    end
+
     method table Stage(integer n)
         -- Stage data is shared by entry, UI, spawning and the encounter controller.
         local names=self:StageNames()
@@ -106,7 +113,7 @@ script BossStageManager extends Logic
     method Entity SummonOwner(Entity target)
         -- Include HP-bearing demon and ember minions as well as humanoid companions.
         if not isvalid(target) then return nil end
-        for _,name in ipairs({"script.HeroSummon","script.HealerSummon","script.SummonDragon","script.IceDemonMinion","script.FireAffinityEmber"}) do
+        for _,name in ipairs({"script.HeroSummon","script.HealerSummon","script.SummonDragon","script.IceDemonMinion","script.FireAffinityEmber","script.ShadowClone"}) do
             local c=target:GetComponent(name)
             if isvalid(c) and isvalid(c.OwnerEntity) then return c.OwnerEntity end
         end
@@ -116,6 +123,8 @@ script BossStageManager extends Logic
     method number SummonMaxHp(Entity target)
         -- Only damageable player companions qualify, never monsters or projectiles.
         if not isvalid(target) then return 0 end
+        local clone=target:GetComponent("script.ShadowClone")
+        if isvalid(clone) and clone.CloneHp>0 then return clone.CloneMaxHp end
         local h=target:GetComponent("script.HeroSummon")
         if isvalid(h) and h.HeroHp>0 then return h.HeroMaxHp end
         local healer=target:GetComponent("script.HealerSummon")
@@ -176,7 +185,7 @@ script BossStageManager extends Logic
         end
         if sv==nil or sv.activeId=="" or session==nil or not session.entered or not isvalid(p) or not isvalid(p.CurrentMap) or data.name==nil then return end
         if not self:IsStageUnlocked(stage,self:ReadClear(sv.saves[sv.activeId] or "")) then self:Notice("이전 보스를 먼저 처치해 주세요.",uid) return end
-        if p.PlayerComponent.Hp<=0 or self:IsArena(p.CurrentMap.Name) or p.CurrentMap.Name=="login" then return end
+        if p.PlayerComponent.Hp<=0 or p.PlayerComponent:IsDead() or self:IsArena(p.CurrentMap.Name) or p.CurrentMap.Name=="login" then return end
         if (_ChannelManager._T.pending or {})[uid]~=nil then self:Notice("맵 이동이 끝난 뒤 입장해 주세요.",uid) return end
         local highest=_LevelCosmeticRewards:ReadState(sv.saves[sv.activeId] or "").highest
         if highest<data.level then self:Notice("입장 레벨은 "..tostring(data.level).."입니다.",uid) return end
@@ -260,6 +269,7 @@ script BossStageManager extends Logic
         local encounter=boss:AddComponent(data.encounter) encounter.OwnerId=senderUserId
         if r.stage>=6 then encounter.StageIndex=r.stage end
         encounter:Decorate()
+        m._T.bossHitRUID=self:StageHitRUID(r.stage)
         if (self._T.runs or {})[senderUserId]~=r or r.state~="spawning" or not isvalid(boss) then
             if isvalid(boss) then boss:Destroy() end
             return
@@ -484,8 +494,15 @@ script BossStageManager extends Logic
             local attack=p:GetComponent("script.PlayerAttack")
             if isvalid(attack) then attack.BossNearestTarget=true end
             p.PlayerComponent.RespawnDuration=r.respawnDuration or 5
-            if p.PlayerComponent.Hp<=0 then p.PlayerComponent:Respawn() end
-            _TeleportService:TeleportToMapPosition(p,r.position,r.origin)
+            local pc=p.PlayerComponent
+            if pc.Hp<=0 or pc:IsDead() then
+                pc:Respawn()
+                pc.Hp=math.max(1,pc.MaxHp)
+                pc:ProcessRevive(r.uid)
+                r.reviveRequestedAt=_UtilLogic.ServerElapsedSeconds
+            end
+            -- Wait for the native death state to clear before starting the return teleport.
+            r.returnStarted=false
         end
         self:EndBattle(r.uid)
     end
@@ -499,7 +516,18 @@ script BossStageManager extends Logic
                 if isvalid(r.boss) then r.boss:Destroy() end
                 _DynamicMapService:DestroyDynamicMap(r.map) self._T.runs[uid]=nil
             elseif r.state=="leaving" then
-                if isvalid(p.CurrentMap) and p.CurrentMap.Name~=r.map then
+                local pc=p.PlayerComponent
+                if pc.Hp<=0 or pc:IsDead() then
+                    if _UtilLogic.ServerElapsedSeconds-(r.reviveRequestedAt or 0)>=1 then
+                        pc.Hp=math.max(1,pc.MaxHp)
+                        pc:ProcessRevive(uid)
+                        r.reviveRequestedAt=_UtilLogic.ServerElapsedSeconds
+                    end
+                elseif not r.returnStarted then
+                    r.returnStarted=true r.age=0
+                    _TeleportService:TeleportToMapPosition(p,r.position,r.origin)
+                    if Environment:IsMakerPlay() then log("[VRF] Boss return after revive hp="..tostring(pc.Hp).." dead="..tostring(pc:IsDead())) end
+                elseif isvalid(p.CurrentMap) and p.CurrentMap.Name==r.origin and (_ChannelManager._T.pending or {})[uid]==nil then
                     _DynamicMapService:DestroyDynamicMap(r.map) self._T.runs[uid]=nil
                     if r.nextStage then self:Enter(uid,r.nextStage) elseif r.retry then self:Enter(uid,r.stage) end
                 elseif r.age>5 then r.age=0 _TeleportService:TeleportToMapPosition(p,r.position,r.origin) end
@@ -574,7 +602,7 @@ script BossStageManager extends Logic
         self:Bind("Modal/Panel/Close",function() self:Close() end)
         self:Bind("Modal/Panel/TitleEquip",function() _ManoTitle:RequestToggle() end)
         self:Bind("Modal/Panel/Enter",function()
-            if not self._T.bossSelected or not self._T.statusReady or self._T.enterPending then return end
+            if self._T.battle or not self._T.bossSelected or not self._T.statusReady or self._T.enterPending then return end
             local data=self:Stage(self.selected)
             if not data.implemented or not self:IsStageUnlocked(self.selected,self.cleared) then return end
             self._T.enterPending=true self._T.enterUntil=_UtilLogic.ElapsedSeconds+10
@@ -622,7 +650,7 @@ script BossStageManager extends Logic
     @ExecSpace("ClientOnly")
     method void Toggle()
         if self.opened then self:Close() return end
-        if not _LoginFlow:IsInGame() or self._T.battle or _GameSystemMenu:BlocksInput() then return end
+        if not _LoginFlow:IsInGame() or _GameSystemMenu:BlocksInput() then return end
         if _EnhancementManager:RequireCubeChoice() then return end
         self.opened=true self.cleared=_ManoTitle.kills
         local remembered=self._T.lastBossSelection
@@ -813,8 +841,8 @@ script BossStageManager extends Logic
             _UITheme:Button(self:UI("Modal/Panel/Info/Tab"..tostring(i)), i==tab and Color(.24,.26,.28,1) or Color(.13,.14,.15,1))
         end
         local ready=selected and self._T.statusReady==true and data.implemented and unlocked
-        self:UI("Modal/Panel/Enter").ButtonComponent.Enable=ready
-        self:UI("Modal/Panel/Enter").TextGUIRendererComponent.Text=not selected and "보스를 선택해 주세요" or (not data.implemented and "아직 준비중입니다." or (ready and ((self._T.practice or {})[self.selected] and "연습 모드 입장" or data.name.." 도전하기") or (self._T.statusReady and "이전 보스 처치 필요" or "기록 확인 중")))
+        self:UI("Modal/Panel/Enter").ButtonComponent.Enable=ready and not self._T.battle
+        self:UI("Modal/Panel/Enter").TextGUIRendererComponent.Text=self._T.battle and "현재 보스전 진행 중" or not selected and "보스를 선택해 주세요" or (not data.implemented and "아직 준비중입니다." or (ready and ((self._T.practice or {})[self.selected] and "연습 모드 입장" or data.name.." 도전하기") or (self._T.statusReady and "이전 보스 처치 필요" or "기록 확인 중")))
         self:UI("Modal/Panel/TitleEquip").Enable=_ManoTitle:CanClaim()
         self:UI("Modal/Panel/TitleEquip").TextGUIRendererComponent.Text="칭호 받기 · ★"..tostring(_ManoTitle.kills)
     end
@@ -955,7 +983,7 @@ script BossStageManager extends Logic
         end
         if self._T.musicPending and self._T.battle then self:StartManoMusic() end
         self:UI("Open").Enable=false self:UI("Event").Enable=false
-        local show=inGame and not _MobileUIManager:IsMobile() and not self._T.battle
+        local show=inGame and not _MobileUIManager:IsMobile()
         for _,name in ipairs({"BtnBoss","BtnEvent"}) do
             local button=_EntityService:GetEntityByPath("/ui/DefaultGroup/MapleHUD/"..name)
             if isvalid(button) then button.Enable=show end

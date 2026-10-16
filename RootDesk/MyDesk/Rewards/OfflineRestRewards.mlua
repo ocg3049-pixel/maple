@@ -109,8 +109,8 @@ script OfflineRestRewards extends Logic
     end
 
     method number OfflineSeconds(table state, number now)
-        -- Do not spend unmeasured time; backwards clocks cannot produce rewards.
-        if state.last<=0 or state.seconds<60 or state.meso<=0 then return 0 end
+        -- Unmeasured characters use the level-10 sample; backwards clocks cannot produce rewards.
+        if state.last<=0 then return 0 end
         return math.max(0,math.min(state.bank,math.floor((now-state.last)/1000)))
     end
 
@@ -120,10 +120,11 @@ script OfflineRestRewards extends Logic
         state.last=now
         if seconds<=0 then return end
         local pending=state.pending or {seconds=0,meso=0,items={}}
-        local factor=seconds/state.seconds*0.7
+        local sample=self:HuntingSample(state)
+        local factor=seconds/sample.seconds*0.7
         pending.seconds=pending.seconds+seconds
-        pending.meso=pending.meso+math.floor(state.meso*factor*(0.9+0.2*_UtilLogic:RandomDouble())+_UtilLogic:RandomDouble())
-        for item,expected in pairs(state.items) do
+        pending.meso=pending.meso+math.floor(sample.meso*factor*(0.9+0.2*_UtilLogic:RandomDouble())+_UtilLogic:RandomDouble())
+        for item,expected in pairs(sample.items) do
             local count=self:RandomCount(expected*factor)
             if count>0 then pending.items[item]=(pending.items[item] or 0)+count end
         end
@@ -280,6 +281,8 @@ script OfflineRestRewards extends Logic
             if pending.meso==0 and next(pending.items)==nil then state.pending=nil
             else state.seq=state.seq+1 pending.id=state.seq pending.sourceBatch=nil end
         end
+        -- A receipt belongs to the client until acknowledged, never to the canonical ledger.
+        state.claim=nil
         return {ok=true,snapshot=self:WriteState(incoming,state)}
     end
 
@@ -371,12 +374,23 @@ script OfflineRestRewards extends Logic
         if self._T.id~=id then return end
         local data=self:ReadState("REST\t"..raw)
         local view=self._T.view
-        if (action=="" and self._T.retryAction==nil) or (action~="" and ok) then self._T.account=data end
+        if data==nil then return end
+        local confirmed=view~=nil and view.claim~=nil and (data.confirmedRev or -1)>=view.rev
+        if (action=="" and self._T.retryAction==nil) or (action~="" and ok) or confirmed then self._T.account=data end
         if action~="" then
             if ok then self._T.retryAction=nil else self._T.retryAction=action end
         end
         for _,ch in ipairs(data.characters or {}) do if ch.pending then ch.pending.items=ch.pending.items or {} end end
-        if view==nil or (data.rev>=view.rev and (view.claim==nil or action=="claim" and ok)) then self._T.view=data end
+        if confirmed then
+            data.claim=nil
+            if self._T.retryAction=="claim" then self._T.retryAction=nil end
+        end
+        if view==nil or (data.rev>=view.rev and (view.claim==nil or confirmed or action=="claim" and ok)) then self._T.view=data end
+        if confirmed and action=="" then
+            self._T.busy=false
+            if self._T.fromCenter then self._T.fromCenter=false _RewardCenter:OnClaimResult("rest",true) end
+            if Environment:IsMakerPlay() then log("[VRF] Rest receipt reconciled revision="..tostring(view.rev)) end
+        end
         self._T.week=week
         self._T.serverNow=data.serverNow self._T.serverAnchor=_UtilLogic.ElapsedSeconds
         if action~="" then
@@ -457,7 +471,7 @@ script OfflineRestRewards extends Logic
         summary=summary.."\n주간 지급: 20시간  |  자동사냥 1분 → 휴식 2분\n현재 캐릭터의 사냥 기록에 따라 보상이 계산됩니다."
         self:UI("Modal/Panel/Summary").TextGUIRendererComponent.Text=summary
         self:UI("Modal/Panel/Recipient").TextGUIRendererComponent.Text=view.name.."의 보상"
-        self:UI("Modal/Panel/Details").TextGUIRendererComponent.Text=pending and ("휴식 "..self:Duration(pending.seconds).." · 평균 효율 70%") or ((view.seconds or 0)<60 and "자동사냥 1분 이상 기록이 필요합니다." or "받을 보상이 없습니다. 접속 중에는 휴식 시간이 소모되지 않습니다.")
+        self:UI("Modal/Panel/Details").TextGUIRendererComponent.Text=pending and ("휴식 "..self:Duration(pending.seconds).." · 평균 효율 70%"..(pending.fallback and " · 10레벨 사냥 기준" or "")) or ((view.seconds or 0)<60 and "사냥 기록이 없으면 10레벨 기본 사냥 기준을 사용합니다." or "받을 보상이 없습니다. 접속 중에는 휴식 시간이 소모되지 않습니다.")
         self:UI("Modal/Panel/Confirm").TextGUIRendererComponent.Text=pending and "보상 받기" or "확인"
         local rows={}
         if pending then
@@ -667,19 +681,38 @@ script OfflineRestRewards extends Logic
         if Environment:IsMakerPlay() then log("[OfflineRest] shared offline seconds="..tostring(account.waiting.seconds)) end
     end
 
+    method table HuntingSample(table state)
+        if (state.seconds or 0)>=60 and (state.meso or 0)>0 then return state end
+        -- Maker measurement 2026-10-16: Lv10 Hero, CP49, Power Strike1,
+        -- 100010000 (Lv8 orange mushrooms): 50 kills / 119.988s, no death.
+        -- Normalize to 120s. Use expected drop earnings rather than lucky rare-item rolls.
+        local sample={seconds=120,meso=50*36.75*_MonsterDropRules:GetMesoDropChance(1),items={},fallback=true}
+        for _,drop in ipairs(_MonsterDropRules:GetItems()) do
+            local expected=50*_MonsterDropRules:CalculateItemChance(drop.rate,drop.fixedRate==true,1,1)
+            if drop.type=="cosmetic_roll" then
+                local categories=_CosmeticBoxCatalog:DropCategories()
+                for _,category in ipairs(categories) do
+                    sample.items[_CosmeticBoxCatalog:BoxItem("cosmetic:"..category.key,1)]=expected/#categories
+                end
+            else sample.items[drop.name.."|"..drop.ruid.."|0|0|0|0|1"]=expected end
+        end
+        return sample
+    end
+
     method table PreviewReward(table account, string id)
         -- Cache each recipient's measured rewards; browsing never rerolls a batch.
         local state=account.characters[id]
         if state==nil then return nil end
         if state.pending then return state.pending end
         local waiting=account.waiting
-        if waiting==nil or state.seconds<60 or state.meso<=0 then return nil end
+        if waiting==nil then return nil end
+        local sample=self:HuntingSample(state)
         waiting.previews=waiting.previews or {}
         local pending=waiting.previews[id]
         if pending==nil then
-            local factor=waiting.seconds/state.seconds*0.7
-            pending={id=waiting.id,preview=true,seconds=waiting.seconds,meso=math.floor(state.meso*factor),items={}}
-            for item,expected in pairs(state.items) do
+            local factor=waiting.seconds/sample.seconds*0.7
+            pending={id=waiting.id,preview=true,seconds=waiting.seconds,meso=math.floor(sample.meso*factor),items={},fallback=sample.fallback==true}
+            for item,expected in pairs(sample.items) do
                 local count=self:RandomCount(expected*factor)
                 if count>0 then pending.items[item]=count end
             end
@@ -718,6 +751,10 @@ script OfflineRestRewards extends Logic
         -- Active inventory receipt and account-wide display data travel independently.
         local account=sv.restAccount
         local data=self:JsonTable(sv.rest)
+        -- Only the successfully persisted account snapshot can acknowledge a lost claim reply.
+        local saved=sv.restSaved and _HttpService:JSONDecode(sv.restSaved) or nil
+        local committed=saved and (saved.characters or {})[sv.activeId] or nil
+        data.confirmedRev=committed and committed.rev or -1
         data.serverNow=self:Now() data.shared=account.bank data.week=account.week data.waitingSeconds=account.waiting and account.waiting.seconds or 0
         data.characters={}
         for _,ch in ipairs(sv.list) do
