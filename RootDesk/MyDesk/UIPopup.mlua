@@ -37,6 +37,8 @@ script UIPopup extends Logic
 			return
 		end
 		self.isOpen = true
+        self._T.dragStart=nil
+        self.popup.UITransformComponent.anchoredPosition=Vector2.zero
 		self.popupGroup.UIGroupComponent.GroupType=UIGroupType.UIType
         self.popupGroup.UIGroupComponent.GroupOrder=1000
         _UILogic:SetSiblingIndex(self.popupGroup.UITransformComponent,100000)
@@ -84,6 +86,8 @@ script UIPopup extends Logic
 	method void Close()
 		-- Release callbacks immediately; repeated close calls cannot stack tweens.
 		if not self.isOpen then return end
+        self._T.dragStart=nil
+        self._T.inputUntil=_UtilLogic.ElapsedSeconds+0.2
 		self:ReleaseHandlers()
 		self.onOk = nil
 		self.onCancel = nil
@@ -156,6 +160,8 @@ script UIPopup extends Logic
         self.tweenEventId = 0
         self.isTweenPlaying = false
         self.isOpen = false
+        self._T.dragStart=nil
+        self._T.inputUntil=0
         self.onOk = nil
         self.onCancel = nil
         if isvalid(self.popupGroup) then self.popupGroup.Enable = false end
@@ -167,16 +173,71 @@ script UIPopup extends Logic
             self:Reset()
             if Environment:IsMakerPlay() then log("[VRF] hidden popup state recovered") end
         end
-        return shown
+        return shown or _UtilLogic.ElapsedSeconds<(self._T.inputUntil or 0)
     end
 
     @ExecSpace("ClientOnly")
     method void OnBeginPlay()
+        -- Route modal keyboard and pointer input before the windows underneath.
         self:Reset()
+        self._T.keyInput=_InputService:ConnectEvent(KeyDownEvent,function(event)
+            if event.key==KeyboardKey.Mouse0 then self:BeginDrag(_InputService:GetCursorPosition()) else self:OnKey(event) end
+        end)
+        self._T.touchInput=_InputService:ConnectEvent(ScreenTouchEvent,function(event)
+            if event.TouchId==1 then self:BeginDrag(event.TouchPoint) end
+        end)
+        self._T.touchHold=_InputService:ConnectEvent(ScreenTouchHoldEvent,function(event)
+            if event.TouchId==1 then self:DragTo(event.TouchPoint) end
+        end)
+        self._T.touchRelease=_InputService:ConnectEvent(ScreenTouchReleaseEvent,function(event)
+            if event.TouchId==1 then self._T.dragStart=nil end
+        end)
+        if Environment:IsMakerPlay() then log("[VRF] popup keyboard and background drag ready") end
     end
 
     @ExecSpace("ClientOnly")
     method void OnEndPlay()
+        -- Release every global subscription before the next play session.
         self:Reset()
+        if self._T.keyInput then _InputService:DisconnectEvent(KeyDownEvent,self._T.keyInput) end
+        if self._T.touchInput then _InputService:DisconnectEvent(ScreenTouchEvent,self._T.touchInput) end
+        if self._T.touchHold then _InputService:DisconnectEvent(ScreenTouchHoldEvent,self._T.touchHold) end
+        if self._T.touchRelease then _InputService:DisconnectEvent(ScreenTouchReleaseEvent,self._T.touchRelease) end
     end
+
+    @ExecSpace("ClientOnly")
+    method void OnKey(KeyDownEvent event)
+        -- One modal consumes Enter/Escape; never activate a hidden/disabled button.
+        if not self.isOpen or not self:BlocksInput() or self.isTweenPlaying then return end
+        if event.key==KeyboardKey.Return or event.key==KeyboardKey.KeypadEnter then
+            if self.btnOk.Enable and self.btnOk.Entity.EnabledInHierarchy then self:OnClickOk() end
+        elseif event.key==KeyboardKey.Escape then
+            if self.btnCancel.Enable and self.btnCancel.Entity.EnabledInHierarchy then self:OnClickCancel() end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BeginDrag(Vector2 point)
+        -- Only the dialog's background is draggable, excluding both action buttons.
+        if not self.isOpen or self.isTweenPlaying or self._T.dragStart~=nil then return end
+        if not _UICursorManager:Hit(self.popup,point) then return end
+        if _UICursorManager:Hit(self.btnOk.Entity,point) or _UICursorManager:Hit(self.btnCancel.Entity,point) then return end
+        self._T.dragStart=_UILogic:ScreenToLocalUIPosition(point,self.popup.Parent.UITransformComponent)
+        self._T.dragOrigin=self.popup.UITransformComponent.anchoredPosition
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DragTo(Vector2 point)
+        -- Convert in the parent's space so dragging stays correct at any resolution.
+        if self._T.dragStart==nil then return end
+        if not self.isOpen or self.isTweenPlaying then self._T.dragStart=nil return end
+        local p=_UILogic:ScreenToLocalUIPosition(point,self.popup.Parent.UITransformComponent)
+        local position=self._T.dragOrigin+p-self._T.dragStart
+        local size=self.popup.UITransformComponent.RectSize
+        local screen=self.popupGroup.UITransformComponent.RectSize
+        local x=math.max(0,(screen.x-size.x)/2-12)
+        local y=math.max(0,(screen.y-size.y)/2-12)
+        self.popup.UITransformComponent.anchoredPosition=Vector2(math.max(-x,math.min(x,position.x)),math.max(-y,math.min(y,position.y)))
+    end
+
 end
