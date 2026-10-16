@@ -1,0 +1,67 @@
+@Logic
+script UIFrameTicker extends Logic
+
+    -- Buff and cooldown controllers retain their own state and share one native timer.
+    @ExecSpace("ClientOnly")
+    method integer Subscribe(any callback, number interval)
+        -- Use independent tokens so a cancelled callback cannot cancel its replacement.
+        self._T.listeners = self._T.listeners or {}
+        self._T.serial = (self._T.serial or 0) + 1
+        local token = self._T.serial
+        local period = math.max(1 / 60, interval)
+        self._T.listeners[token] = {callback = callback, interval = period, due = _UtilLogic.ElapsedSeconds + period}
+        if self._T.timerId == nil then
+            local timerId = _TimerService:SetTimerRepeat(function() self:Tick() end, 1 / 60)
+            if timerId == 0 then
+                self._T.listeners[token] = nil
+                return 0
+            end
+            self._T.timerId = timerId
+            if Environment:IsMakerPlay() then log("[VRF][UIFrameTicker] shared timer started") end
+        end
+        return token
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Unsubscribe(integer token)
+        -- Release the native timer as soon as the last display stops updating.
+        local listeners = self._T.listeners
+        if listeners == nil or token == nil or token <= 0 then return end
+        listeners[token] = nil
+        if next(listeners) == nil and self._T.timerId ~= nil then
+            _TimerService:ClearTimer(self._T.timerId)
+            self._T.timerId = nil
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Tick()
+        -- Snapshot the work list; callbacks may subscribe, cancel, or replace peers.
+        local listeners = self._T.listeners
+        if listeners == nil then return end
+        local now = _UtilLogic.ElapsedSeconds
+        local due = {}
+        for token, entry in pairs(listeners) do
+            if now >= entry.due then table.insert(due, {token = token, entry = entry}) end
+        end
+        for _, work in ipairs(due) do
+            local entry = work.entry
+            if listeners[work.token] == entry then
+                entry.due = now + entry.interval
+                local ok, reason = pcall(entry.callback)
+                if not ok then
+                    self:Unsubscribe(work.token)
+                    log_error("[UIFrameTicker] callback stopped: " .. tostring(reason))
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- End all subscriptions regardless of controller shutdown order.
+        if self._T.timerId ~= nil then _TimerService:ClearTimer(self._T.timerId) end
+        self._T.timerId = nil
+        self._T.listeners = {}
+    end
+end
