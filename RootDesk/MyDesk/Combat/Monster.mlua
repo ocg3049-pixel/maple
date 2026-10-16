@@ -779,6 +779,7 @@ script Monster extends Component
                 self:ApplyAggroState(false, nil)
             end
         end
+        self:HoldMovementPause()
         local attack = self.Entity:GetComponent("script.MonsterAttack")
         if isvalid(attack) then attack:SetMapActivity(active) end
     end
@@ -799,56 +800,89 @@ script Monster extends Component
             local ownHit=self._T.bossHitRUID
             self.HitReactionRUID=(ownHit~=nil and ownHit~="") and ownHit or self.Entity.SpriteRendererComponent.SpriteRUID
         end
-        self.HitReactionUntil=now+1.25
+        self.HitReactionUntil=now+0.25
         self._T.nextHitReaction=self.HitReactionUntil+2.5
         self:PauseHitReactionAI()
         self:HoldHitReaction()
         if Environment:IsMakerPlay() and not self._T.hitReactionVerified then
             self._T.hitReactionVerified=true
-            log("[VRF] Hit reaction stationary=1.25 protection=2.5")
+            log("[VRF] Hit reaction stationary=0.25 protection=2.5")
         end
         return true
     end
 
     @ExecSpace("ServerOnly")
     method boolean HoldHitReaction()
-        -- Stop walking and clear external force throughout the visible hit pose.
+        -- Hit animation and physical stop share one deadline.
         if self.IsDead or _UtilLogic.ServerElapsedSeconds>=self.HitReactionUntil then return false end
-        local movement=self.Entity.MovementComponent
-        if isvalid(movement) then movement:Stop() end
-        local body=self.Entity.RigidbodyComponent
-        if isvalid(body) then
-            body.MoveVelocity=Vector2.zero
-            body:SetForce(Vector2.zero)
-        end
+        self:PauseMovement("hit")
         return true
     end
 
     @ExecSpace("ServerOnly")
     method void PauseHitReactionAI()
-        for _,name in ipairs({"MOD.Core.AIChaseComponent","MOD.Core.AIWanderComponent","MOD.Core.AIComponent"}) do
-            local ai=self.Entity:GetComponent(name)
-            if isvalid(ai) and ai.Enable then
-                self._T.hitPausedAI=self._T.hitPausedAI or {}
-                self._T.hitPausedAI[name]=true ai.Enable=false
-            end
-        end
+        -- Share the baseline with skill stuns instead of snapshotting disabled AI.
+        self:PauseMovement("hit")
     end
 
     @ExecSpace("ServerOnly")
     method void ResumeHitReactionAI()
-        if self._T.hitPausedAI==nil then return end
-        if not self.IsDead and self._T.mapSimulationActive~=false then
-            for name,_ in pairs(self._T.hitPausedAI) do
+        -- A remaining skill stun keeps its own lock until its deadline.
+        self:ResumeMovement("hit")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void PauseMovement(string reason)
+        -- Snapshot the original movement once, before hit/stun locks can overlap.
+        local record=self._T.movementPause
+        if record==nil then
+            local movement=self.Entity.MovementComponent local body=self.Entity.RigidbodyComponent
+            record={reasons={},ai={},move=isvalid(movement) and movement.Enable,body=isvalid(body) and body.Enable}
+            for _,name in ipairs({"MOD.Core.AIChaseComponent","MOD.Core.AIWanderComponent","MOD.Core.AIComponent"}) do
                 local ai=self.Entity:GetComponent(name)
-                if isvalid(ai) then ai.Enable=true end
+                if isvalid(ai) then record.ai[name]=ai.Enable or (self._T.sleepAI~=nil and self._T.sleepAI[name]==true) end
             end
-            self:ApplyAggroState((self._T.aggroUntil or 0)>_UtilLogic.ServerElapsedSeconds,self._T.lastKiller)
-        elseif not self.IsDead then
-            self._T.sleepAI=self._T.sleepAI or {}
-            for name,_ in pairs(self._T.hitPausedAI) do self._T.sleepAI[name]=true end
+            self._T.movementPause=record
         end
-        self._T.hitPausedAI=nil
+        record.reasons[reason]=true
+        self:HoldMovementPause()
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HoldMovementPause()
+        -- Stop physical inertia as well as AI input; no per-frame teleport is needed.
+        if self._T.movementPause==nil then return end
+        for name,_ in pairs(self._T.movementPause.ai) do
+            local ai=self.Entity:GetComponent(name) if isvalid(ai) then ai.Enable=false end
+        end
+        local movement=self.Entity.MovementComponent local body=self.Entity.RigidbodyComponent
+        if isvalid(movement) then movement:Stop() movement.Enable=false end
+        if isvalid(body) then body.MoveVelocity=Vector2.zero body:SetForce(Vector2.zero) body:SetForceReserve(Vector2.zero) body.Enable=false end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ResumeMovement(string reason)
+        -- Only the last lock restores the shared baseline, respecting map sleep.
+        local record=self._T.movementPause
+        if record==nil then return end
+        if reason=="lifecycle" then record.reasons={} else record.reasons[reason]=nil end
+        if next(record.reasons)~=nil then self:HoldMovementPause() return end
+        self._T.movementPause=nil
+        local movement=self.Entity.MovementComponent local body=self.Entity.RigidbodyComponent
+        if isvalid(body) then
+            body.MoveVelocity=Vector2.zero body:SetForce(Vector2.zero) body:SetForceReserve(Vector2.zero)
+            body.Enable=record.body
+            if record.body then body:PositionReset() end
+        end
+        if isvalid(movement) then movement.Enable=record.move end
+        for name,enabled in pairs(record.ai) do
+            local ai=self.Entity:GetComponent(name)
+            if isvalid(ai) then ai.Enable=enabled and self._T.mapSimulationActive~=false end
+            if enabled and self._T.mapSimulationActive==false then
+                self._T.sleepAI=self._T.sleepAI or {} self._T.sleepAI[name]=true
+            end
+        end
+        if not self.IsDead then self:ApplyAggroState((self._T.aggroUntil or 0)>_UtilLogic.ServerElapsedSeconds,self._T.lastKiller) end
     end
 
     @ExecSpace("ServerOnly")
@@ -938,6 +972,7 @@ script Monster extends Component
                 ai:SetTarget(nextTarget)
             end
             ai.IsChaseNearPlayer = false
+            self:HoldMovementPause()
             return
         end
         if aggro and isvalid(ai) and isvalid(target) then
@@ -952,6 +987,7 @@ script Monster extends Component
             end
             if isvalid(aw) and not aw.Enable then aw.Enable = true end
         end
+        self:HoldMovementPause()
         -- An aggro-expiry callback must not wake AI after the last player left.
         if self._T.mapSimulationActive == false then self:SetMapSimulationActive(false) end
     end
@@ -1066,6 +1102,9 @@ script Monster extends Component
         self.DeathFadeAlpha = self:GetLifecycleAlpha()
         self.DeathFadeStarted = _UtilLogic.ServerElapsedSeconds
         self.IsDead = true
+        self.HitReactionUntil=0
+        _MonsterStatusLedger:Clear(self.Entity)
+        self:ResumeMovement("lifecycle")
         _FieldMonsterSkills:Reset(self)
         self:PlayDeathSound()
         self.HealthBarUntil = 0
@@ -1168,6 +1207,8 @@ script Monster extends Component
 		self._T.iceDemonMarkToken = (self._T.iceDemonMarkToken or 0) + 1
 		self._T.fireDemonMarkOwner=nil self._T.fireDemonMarkLevel=nil self._T.fireDemonMarkExpiresAt=nil self._T.fireDemonMarkToken=(self._T.fireDemonMarkToken or 0)+1
 		self:ClearIceDemonMarkEffect()
+        _MonsterStatusLedger:Clear(self.Entity)
+        self:ResumeMovement("lifecycle")
         self.IsDead = false
         self.HealthBarUntil = 0
         self.Hp = self.MaxHp
@@ -1206,6 +1247,7 @@ script Monster extends Component
         -- 그 상태가 리스폰까지 따라 나온다. 살아날 때 렌더 상태를 항상 기본값으로 초기화한다.
         self:ResetTint()
         self:SetMapSimulationActive(_MonsterZoneRespawn:IsMapActive(self.Entity.CurrentMap))
+        if self._T.fieldPatrolReady and isvalid(self.Entity.AIChaseComponent) then self.Entity.AIChaseComponent.Enable=self._T.mapSimulationActive~=false end
         if Environment:IsMakerPlay() then log("Monster: Respawn(), Hp=" .. tostring(self.Hp) .. " pos=" .. tostring(self._T.spawnX) .. "," .. tostring(self._T.spawnY)) end
     end
 
@@ -1252,16 +1294,15 @@ script Monster extends Component
                 self._T.hitPose=saved
                 if Environment:IsMakerPlay() then log("[VRF] Hit pose held "..self.Entity.Name.." ruid="..self.HitReactionRUID) end
             end
-            -- Keep the actual hit pose throughout recoil and the following one-second stop.
+            -- Display the short hit clip without owning another status effect's PlayRate.
             if sprite.SpriteRUID~=self.HitReactionRUID then sprite.SpriteRUID=self.HitReactionRUID end
-            sprite.StartFrameIndex=0 sprite.EndFrameIndex=0 sprite.PlayRate=0
+            sprite.StartFrameIndex=0 sprite.EndFrameIndex=2147483647
             return true
         end
         if saved~=nil then
             if sprite.StartFrameIndex==0 and sprite.EndFrameIndex==0 then
                 sprite.EndFrameIndex=saved.last sprite.StartFrameIndex=saved.first
             end
-            if sprite.PlayRate==0 then sprite.PlayRate=saved.rate end
             if not self.IsDead and sprite.SpriteRUID==self.HitReactionRUID then sprite.SpriteRUID=saved.ruid end
             self._T.hitPose=nil self._T.fieldAnimationState=nil
             if Environment:IsMakerPlay() then log("[VRF] Hit pose released "..self.Entity.Name) end
